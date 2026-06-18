@@ -1,0 +1,94 @@
+{
+  "id": "C00PacketKeepAlive",
+  "hex": "0x00",
+  "dec": 0,
+  "dir": "SERVERBOUND",
+  "state": "PLAY",
+  "name": "Keep Alive (Response)",
+  "desc": "Response to S00PacketKeepAlive. The client echoes back the server's keep-alive ID.",
+  "tags": [
+    "connection",
+    "player"
+  ],
+  "fields": [
+    {
+      "name": "key",
+      "type": "int",
+      "desc": "The keep-alive ID received from the server"
+    }
+  ],
+  "encoding": [
+    [
+      "Keep Alive ID",
+      "int",
+      "Echoed from S00PacketKeepAlive"
+    ]
+  ],
+  "mcp": [
+    "NetHandlerPlayServer.processKeepAlive()"
+  ],
+  "handler": "INetHandlerPlayServer",
+  "notes": "If the client doesn't respond within ~30 seconds, the server will disconnect them.",
+  "implementation": {
+    "overview": "C00PacketKeepAlive is the client\"s response to the server\"s S00PacketKeepAlive. The server periodically sends a keepalive request with a random integer ID, and the client MUST echo that ID back within ~30 seconds or the server disconnects with \"Timed out\". This packet is one of the most commonly intercepted in 1.8.9 clients because it directly controls how the anti-cheat measures connection latency and packet timing. Intercepting or delaying it is the foundation of PingSpoof, many Disabler modes, and Timer/LagSwitch modules.",
+    "modules": [
+      {
+        "name": "PingSpoof",
+        "found_in": [
+          "Astro 2.2.1",
+          "Sigma 3.9",
+          "Sigma 2.08",
+          "Tenacity 5.1",
+          "Lycoris 2.0",
+          "November 0.2",
+          "Raze Recode 1.1"
+        ],
+        "purpose": "Fakes higher ping by delaying the keepalive response. Useful for looking like you have lag (to explain away impossible angles/fast reactions) or for anti-cheat bypass.",
+        "how_it_works": "When S00PacketKeepAlive arrives (incoming), the module cancels the normal handler and saves the keepalive ID. Then instead of immediately sending C00 back, it waits a configurable delay (e.g. 500ms - 3000ms). After the timer fires, it sends C00PacketKeepAlive with the stored ID back. Some clients modify the ID by adding a random offset to make it look \"natural\".",
+        "detailed_code": "// Astro 2.2.1 - PingSpoof.java\n@Subscribe\npublic void onEvent(EventReceivePacket event) {\n  if (event.getPacket() instanceof S00PacketKeepAlive) {\n    event.setCancelled();\n    S00PacketKeepAlive s00 = (S00PacketKeepAlive) event.getPacket();\n    // Add FPS/2 offset to the ID to avoid simple pattern detection\n    mc.getNetHandler().getNetworkManager().sendPacket(\n      new C00PacketKeepAlive(s00.func_149134_c() + mc.getDebugFPS() / 2));\n  }\n}\n\n// Sigma 3.9 - PingSpoof.java - Queue-based delay\nif (ep.isOutgoing() && ep.getPacket() instanceof C00PacketKeepAlive && mc.thePlayer.isEntityAlive()) {\n  packetList.add(ep.getPacket());  // store in queue\n  event.setCancelled(true);        // block immediate send\n}\n// On each game tick, flush packets that have aged past the delay threshold:\nif (timer.delay(1000 * waitSeconds)) {\n  // release packets in small batches to simulate real network\n  mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C00PacketKeepAlive(10000));\n}",
+        "vanilla_hook": "NetHandlerPlayClient.handleKeepAlive() — the method that receives S00 and sends back C00. Override via EventReceivePacket before this method runs.",
+        "anti_cheat_notes": "Vanilla timeout is ~30 seconds. Most anti-cheats (Watchdog, AAC, NCP) check that the lag is consistent — if you delay exactly 500ms every time, they flag it. Smart PingSpoof modules randomize the delay by ±15%. Some anti-cheats also check that the keepalive ID matches what they sent; random modifications to the ID can trigger flags."
+      },
+      {
+        "name": "Disabler — Watchdog (Hypixel) mode",
+        "found_in": [
+          "Tenacity 5.1",
+          "Tenacity 4.0",
+          "Lycoris 2.0",
+          "November 0.2"
+        ],
+        "purpose": "Hypixel\"s Watchdog anti-cheat uses keepalive timing + transaction (C0F) ordering to detect cheat modules. By queueing C00+C0F together and releasing them after a precise delay, the module \"disables\" Watchdog\"s ability to correlate movement vs server position.",
+        "how_it_works": "The disabler intercepts BOTH C00PacketKeepAlive and C0FPacketConfirmTransaction. For the first 350ms of a movement burst, all C00 and C0F packets are cancelled and saved to a queue. After 350ms, ALL queued packets are flushed at once. This creates a burst of \"valid\" transactions that saturate Watchdog\"s buffer, causing it to stop checking movement legitimacy.",
+        "detailed_code": "// Tenacity 5.1 - Disabler.java\nif(!timer.hasTimeElapsed(350)) {\n  if(event.getPacket() instanceof C0FPacketConfirmTransaction\n    || event.getPacket() instanceof C00PacketKeepAlive) {\n    event.cancel();\n    watchdogC0FC00Packets.add(event.getPacket());\n  }\n} else if(!watchdogC0FC00Packets.isEmpty()) {\n  // Flush all queued packets\n  watchdogC0FC00Packets.forEach(PacketUtils::sendPacketNoEvent);\n  watchdogC0FC00Packets.clear();\n}",
+        "vanilla_hook": "The keepalive ID flows through: NetworkManager.sendPacket() → EventSendPacket → Netty pipeline. Cancelling in EventSendPacket is the cleanest approach.",
+        "anti_cheat_notes": "Watchdog: this technique (queue + burst) works because Watchdog uses a sliding window of ~500ms. By withholding all data for 350ms and then sending it all at once, the server-side check sees a \"snapshot\" of valid transactions. AAC: queues keepalive and transaction together, drops every Nth one."
+      },
+      {
+        "name": "Disabler — Faithful / Erisium / Mineplex mode",
+        "found_in": [
+          "Sigma 3.9",
+          "Memeware 7.3",
+          "Lycoris 2.0"
+        ],
+        "purpose": "Cancels C00 entirely or replaces it with a corruted key to confuse specific anti-cheats.",
+        "how_it_works": "Faithful: cancel all C00 outgoing packets. The server never receives a response, but other tricks (like movement desync) keep the connection alive. Erisium: cancel and re-send with a random key. Mineplex: modify the key value by subtracting a random amount each time, making the keepalive look like it\"s drifting.",
+        "detailed_code": "// Sigma 3.9 - Disabler.java (Erisium/Faithful/SagePvP mode)\nif (p instanceof C00PacketKeepAlive) {\n  C00PacketKeepAlive packet = (C00PacketKeepAlive) p;\n  if (mode.equalsIgnoreCase(\"Faithful\") || mode.equalsIgnoreCase(\"Erisium\")) {\n    ep.setCancelled(true);  // completely block keepalive\n  }\n}\n\n// Memeware 7.3 - Disabler.java (Mineplex mode)\nif (event.getPacket() instanceof C00PacketKeepAlive) {\n  C00PacketKeepAlive packetKeepAlive = (C00PacketKeepAlive) event.getPacket();\n  packetKeepAlive.key -= RandomUtils.nextInt(3, 128);  // shift key value\n}\n\n// Lycoris 2.0 - DisablerMod.java (Faithful)\nif (event.getPacket() instanceof C00PacketKeepAlive) {\n  // Replace with Integer.MIN_VALUE + random small offset\n  mc.getNetHandler().addToSendQueueSilent(new C00PacketKeepAlive(Integer.MIN_VALUE + new Random().nextInt(100)));\n  event.setCancelled();\n}",
+        "vanilla_hook": "Same pattern — EventSendPacket. The key field on C00PacketKeepAlive can be modified via reflection or direct field access in MCP (the field is literally named \"key\" in 1.8.9).",
+        "anti_cheat_notes": "Faithful: cancel all keepalives and rely on movement syncing. Works on servers that only check keepalive for timeout (not anticheat). Mineplex: shifting the key exploits a bug in Mineplex\"s anticheat where it accepts a range of values around the expected key. Modern anti-cheats expect an exact match."
+      },
+      {
+        "name": "DialUpPing / LagSwitch",
+        "found_in": [
+          "Jigsaw 0.24"
+        ],
+        "purpose": "Causes deliberate lag by dropping keepalive packets. Makes the player appear \"laggy\" to avoid suspicion or triggers a temporary server freeze.",
+        "how_it_works": "Every Nth keepalive packet is dropped entirely. The server eventually sees a timeout disconnect, but if the module starts sending again before the 30-second timeout, the connection survives. The player appears to have high packet loss.",
+        "detailed_code": "// Jigsaw 0.24 - DialUpPing.java\nif (packet instanceof C00PacketKeepAlive) {\n  if (tries != 0) { packet.cancel(); }  // drop this keepalive\n  tries++;\n  if (tries > 149) tries = 0;\n}",
+        "vanilla_hook": "EventSendPacket — same as PingSpoof.",
+        "anti_cheat_notes": "Easy to detect server-side by checking packet loss ratio. Most ghost clients don\"t use this; it\"s a free/leisure client feature."
+      }
+    ],
+    "general_hooks": "There are THREE primary ways to intercept this packet in 1.8.9 clients:\n1. EventSendPacket/EventReceivePacket — Most common. The client has a mixin or edited NetworkManager that fires events before/after every packet. You check instanceof C00PacketKeepAlive or S00PacketKeepAlive.\n2. NetHandlerPlayClient.handleKeepAlive() — Override the specific handler method. Only works for incoming S00, but gives you direct access.\n3. NetworkManager.sendPacket() — Modify the sendPacket method to filter or queue C00 packets globally. This is how Blink and similar modules often work at the lowest level.",
+    "client_variations": "Astro 2.2.1: Uses EventReceivePacket, modifies the keepalive ID by adding mc.getDebugFPS()/2 as offset.\nSigma 3.9: Full queue-based PingSpoof with configurable waitSeconds. Also has Disabler mode that completely cancels C00.\nTenacity 5.1: Integrates C00 handling into the Watchdog disabler — queues C00 alongside C0F, flushes after 350ms.\nLycoris 2.0: Sends a completely spoofed C00 with Integer.MIN_VALUE key for Faithful bypass.\nNovember 0.2: Uses a timestamp-indexed queue (TreeMap with System.currentTimeMillis() + delay as key).\nMemeware 7.3: Direct field mutation on the packet object (packetKeepAlive.key -= random bits).\nRaze v1.5b: Drops C00 entirely as part of a hypixel fast disabler (allows only every Nth C03).\nJigsaw 0.24: Every 150th keepalive is dropped to simulate dial-up ping."
+  }
+}

@@ -1,0 +1,135 @@
+{
+  "id": "C07PacketPlayerDigging",
+  "hex": "0x07",
+  "dec": 7,
+  "dir": "SERVERBOUND",
+  "state": "PLAY",
+  "name": "Player Digging",
+  "desc": "Player starts/cancels/ends mining a block, or drops an item (press Q).",
+  "tags": [
+    "player",
+    "block",
+    "mining",
+    "item",
+    "world"
+  ],
+  "fields": [
+    {
+      "name": "position",
+      "type": "BlockPos",
+      "desc": "Position of the affected block"
+    },
+    {
+      "name": "facing",
+      "type": "EnumFacing",
+      "desc": "Face of the block being mined"
+    },
+    {
+      "name": "status",
+      "type": "Enum",
+      "desc": "START_DESTROY_BLOCK, ABORT_DESTROY_BLOCK, STOP_DESTROY_BLOCK, DROP_ALL_ITEMS, DROP_ITEM, RELEASE_USE_ITEM"
+    }
+  ],
+  "encoding": [
+    [
+      "Block Pos",
+      "Position (long)",
+      "Encoded as ((x & 0x3FFFFFF) << 38) | ((y & 0xFFF) << 26) | (z & 0x3FFFFFF)"
+    ],
+    [
+      "Facing",
+      "byte",
+      "0=bottom, 1=top, 2=north, 3=south, 4=west, 5=east"
+    ],
+    [
+      "Status",
+      "byte",
+      "0=start, 1=cancel, 2=finish, 3=dropStack, 4=dropItem, 5=finishUse"
+    ]
+  ],
+  "mcp": [
+    "NetHandlerPlayServer.processPlayerDigging()"
+  ],
+  "handler": "INetHandlerPlayServer",
+  "notes": "RELEASE_USE_ITEM (5) is used when the player stops eating/drinking/using a bow.",
+  "implementation": {
+    "overview": "C07PacketPlayerDigging handles all block-breaking actions and item-use release. It has six actions: START_DESTROY_BLOCK (begin mining), ABORT_DESTROY_BLOCK (cancel mining), STOP_DESTROY_BLOCK (finish mining — block breaks), DROP_ALL_ITEMS (drop entire stack with Q), DROP_ITEM (drop one item), and RELEASE_USE_ITEM (release right-click — used for bows, eating, blocking). The first three are used by Nuker/SpeedMine/Fucker/BedFucker to destroy blocks. RELEASE_USE_ITEM is arguably more important — it\"s the backbone of autoblock (resetting the sword after attack), NoSlowdown (cancelling the use-item slowdown), FastBow (instantly shooting), and FastUse/Eat.",
+    "modules": [
+      {
+        "name": "Autoblock (Block-hitting / Sword blocking reset)",
+        "found_in": [
+          "Slice v15",
+          "Mint B1",
+          "Gugustus",
+          "Koks v1"
+        ],
+        "purpose": "Resets the block animation during combat to reduce damage taken and maintain blocking. Also triggers \"block-hitting\" which deals more knockback.",
+        "how_it_works": "After every C02PacketUseEntity ATTACK, the module sends C07 RELEASE_USE_ITEM (same as pressing Q on a sword to stop blocking). This breaks the block animation early, causing the server to think the player stopped blocking momentarily. When combined with an immediate C08 (start blocking again), the server sees: attack → unblock → reblock → attack → unblock → reblock... which produces the block-hitting effect.",
+        "detailed_code": "// Slice v15 - KillAura.java (autoblock)\nthePlayersendQueue.addToSendQueue(new C02PacketUseEntity(e, C02PacketUseEntity.Action.ATTACK));\nthePlayersendQueue.addToSendQueue(new C07PacketPlayerDigging(\n  C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, new BlockPos(0, 0, 0), EnumFacing.DOWN));\n\n// Mint B1 - KillAura.java\nmc.thePlayer.sendQueue.addToSendQueue(new C02PacketUseEntity(target, C02PacketUseEntity.Action.ATTACK));\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));\n\n// Gugustus - KillAura.java\nmc.thePlayer.sendQueue.addToSendQueue(new C02PacketUseEntity(entity, Action.ATTACK));\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, mc.thePlayer.getPosition(), EnumFacing.DOWN));",
+        "vanilla_hook": "EventSendPacket — sent immediately after C02 ATTACK. The packet position doesn\"t matter for RELEASE_USE_ITEM (BlockPos.ORIGIN / new BlockPos(-1,-1,-1) are both commonly used)."
+      },
+      {
+        "name": "NoSlowdown (Item use speed)",
+        "found_in": [
+          "Slice v15",
+          "Mint B1",
+          "Gugustus",
+          "Tenacity 6.0",
+          "November 0.2"
+        ],
+        "purpose": "Prevents the slowness effect when using items (eating, blocking, bow charging) so the player can run at full speed while blocking.",
+        "how_it_works": "While the player is using an item (e.g., blocking with sword), the module sends C07 RELEASE_USE_ITEM every movement tick. This tells the server \"I stopped using the item\", which cancels the slow effect. The client keeps the item-use animation visually. On the next tick, a C08 places an invalid block (autoblock start) to resume the animation. The net effect: the player appears to be blocking/using item but moves at full speed.",
+        "detailed_code": "// Slice v15 - NoSlowDown.java\nthePlayersendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, new BlockPos(0, 0, 0), EnumFacing.DOWN));\n\n// Mint B1 - NoSlow.java\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));\n\n// November 0.2 - NoSlow.java (EventMotion based)\nif (isBlocking() && shouldNoSlow) {\n  mc.thePlayer.sendQueue.addToSendQueue(\n    new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));\n}",
+        "vanilla_hook": "EventSendPacket / EventMotion (PRE/POST). The C07 must be sent during the movement packet phase."
+      },
+      {
+        "name": "FastBow / FastUse / FastEat",
+        "found_in": [
+          "Gugustus",
+          "Slice v15",
+          "November 0.2"
+        ],
+        "purpose": "Fully charges a bow instantly (FastBow) or consumes items faster than normal (FastUse).",
+        "how_it_works": "The bow charging is controlled by the server — the bow fires when RELEASE_USE_ITEM is received. Normally this only happens when the player releases right-click after charging. FastBow sends both C07 RELEASE_USE_ITEM and C08 place back-to-back rapidly, tricking the server into thinking the bow was fully charged. For eating, FastUse sends RELEASE_USE_ITEM + place repeatedly to accelerate the consumption animation.",
+        "detailed_code": "// Gugustus - FastBow.java\nmc.getNetHandler().addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));\n\n// Slice v15 - FastUse.java\n// Rapidly toggle item usage\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, new BlockPos(-1,-1,-1), EnumFacing.DOWN));\n\n// Full FastBow sequence:\nmc.getNetHandler().addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, mc.thePlayer.getHeldItem(), 0, 0, 0));",
+        "vanilla_hook": "NetHandlerPlayServer.processPlayerDigging() — the server side. On the client, hook into EventSendPacket or use a timer-driven packet scheduler."
+      },
+      {
+        "name": "Nuker / BedFucker (Block destruction)",
+        "found_in": [
+          "Slice v15",
+          "Gugustus",
+          "Koks v1",
+          "Swift Developer Alpha"
+        ],
+        "purpose": "Destroys blocks rapidly — either the block you\"re looking at (bedfuck) or all blocks in a radius (nuker).",
+        "how_it_works": "The module sends C07 START_DESTROY_BLOCK followed immediately by STOP_DESTROY_BLOCK for each target block. The server processes the start → cancel → start → cancel pattern and breaks the block instantly (because the client says it finished mining before the server can recalculate). For bed/block destruction, the module iterates through nearby blocks and sends START+STOP for each one.",
+        "detailed_code": "// Slice v15 - BedFucker.java\nthePlayersendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, pos, EnumFacing.UP));\nthePlayersendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, pos, EnumFacing.UP));\n\n// Gugustus - Fucker.java (same pattern)\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, enumFacing));\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, blockPos, enumFacing));\n\n// Koks v1 - BedFucker.java\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, this.blockPos, EnumFacing.DOWN));\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, this.blockPos, EnumFacing.DOWN));",
+        "vanilla_hook": "NetHandlerPlayServer.processPlayerDigging() server-side. Client-side: send START+STOP in immediate succession."
+      },
+      {
+        "name": "SpeedMine / FastBreak",
+        "found_in": [
+          "Swift Developer Alpha",
+          "Tenacity 6.0"
+        ],
+        "purpose": "Breaks blocks faster than normally possible by manipulating the dig cycle.",
+        "how_it_works": "Intercepts C07 START_DESTROY_BLOCK packets and modifies the timing. Some modules also resend the block break animation packets at an accelerated rate. The server sees the client claiming to have progressed through the mining stages faster than the block\"s hardness allows.",
+        "detailed_code": "// Swift Developer Alpha - FastBreak.java\nif (event.getPacket() instanceof C07PacketPlayerDigging) {\n  C07PacketPlayerDigging packet = (C07PacketPlayerDigging) event.getPacket();\n  if (packet.getStatus() == C07PacketPlayerDigging.Action.START_DESTROY_BLOCK) {\n    // Modify block break timing\n    mc.getNetHandler().addToSendQueue(\n      new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, packet.getPosition(), packet.getFacing()));\n  }\n}",
+        "vanilla_hook": "EventSendPacket — detect START_DESTROY_BLOCK, immediately precede with STOP_DESTROY_BLOCK."
+      },
+      {
+        "name": "AutoSoup / AutoPot (DROP_ITEM)",
+        "found_in": [
+          "Mint B1"
+        ],
+        "purpose": "Quickly drops empty soup bowls after consumption.",
+        "how_it_works": "After eating soup, sends DROP_ITEM action to discard the empty bowl from inventory. The packet position is irrelevant for DROP_ITEM/DROP_ALL_ITEMS.",
+        "detailed_code": "// Mint B1 - AutoPot.java\nmc.thePlayer.sendQueue.addToSendQueue(\n  new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.DROP_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));",
+        "vanilla_hook": "Same as other C07 actions."
+      }
+    ],
+    "general_hooks": "All uses go through EventSendPacket. The action enum determines behavior. RELEASE_USE_ITEM is the most versatile action (used by autoblock, noslow, fastbow, fasteat). START_DESTROY_BLOCK + STOP_DESTROY_BLOCK are always paired for block-breaking modules. DROP_ITEM is rarely used by modules (most use the vanilla drop stack key instead).\n\nServer handler: NetHandlerPlayServer.processPlayerDigging() dispatches based on action. RELEASE_USE_ITEM maps to the current item\"s onItemRightClick release logic. The block position field is only meaningful for DESTROY_BLOCK actions — RELEASE_USE_ITEM ignores it.",
+    "client_variations": "Slice v15: BedFucker uses START+STOP. NoSlow uses RELEASE. FastUse uses RELEASE. Autoblock uses RELEASE after ATTACK.\nMint B1: Autoblock + NoSlow + AutoPot + Disabler (START spam) + Fly (RELEASE for speed).\nGugustus: Fucker (START+STOP), NoSlow/NoSlow2 (RELEASE + DROP combos), Autoblock, FastBow.\nKoks v1: BedFucker (START+STOP), Autoblock (RELEASE).\nSwift Developer Alpha: Nuker (START+STOP), FastBreak (intercept and modify).\nNovember 0.2: NoSlow (EventMotion RELEASE)."
+  }
+}
