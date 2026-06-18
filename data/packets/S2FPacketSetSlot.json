@@ -5,53 +5,44 @@
   "dir": "CLIENTBOUND",
   "state": "PLAY",
   "name": "Set Slot",
-  "desc": "Sets a single item in an inventory slot.",
-  "tags": [
-    "inventory",
-    "item",
-    "container"
-  ],
+  "desc": "Sets a single slot in an inventory window. Used for cursor updates, specific slot changes, and armor slot updates.",
+  "tags": ["inventory", "item", "container"],
   "fields": [
-    {
-      "name": "windowId",
-      "type": "byte",
-      "desc": "Window ID"
-    },
-    {
-      "name": "slot",
-      "type": "short",
-      "desc": "Slot index"
-    },
-    {
-      "name": "item",
-      "type": "Slot",
-      "desc": "New ItemStack in the slot"
-    }
+    { "name": "windowId", "type": "byte", "desc": "Window ID (-1 = cursor, 0 = player inv)" },
+    { "name": "slot", "type": "short", "desc": "Slot index (-1 = cursor)" },
+    { "name": "item", "type": "Slot (ItemStack)", "desc": "ItemStack to place in slot (null = clear)" }
   ],
   "encoding": [
-    [
-      "Window ID",
-      "byte",
-      ""
-    ],
-    [
-      "Slot",
-      "short",
-      ""
-    ],
-    [
-      "Slot Data",
-      "Slot",
-      ""
-    ]
+    ["Window ID", "byte", "-1=cursor, 0=player inventory"],
+    ["Slot", "short", "Slot index"],
+    ["Slot Data", "Slot", "ItemStack or null"]
   ],
-  "mcp": [
-    "NetHandlerPlayClient.handleSetSlot()"
-  ],
+  "mcp": ["NetHandlerPlayClient.handleSetSlot()"],
   "handler": "INetHandlerPlayClient",
-  "notes": "Used for player cursor item, specific slot updates, or equipping armor.",
+  "notes": "windowId=-1 special case: updates the cursor item (the item held by the mouse cursor). windowId=0: updates player inventory. S2F is sent for EVERY slot change — armor equips, hotbar changes, cursor picks up/drops. Inventory modules track S2F to detect armor swaps and item pickups.",
   "implementation": {
-    "overview": "Sets a single inventory slot. Modules: InvManager (track slot changes).",
-    "modules": []
+    "overview": "S2FPacketSetSlot updates a single inventory slot. Three fields: windowId (-1=cursor, 0=player inv), slot index, and the ItemStack (null = clear). Used for cursor item tracking, armor swaps (slots 5-8), and hotbar updates. InventoryManager modules read S2F to detect when armor is equipped (slot 5=helmet through 8=boots), and AutoPot detects when potion items change in the hotbar. Disabler modules may cancel S2F to prevent the client from seeing inventory changes, causing inventory desync.",
+    "modules": [
+      {
+        "name": "Inventory Manager / AutoArmor Tracking",
+        "found_in": ["Rise 6.0", "Sigma 4.11", "Tenacity 6.0", "Gugustus"],
+        "purpose": "Track inventory slot changes via S2FPacketSetSlot to detect item pickups, armor swaps, and cursor changes without polling. AutoArmor uses S2F to detect when new armor items enter the inventory.",
+        "how_it_works": "On each S2F, read windowId, slot, and item. If windowId=0 (player inventory) and slot is an armor slot (5-8), the module checks if the new item is better than currently equipped. If windowId=-1, the cursor item changed — used to detect when items are being dragged. The module tracks these changes to trigger actions without waiting for the next tick update.",
+        "detailed_code": "// Rise 6.0 - S2F tracking in inventory component:\nif (event.getPacket() instanceof S2FPacketSetSlot) {\n    S2FPacketSetSlot s2f = (S2FPacketSetSlot) event.getPacket();\n    int windowId = s2f.func_149175_c();  // getWindowId\n    int slot = s2f.func_149173_d();       // getSlot\n    ItemStack item = s2f.func_149174_e();  // getItem\n\n    // Track cursor item changes (windowId=-1)\n    if (windowId == -1) {\n        cursorStack = item;\n        return;\n    }\n\n    // Track armor slot changes\n    if (windowId == 0 && slot >= 5 && slot <= 8) {\n        int armorType = slot - 5;  // 0=boots, 1=legs, 2=chest, 3=helmet\n        if (item != null && isBetterArmor(armorType, item)) {\n            needsArmorUpdate = true;\n        }\n    }\n\n    // Track hotbar changes (slots 36-44)\n    if (windowId == 0 && slot >= 36 && slot <= 44) {\n        if (item != null && item.getItem() instanceof ItemPotion) {\n            potionInHotbar = true;  // AutoPot trigger\n        }\n    }\n}\n\n// Vanilla S2FPacketSetSlot definition:\npackage net.minecraft.network.play.server;\n\nimport net.minecraft.item.ItemStack;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.PacketBuffer;\nimport net.minecraft.network.play.INetHandlerPlayClient;\nimport java.io.IOException;\n\npublic class S2FPacketSetSlot implements Packet<INetHandlerPlayClient> {\n    private int windowId;\n    private int slot;\n    private ItemStack item;\n\n    public S2FPacketSetSlot() {}\n    public S2FPacketSetSlot(int windowIdIn, int slotIn, ItemStack itemIn) {\n        this.windowId = windowIdIn;\n        this.slot = slotIn;\n        this.item = itemIn;\n    }\n\n    public void processPacket(INetHandlerPlayClient handler) { handler.handleSetSlot(this); }\n    public int func_149175_c() { return this.windowId; }\n    public int func_149173_d() { return this.slot; }\n    public ItemStack func_149174_e() { return this.item; }\n}\n\n// Vanilla handler (NetHandlerPlayClient):\n// public void handleSetSlot(S2FPacketSetSlot packetIn) {\n//     if (packetIn.func_149175_c() == -1) {\n//         mc.thePlayer.inventory.setItemStack(packetIn.func_149174_e());\n//     } else {\n//         mc.thePlayer.openContainer.putStackInSlot(\n//             packetIn.func_149173_d(), packetIn.func_149174_e());\n//     }\n// }",
+        "vanilla_hook": "NetHandlerPlayClient.handleSetSlot(S2FPacketSetSlot) — updates the cursor stack (windowId=-1) or a container slot.",
+        "anti_cheat_notes": "Cancelling S2F causes the client inventory to desync from server — items may appear duplicated or missing. Disabler modules that cancel S2F use it to hide inventory modifications from anti-cheats."
+      },
+      {
+        "name": "Disabler (S2F Cancel)",
+        "found_in": ["Gugustus", "Tenacity 5.1"],
+        "purpose": "Cancel S2FPacketSetSlot to prevent the client from seeing specific inventory changes. Used to hide item manipulation from anti-cheat trackers.",
+        "how_it_works": "When the Disabler is in a mode that manipulates inventory, S2F packets for specific slots are cancelled. The client never sees the slot update, so it maintains its previous (possibly fake) inventory state.",
+        "detailed_code": "// Disabler - S2F cancel:\nif (event.getPacket() instanceof S2FPacketSetSlot) {\n    S2FPacketSetSlot s2f = (S2FPacketSetSlot) event.getPacket();\n    if (s2f.func_149175_c() == 0 && s2f.func_149173_d() == currentSlot) {\n        event.setCancelled(true);  // Don't update this slot\n    }\n}",
+        "vanilla_hook": "EventReceivePacket — cancel before handleSetSlot.",
+        "anti_cheat_notes": "Cancelling S2F for specific slots causes local inventory desync. The player may see items in slots that the server thinks are empty."
+      }
+    ],
+    "general_hooks": "Client: NetHandlerPlayClient.handleSetSlot(S2FPacketSetSlot) — updates single slot or cursor. Inventory modules track this for item change detection. Disabler modules cancel it.\n\nServer: Sent by the server whenever a single inventory slot changes — item pickup, armor equip, cursor grab, enchantment result, anvil rename, creative tab drag.",
+    "client_variations": "Rise 6.0: Inventory component tracks S2F for armor/hotbar changes.\nSigma 4.11: InventoryManager reads S2F for slot tracking. AutoArmor detects armor S2F.\nGugustus: Disabler cancels S2F for slot hiding.\nTenacity 5.1: Disabler may cancel S2F in certain modes.\nRektSky B5: No specific S2F module.\nJigsaw 0.26: Vanilla handler only."
   }
 }

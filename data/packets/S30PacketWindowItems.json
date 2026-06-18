@@ -5,57 +5,34 @@
   "dir": "CLIENTBOUND",
   "state": "PLAY",
   "name": "Window Items",
-  "desc": "Sends the full contents of an inventory window (all slots).",
-  "tags": [
-    "inventory",
-    "container",
-    "item"
-  ],
+  "desc": "Sends the full contents of an inventory window — all slots at once. Used for initial container opening and rejected transaction recovery.",
+  "tags": ["inventory", "container", "item"],
   "fields": [
-    {
-      "name": "windowId",
-      "type": "byte",
-      "desc": "Window ID"
-    },
-    {
-      "name": "items",
-      "type": "ItemStack[]",
-      "desc": "Array of all items in the window"
-    }
+    { "name": "windowId", "type": "unsigned byte", "desc": "Window ID (0 = player inventory)" },
+    { "name": "items", "type": "ItemStack[]", "desc": "Array of all ItemStacks in the window, slot by slot" }
   ],
   "encoding": [
-    [
-      "Window ID",
-      "Unsigned Byte",
-      ""
-    ],
-    [
-      "Count",
-      "short",
-      "Number of slots"
-    ],
-    [
-      "Slot Data",
-      "Array of Slot",
-      "All ItemStacks in order"
-    ]
+    ["Window ID", "Unsigned Byte", ""],
+    ["Count", "short", "Number of slots"],
+    ["Slot Data", "Array of Slot", "All ItemStacks"]
   ],
-  "mcp": [
-    "NetHandlerPlayClient.handleWindowItems()"
-  ],
+  "mcp": ["NetHandlerPlayClient.handleWindowItems()"],
   "handler": "INetHandlerPlayClient",
-  "notes": "For windowId=0 (player inventory), this is the full player inventory update.",
+  "notes": "For windowId=0, this updates the entire player inventory (45 slots: 9 hotbar + 36 main). For chests, this is sent immediately after S2DPacketOpenWindow. When a C0E click is rejected (S32 accepted=false), the server re-sends S30 to force the client to revert its inventory.",
   "implementation": {
-    "overview": "Full inventory sync. Modules: ChestStealer (read items), AutoArmor, InvManager.",
+    "overview": "S30PacketWindowItems sends the FULL contents of a container — all ItemStacks in order. This is used for initial container sync (after S2D open), full inventory resync (after rejected transaction), and dimension change. RektSky B5 ChestStealer intercepts S30 in silent mode to fill the silent chest container with the current items. InventoryManager modules read S30 to analyze the current state of the container for sorting/stealing decisions.",
     "modules": [
       {
-        "name": "ChestStealer",
-        "found_in": [
-          "Tenacity 6.0",
-          "Gugustus"
-        ],
-        "purpose": "Read chest contents and auto-steal."
+        "name": "ChestStealer Silent Items (RektSky B5)",
+        "found_in": ["RektSky B5", "Rise 6.0", "Tenacity 6.0", "Sigma 4.11"],
+        "purpose": "Intercept S30PacketWindowItems to fill the silent chest container with items for analysis. In silent mode, the chest GUI is never shown but S30 carries the full item list which the module reads to determine what to steal.",
+        "how_it_works": "After S2D is cancelled (silent mode), S30 arrives with all chest item stacks. The module matches the windowId to the stored silent container, fills the container slots via putStacksInSlots(), and cancels the packet (preventing vanilla handler from processing it). The item list is then used by the stealer loop to shift-click items out.",
+        "detailed_code": "// RektSky B5 - ChestStealer.java (S30 silent item reading)\n// Full source excerpt showing S30 handling\npublic class ChestStealer extends Module {\n    private Container inventory;   // silent container\n    private Integer windowId;      // stored from S2D\n\n    @Override\n    public void onEvent(Event e2) {\n        if (e2 instanceof PacketReceiveEvent && this.slientSetting.getValue().booleanValue()) {\n            Object p2 = ((PacketReceiveEvent) e2).getPacket();\n\n            // S2D: store window data (already handled)\n            if (p2 instanceof S2DPacketOpenWindow) { /* ... store windowId, create silent container ... */ }\n\n            // S30: fill silent container with items\n            if (p2 instanceof S30PacketWindowItems) {\n                S30PacketWindowItems packet = (S30PacketWindowItems) p2;\n                // Match windowId to stored silent chest\n                if (this.windowId != null && packet.getWindowID() == this.windowId.intValue()) {\n                    // Fill the silent container with actual items from server\n                    this.inventory.putStacksInSlots(packet.getItemStacks());\n                    // Cancel so vanilla handler doesn't open GUI\n                    ((PacketReceiveEvent) e2).setCanceled(true);\n                }\n            }\n        }\n\n        // In the tick handler, check silent container for stealable items\n        if (e2 instanceof WorldTickEvent) {\n            // ... steal loop iterates inventory slots, shift-clicks via C0E ...\n            // When empty(), send C0D close\n        }\n    }\n\n    private boolean empty(Container c2) {\n        int slot = c2.inventorySlots.size() == 90 ? 54 : 27;\n        for (int i2 = 0; i2 < slot; ++i2) {\n            if (!c2.getSlot(i2).getHasStack()) continue;\n            return false;\n        }\n        return true;\n    }\n\n    private int next(Container c2) {\n        int slot = c2.inventorySlots.size() == 90 ? 54 : 27;\n        for (int i2 = 0; i2 < slot; ++i2) {\n            if (c2.getInventory().get(i2) == null) continue;\n            return i2;\n        }\n        return -1;\n    }\n}\n\n// Vanilla S30PacketWindowItems definition:\npackage net.minecraft.network.play.server;\n\nimport net.minecraft.item.ItemStack;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.PacketBuffer;\nimport net.minecraft.network.play.INetHandlerPlayClient;\nimport java.io.IOException;\nimport java.util.List;\n\npublic class S30PacketWindowItems implements Packet<INetHandlerPlayClient> {\n    private int windowId;\n    private ItemStack[] itemStacks;\n\n    public S30PacketWindowItems() {}\n    public S30PacketWindowItems(int windowIdIn, List<ItemStack> p_i45186_2_) {\n        this.windowId = windowIdIn;\n        this.itemStacks = new ItemStack[p_i45186_2_.size()];\n        for (int i = 0; i < this.itemStacks.length; ++i) {\n            this.itemStacks[i] = p_i45186_2_.get(i).copy();\n        }\n    }\n\n    public void processPacket(INetHandlerPlayClient handler) { handler.handleWindowItems(this); }\n    public int getWindowID() { return this.windowId; }\n    public ItemStack[] getItemStacks() { return this.itemStacks; }\n}\n\n// Vanilla handler (NetHandlerPlayClient):\n// public void handleWindowItems(S30PacketWindowItems packetIn) {\n//     if (packetIn.getWindowID() == 0) {\n//         mc.thePlayer.inventoryContainer.putStacksInSlots(packetIn.getItemStacks());\n//     } else if (packetIn.getWindowID() == mc.thePlayer.openContainer.windowId) {\n//         mc.thePlayer.openContainer.putStacksInSlots(packetIn.getItemStacks());\n//     }\n// }\n\n// This fills the Container object's inventory slots with the provided ItemStacks.\n// When C0E transaction fails, server re-sends S30 to force inventory revert.",
+        "vanilla_hook": "NetHandlerPlayClient.handleWindowItems(S30PacketWindowItems) — fills the container's slots. For windowId=0 (player inv), fills all 45 slots. Cancelling prevents the container from being updated.",
+        "anti_cheat_notes": "Cancelling S30 causes the client inventory to not update. If the server re-sends S30 after a rejected transaction (S32 accepted=false), cancelling S30 means the client keeps its (incorrect) inventory state — which leads to further transaction rejections. Silent ChestStealer cancels S30 to prevent GUI display but still reads the items for its own processing."
       }
-    ]
+    ],
+    "general_hooks": "Client: NetHandlerPlayClient.handleWindowItems(S30PacketWindowItems) — fills container slots. RektSky B5 ChestStealer cancels in silent mode. InventoryManager modules read items for sorting/stealing.\n\nServer: Sent after S2D (initial container open) and after S32 rejected (inventory revert).",
+    "client_variations": "RektSky B5: ChestStealer cancels S30 in silent mode to fill silent container.\nRise 6.0: ChestStealer reads S30 items for stealing.\nSigma 4.11: InventoryManager reads S30 for inventory state.\nTenacity 6.0: ChestStealer detects S30 to start auto-steal.\nJigsaw 0.26: Vanilla handler only.\nAqua 13: EventPacket fires for S30."
   }
 }
