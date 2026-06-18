@@ -5,95 +5,50 @@
   "dir": "SERVERBOUND",
   "state": "PLAY",
   "name": "Click Window",
-  "desc": "Player clicks in an inventory window. Handles item moves, pickup, shifts, swaps, etc.",
-  "tags": [
-    "player",
-    "inventory",
-    "container",
-    "item"
-  ],
+  "desc": "Player clicks in an inventory window. Handles item moves: pickup, shift-click, number key swap, middle click, drop, drag init, and double-click.",
+  "tags": ["player", "inventory", "container", "item"],
   "fields": [
-    {
-      "name": "windowId",
-      "type": "byte",
-      "desc": "The window ID being clicked in"
-    },
-    {
-      "name": "slotId",
-      "type": "short",
-      "desc": "The clicked slot number"
-    },
-    {
-      "name": "usedButton",
-      "type": "byte",
-      "desc": "Mouse button and modifiers"
-    },
-    {
-      "name": "actionNumber",
-      "type": "short",
-      "desc": "Sequential number for the action (transaction ID)"
-    },
-    {
-      "name": "mode",
-      "type": "int",
-      "desc": "Click mode (0=normal, 1=shift, 2=number key, 3=middle, 4=drop, 5=drag, 6=double)"
-    },
-    {
-      "name": "clickedItem",
-      "type": "ItemStack",
-      "desc": "The item in the clicked slot"
-    }
+    { "name": "windowId", "type": "byte", "desc": "Container window ID" },
+    { "name": "slotId", "type": "short", "desc": "Slot index (-999=outside, -1=drop area)" },
+    { "name": "usedButton", "type": "byte", "desc": "Mouse button + shift modifier" },
+    { "name": "actionNumber", "type": "short", "desc": "Transaction ID, auto-incremented by server" },
+    { "name": "mode", "type": "byte", "desc": "0=click, 1=shiftClick, 2=numKey, 3=midClick, 4=drop, 5/6=drag, 7=doubleClick" },
+    { "name": "clickedItem", "type": "ItemStack", "desc": "Item in slot before click" }
   ],
   "encoding": [
-    [
-      "Window ID",
-      "byte",
-      ""
-    ],
-    [
-      "Slot",
-      "short",
-      "-999=outside window, -1=drop"
-    ],
-    [
-      "Used Button",
-      "byte",
-      "Button + shift modifiers"
-    ],
-    [
-      "Action Number",
-      "short",
-      "Transaction counter"
-    ],
-    [
-      "Mode",
-      "byte",
-      "0=click,1=shiftClick,2=numberKey,3=midClick,4=drop,5/6=drag,7=doubleClick"
-    ],
-    [
-      "Clicked Item",
-      "Slot",
-      "ItemStack in the clicked slot"
-    ]
+    ["Window ID", "byte", "0=player inv + custom windows"],
+    ["Slot", "short", "-999=outside"],
+    ["Used Button", "byte", "0=left, 1=right + shift flags"],
+    ["Action Number", "short", "Transaction counter"],
+    ["Mode", "byte", "0=click, 1=shiftClick, 2=numKey, 3=midClick, 4=drop, 5/6=drag"],
+    ["Clicked Item", "Slot", "ItemStack before click"]
   ],
-  "mcp": [
-    "NetHandlerPlayServer.processClickWindow()"
-  ],
+  "mcp": ["NetHandlerPlayServer.processClickWindow()"],
   "handler": "INetHandlerPlayServer",
-  "notes": "The server validates the action and returns a confirm packet (S31/WindowItems). If the client action fails validation, the server can send S32PacketConfirmTransaction to reject it and revert the client inventory.",
+  "notes": "Rise 6.0 BufferAbuseInventoryMove sends empty C0EPacketClickWindow() packets to desync inventory buffer. RektSky B5 ChestStealer constructs C0E directly with custom transaction IDs. Sigma 4.11 InventoryManager imports C0E for mass inventory operations.",
   "implementation": {
+    "overview": "C0EPacketClickWindow is the most complex inventory packet — 6 fields controlling item movement. Used by ALL inventory modules (ChestStealer, AutoArmor, InvManager, AutoPot). Rise 6.0 BufferAbuseInventoryMove exploits it by sending empty C0E() packets to desync server inventory buffer (reduces anti-cheat checks). RektSky B5 ChestStealer constructs C0E directly with custom transaction IDs for silent stealing.",
     "modules": [
-      "ChestStealer",
-      "AutoArmor",
-      "InvManager",
-      "AutoPot"
+      {
+        "name": "BufferAbuseInventoryMove (Rise 6.0)",
+        "found_in": ["Rise 6.0"],
+        "purpose": "Abuse C0EPacketClickWindow buffer desync to reduce anti-cheat checks on inventory actions. Sends burst of empty C0E() packets to overflow the server's transaction tracking buffer.",
+        "how_it_works": "When the player has clicked enough inventory slots (modulo clicksSetting), the module sends N empty C0EPacketClickWindow() packets in a single pre-motion. The server's C0E tracker overflows and stops validating subsequent inventory clicks. All queued legitimate C0E packets are flushed after the burst.",
+        "detailed_code": "// Rise 6.0 - BufferAbuseInventoryMove.java (FULL SOURCE)\npackage com.alan.clients.module.impl.movement.inventorymove;\n\nimport com.alan.clients.module.impl.movement.InventoryMove;\nimport com.alan.clients.newevent.Listener;\nimport com.alan.clients.newevent.annotations.EventLink;\nimport com.alan.clients.newevent.impl.motion.JumpEvent;\nimport com.alan.clients.newevent.impl.motion.PreMotionEvent;\nimport com.alan.clients.newevent.impl.motion.PreUpdateEvent;\nimport com.alan.clients.newevent.impl.motion.StrafeEvent;\nimport com.alan.clients.newevent.impl.other.WorldChangeEvent;\nimport com.alan.clients.newevent.impl.packet.PacketSendEvent;\nimport com.alan.clients.util.packet.PacketUtil;\nimport com.alan.clients.value.Mode;\nimport com.alan.clients.value.impl.NumberValue;\nimport net.minecraft.client.gui.GuiChat;\nimport net.minecraft.client.settings.GameSettings;\nimport net.minecraft.client.settings.KeyBinding;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.play.client.C0EPacketClickWindow;\nimport java.util.concurrent.ConcurrentLinkedQueue;\n\npublic class BufferAbuseInventoryMove extends Mode<InventoryMove> {\n\n    private final NumberValue clicksSetting = new NumberValue(\"Clicks\", this, 3, 2, 10, 1);\n    private final NumberValue amount = new NumberValue(\"Amount\", this, 5, 1, 10, 1);\n    private final ConcurrentLinkedQueue<Packet<?>> packets = new ConcurrentLinkedQueue<>();\n    private boolean done, sent;\n    private int clicks;\n\n    public BufferAbuseInventoryMove(String name, InventoryMove parent) {\n        super(name, parent);\n    }\n\n    @EventLink()\n    public final Listener<PreMotionEvent> onPreMotionEvent = event -> {\n        if (this.canAbuse()) {\n            if (!this.sent) {\n                if (!this.done) {\n                    this.done = true;\n                } else {\n                    // Send burst of empty C0E() to overflow server buffer\n                    for (int i = 0; i < this.amount.getValue().intValue(); i++) {\n                        PacketUtil.sendNoEvent(new C0EPacketClickWindow());  // <-- empty C0E\n                    }\n                    // Flush all queued legitimate C0E packets\n                    packets.forEach(PacketUtil::sendNoEvent);\n                    packets.clear();\n                    this.sent = true;\n                }\n            }\n        } else {\n            this.done = false;\n            this.sent = false;\n        }\n    };\n\n    @EventLink()\n    public final Listener<PacketSendEvent> onPacketSend = event -> {\n        final Packet<?> p = event.getPacket();\n        if (p instanceof C0EPacketClickWindow) {\n            if (this.canAbuse() && !this.sent) {\n                // Queue legitimate C0E for release after buffer burst\n                event.setCancelled(true);\n                packets.add(p);\n                return;\n            }\n            this.clicks++;\n        }\n    };\n\n    @EventLink()\n    public final Listener<WorldChangeEvent> onWorldChange = event -> {\n        packets.clear();\n    };\n\n    private boolean canAbuse() {\n        return clicks > 0 && clicks % this.clicksSetting.getValue().intValue() == 0;\n    }\n\n    // Movement key bindings handling (PreUpdateEvent)\n    private final KeyBinding[] AFFECTED_BINDINGS = {\n        mc.gameSettings.keyBindForward, mc.gameSettings.keyBindBack,\n        mc.gameSettings.keyBindRight, mc.gameSettings.keyBindLeft,\n        mc.gameSettings.keyBindJump\n    };\n\n    @EventLink()\n    public final Listener<PreUpdateEvent> onPreUpdate = event -> {\n        if (mc.currentScreen instanceof GuiChat || mc.currentScreen == this.getStandardClickGUI()) {\n            return;\n        }\n        for (final KeyBinding bind : AFFECTED_BINDINGS) {\n            bind.setPressed(GameSettings.isKeyDown(bind));\n        }\n    };\n}\n\n// Vanilla C0EPacketClickWindow definition:\npackage net.minecraft.network.play.client;\n\nimport net.minecraft.item.ItemStack;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.PacketBuffer;\nimport net.minecraft.network.play.INetHandlerPlayServer;\nimport java.io.IOException;\n\npublic class C0EPacketClickWindow implements Packet<INetHandlerPlayServer> {\n    private int windowId;\n    private int slotId;\n    private int usedButton;\n    private short actionNumber;\n    private ItemStack clickedItem;\n    private int mode;\n\n    public C0EPacketClickWindow() {}\n    public C0EPacketClickWindow(int windowId, int slotId, int usedButton,\n                                 int mode, ItemStack clickedItem, short actionNumber) {\n        this.windowId = windowId;\n        this.slotId = slotId;\n        this.usedButton = usedButton;\n        this.clickedItem = clickedItem;\n        this.actionNumber = actionNumber;\n        this.mode = mode;\n    }\n\n    public void readPacketData(PacketBuffer buf) throws IOException {\n        this.windowId = buf.readByte();\n        this.slotId = buf.readShort();\n        this.usedButton = buf.readByte();\n        this.actionNumber = buf.readShort();\n        this.mode = buf.readByte();\n        this.clickedItem = buf.readItemStackFromBuffer();\n    }\n\n    public void writePacketData(PacketBuffer buf) throws IOException {\n        buf.writeByte(this.windowId);\n        buf.writeShort(this.slotId);\n        buf.writeByte(this.usedButton);\n        buf.writeShort(this.actionNumber);\n        buf.writeByte(this.mode);\n        buf.writeItemStackToBuffer(this.clickedItem);\n    }\n\n    public void processPacket(INetHandlerPlayServer handler) {\n        handler.processClickWindow(this);\n    }\n\n    public int getWindowId() { return this.windowId; }\n    public int getSlotId() { return this.slotId; }\n    public int getUsedButton() { return this.usedButton; }\n    public short getActionNumber() { return this.actionNumber; }\n    public ItemStack getClickedItem() { return this.clickedItem; }\n    public int getMode() { return this.mode; }\n}",
+        "vanilla_hook": "NetHandlerPlayServer.processClickWindow(C0EPacketClickWindow) — re-executes slotClick server-side with same parameters. Validates actionNumber against container transaction counter. If mismatched, sends S32PacketConfirmTransaction(accepted=false) and reverts client inventory via S30PacketWindowItems.",
+        "anti_cheat_notes": "BufferAbuse overflows the transaction ID counter. The server tracks actionNumber as a short (max 32767). Sending 10+ C0E in one tick causes quick overflow. Anti-cheats detect this by monitoring transaction sequence gaps — Grim flags C0E packets with non-sequential action numbers."
+      },
+      {
+        "name": "ChestStealer Silent Click (RektSky B5)",
+        "found_in": ["RektSky B5"],
+        "purpose": "Silent chest stealing that constructs C0EPacketClickWindow directly (bypassing PlayerControllerMP) to avoid client-side sound effects and visual updates. The server processes the click but the client doesn't show the item movement.",
+        "how_it_works": "The module constructs C0E with the correct windowId, slotIndex, mode=1 (shift-click), and a custom transaction ID from the container. It then calls inventory.slotClick() locally to sync client-side state without GUI sound. The packet is sent silently via addToSendQueue.",
+        "detailed_code": "// RektSky B5 - ChestStealer.java (silent C0E construction)\n// From FULL source (lines 96-104):\nif (!this.empty(this.inventory) && emptySlots != 0) {\n    int index = this.next(this.inventory);\n    if (this.slientSetting.getValue().booleanValue()) {\n        // SILENT MODE: construct C0E directly\n        short short1 = this.inventory.getNextTransactionID(this.mc.thePlayer.inventory);\n        this.mc.getNetHandler().addToSendQueue(\n            new C0EPacketClickWindow(\n                this.windowId,     // stored from S2DPacketOpenWindow\n                index,             // slot to shift-click\n                0,                 // left button\n                1,                 // shift-click mode\n                this.inventory.getSlot(index).getStack(),  // item at slot\n                short1             // transaction ID from container\n            ));\n        this.inventory.slotClick(index, 0, 1, this.mc.thePlayer);\n    } else {\n        // NORMAL MODE: use vanilla PlayerControllerMP\n        this.mc.playerController.windowClick(\n            this.mc.thePlayer.openContainer.windowId, index, 0, 1, this.mc.thePlayer);\n    }\n}",
+        "vanilla_hook": "NetHandlerPlayServer.processClickWindow(C0EPacketClickWindow) — server validates transaction ID and executes slotClick.",
+        "anti_cheat_notes": "Direct C0E construction with custom transaction IDs can cause desync if the server's container has a different transaction counter. RektSky's ChestStealer gets the transaction ID from the container to keep it in sync."
+      }
     ],
-    "pattern": "Usually NOT constructed directly — modules use mc.playerController.windowClick() which sends C0E internally. Disabler cancels C0E to prevent server from detecting fast inventory actions.",
-    "code": "// Vanilla sends this through PlayerControllerMP:\nthis.connection.sendPacket(new C0EPacketClickWindow(windowId, slotId, mouseButton, mode, itemStack, actionNumber));\n// Disabler — cancel\nevent.setCancelled(true);",
-    "hook": "EventSendPacket / PlayerControllerMP.windowClick()",
-    "clients": [
-      "Vestige 3.0",
-      "Gugustus"
-    ]
+    "general_hooks": "Client: PlayerControllerMP.windowClick() sends C0E. Rise 6.0 BufferAbuseInventoryMove sends empty C0E() burst. RektSky B5 ChestStealer constructs C0E directly.\n\nServer: NetHandlerPlayServer.processClickWindow(C0EPacketClickWindow) re-executes slotClick with provided parameters. Transaction ID must match server's counter.",
+    "client_variations": "Rise 6.0: BufferAbuseInventoryMove sends empty C0E() burst + queue flush. PingSpoofComponent delays C0E packets.\nRektSky B5: ChestStealer constructs C0E directly for silent mode.\nSigma 4.11: InventoryManager imports C0E but uses windowClick(). AutoPot imports C0E.\nJigsaw 0.26: Uses windowClick() for all inventory operations."
   }
 }

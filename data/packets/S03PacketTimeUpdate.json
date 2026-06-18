@@ -5,52 +5,42 @@
   "dir": "CLIENTBOUND",
   "state": "PLAY",
   "name": "Time Update",
-  "desc": "Synchronizes the world time (day/night cycle) and the world age.",
-  "tags": [
-    "world",
-    "time"
-  ],
+  "desc": "Synchronizes the world time (total world age and day/night cycle time). Sent every few seconds or when time accelerates (sleeping).",
+  "tags": ["world", "time"],
   "fields": [
-    {
-      "name": "totalWorldTime",
-      "type": "long",
-      "desc": "Total ticks since world creation"
-    },
-    {
-      "name": "worldTime",
-      "type": "long",
-      "desc": "Current day/night time (0-24000). Mod 24000 for time of day."
-    }
+    { "name": "totalWorldTime", "type": "long", "desc": "Total ticks since world creation (monotonically increasing)" },
+    { "name": "worldTime", "type": "long", "desc": "Current day/night time (0-24000). worldTime % 24000 for time-of-day." }
   ],
   "encoding": [
-    [
-      "World Age",
-      "long",
-      "Incremented each tick since world start"
-    ],
-    [
-      "Time of Day",
-      "long",
-      "0-24000, wraps around"
-    ]
+    ["World Age", "long", "Incremented each tick"],
+    ["Time of Day", "long", "0-24000, wraps around"]
   ],
-  "mcp": [
-    "NetHandlerPlayClient.handleTimeUpdate()"
-  ],
+  "mcp": ["NetHandlerPlayClient.handleTimeUpdate()"],
   "handler": "INetHandlerPlayClient",
-  "notes": "Time of day values: 0=dawn, 6000=noon, 12000=sunset, 18000=midnight. When players sleep, time accelerates.",
+  "notes": "Time values: 0=dawn, 6000=noon, 12000=sunset, 18000=midnight. When all players sleep, time jumps to 0 (dawn). S03 is used by modules to calculate server TPS (ticks per second) by measuring the time between S03 updates.",
   "implementation": {
-    "overview": "Syncs world time. Carries totalWorldTime (long) and worldTime (long, 0-24000). Modules: TimeChanger, Ambience (modify/cancel time).",
+    "overview": "S03PacketTimeUpdate syncs the world clock. Two long fields: totalWorldTime (absolute tick count since world creation) and worldTime (0-24000 day/night cycle). TimeChanger modules cancel S03 to freeze time client-side (always noon, always night for PVP visibility). TPS tracker modules measure the tick delta between consecutive S03 packets to calculate server performance. Ambience modules modify the displayed time for visual preference without affecting actual time.",
     "modules": [
       {
-        "name": "TimeChanger",
-        "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
-        ],
-        "purpose": "Cancel time updates or replace with custom time.",
-        "detailed_code": "if (event.getPacket() instanceof S03PacketTimeUpdate) event.setCancelled(true);"
+        "name": "TimeChanger / Ambience (World Time Override)",
+        "found_in": ["Gugustus", "Rise 6.0", "Tenacity 6.0", "Jigsaw 0.26"],
+        "purpose": "Cancel S03PacketTimeUpdate to freeze world time, or replace the time value with a custom one (always noon, always night). This gives the player a visual advantage by controlling lighting conditions.",
+        "how_it_works": "The module cancels S03 in EventReceivePacket and sets the client-side worldTime to a fixed value (e.g., 6000 for noon, 18000 for night). The server keeps sending updates but they're ignored. The client-side world renderer displays the overridden time. Some modes also modify the worldTime field instead of cancelling, allowing the clock to advance but starting from a different base.",
+        "detailed_code": "// Gugustus - TimeChanger.java (freeze world time):\n@EventTarget\npublic void onPacketReceive(EventReceivePacket event) {\n    if (event.getPacket() instanceof S03PacketTimeUpdate) {\n        S03PacketTimeUpdate s03 = (S03PacketTimeUpdate) event.getPacket();\n        // Cancel server time updates — freeze at custom time\n        event.setCancelled(true);\n        // Keep client worldTime at a fixed value\n        mc.theWorld.setWorldTime(customTime * 1000 + 18000);  // custom 0-1 * 1000 = time of day\n        // This doesn't affect server-side time — other players see normal day/night\n    }\n}\n\n// Vanilla S03PacketTimeUpdate definition:\npackage net.minecraft.network.play.server;\n\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.PacketBuffer;\nimport net.minecraft.network.play.INetHandlerPlayClient;\nimport java.io.IOException;\n\npublic class S03PacketTimeUpdate implements Packet<INetHandlerPlayClient> {\n    private long totalWorldTime;\n    private long worldTime;\n\n    public S03PacketTimeUpdate() {}\n    public S03PacketTimeUpdate(long totalWorldTimeIn, long worldTimeIn, boolean doDaylightCycleIn) {\n        this.totalWorldTime = totalWorldTimeIn;\n        this.worldTime = worldTimeIn;\n    }\n\n    public void readPacketData(PacketBuffer buf) throws IOException {\n        this.totalWorldTime = buf.readLong();\n        this.worldTime = buf.readLong();\n    }\n\n    public void writePacketData(PacketBuffer buf) throws IOException {\n        buf.writeLong(this.totalWorldTime);\n        buf.writeLong(this.worldTime);\n    }\n\n    public void processPacket(INetHandlerPlayClient handler) {\n        handler.handleTimeUpdate(this);\n    }\n\n    public long getTotalWorldTime() { return this.totalWorldTime; }\n    public long getWorldTime() { return this.worldTime; }\n}",
+        "vanilla_hook": "NetHandlerPlayClient.handleTimeUpdate(S03PacketTimeUpdate) — the client calls mc.theWorld.setWorldTime(). Setting worldTime to 6000 (noon) provides maximum lighting for PVP.",
+        "anti_cheat_notes": "TimeChanger is not detectable — it's purely client-side visual. The server cannot tell what time of day the client is rendering. However, servers that use gamerule doDaylightCycle=true and expect consistent time reporting for PVP events are unaffected since players see different times locally."
+      },
+      {
+        "name": "TPS Tracker (Server Performance)",
+        "found_in": ["Rise 6.0", "RektSky B5", "Sigma 4.11"],
+        "purpose": "Calculate server TPS by measuring the tick delta between consecutive S03PacketTimeUpdate packets. Used to auto-adjust Timer speed and predict lag spikes.",
+        "how_it_works": "Each S03 carries totalWorldTime which increments by 1 per server tick. By capturing tick values and timestamps, the module computes server TPS as tickDelta / (lastReceiveTime - firstReceiveTime). If TPS drops below 19.5, modules like Timer auto-adjust their multiplier to avoid detection (lower TPS = more lenient anti-cheat).",
+        "detailed_code": "// Rise 6.0 - TPS tracker using S03:\nprivate long lastTick = -1, lastTime = -1;\npublic float tps = 20.0f;\n\n@EventLink()\npublic final Listener<PacketReceiveEvent> onPacketReceive = event -> {\n    if (event.getPacket() instanceof S03PacketTimeUpdate) {\n        S03PacketTimeUpdate s03 = (S03PacketTimeUpdate) event.getPacket();\n        long currentTick = s03.getTotalWorldTime();\n        long now = System.currentTimeMillis();\n\n        if (lastTick != -1 && lastTime != -1) {\n            long tickDelta = currentTick - lastTick;\n            long timeDelta = now - lastTime;\n            if (timeDelta > 0) {\n                // TPS = ticks elapsed / time elapsed * 1000\n                tps = Math.min(20.0f, (tickDelta * 1000.0f) / timeDelta);\n            }\n        }\n\n        lastTick = currentTick;\n        lastTime = now;\n    }\n};\n\n// TPS display in HUD or auto-Timer adjustment\n// If tps < 19, increase Timer (server can't keep up)\n// If tps > 19.5, normal Timer",
+        "vanilla_hook": "NetHandlerPlayClient.handleTimeUpdate(S03PacketTimeUpdate) — fires every ~50ms on a healthy server.",
+        "anti_cheat_notes": "N/A — TPS tracking is passive listening. No anti-cheat can detect it."
       }
-    ]
+    ],
+    "general_hooks": "Client: NetHandlerPlayClient.handleTimeUpdate(S03PacketTimeUpdate) sets WorldClient.worldTime. S03 is sent every ~30-60 seconds or on sleep events.\n\nServer: WorldServer.updateBlocks() sends S03 every N ticks via PacketTimeUpdate.",
+    "client_variations": "Gugustus: TimeChanger cancels S03 and sets custom time.\nRise 6.0: TPS tracker calculates server performance from S03 totalWorldTime.\nTenacity 6.0: TimeChanger has modes (Day, Night, Sunset, Custom, RealTime).\nJigsaw 0.26: Ambience module changes world color and time visuals."
   }
 }

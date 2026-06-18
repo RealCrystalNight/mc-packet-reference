@@ -5,43 +5,38 @@
   "dir": "SERVERBOUND",
   "state": "PLAY",
   "name": "Close Window",
-  "desc": "Player closes an inventory window (chest, crafting table, etc).",
-  "tags": [
-    "player",
-    "inventory",
-    "container"
-  ],
+  "desc": "Player closes an inventory window (chest, crafting table, furnace, etc).",
+  "tags": ["player", "inventory", "container"],
   "fields": [
-    {
-      "name": "windowId",
-      "type": "byte",
-      "desc": "The window ID being closed (0 for player inventory)"
-    }
+    { "name": "windowId", "type": "byte", "desc": "Window ID of the container being closed" }
   ],
-  "encoding": [
-    [
-      "Window ID",
-      "unsigned byte",
-      "Server-assigned window ID"
-    ]
-  ],
-  "mcp": [
-    "NetHandlerPlayServer.processCloseWindow()"
-  ],
+  "encoding": [["Window ID", "unsigned byte", "Server-assigned window ID from S2DPacketOpenWindow"]],
+  "mcp": ["NetHandlerPlayServer.processCloseWindow()"],
   "handler": "INetHandlerPlayServer",
+  "notes": "Rise 6.0 CancelInventoryMove cancels C0D to keep the inventory 'open' and allow WASD movement. RektSky B5 ChestStealer sends C0D after stealing. Jigsaw 0.26 InventoryPlus cancels C0D. Sigma 4.11 InventoryWalk cancels C0D.",
   "implementation": {
-    "overview": "Sent when player closes a GUI window. Carries windowId. Modules: ChestStealer (delay close to finish steal), InvManager.",
+    "overview": "C0DPacketCloseWindow tells the server the player closed an inventory screen. Window ID 0 = player inventory, other IDs = chests/tables. Exploited by: CancelInventoryMove (cancel C0D to allow WASD move with open GUI), ChestStealer (send C0D when done stealing to auto-close), and InventoryWalk (cancel C0D to keep inventory open while moving).",
     "modules": [
       {
-        "name": "ChestStealer delay",
-        "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
-        ],
-        "purpose": "Delay sending C0D until inventory is fully stolen.",
-        "detailed_code": "// ChestStealer pattern: delay window closing\nif (event.getPacket() instanceof C0DPacketCloseWindow\n    && !doneStealing) {\n  event.setCancelled(true);  // dont close yet\n}",
-        "vanilla_hook": "EventSendPacket"
+        "name": "CancelInventoryMove (Rise 6.0)",
+        "found_in": ["Rise 6.0", "Sigma 4.11"],
+        "purpose": "Cancel C0DPacketCloseWindow to keep the inventory GUI technically open on the server, allowing WASD movement while the player has a screen open. Combined with cancelling C0B OPEN_INVENTORY and C16 OPEN_INVENTORY_ACHIEVEMENT.",
+        "how_it_works": "The PacketSendEvent listener cancels three packet types: C16PacketClientStatus(OPEN_INVENTORY_ACHIEVEMENT) to prevent the server from hearing the inventory open, C0BPacketEntityAction(OPEN_INVENTORY) for the same, and C0DPacketCloseWindow to prevent the server from hearing the inventory close. As far as the server knows, the player never had an inventory open at all — so WASD movement is never blocked by the 'can't move with GUI open' server rule.",
+        "detailed_code": "// Rise 6.0 - CancelInventoryMove.java (FULL SOURCE)\npackage com.alan.clients.module.impl.movement.inventorymove;\n\nimport com.alan.clients.module.impl.movement.InventoryMove;\nimport com.alan.clients.newevent.Listener;\nimport com.alan.clients.newevent.annotations.EventLink;\nimport com.alan.clients.newevent.impl.motion.PreUpdateEvent;\nimport com.alan.clients.newevent.impl.packet.PacketSendEvent;\nimport com.alan.clients.value.Mode;\nimport net.minecraft.client.gui.GuiChat;\nimport net.minecraft.client.settings.GameSettings;\nimport net.minecraft.client.settings.KeyBinding;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.play.client.C0BPacketEntityAction;\nimport net.minecraft.network.play.client.C0DPacketCloseWindow;\nimport net.minecraft.network.play.client.C16PacketClientStatus;\n\npublic class CancelInventoryMove extends Mode<InventoryMove> {\n\n    public CancelInventoryMove(String name, InventoryMove parent) {\n        super(name, parent);\n    }\n\n    @EventLink()\n    public final Listener<PacketSendEvent> onPacketSend = event -> {\n        final Packet<?> p = event.getPacket();\n\n        if (p instanceof C16PacketClientStatus) {\n            final C16PacketClientStatus wrapper = (C16PacketClientStatus) p;\n            if (wrapper.getStatus() == C16PacketClientStatus.EnumState.OPEN_INVENTORY_ACHIEVEMENT) {\n                event.setCancelled(true);\n            }\n        }\n\n        if (p instanceof C0BPacketEntityAction) {\n            final C0BPacketEntityAction wrapper = (C0BPacketEntityAction) p;\n            if (wrapper.getAction() == C0BPacketEntityAction.Action.OPEN_INVENTORY) {\n                event.setCancelled(true);\n            }\n        }\n\n        if (p instanceof C0DPacketCloseWindow) {\n            event.setCancelled(true);\n        }\n    };\n\n    private final KeyBinding[] AFFECTED_BINDINGS = new KeyBinding[]{\n            mc.gameSettings.keyBindForward,\n            mc.gameSettings.keyBindBack,\n            mc.gameSettings.keyBindRight,\n            mc.gameSettings.keyBindLeft,\n            mc.gameSettings.keyBindJump\n    };\n\n    @EventLink()\n    public final Listener<PreUpdateEvent> onPreUpdate = event -> {\n        if (mc.currentScreen instanceof GuiChat || mc.currentScreen == this.getStandardClickGUI()) {\n            return;\n        }\n        for (final KeyBinding bind : AFFECTED_BINDINGS) {\n            bind.setPressed(GameSettings.isKeyDown(bind));\n        }\n    };\n}\n\n// Vanilla C0DPacketCloseWindow definition:\npackage net.minecraft.network.play.client;\n\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.PacketBuffer;\nimport net.minecraft.network.play.INetHandlerPlayServer;\nimport java.io.IOException;\n\npublic class C0DPacketCloseWindow implements Packet<INetHandlerPlayServer> {\n    private int windowId;\n\n    public C0DPacketCloseWindow() {}\n    public C0DPacketCloseWindow(int windowIdIn) {\n        this.windowId = windowIdIn;\n    }\n\n    public void readPacketData(PacketBuffer buf) throws IOException {\n        this.windowId = buf.readByte();\n    }\n\n    public void writePacketData(PacketBuffer buf) throws IOException {\n        buf.writeByte(this.windowId);\n    }\n\n    public void processPacket(INetHandlerPlayServer handler) {\n        handler.processCloseWindow(this);\n    }\n\n    public int getWindowId() { return this.windowId; }\n}",
+        "vanilla_hook": "NetHandlerPlayServer.processCloseWindow(C0DPacketCloseWindow) closes the player's open container. When cancelled, the server thinks the inventory is still open and does not allow movement. The PreUpdateEvent handler in CancelInventoryMove re-presses movement keys so the client keeps moving despite the open GUI.",
+        "anti_cheat_notes": "Cancelling C0D while moving with an open inventory is detectable by anti-cheats that track GUI state (e.g., checking if the player moved while a container was open). Watchdog and Grim both flag 'inventory move' by checking that the player's C03 packets show movement while server-side container state is non-null. Cancelling C16 + C0B + C0D together desyncs the inventory state entirely."
+      },
+      {
+        "name": "ChestStealer Close (RektSky B5)",
+        "found_in": ["RektSky B5", "Rise 6.0", "Sigma 4.11"],
+        "purpose": "After all items in a chest are stolen, send C0DPacketCloseWindow to auto-close the chest GUI. The player doesn't need to press E or ESC.",
+        "how_it_works": "ChestStealer tracks the chest container via S2DPacketOpenWindow. After shift-clicking all items (C0EPacketClickWindow), it sends C0DPacketCloseWindow with the stored window ID. The auto-close is instant or delayed depending on the mode.",
+        "detailed_code": "// RektSky B5 - ChestStealer.java (C0D send after steal)\n// Full source excerpt showing the close:\npublic class ChestStealer extends Module {\n    private Container inventory;\n    private IInventory iinventory;\n    private Integer windowId;\n    private Integer ticks = 0;\n    private Timer timer = new Timer();\n    public DoubleSetting speed = new DoubleSetting(\"Speed\", 0.0, 500.0, 0.0);\n    public BooleanSetting slientSetting = new BooleanSetting(\"Slient\", true);\n    public BooleanSetting chestCheck = new BooleanSetting(\"ChestCheck\", true);\n\n    public ChestStealer() {\n        super(\"ChestStealer\", \"Grab all items from chest\", 0, Category.PLAYER);\n    }\n\n    @Override\n    public void onEvent(Event e2) {\n        try {\n            if (e2 instanceof WorldTickEvent) {\n                if (this.ticks % 1 == 0 && this.timer.hasTimeElapsed((int)this.speed.getValue().doubleValue(), true)) {\n                    for (int i2 = 0; i2 <= 10; ++i2) {\n                        boolean isChest = false;\n                        if (!this.slientSetting.getValue().booleanValue()) {\n                            this.inventory = this.mc.thePlayer.openContainer;\n                            isChest = this.chestCheck.getValue().booleanValue()\n                                ? this.mc.currentScreen instanceof GuiChest && ((GuiChest)this.mc.currentScreen)\n                                    .lowerChestInventory.getDisplayName().getUnformattedText().equalsIgnoreCase(\"chest\")\n                                : this.mc.currentScreen instanceof GuiChest;\n                        } else {\n                            boolean bl = isChest = this.windowId != null;\n                        }\n                        if (!isChest) continue;\n\n                        int emptySlots = 0;\n                        for (int slot = 10; slot < 45; ++slot) {\n                            if (this.mc.thePlayer.inventoryContainer.getSlot(slot).getHasStack()) continue;\n                            ++emptySlots;\n                        }\n\n                        if (!this.empty(this.inventory) && emptySlots != 0) {\n                            int index = this.next(this.inventory);\n                            if (this.slientSetting.getValue().booleanValue()) {\n                                short short1 = this.inventory.getNextTransactionID(this.mc.thePlayer.inventory);\n                                this.mc.getNetHandler().addToSendQueue(new C0EPacketClickWindow(\n                                    this.windowId, index, 0, 1, this.inventory.getSlot(index).getStack(), short1));\n                                this.inventory.slotClick(index, 0, 1, this.mc.thePlayer);\n                            } else {\n                                this.mc.playerController.windowClick(\n                                    this.mc.thePlayer.openContainer.windowId, index, 0, 1, this.mc.thePlayer);\n                            }\n                            if (!this.slientSetting.getValue().booleanValue()) continue;\n                            this.inventory.putStackInSlot(index, null);\n                            continue;\n                        }\n\n                        // ALL ITEMS STOLEN — close the chest\n                        if (this.slientSetting.getValue().booleanValue()) {\n                            this.mc.getNetHandler().addToSendQueue(\n                                new C0DPacketCloseWindow(this.inventory.windowId));  // <-- C0D SEND\n                            this.windowId = null;\n                            continue;\n                        }\n                        this.mc.thePlayer.closeScreen();\n                    }\n                }\n            }\n        } catch (Exception e1) { e1.printStackTrace(); }\n    }\n\n    private boolean empty(Container c2) {\n        int slot = c2.inventorySlots.size() == 90 ? 54 : 27;\n        for (int i2 = 0; i2 < slot; ++i2) {\n            if (!c2.getSlot(i2).getHasStack()) continue;\n            return false;\n        }\n        return true;\n    }\n\n    private int next(Container c2) {\n        int slot = c2.inventorySlots.size() == 90 ? 54 : 27;\n        for (int i2 = 0; i2 < slot; ++i2) {\n            if (c2.getInventory().get(i2) == null) continue;\n            return i2;\n        }\n        return -1;\n    }\n}",
+        "vanilla_hook": "NetHandlerPlayServer.processCloseWindow(C0DPacketCloseWindow) — closes container and confirms via S2EPacketCloseWindow.",
+        "anti_cheat_notes": "ChestStealer auto-closing is not flagged by anti-cheats. Legitimate players close chests after looting."
       }
-    ]
+    ],
+    "general_hooks": "Client: EntityPlayerSP.closeScreen() sends C0D. Rise 6.0 hooks via PacketSendEvent. RektSky B5 sends C0D in ChestStealer. Sigma 4.11 InventoryWalk cancels C0D.\n\nServer: NetHandlerPlayServer.processCloseWindow(C0DPacketCloseWindow) closes the container. The server sends S2EPacketCloseWindow back.",
+    "client_variations": "Rise 6.0: CancelInventoryMove cancels C0D + C16 + C0B for inventory movement. Manager.java sends C0D after auto-managing inventory.\nRektSky B5: ChestStealer sends C0D after all items stolen.\nJigsaw 0.26: InventoryPlus cancels C0D.\nSigma 4.11: InventoryWalk cancels C0D for carry mode.\nPingSpoofComponent (Rise) delays C0D packets."
   }
 }
