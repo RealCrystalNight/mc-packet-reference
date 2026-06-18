@@ -12,6 +12,38 @@ var state = {
   stateFilter: ''
 };
 
+function debounce(fn, wait) {
+  var timer;
+  return function() {
+    var ctx = this, args = arguments;
+    clearTimeout(timer);
+    timer = setTimeout(function() { fn.apply(ctx, args); }, wait || 120);
+  };
+}
+
+function initSearchData(packets) {
+  packets.forEach(function(p) {
+    var parts = [
+      p.id || '', p.name || '', p.desc || '',
+      p.hex || '', String(p.dec || ''),
+      p.state || '', p.dir || '',
+      (p.notes || '').toLowerCase(), (p.handler || '').toLowerCase()
+    ];
+    (p.tags || []).forEach(function(t) { parts.push(t); });
+    (p.mcp || []).forEach(function(m) { parts.push(m.toLowerCase()); });
+    (p.fields || []).forEach(function(f) {
+      parts.push((f.name || '').toLowerCase(), (f.type || '').toLowerCase(), (f.desc || '').toLowerCase());
+    });
+    (p.encoding || []).forEach(function(e) {
+      parts.push(String(e[0] || '').toLowerCase(), String(e[1] || '').toLowerCase(), (e[2] || '').toLowerCase());
+    });
+    (p.subclasses || []).forEach(function(s) {
+      parts.push((s.name || '').toLowerCase(), (s.desc || '').toLowerCase());
+    });
+    p._search = parts.join(' ').toLowerCase();
+  });
+}
+
 // ============================================================
 // GROUP PACKETS
 // ============================================================
@@ -46,7 +78,7 @@ function buildSidebarNav(visiblePackets) {
     if (filtered.length === 0) return;
 
     html += '<div class="nav-section">';
-    html += '<div class="nav-section-header" data-group="' + group.id + '">';
+    html += '<div class="nav-section-header" role="button" tabindex="0" data-group="' + group.id + '">';
     html += '<svg class="chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg>';
     html += '<span>' + group.label + '</span>';
     html += '<span class="count">' + filtered.length + '</span>';
@@ -75,6 +107,12 @@ function buildSidebarNav(visiblePackets) {
       header.classList.toggle('collapsed');
       header.nextElementSibling.classList.toggle('collapsed');
     });
+    header.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        header.click();
+      }
+    });
   });
 }
 
@@ -85,26 +123,7 @@ function searchPackets(term) {
   if (!term.trim()) return PACKETS.slice();
   var t = term.toLowerCase().trim();
   return PACKETS.filter(function(p) {
-    var searchable = [
-      p.id.toLowerCase(), p.name.toLowerCase(), p.desc.toLowerCase(),
-      p.hex.toLowerCase(), String(p.dec), p.state.toLowerCase(), p.dir.toLowerCase(),
-      (p.notes || '').toLowerCase(), (p.handler || '').toLowerCase()
-    ];
-    (p.tags || []).forEach(function(x) { searchable.push(x); });
-    (p.mcp || []).forEach(function(m) { searchable.push(m.toLowerCase()); });
-    (p.fields || []).forEach(function(f) {
-      searchable.push(f.name.toLowerCase(), f.type.toLowerCase(), f.desc.toLowerCase());
-    });
-    (p.encoding || []).forEach(function(e) {
-      searchable.push(String(e[0]).toLowerCase(), String(e[1]).toLowerCase(), (e[2]||'').toLowerCase());
-    });
-    (p.subclasses || []).forEach(function(s) {
-      searchable.push(s.name.toLowerCase(), s.desc.toLowerCase());
-    });
-    for (var i = 0; i < searchable.length; i++) {
-      if (searchable[i].indexOf(t) !== -1) return true;
-    }
-    return false;
+    return p._search.indexOf(t) !== -1;
   });
 }
 
@@ -139,7 +158,7 @@ function buildFilterTagGrid() {
   var tags = getAllTags();
   grid.innerHTML = tags.map(function(t) {
     var a = state.activeTag === t ? ' active' : '';
-    return '<span class="filter-tag-chip' + a + '" data-tag="' + t + '">' + t + '</span>';
+    return '<button type="button" class="filter-tag-chip' + a + '" aria-pressed="' + (state.activeTag === t ? 'true' : 'false') + '" data-tag="' + t + '">' + t + '</button>';
   }).join('');
   grid.querySelectorAll('.filter-tag-chip').forEach(function(chip) {
     chip.addEventListener('click', function() {
@@ -215,10 +234,10 @@ function buildOverviewSections(filtered) {
 // ============================================================
 // EVENT HANDLERS
 // ============================================================
-document.getElementById('sidebarSearch').addEventListener('input', function() {
+document.getElementById('sidebarSearch').addEventListener('input', debounce(function() {
   state.searchTerm = this.value;
   refresh();
-});
+}, 120));
 
 document.getElementById('filterBtn').addEventListener('click', function(e) {
   e.stopPropagation();
@@ -259,6 +278,7 @@ document.addEventListener('keydown', function(e) {
 // INIT
 // ============================================================
 function init() {
+  initSearchData(PACKETS);
   buildFilterTagGrid();
   refresh();
 }

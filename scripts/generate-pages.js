@@ -11,7 +11,8 @@ const BASE = path.join(__dirname, '..');
 const PACKETS_DIR = path.join(BASE, 'data', 'packets');
 const OUT_DIR = path.join(BASE, 'packets');
 
-const SITE = 'https://realcrystalnight.github.io/mc-packet-reference';
+let SITE;
+try { const cfg = require('../config.json'); SITE = cfg.SITE || 'https://realcrystalnight.github.io/mc-packet-reference'; } catch (e) { SITE = 'https://realcrystalnight.github.io/mc-packet-reference'; }
 
 const GROUPS = [
   { label: 'Handshaking', state: 'HANDSHAKING', dir: 'SERVERBOUND' },
@@ -29,7 +30,7 @@ function buildSidebarHtml(allPkts) {
     const pkts = allPkts.filter(function(p) { return p.state === g.state && p.dir === g.dir; });
     if (pkts.length === 0) return;
     html += '<div class="nav-section">';
-    html += '<div class="nav-section-header"><svg class="chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg><span>' + g.label + '</span><span class="count">' + pkts.length + '</span></div>';
+    html += '<div class="nav-section-header" role="button" tabindex="0"><svg class="chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M6 9l6 6 6-6"/></svg><span>' + g.label + '</span><span class="count">' + pkts.length + '</span></div>';
     html += '<div class="nav-items">';
     pkts.forEach(function(p) {
       var prefix = p.id.substring(0, 3);
@@ -51,22 +52,22 @@ function renderDetail(p) {
   var parts = [];
   if (p.fields && p.fields.length) {
     parts.push('<div class="detail-section"><h3>Fields</h3><table class="fields-table"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>');
-    p.fields.forEach(function(f) { parts.push('<tr><td class="f-name">' + f.name + '</td><td class="f-type">' + f.type + '</td><td class="f-desc">' + f.desc + '</td></tr>'); });
+    p.fields.forEach(function(f) { parts.push('<tr><td class="f-name">' + esc(f.name) + '</td><td class="f-type">' + esc(f.type) + '</td><td class="f-desc">' + esc(f.desc) + '</td></tr>'); });
     parts.push('</tbody></table></div>');
   }
   if (p.subclasses && p.subclasses.length) {
     parts.push('<div class="detail-section"><h3>Subclasses</h3><div class="subclass-list">');
-    p.subclasses.forEach(function(s) { parts.push('<div class="subclass-item"><span class="sub-name">' + s.name + '</span><span class="sub-desc">' + s.desc + '</span></div>'); });
+    p.subclasses.forEach(function(s) { parts.push('<div class="subclass-item"><span class="sub-name">' + esc(s.name) + '</span><span class="sub-desc">' + esc(s.desc) + '</span></div>'); });
     parts.push('</div></div>');
   }
   if (p.encoding && p.encoding.length) {
     parts.push('<div class="detail-section"><h3>Wire Encoding</h3><table class="encoding-table"><thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead><tbody>');
-    p.encoding.forEach(function(e) { parts.push('<tr><td class="e-field">' + e[0] + '</td><td class="e-type">' + e[1] + '</td><td class="e-notes">' + (e[2] || '') + '</td></tr>'); });
+    p.encoding.forEach(function(e) { parts.push('<tr><td class="e-field">' + esc(e[0]) + '</td><td class="e-type">' + esc(e[1]) + '</td><td class="e-notes">' + esc(e[2] || '') + '</td></tr>'); });
     parts.push('</tbody></table></div>');
   }
   if (p.mcp && p.mcp.length) {
     parts.push('<div class="detail-section"><h3>MCP References</h3><div class="mcp-block">');
-    p.mcp.forEach(function(m) { parts.push('<div class="mcp-row"><span class="mcp-label">MCP</span><code>' + m + '</code></div>'); });
+    p.mcp.forEach(function(m) { parts.push('<div class="mcp-row"><span class="mcp-label">MCP</span><code>' + esc(m) + '</code></div>'); });
     parts.push('</div></div>');
   }
   if (p.handler) {
@@ -165,7 +166,7 @@ function main() {
       + '  </div>\n'
       + '  <div class="sidebar-search">\n'
       + '    <svg class="sidebar-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>\n'
-      + '    <input type="text" placeholder="Search all packets..." onclick="window.location.href=\'../../\'" role="button" readonly>\n'
+      + '    <input type="text" placeholder="Search all packets..." onclick="window.location.href=\'../../\'" role="button" readonly aria-label="Search all packets (opens main page)">\n'
       + '    <kbd class="search-kbd">/</kbd>\n'
       + '  </div>\n'
       + '  <nav class="sidebar-nav" id="sidebarNav">' + sidebarHtml + '</nav>\n'
@@ -197,11 +198,15 @@ function main() {
     fs.writeFileSync(path.join(dir2, 'index.html'), html);
   }
 
-  // Sitemap
+  // Sitemap — use real file mtimes
+  function mtime(p) {
+    try { return fs.statSync(p).mtime.toISOString().slice(0, 10); }
+    catch (e) { return new Date().toISOString().slice(0, 10); }
+  }
   const sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-    + '  <url><loc>' + SITE + '/</loc><lastmod>2025-06-18</lastmod><changefreq>weekly</changefreq><priority>1.0</priority></url>\n'
-    + '  <url><loc>' + SITE + '/packets/</loc><lastmod>2025-06-18</lastmod><changefreq>weekly</changefreq><priority>0.9</priority></url>\n'
-    + allPkts.map(function(p) { return '  <url><loc>' + SITE + '/packets/' + p.id + '/</loc><lastmod>2025-06-18</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>'; }).join('\n') + '\n'
+    + '  <url><loc>' + SITE + '/</loc><lastmod>' + mtime(path.join(BASE, 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>1.0</priority></url>\n'
+    + '  <url><loc>' + SITE + '/packets/</loc><lastmod>' + mtime(path.join(BASE, 'packets', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.9</priority></url>\n'
+    + allPkts.map(function(p) { return '  <url><loc>' + SITE + '/packets/' + p.id + '/</loc><lastmod>' + mtime(path.join(PACKETS_DIR, p.id + '.json')) + '</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>'; }).join('\n') + '\n'
     + '</urlset>\n';
 
   fs.writeFileSync(path.join(BASE, 'sitemap.xml'), sitemap);
