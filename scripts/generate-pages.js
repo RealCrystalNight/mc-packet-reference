@@ -35,7 +35,7 @@ function buildSidebarHtml(allPkts) {
       var prefix = p.id.substring(0, 3);
       var dirClass = p.dir === 'SERVERBOUND' ? 'sb' : 'cb';
       var dirLabel = p.dir === 'SERVERBOUND' ? 'SB' : 'CB';
-      html += '<a href="/mc-packet-reference/packets/' + p.id + '/" class="nav-item">';
+      html += '<a href="../../packets/' + p.id + '/" class="nav-item">';
       html += '<span class="nav-hex">' + prefix + '</span>';
       html += '<span class="nav-name">' + p.name + '</span>';
       html += '<span class="nav-dir ' + dirClass + '">' + dirLabel + '</span></a>';
@@ -153,19 +153,19 @@ function main() {
       + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
       + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
       + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
-      + '<link rel="stylesheet" href="/mc-packet-reference/css/style.css">\n'
+      + '<link rel="stylesheet" href="../../css/style.css">\n'
       + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"TechArticle","headline":"' + metaTitle + '","description":"' + implEsc + '","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"' + pkt.state + ' Protocol \u2014 ' + dirLabel + '"}\n</script>\n'
       + '</head>\n<body>\n'
       + '<aside class="sidebar" id="sidebar">\n'
       + '  <div class="sidebar-header">\n'
-      + '    <a href="/mc-packet-reference/" class="logo" style="text-decoration:none">\n'
+      + '    <a href="../../" class="logo" style="text-decoration:none">\n'
       + '      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 7h10M7 12h10M7 17h6"/></svg>\n'
       + '      <span>MC <strong>1.8.9</strong></span>\n'
       + '    </a>\n'
       + '  </div>\n'
       + '  <div class="sidebar-search">\n'
       + '    <svg class="sidebar-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>\n'
-      + '    <input type="text" placeholder="Search all packets..." onfocus="this.value=\'\';window.location.href=\'/mc-packet-reference/\'" role="button" readonly>\n'
+      + '    <input type="text" placeholder="Search all packets..." onclick="window.location.href=\'../../\'" role="button" readonly>\n'
       + '    <kbd class="search-kbd">/</kbd>\n'
       + '  </div>\n'
       + '  <nav class="sidebar-nav" id="sidebarNav">' + sidebarHtml + '</nav>\n'
@@ -188,7 +188,7 @@ function main() {
       + renderDetail(pkt) + '\n'
       + '    </div>\n'
       + '    <div style="margin-top:32px;text-align:center">\n'
-      + '      <a href="/mc-packet-reference/" style="color:var(--accent);font-size:0.85rem">\u2190 Back to all packets</a>\n'
+      + '      <a href="../../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to all packets</a>\n'
       + '    </div>\n'
       + '  </div>\n'
       + '</main>\n'

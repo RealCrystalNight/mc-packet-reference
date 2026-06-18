@@ -57,7 +57,7 @@ function buildSidebarNav(visiblePackets) {
       var prefix = p.id.substring(0, 3);
       var dirClass = p.dir === 'SERVERBOUND' ? 'sb' : 'cb';
       var dirLabel = p.dir === 'SERVERBOUND' ? 'SB' : 'CB';
-      html += '<a href="/mc-packet-reference/packets/' + p.id + '/" class="nav-item">';
+      html += '<a href="packets/' + p.id + '/" class="nav-item">';
       html += '<span class="nav-hex">' + prefix + '</span>';
       html += '<span class="nav-name">' + p.name + '</span>';
       html += '<span class="nav-dir ' + dirClass + '">' + dirLabel + '</span>';
@@ -201,7 +201,7 @@ function buildOverviewSections(filtered) {
     html += '<div class="section-packet-list">';
     pkts.forEach(function(p) {
       var prefix = p.id.substring(0, 3);
-      html += '<a href="/mc-packet-reference/packets/' + p.id + '/" class="section-packet-row">';
+      html += '<a href="packets/' + p.id + '/" class="section-packet-row">';
       html += '<span class="row-hex">' + prefix + '</span>';
       html += '<span class="row-name">' + p.name + '</span>';
       html += '<span class="row-desc">' + p.desc + '</span>';
