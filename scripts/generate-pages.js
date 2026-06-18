@@ -86,7 +86,7 @@ function renderDetail(p) {
         parts.push('</div>');
         if (m.purpose) parts.push('<p class="impl-pattern">' + m.purpose + '</p>');
         if (m.how_it_works) parts.push('<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">' + m.how_it_works + '</p>');
-        if (m.detailed_code) parts.push('<div class="impl-code"><code>' + esc(m.detailed_code) + '</code></div>');
+        if (m.detailed_code) parts.push('<div class="impl-code-wrap collapsed"><div class="impl-code"><code>' + esc(m.detailed_code) + '</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle(\'collapsed\');w.classList.toggle(\'expanded\');this.querySelector(\'.expand-label\').textContent=w.classList.contains(\'collapsed\')?\'Show more\':\'Show less\'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>');
         if (m.vanilla_hook) parts.push('<div class="impl-meta"><span><strong>Vanilla hook:</strong> ' + m.vanilla_hook + '</span></div>');
         if (m.anti_cheat_notes) parts.push('<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>' + m.anti_cheat_notes + '</span></div>');
         parts.push('</div>');
