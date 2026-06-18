@@ -312,6 +312,8 @@ function renderDetail(p) {
   headerHtml += '<span class="meta-mcp">net/minecraft/network/' + (p.dir === 'SERVERBOUND' ? 'play/client' : p.state.toLowerCase() === 'play' ? 'play/server' : '') + '/' + p.id + '.java</span>';
   headerHtml += '</div>';
 
+  headerHtml += '<a href="/mc-packet-reference/packets/' + p.id + '/" class="detail-permalink" title="Permalink to standalone page" target="_blank"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> Permalink</a>';
+
   if (p.tags && p.tags.length) {
     headerHtml += '<div class="detail-tags">';
     p.tags.forEach(function(t) { headerHtml += '<span class="dtag">' + t + '</span>'; });
