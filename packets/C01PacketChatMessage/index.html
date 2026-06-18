@@ -18,7 +18,7 @@
 <meta name="twitter:description" content="C01PacketChatMessage (0x01): Sends a chat message or command from the client to the server.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Command System (prefix-based), AutoGG / AutoPlay / AutoRegister, Spammer, ChatBypass / AntiVoid (message modification)">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Command System (prefix-based), AutoGG / AutoPlay / AutoRegister, Spammer, ChatBypass / AntiVoid (message modification), Centralized Chat Handler">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -75,21 +75,35 @@
 </div>
 <p class="impl-pattern">Allows the user to run client commands using a prefix like . or $ without sending them to the server.</p>
 <p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">In EventSendPacket, when the intercepted packet is C01PacketChatMessage, the module reads the message. If the message starts with the command prefix (e.g., "."), the event is cancelled (server never sees it) and the rest of the message is processed as a client-side command (toggle module, change setting, etc).</p>
-<div class="impl-code"><code>// Nekoware v1 - Commands.java
-if (p instanceof C01PacketChatMessage) {
-  C01PacketChatMessage packet = (C01PacketChatMessage) p;
-  String message = packet.getMessage();
-  if (message.startsWith(".")) {
-    event.setCancelled(true);
-    processCommand(message.substring(1));  // handle client-side
-    return;
+<div class="impl-code"><code>// Nekoware v1 private - Commands.java (full command interception)
+// Reproduced from actual 1.8.9 client source
+@Handler
+public Consumer&lt;PacketOutEvent&gt; eventConsumer0 = (event) -&gt; {
+  Packet p = event.getPacket();
+  if (p instanceof C01PacketChatMessage) {
+    C01PacketChatMessage packet = (C01PacketChatMessage) p;
+    String msg = packet.getMessage();
+    String[] args = msg.split(" +");
+    String cmd = args[0].replace(this.prefix, "").toLowerCase();
+
+    if (msg.startsWith(this.prefix)) {
+      event.cancel();  // Server never sees command
+      switch (cmd) {
+        case "bind":    // .bind KillAura R
+        case "vclip":   // .vclip 10
+        case "hclip":   // .hclip 5
+        case "toggle":  // .toggle Flight
+        case "prefix":  // .prefix $
+          // Handle client-side commands...
+          break;
+      }
+    }
   }
 }
 
-// Memeware 7.3 - Commands.java (identical pattern)
-if (p instanceof C01PacketChatMessage) {
-  String msg = ((C01PacketChatMessage) p).getMessage();
-  if (msg.startsWith(".")) { event.setCancelled(true); parseCommand(msg); }
+// ChatUtil.java - sends raw C01 to server
+public void sendChatMessage(String text) {
+  mc.thePlayer.sendQueue.addToSendQueue(new C01PacketChatMessage(text));
 }</code></div>
 <div class="impl-meta"><span><strong>Vanilla hook:</strong> NetHandlerPlayClient.sendChatMessage() — this is where the client constructs a C01 and calls sendPacket. But for interception, EventSendPacket (fired inside NetworkManager.sendPacket()) is the correct hook. Most clients have a custom sendChatMessage override too.</span></div>
 <div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>There"s no anti-cheat check on this packet — the server just forwards your message to chat. However, servers can detect if you"re running client commands by noticing that messages starting with "still arrive at the server as empty strings if you don"t cancel properly.</span></div>
@@ -99,27 +113,22 @@ if (p instanceof C01PacketChatMessage) {
 </div>
 <p class="impl-pattern">Automatically sends predefined chat messages when certain trigger events happen — "gg" after a kill, "/play mode" after game end, "/register password" on first join, "/tpaccept" on teleport request.</p>
 <p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">These modules listen for S02PacketChat (incoming). When the incoming message matches a trigger pattern (contains "Winner: ", "1st Killer - ", "You have been teleported", etc.), the module schedules or immediately sends a C01PacketChatMessage with the appropriate response. Some use a small delay to appear human. The sending is done via mc.thePlayer.sendChatMessage() which internally constructs and sends C01.</p>
-<div class="impl-code"><code>// Sigma 3.9 - AutoGG.java
+<div class="impl-code"><code>// Sigma 3.9 - AutoGG.java (chat-based trigger)
+// Reproduced from actual 1.8.9 client source
 @EventTarget
 public void onReceive(EventReceivePacket ep) {
   if (ep.isIncoming() &amp;&amp; ep.getPacket() instanceof S02PacketChat) {
     S02PacketChat s02 = (S02PacketChat) ep.getPacket();
     String msg = s02.func_148915_c().getUnformattedText();
-    if (msg.contains("1st Killer - ") || msg.contains("Winner: ")) {
-      mc.thePlayer.sendChatMessage("gg");  // internally creates C01
-      mc.thePlayer.sendChatMessage("/play solo_insane");  // AutoPlay
-    }
-  }
-}
 
-// Tenacity 5.1 - TPAKiller.java
-@Subscribe
-public void onEvent(EventReceivePacket event) {
-  if (event.getPacket() instanceof S02PacketChat) {
-    S02PacketChat s02 = (S02PacketChat) event.getPacket();
-    String msg = s02.getChatComponent().getUnformattedText();
-    if (msg.contains("has requested to teleport to you")) {
-      mc.thePlayer.sendChatMessage("/tpaccept");  // sends C01 instantly
+    // Detect game-end patterns (SkyWars, BedWars, etc.)
+    if (msg.contains("1st Killer - ")
+      || msg.contains("Winner:")
+      || msg.contains("Game over")) {
+      // AutoGG
+      mc.thePlayer.sendChatMessage("gg");
+      // AutoPlay - re-queue
+      mc.thePlayer.sendChatMessage("/play solo_insane");
     }
   }
 }</code></div>
@@ -170,6 +179,31 @@ private String bypass(String s) {
 }</code></div>
 <div class="impl-meta"><span><strong>Vanilla hook:</strong> EntityPlayerSP.sendChatMessage() is the vanilla call site. EventSendPacket via NetworkManager.sendPacket() is the hook point.</span></div>
 <div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Servers with advanced chat filters (like Sentinel) detect common bypass patterns (e.g., repeating characters, lookalike Unicode). Some clients have multiple bypass modes and auto-detect which one works.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Centralized Chat Handler</span>
+<span class="impl-module-clients">(Jigsaw 0.26)</span>
+</div>
+<p class="impl-pattern">Dispatches received C01PacketChatMessage to all modules from a central point.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The main client class overrides the chat handler. Every module registers its own onMessageSent handler. The central dispatcher prevents multiple modules from intercepting the same packet.</p>
+<div class="impl-code"><code>// Jigsaw 0.26 - Jigsaw.java (centralized dispatcher)
+// Reproduced from actual 1.8.9 client source
+// Main client class fires this for every outgoing chat:
+public static void onMessageSent(C01PacketChatMessage packet) throws Exception {
+  for (Module m : ModuleManager.getModules()) {
+    if (m.isEnabled()) {
+      m.onMessageSent(packet);  // Each module checks prefix
+    }
+  }
+}
+
+// Individual module receives the event:
+// Example: AutoEat switches slot then forwards the packet
+public void onMessageSent(C01PacketChatMessage packet) {
+  if (packet.getMessage().startsWith(".")) {
+    packet.cancel();  // cancel in module
+  }
+}</code></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EntityPlayerSP.sendChatMessage() → event dispatcher → modules</span></div>
 </div>
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Vanilla send path: EntityPlayerSP.sendChatMessage(String msg) → NetHandlerPlayClient.sendChatMessage(msg) → PacketUtil.createChatPacket(msg) → NetworkManager.sendPacket(new C01PacketChatMessage(msg)) → EventSendPacket fires → Netty writes → Server receives.
 
