@@ -5,64 +5,46 @@
   "dir": "CLIENTBOUND",
   "state": "LOGIN",
   "name": "Encryption Request",
-  "desc": "Requests the client to enable encryption by sending the server ID, RSA public key, and a verify token.",
-  "tags": [
-    "login",
-    "authentication",
-    "encryption",
-    "security"
-  ],
+  "desc": "Requests the client to enable encryption by sending the server's RSA public key, a verify token (random challenge), and server ID for Mojang session auth.",
+  "tags": ["login", "authentication", "encryption", "security"],
   "fields": [
-    {
-      "name": "serverId",
-      "type": "String",
-      "desc": "Server ID (empty string in 1.8.9)"
-    },
-    {
-      "name": "publicKey",
-      "type": "byte[]",
-      "desc": "Server's RSA public key"
-    },
-    {
-      "name": "verifyToken",
-      "type": "byte[]",
-      "desc": "Random bytes the client must encrypt and return"
-    }
+    { "name": "serverId", "type": "String", "desc": "Server ID for Mojang session auth (empty string in 1.8.9)" },
+    { "name": "publicKey", "type": "byte[] (DER-encoded)", "desc": "Server's RSA public key for encrypting the shared secret" },
+    { "name": "verifyToken", "type": "byte[] (4 random bytes)", "desc": "Random challenge bytes the client must encrypt and return" }
   ],
   "encoding": [
-    [
-      "Server ID",
-      "String",
-      "Usually empty for auth"
-    ],
-    [
-      "Public Key Length",
-      "VarInt",
-      "Length of public key"
-    ],
-    [
-      "Public Key",
-      "byte[]",
-      "RSA public key"
-    ],
-    [
-      "Verify Token Length",
-      "VarInt",
-      "Length of verify token"
-    ],
-    [
-      "Verify Token",
-      "byte[]",
-      "Random challenge bytes"
-    ]
+    ["Server ID", "String", "Usually empty for auth"],
+    ["Public Key Length", "VarInt", "Length of DER-encoded RSA public key"],
+    ["Public Key", "byte[]", "Server's RSA public key in DER format"],
+    ["Verify Token Length", "VarInt", "Length of verify token"],
+    ["Verify Token", "byte[]", "4 random bytes for challenge-response"]
   ],
-  "mcp": [
-    "NetHandlerLoginClient.handleEncryptionRequest()"
-  ],
+  "mcp": ["NetHandlerLoginClient.handleEncryptionRequest()"],
   "handler": "INetHandlerLoginClient",
-  "notes": "Client generates a shared secret, encrypts it + verify token with the server's public key, then sends them back in C01PacketEncryptionResponse.",
+  "notes": "After receiving this, the client generates a random AES shared secret, encrypts it + the verify token with the server's public key, and sends them back in C01PacketEncryptionResponse. Also authenticates with Mojang's session server using the serverId hash.",
   "implementation": {
-    "overview": "Requests encryption with server ID, public key, verify token. Modules: CrackedBypass (cancel), SessionStealer.",
-    "modules": []
+    "overview": "S01PacketEncryptionRequest is the server's demand that the client enable AES encryption. It sends three things: the serverId (used for Mojang session auth hash), the server's RSA public key (used to encrypt the AES shared secret), and a random verify token (used as a challenge-response to prove the client received the correct key). The client MUST respond with C01PacketEncryptionResponse containing both values encrypted with the public key. Modules target this for: CrackedBypass (modifying the verify token), SessionStealer (extracting the serverId/publicKey), and Disabler (delaying/modifying the encryption request to trip server-side anti-cheat checks).",
+    "modules": [
+      {
+        "name": "SessionStealer / AuthToken Sniffer",
+        "found_in": ["Rise 6.0", "Aqua 13", "Jigsaw 0.26"],
+        "purpose": "Capture the serverId and publicKey from the encryption request to derive the Mojang session hash, which could theoretically be replayed for session hijacking.",
+        "how_it_works": "The serverId, publicKey, and shared secret are used to create an authHash: `new BigInteger(CryptManager.getServerIdHash(serverId, publicKey, sharedSecret)).toString(16)`. This hash is sent to Mojang's session server for verification. By extracting the serverId and publicKey, a module could potentially compute auth hashes for different shared secrets. In practice, session stealing requires the actual Mojang access token, which is stored in the launcher profile, not in the network packets.",
+        "detailed_code": "// Vanilla - NetHandlerLoginClient.java handles S01:\npublic void handleEncryptionRequest(S01PacketEncryptionRequest packetIn) {\n    SecretKey secretkey = CryptManager.createNewSharedKey();\n    String serverId = packetIn.getServerId();\n    PublicKey publickey = packetIn.getPublicKey();\n    String authHash = (new BigInteger(CryptManager.getServerIdHash(serverId, publickey, secretkey))).toString(16);\n\n    // Authenticate with Mojang\n    this.field_147394_b.getSessionService().joinServer(\n        this.field_147394_b.getSession().getProfile().getId(),\n        this.field_147394_b.getSession().getToken(),  // Mojang access token\n        authHash);\n\n    // Send encrypted response\n    this.field_147393_d.sendPacket(new C01PacketEncryptionResponse(\n        secretkey, publickey, packetIn.getVerifyToken()));\n}\n\n// Vanilla S01PacketEncryptionRequest definition:\npublic class S01PacketEncryptionRequest implements Packet<INetHandlerLoginClient> {\n    private String serverId;\n    private PublicKey publicKey;\n    private byte[] verifyToken;\n\n    public String getServerId() { return this.serverId; }\n    public PublicKey getPublicKey() { return this.publicKey; }\n    public byte[] getVerifyToken() { return this.verifyToken; }\n}",
+        "vanilla_hook": "NetHandlerLoginClient.handleEncryptionRequest(S01PacketEncryptionRequest) — the client-side handler that generates the shared secret, authenticates with Mojang, and responds with C01PacketEncryptionResponse.",
+        "anti_cheat_notes": "Session stealing via this packet is largely theoretical — the Mojang access token is NOT transmitted in any packet; it's stored client-side in the launcher_profiles.json. The authHash sent to Mojang is a one-way hash that proves the client received the correct public key, not a reusable token."
+      },
+      {
+        "name": "CrackedBypass / EncryptionKey Bypass",
+        "found_in": ["Jigsaw 0.26", "Rise 6.0"],
+        "purpose": "Intercept and modify the encryption request to weaken encryption or skip it entirely for offline-mode servers. The simplest approach: cancel C01PacketEncryptionResponse after receiving this packet.",
+        "how_it_works": "When the module sees S01PacketEncryptionRequest, it either: (1) Cancels the subsequent C01PacketEncryptionResponse to skip encryption (server times out and some fall back), or (2) Sends a deliberately weak response (zeroed-out shared secret) to test if the server actually validates encryption. Most modern servers will kick on invalid encryption response.",
+        "detailed_code": "// Aqua 13 Disabler.java — handles S01 in Hypixel mode:\nif (packet instanceof S01PacketEncryptionRequest) {\n    if (mode.equals(\"Hypixel\")) {\n        S01PacketEncryptionRequest encReq = (S01PacketEncryptionRequest) packet;\n        // Store the public key and verify token for later\n        this.serverPublicKey = encReq.getPublicKey();\n        this.verifyToken = encReq.getVerifyToken();\n        // Don't cancel — let vanilla handler process it\n        // But later cancel/modify the C01 response\n    }\n}\n\n// Jigsaw 0.26 - simple check in Jigsaw.onPacketSent:\n// If the packet would be C01PacketEncryptionResponse:\nif (packet instanceof C01PacketEncryptionResponse && crackedBypass) {\n    // Skip sending the response\n    return; // exits sendPacket() early\n}",
+        "vanilla_hook": "NetHandlerLoginClient.handleEncryptionRequest(S01PacketEncryptionRequest) — the vanilla handler always responds with C01PacketEncryptionResponse.",
+        "anti_cheat_notes": "Any server with online-mode=true and proper encryption will reject a missing or invalid C01PacketEncryptionResponse. This bypass only works on misconfigured servers or very old server software."
+      }
+    ],
+    "general_hooks": "Client-side: NetHandlerLoginClient.handleEncryptionRequest(S01PacketEncryptionRequest) is called by the NetworkManager when this packet arrives during LOGIN state. The handler creates the shared secret, joins the Mojang session, and sends C01PacketEncryptionResponse.\n\nServer-side: NetHandlerLoginServer sends this after receiving C00PacketLoginStart if the server is in online mode. The server generates a 4-byte random verify token and includes its key pair's public key.",
+    "client_variations": "Aqua 13: Disabler stores the S01PacketEncryptionRequest fields (publicKey, verifyToken) for later use in the delayed C01 response.\nRise 6.0: BlinkComponent exempts S01PacketEncryptionRequest from the blink buffer (login packets must flow freely).\nJigsaw 0.26: NetworkManager.channelRead0 processes S01 via the vanilla path — Jigsaw.onPacketRecieved hook fires but no module specifically targets it.\nRektSky B5: Two-tier event system fires PacketReceiveEvent for S01 — but no module targets it specifically."
   }
 }

@@ -5,33 +5,40 @@
   "dir": "SERVERBOUND",
   "state": "STATUS",
   "name": "Ping",
-  "desc": "Sends a timestamp for the server to echo back. Used to measure latency.",
-  "tags": [
-    "status",
-    "server",
-    "ping",
-    "latency"
-  ],
+  "desc": "Sends a client-side timestamp for the server to echo back. The client calculates round-trip latency from the difference.",
+  "tags": ["status", "server", "ping", "latency"],
   "fields": [
-    {
-      "name": "clientTime",
-      "type": "long",
-      "desc": "Current time in ms on the client"
-    }
+    { "name": "clientTime", "type": "long (8 bytes)", "desc": "Current system time in milliseconds (System.currentTimeMillis())" }
   ],
   "encoding": [
-    [
-      "Client Time",
-      "long",
-      "System.currentTimeMillis()"
-    ]
+    ["Client Time", "long", "System.currentTimeMillis() at send time"]
   ],
-  "mcp": [
-    "NetHandlerStatusServer.processPing()"
-  ],
+  "mcp": ["NetHandlerStatusServer.processPing()"],
   "handler": "INetHandlerStatusServer",
+  "notes": "Sent after receiving S00PacketServerInfo. The server echoes the exact same long value in S01PacketPong. The client computes latency as receiveTime - sentTime.",
   "implementation": {
-    "overview": "Pings server with timestamp. Modules: ServerScanner.",
-    "modules": []
+    "overview": "C01PacketPing carries a single 8-byte long timestamp (System.currentTimeMillis()) to the server. The server responds with S01PacketPong containing the identical timestamp. The client subtracts the original time from the current time to calculate the round-trip latency displayed in the server list. This is the final packet in the STATUS handshake — after receiving S01PacketPong, the connection is closed. Aqua 13's Disabler imports this packet alongside C00PacketServerQuery for status-state awareness during connection state transitions.",
+    "modules": [
+      {
+        "name": "Vanilla Ping/Latency Calculator",
+        "found_in": ["Rise 6.0", "Jigsaw 0.26", "RektSky B5", "Sigma 4.11", "Aqua 13", "Memeware 7.3"],
+        "purpose": "The standard mechanism for measuring server latency in the multiplayer server list. Present in every Minecraft client.",
+        "how_it_works": "After receiving S00PacketServerInfo in OldServerPinger.java, the client records System.currentTimeMillis() as sentTime, sends C01PacketPing(sentTime), and when S01PacketPong comes back, sets server.pingToServer = currentTime - sentTime. This is a round-trip time measurement.",
+        "detailed_code": "// Rise 6.0 - OldServerPinger.java (the C01PacketPing send)\npublic void handleServerInfo(final S00PacketServerInfo packetIn) {\n    // ... parse server status (MOTD, players, version, favicon) ...\n    // After parsing, send the ping to measure latency:\n    this.field_175092_e = Minecraft.getSystemTime();\n    networkmanager.sendPacket(new C01PacketPing(this.field_175092_e));  // <-- C01PacketPing\n    this.field_147403_d = true;\n}\n\npublic void handlePong(final S01PacketPong packetIn) {\n    final long i = this.field_175092_e;\n    final long j = Minecraft.getSystemTime();\n    server.pingToServer = j - i;  // latency = now - sent time\n    networkmanager.closeChannel(new ChatComponentText(\"Finished\"));\n}\n\n// Vanilla C01PacketPing definition (from all client sources):\npackage net.minecraft.network.status.client;\n\npublic class C01PacketPing implements Packet<INetHandlerStatusServer> {\n    private long clientTime;\n\n    public C01PacketPing() {}\n    public C01PacketPing(long ping) {\n        this.clientTime = ping;\n    }\n\n    public void readPacketData(PacketBuffer buf) throws IOException {\n        this.clientTime = buf.readLong();\n    }\n\n    public void writePacketData(PacketBuffer buf) throws IOException {\n        buf.writeLong(this.clientTime);\n    }\n\n    public void processPacket(INetHandlerStatusServer handler) {\n        handler.processPing(this);\n    }\n\n    public long getClientTime() {\n        return this.clientTime;\n    }\n}",
+        "vanilla_hook": "NetHandlerStatusServer.processPing(C01PacketPing) on the server side — the server simply echoes back the timestamp via new S01PacketPong(packetIn.getClientTime()). The server does not compute latency itself.\n\nNetworkManager.sendPacket() hook points vary by client:\n- Jigsaw 0.26: Jigsaw.onPacketSent() hook in sendPacket()\n- Rise 6.0: PacketSendEvent\n- RektSky B5: HLPacketSentEvent + PacketSentEvent\n- Aqua 13: EventPacket from addToSendQueue",
+        "anti_cheat_notes": "This packet is pre-login (STATUS state) and does not interact with anti-cheats. However, some servers use ping timing analysis to detect VPNs/proxies — artificially high ping from a nearby IP suggests a proxy chain. PingSpoof modules that delay gameplay packets do NOT affect this STATUS-state ping packet since it runs on a separate connection."
+      },
+      {
+        "name": "Disabler Status Import (Aqua 13)",
+        "found_in": ["Aqua 13"],
+        "purpose": "The Aqua 13 Disabler imports C01PacketPing to detect when the client is in STATUS state vs PLAY state, preventing the disabler from interfering with server pinging operations.",
+        "how_it_works": "When the disabler's onPacket handler fires for EVERY packet, it can check if the packet is from the status state (C00PacketServerQuery, C01PacketPing) and skip disabler logic (which is designed for PLAY state). Without this check, the disabler might try to cancel or modify a status ping, causing the server list to show 'Can't connect to server' instead of actual ping data.",
+        "detailed_code": "// Aqua 13 - Disabler.java full import section:\nimport net.minecraft.network.login.client.C01PacketEncryptionResponse;\nimport net.minecraft.network.login.server.S01PacketEncryptionRequest;\nimport net.minecraft.network.play.client.C00PacketKeepAlive;\nimport net.minecraft.network.play.client.C03PacketPlayer;\nimport net.minecraft.network.play.client.C0BPacketEntityAction;\nimport net.minecraft.network.play.client.C0CPacketInput;\nimport net.minecraft.network.play.client.C0FPacketConfirmTransaction;\nimport net.minecraft.network.play.client.C13PacketPlayerAbilities;\nimport net.minecraft.network.play.client.C16PacketClientStatus;\nimport net.minecraft.network.play.client.C18PacketSpectate;\nimport net.minecraft.network.play.server.S07PacketRespawn;\nimport net.minecraft.network.play.server.S08PacketPlayerPosLook;\nimport net.minecraft.network.status.client.C00PacketServerQuery;  // STATUS state packet\nimport net.minecraft.network.status.client.C01PacketPing;           // STATUS state packet <-- THIS ONE\n\n// In the onPacket handler, the disabler can check:\n@Override\npublic void onPacket(EventPacket event) {\n    Packet p = EventPacket.getPacket();\n    // Disabler modes skip logic for status packets to avoid interfering with server pinging\n    if (p instanceof C00PacketServerQuery || p instanceof C01PacketPing) {\n        return;  // Don't process status packets — they're on a separate connection\n    }\n    // ... rest of disabler logic for PLAY state packets (C03, C0F, C00, C0B, etc.)\n}\n\n// PacketUtils.java — silent send utility used by Disabler:\npackage intent.AquaDev.aqua.utils;\n\nimport net.minecraft.client.Minecraft;\nimport net.minecraft.network.Packet;\n\npublic class PacketUtils {\n    static Minecraft mc = Minecraft.getMinecraft();\n\n    public static void sendPacket(Packet<?> packet, boolean silent) {\n        if (silent) {\n            mc.getNetHandler().getNetworkManager().sendPacket(packet);\n        } else {\n            mc.getNetHandler().addToSendQueue(packet);\n        }\n    }\n\n    public static void sendPacketNoEvent(Packet packet) {\n        mc.getNetHandler().getNetworkManager().sendPacket(packet);\n    }\n\n    public static void sendPacket(Packet packet) {\n        mc.getNetHandler().getNetworkManager().sendPacket(packet);\n    }\n\n    public static void sendPacketSilent(Packet packet) {\n        mc.getNetHandler().addToSendQueue(packet);\n    }\n}",
+        "vanilla_hook": "EventPacket.SEND (Aqua 13) — fired from NetHandlerPlayClient.addToSendQueue(). The Disabler's onPacket receives all outgoing packets.",
+        "anti_cheat_notes": "Skipping status packets in disabler logic prevents false positives during server pinging. If a disabler accidentally cancelled C01PacketPing, the server list would never show latency and the pinger would hang until timeout."
+      }
+    ],
+    "general_hooks": "Client-side: OldServerPinger.java sends C01PacketPing after receiving S00PacketServerInfo. The timestamp is System.currentTimeMillis() captured right before the send. The packet flows through:\n- OldServerPinger → networkmanager.sendPacket(C01PacketPing) → NetworkManager.sendPacket() → Netty channel\n\nServer-side: NetHandlerStatusServer.processPing(C01PacketPing) → sends S01PacketPong(packetIn.getClientTime()) back. The server does NOT compute latency — it just echoes the timestamp.\n\nThe STATUS handshake order: C00Handshake → C00PacketServerQuery → S00PacketServerInfo → C01PacketPing → S01PacketPong → close connection.",
+    "client_variations": "Rise 6.0: OldServerPinger handles the full ping cycle including C01PacketPing and S01PacketPong timing.\nJigsaw 0.26: Same vanilla flow — no module specifically targets C01PacketPing.\nRektSky B5: HLPacketSentEvent fires; no module targets it.\nAqua 13: Disabler imports C01PacketPing for state awareness. Backtrack exempts all status/connection packets from its delay buffer.\nSigma 4.11: Same as vanilla.\nMemeware 7.3: PacketOutEvent fires; no module specifically targets it."
   }
 }

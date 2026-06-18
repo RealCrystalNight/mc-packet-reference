@@ -5,51 +5,42 @@
   "dir": "CLIENTBOUND",
   "state": "LOGIN",
   "name": "Login Success",
-  "desc": "Confirms successful authentication. Transitions the connection to the PLAY state.",
-  "tags": [
-    "login",
-    "authentication",
-    "player"
-  ],
+  "desc": "Confirms successful authentication. Contains the player's UUID and username. Transitions the connection state from LOGIN to PLAY.",
+  "tags": ["login", "authentication", "player"],
   "fields": [
-    {
-      "name": "uuid",
-      "type": "String",
-      "desc": "Player's UUID as a string"
-    },
-    {
-      "name": "username",
-      "type": "String",
-      "desc": "Player's username"
-    }
+    { "name": "uuid", "type": "String (36 chars)", "desc": "Player's UUID in standard format (e.g. '123e4567-e89b-12d3-a456-426614174000')" },
+    { "name": "username", "type": "String (max 16)", "desc": "The player's confirmed username" }
   ],
   "encoding": [
-    [
-      "UUID",
-      "String",
-      "e.g. 123e4567-e89b-12d3-a456-426614174000"
-    ],
-    [
-      "Username",
-      "String",
-      "Player's Minecraft username"
-    ]
+    ["UUID", "String", "UUID with dashes"],
+    ["Username", "String", "Player's Minecraft username"]
   ],
-  "mcp": [
-    "NetHandlerLoginClient.handleLoginSuccess()"
-  ],
+  "mcp": ["NetHandlerLoginClient.handleLoginSuccess()"],
   "handler": "INetHandlerLoginClient",
-  "notes": "After receiving this, the client-side connection state changes to PLAY.",
+  "notes": "After receiving this, the client connection state transitions to PLAY. The client creates the EntityPlayerSP (local player entity) with the received UUID and username. Compression may be enabled next via S03PacketEnableCompression.",
   "implementation": {
-    "overview": "Login successful, provides UUID+username. Modules: SessionStealer (capture data).",
+    "overview": "S02PacketLoginSuccess marks the successful completion of the login handshake. The server sends the player's real UUID (resolved from Mojang or generated for offline mode) and their confirmed username. This is the client's first confirmation that they've been fully authenticated and are about to enter the game world. After this packet, the connection transitions from LOGIN to PLAY state, and the client begins expecting PLAY-state packets. Modules target this for: UUID Capture (extracting and storing the UUID for session tools), LoginState Detector (triggering auto-enable of modules on successful login), and OfflineUUID (replacing the server-assigned UUID with a fixed one for cracked clients).",
     "modules": [
       {
-        "name": "SessionStealer",
-        "found_in": [
-          "November 0.2"
-        ],
-        "purpose": "Capture UUID and username after login."
+        "name": "LoginState Hook / Module Auto-Enable",
+        "found_in": ["Rise 6.0", "RektSky B5", "Sigma 4.11", "Aqua 13"],
+        "purpose": "Detect when the client has successfully logged in and automatically enable modules that should only run during gameplay (e.g., KillAura, Scaffold, ESP).",
+        "how_it_works": "Many modules remain disabled until the player is actually in the game world, since they depend on WorldClient, EntityPlayerSP, and other objects that don't exist during login. By listening for S02PacketLoginSuccess, modules know it's safe to activate. Some clients use this packet as the trigger for their 'onWorldLoad' event, which initializes module state.",
+        "detailed_code": "// Vanilla - NetHandlerLoginClient.java processes login success:\npublic void handleLoginSuccess(S02PacketLoginSuccess packetIn) {\n    // Set the client's session profile with the server-confirmed data\n    this.field_147394_b.setSession(new Session(\n        packetIn.getProfile().getName(),\n        packetIn.getProfile().getId().toString(),\n        this.field_147394_b.getSession().getToken(),\n        Session.Type.MOJANG.name()));\n\n    // Transition to PLAY state\n    this.netManager.setConnectionState(EnumConnectionState.PLAY);\n    this.netManager.setNetHandler(new NetHandlerPlayClient(\n        this.field_147394_b, this.field_147392_c, this.netManager, packetIn.getProfile()));\n}\n\n// Vanilla S02PacketLoginSuccess definition:\npublic class S02PacketLoginSuccess implements Packet<INetHandlerLoginClient> {\n    private GameProfile profile;\n\n    public S02PacketLoginSuccess() {}\n    public S02PacketLoginSuccess(GameProfile profileIn) {\n        this.profile = profileIn;\n    }\n\n    public void readPacketData(PacketBuffer buf) throws IOException {\n        String uuid = buf.readStringFromBuffer(36);\n        String username = buf.readStringFromBuffer(16);\n        this.profile = new GameProfile(UUID.fromString(uuid), username);\n    }\n\n    public GameProfile getProfile() {\n        return this.profile;\n    }\n}\n\n// Rise 6.0 - Manager.java detects PLAY state transition:\n// After S02PacketLoginSuccess, modules can safely use mc.theWorld/mc.thePlayer",
+        "vanilla_hook": "NetHandlerLoginClient.handleLoginSuccess(S02PacketLoginSuccess) — transitions from NetHandlerLoginClient to NetHandlerPlayClient. The NetworkManager state changes from LOGIN to PLAY.",
+        "anti_cheat_notes": "Anti-cheats don't inspect S02PacketLoginSuccess directly, but they DO monitor the timing between S02 and the first PLAY packet. Abnormal delays (caused by Blink/PingSpoof that accidentally delayed login packets) can trigger 'invalid state transition' flags."
+      },
+      {
+        "name": "UUID Capture / Alt Manager",
+        "found_in": ["Rise 6.0", "Jigsaw 0.26", "Sigma 4.11"],
+        "purpose": "Capture the assigned UUID on login for alt account management, session tracking, and offline-mode UUID spoofing.",
+        "how_it_works": "The module reads the UUID from S02PacketLoginSuccess and stores it alongside the alt account name in a local database. This UUID is later used for session tools, account switching, and for setting a fixed UUID on offline-mode servers (some plugins track players by UUID, so having a consistent UUID across sessions prevents stat resets).",
+        "detailed_code": "// Jigsaw 0.26 - Alt Manager reads UUID from login success:\n// NetHandlerLoginClient stores the game profile after S02:\npublic void handleLoginSuccess(S02PacketLoginSuccess packetIn) {\n    this.gameProfile = packetIn.getProfile();\n    // Alt manager can now read UUID from this.gameProfile.getId()\n}\n\n// Sigma 4.11 - AltManager captures UUID:\n// After successful login, UUID is extracted from mc.session.getProfile()\n// Stored in AltManager database for future use\n\n// Rise 6.0 - Session.java stores profile after login:\n// mc.getSession().getProfile().getId() provides the UUID",
+        "vanilla_hook": "NetHandlerLoginClient.handleLoginSuccess(S02PacketLoginSuccess) — the profile field is stored for the duration of the session.",
+        "anti_cheat_notes": "UUID capture is benign — servers don't check for this. However, using a fixed UUID across sessions on offline servers can be detected by anti-bot plugins that track the ratio of new UUIDs to new IPs."
       }
-    ]
+    ],
+    "general_hooks": "Client-side: NetHandlerLoginClient.handleLoginSuccess(S02PacketLoginSuccess) — this is the single most important callback during login. It creates the NetHandlerPlayClient, sets the player's session profile, and transitions to PLAY state.\n\nServer-side: NetHandlerLoginServer sends this after successful Mojang authentication (or immediately for offline mode). The server composes a GameProfile with the player's UUID and name.",
+    "client_variations": "Rise 6.0: BlinkComponent exempts S02PacketLoginSuccess from blink buffer. Manager.java watches for the PLAY state transition to auto-enable modules.\nJigsaw 0.26: AltManager captures the UUID from the login success GameProfile.\nRektSky B5: The NetworkManager state transition from LOGIN to PLAY is a key hook point for module initialization."
   }
 }

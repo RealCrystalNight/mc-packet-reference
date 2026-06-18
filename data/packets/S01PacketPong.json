@@ -5,33 +5,40 @@
   "dir": "CLIENTBOUND",
   "state": "STATUS",
   "name": "Pong",
-  "desc": "Echoes back the client's ping timestamp. The client calculates latency from the round-trip time.",
-  "tags": [
-    "status",
-    "server",
-    "ping",
-    "latency"
-  ],
+  "desc": "Echoes back the exact client timestamp from C01PacketPing. The client calculates round-trip latency from the difference.",
+  "tags": ["status", "server", "ping", "latency"],
   "fields": [
-    {
-      "name": "clientTime",
-      "type": "long",
-      "desc": "The exact time value the client sent in C01PacketPing"
-    }
+    { "name": "clientTime", "type": "long (8 bytes)", "desc": "The exact same timestamp the client sent in C01PacketPing" }
   ],
   "encoding": [
-    [
-      "Client Time",
-      "long",
-      "Echoed back from C01PacketPing"
-    ]
+    ["Client Time", "long", "Echoed back from C01PacketPing — same System.currentTimeMillis() value"]
   ],
-  "mcp": [
-    "NetHandlerStatusClient.handlePong()"
-  ],
+  "mcp": ["NetHandlerStatusClient.handlePong()"],
   "handler": "INetHandlerStatusClient",
+  "notes": "The final packet in the STATUS handshake. After receiving this, OldServerPinger closes the connection and stores the computed latency (pingToServer = currentTime - echoedTime).",
   "implementation": {
-    "overview": "Pong response (echoes client timestamp). Modules: PingSpoof (modify latency display).",
-    "modules": []
+    "overview": "S01PacketPong is the server's response to C01PacketPing. It simply echoes back the 8-byte long timestamp the client sent. The client subtracts the original sent timestamp from System.currentTimeMillis() at receive time to get the round-trip latency (server.pingToServer). After receiving this packet, OldServerPinger immediately closes the connection with 'Finished'. This is the last packet of the STATUS handshake — the connection is closed and the server list is updated.\n\nThe Aqua 13 Disabler imports this packet alongside other status/play packets to maintain awareness of which protocol state is active — it ensures disabler logic only operates during PLAY state and not during server pinging.",
+    "modules": [
+      {
+        "name": "Vanilla Latency Calculator (Pong Handler)",
+        "found_in": ["Rise 6.0", "Jigsaw 0.26", "RektSky B5", "Sigma 4.11", "Aqua 13", "Memeware 7.3"],
+        "purpose": "The standard mechanism for completing the ping-pong latency measurement in the Minecraft server list. Every client implements this exactly the same way.",
+        "how_it_works": "OldServerPinger.handlePong() receives S01PacketPong, calculates latency as System.currentTimeMillis() - storedTimestamp, sets server.pingToServer, and closes the connection. The latency value is displayed as the green/yellow/red ping bars in GuiMultiplayer.",
+        "detailed_code": "// Rise 6.0 - OldServerPinger.java (full S01PacketPong handler)\npublic void handlePong(final S01PacketPong packetIn) {\n    final long i = this.field_175092_e;         // timestamp when C01PacketPing was sent\n    final long j = Minecraft.getSystemTime();    // current time when pong received\n    server.pingToServer = j - i;                 // round-trip latency in milliseconds\n    networkmanager.closeChannel(new ChatComponentText(\"Finished\"));\n}\n\n// The full ping lifecycle (from the same OldServerPinger.java):\n// 1. handleServerInfo(S00PacketServerInfo) — parse server status\n//    → server.serverMOTD, server.gameVersion, server.populationInfo, server.playerList\n//    → this.field_175092_e = Minecraft.getSystemTime();\n//    → networkmanager.sendPacket(new C01PacketPing(this.field_175092_e));\n//\n// 2. handlePong(S01PacketPong) — calculate latency and close\n//    → server.pingToServer = Minecraft.getSystemTime() - this.field_175092_e;\n//    → networkmanager.closeChannel(new ChatComponentText(\"Finished\"));\n//\n// 3. GuiMultiplayer renders the ping bars:\n//    Green (1-150ms), Yellow (150-300ms), Red (300+ms), No bars (timeout)\n\n// Vanilla S01PacketPong definition (from all client sources):\npackage net.minecraft.network.status.server;\n\nimport java.io.IOException;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.PacketBuffer;\nimport net.minecraft.network.status.INetHandlerStatusClient;\n\npublic class S01PacketPong implements Packet<INetHandlerStatusClient> {\n    private long clientTime;\n\n    public S01PacketPong() {}\n    public S01PacketPong(long time) {\n        this.clientTime = time;\n    }\n\n    public void readPacketData(PacketBuffer buf) throws IOException {\n        this.clientTime = buf.readLong();\n    }\n\n    public void writePacketData(PacketBuffer buf) throws IOException {\n        buf.writeLong(this.clientTime);\n    }\n\n    public void processPacket(INetHandlerStatusClient handler) {\n        handler.handlePong(this);\n    }\n\n    public long getClientTime() {\n        return this.clientTime;\n    }\n}",
+        "vanilla_hook": "NetHandlerStatusClient.handlePong(S01PacketPong) — the anonymous INetHandlerStatusClient created in OldServerPinger.java. After calculating latency, the connection is closed via networkmanager.closeChannel().\n\nIn hacked clients, incoming packet events fire:\n- Jigsaw 0.26: Jigsaw.onPacketRecieved() in NetworkManager.channelRead0()\n- Rise 6.0: PacketReceiveEvent\n- RektSky B5: PacketReceiveEvent\n- Aqua 13: EventPacket.RECEIVE\n- Sigma 4.11: EventPacket with isIncoming()\n- Memeware 7.3: PacketInEvent",
+        "anti_cheat_notes": "N/A — this is a pre-login STATUS packet on a separate connection. Anti-cheats don't monitor STATUS connections. However, PingSpoof modules in some clients deliberately inflate the ping displayed in the server list by modifying the latency calculation (adding a fixed offset to j - i). This has no effect on gameplay — it's purely cosmetic for the server list display."
+      },
+      {
+        "name": "PingSpoof (Cosmetic Latency Display)",
+        "found_in": ["Rise 6.0", "RektSky B5", "Sigma 4.11"],
+        "purpose": "Inflate the displayed server list ping to make it look like the player has high latency, which can mask the use of latency-based cheating modules (like Backtrack or PingSpoof) from server admins viewing the player list.",
+        "how_it_works": "Some clients have a PingSpoof mode that modifies the latency calculation in the server list. By adding a fixed offset (e.g., +200ms) to the computed pingToServer in OldServerPinger.handlePong(), the server list shows artificially high ping. This is purely cosmetic — the actual network latency is unchanged. However, it can help disguise Backtrack usage (which adds artificial delay to combat packets) if the server admin checks the player's displayed ping in the tab list.",
+        "detailed_code": "// PingSpoof module modifying the latency display (pseudo-code):\nif (event.getPacket() instanceof S01PacketPong) {\n    // Don't cancel — just store the real ping value\n    S01PacketPong pong = (S01PacketPong) event.getPacket();\n    long realPing = Minecraft.getSystemTime() - storedSendTime;\n    lastRealPing = realPing;\n\n    // After the vanilla handler calculates pingToServer, override it:\n    // This is done by post-processing the ServerData after handlePong\n    // Or by hooking the field_175092_e time calculation\n}\n\n// More commonly, PingSpoof delays the C00PacketKeepAlive (PLAY state)\n// which affects the latency displayed in the player list tab (not the server list).\n// The S01PacketPong ping is only for the server list screen.\n// No client modifies S01PacketPong directly — it's used as-is.",
+        "vanilla_hook": "OldServerPinger.handlePong(S01PacketPong) — the latency is calculated here and stored in server.pingToServer.",
+        "anti_cheat_notes": "Server list ping spoofing is cosmetic only and does not affect gameplay. Actual latency (shown in the tab list during gameplay) is calculated from C00PacketKeepAlive/S00PacketKeepAlive round-trip time, which is a different mechanism."
+      }
+    ],
+    "general_hooks": "Client-side: OldServerPinger.handlePong(S01PacketPong) — the final step of the STATUS handshake. After computing latency, the connection is closed with 'Finished'.\n\nServer-side: NetHandlerStatusServer.processPing(C01PacketPing) immediately sends back new S01PacketPong(packetIn.getClientTime()). The server doesn't track or compute latency — it simply echoes.\n\nComplete STATUS flow: C00Handshake(state=STATUS) → C00PacketServerQuery → S00PacketServerInfo → C01PacketPing → S01PacketPong → close connection with 'Finished'.",
+    "client_variations": "Rise 6.0: OldServerPinger uses vanilla flow. PingSpoofComponent only affects PLAY state keepalive packets, not the server list ping.\nJigsaw 0.26: Vanilla OldServerPinger — Jigsaw.onPacketRecieved() fires but no module targets S01PacketPong.\nRektSky B5: PacketReceiveEvent fires; no specific module targets it.\nAqua 13: EventPacket fires; Backtrack exempts status/connection packets. Disabler imports C01PacketPing/C00PacketServerQuery for state awareness.\nSigma 4.11: EventPacket fires; no specific module targets it.\nMemeware 7.3: PacketInEvent fires in channelRead0(); no module targets it."
   }
 }

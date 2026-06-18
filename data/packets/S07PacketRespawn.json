@@ -5,73 +5,46 @@
   "dir": "CLIENTBOUND",
   "state": "PLAY",
   "name": "Respawn",
-  "desc": "Sends respawn/teleport to another dimension. Client must reload the world.",
-  "tags": [
-    "player",
-    "world",
-    "respawn",
-    "death",
-    "dimension"
-  ],
+  "desc": "Sends respawn or dimension change request. The client must reload the world (clear chunks, entities) and re-sync position.",
+  "tags": ["player", "world", "respawn", "death", "dimension"],
   "fields": [
-    {
-      "name": "dimensionId",
-      "type": "int",
-      "desc": "-1=nether, 0=overworld, 1=end"
-    },
-    {
-      "name": "difficulty",
-      "type": "byte",
-      "desc": "Current difficulty"
-    },
-    {
-      "name": "gamemode",
-      "type": "byte",
-      "desc": "Current gamemode"
-    },
-    {
-      "name": "worldType",
-      "type": "String",
-      "desc": "World type string"
-    }
+    { "name": "dimensionId", "type": "int", "desc": "-1=nether, 0=overworld, 1=end" },
+    { "name": "difficulty", "type": "unsigned byte", "desc": "Current server difficulty" },
+    { "name": "gamemode", "type": "unsigned byte", "desc": "Current gamemode" },
+    { "name": "worldType", "type": "String", "desc": "World type string" }
   ],
   "encoding": [
-    [
-      "Dimension",
-      "int",
-      "-1=nether, 0=overworld, 1=end"
-    ],
-    [
-      "Difficulty",
-      "unsigned byte",
-      ""
-    ],
-    [
-      "Gamemode",
-      "unsigned byte",
-      ""
-    ],
-    [
-      "Level Type",
-      "String",
-      ""
-    ]
+    ["Dimension", "int", "-1=nether, 0=overworld, 1=end"],
+    ["Difficulty", "unsigned byte", "0=peaceful, 1=easy, 2=normal, 3=hard"],
+    ["Gamemode", "unsigned byte", "0=survival, 1=creative, 2=adventure, 3=spectator"],
+    ["Level Type", "String", "World type"]
   ],
-  "mcp": [
-    "NetHandlerPlayClient.handleRespawn()"
-  ],
+  "mcp": ["NetHandlerPlayClient.handleRespawn()"],
   "handler": "INetHandlerPlayClient",
-  "notes": "After receiving this, the client resets chunk loading and sends a C00PacketKeepAlive and C03PacketPlayer to re-sync.",
+  "notes": "After receiving this, the client resets chunk loading, clears all entities, sends C00PacketKeepAlive to re-sync, and sends a C03/C06 position packet. The packet is used both for death respawn (same dimension) and portal dimension changes (dimension changes).",
   "implementation": {
-    "overview": "Respawns player in a dimension. Modules: DimensionDetector, WorldChange, AutoRespawn (reset state).",
+    "overview": "S07PacketRespawn is sent when the player dies and clicks 'Respawn' (same dimension) or travels through a portal (dimension change). It carries the target dimension, difficulty, gamemode, and world type. The client must clear all chunks, entities, and HUD elements, then send C00PacketKeepAlive to re-establish timing sync. Disabler modules use this packet extensively — they cancel or modify S07 to prevent dimension-change anti-cheat resets, to maintain flight state across worlds, or to bypass the respawn invulnerability timer. Aqua 13's Disabler imports S07PacketRespawn as one of its key targets alongside S08, C03, C0F, and C00.",
     "modules": [
       {
-        "name": "DimensionDetector",
-        "found_in": [
-          "Tenacity 6.0"
-        ],
-        "purpose": "Detect dimension change to reset modules."
+        "name": "Disabler (Dimension Change Bypass)",
+        "found_in": ["Aqua 13", "Rise 6.0", "RektSky B5"],
+        "purpose": "Cancel or modify S07PacketRespawn to prevent anti-cheat state resets during dimension changes. On Hypixel, changing dimensions resets Watchdog's movement tracking — the disabler uses this window to enable flight modules undetected.",
+        "how_it_works": "When the player enters a portal, the server sends S07 with the new dimension. The vanilla client clears all world data, recreates the world, and re-syncs. The anti-cheat also resets its tracking state. Some disabler modes exploit this window by cancelling the respawn packet, keeping the old world state while the server thinks the player is in a new dimension — this causes desync that masks movement cheats. Other modes detect the dimension change and briefly enable modules during the anti-cheat's reset window.",
+        "detailed_code": "// Aqua 13 - Disabler.java imports S07PacketRespawn:\nimport net.minecraft.network.play.server.S07PacketRespawn;\n\n// In the onPacket handler, S07 is checked alongside other server packets:\n@Override\npublic void onPacket(EventPacket event) {\n    Packet packet = EventPacket.getPacket();\n\n    // Ghostly mode: handle respawn for dimension change\n    if (packet instanceof S07PacketRespawn) {\n        if (mode.equals(\"Ghostly\")) {\n            S07PacketRespawn respawn = (S07PacketRespawn) packet;\n            // Track dimension change for state management\n            this.lastDimension = respawn.getDimensionID();\n            this.worldChanges++;\n        }\n    }\n\n    // ... rest of disabler logic for C03, C0F, C00, C0B, C13, etc.\n}\n\n// Vanilla S07PacketRespawn definition (from all clients):\npackage net.minecraft.network.play.server;\n\npublic class S07PacketRespawn implements Packet<INetHandlerPlayClient> {\n    private int dimensionID;\n    private EnumDifficulty difficulty;\n    private WorldSettings.GameType gameType;\n    private WorldType worldType;\n\n    public S07PacketRespawn() {}\n    public S07PacketRespawn(int dimensionIDIn, EnumDifficulty difficultyIn,\n                            WorldType worldTypeIn, WorldSettings.GameType gameTypeIn) {\n        this.dimensionID = dimensionIDIn;\n        this.difficulty = difficultyIn;\n        this.gameType = gameTypeIn;\n        this.worldType = worldTypeIn;\n    }\n\n    public void processPacket(INetHandlerPlayClient handler) {\n        handler.handleRespawn(this);\n    }\n\n    public int getDimensionID() { return this.dimensionID; }\n    public EnumDifficulty getDifficulty() { return this.difficulty; }\n    public WorldSettings.GameType getGameType() { return this.gameType; }\n    public WorldType getWorldType() { return this.worldType; }\n}\n\n// Vanilla NetHandlerPlayClient.handleRespawn():\npublic void handleRespawn(S07PacketRespawn packetIn) {\n    if (packetIn.getDimensionID() != this.gameController.thePlayer.dimension) {\n        // Dimension change — reset everything\n        this.doneLoadingTerrain = false;\n        this.gameController.loadWorld((WorldClient) null);\n        this.gameController.theWorld = new WorldClient(\n            this, new WorldSettings(...), packetIn.getDimensionID(),\n            packetIn.getDifficulty(), this.gameController.mcProfiler);\n        this.gameController.thePlayer.dimension = packetIn.getDimensionID();\n        this.gameController.displayGuiScreen(new GuiDownloadTerrain(this));\n    }\n    this.gameController.thePlayer.setDead(false);\n    this.gameController.thePlayer.setHealth(20.0F);\n    // Re-sync keepalive\n    this.netManager.sendPacket(new C00PacketKeepAlive(-1));\n}",
+        "vanilla_hook": "NetHandlerPlayClient.handleRespawn(S07PacketRespawn) — resets world, clears entities, sets player alive with full health, sends C00PacketKeepAlive for re-sync. In hacked clients, PacketReceiveEvent fires before this handler.\n\nRise 6.0: BlinkComponent exempts S07PacketRespawn from blink buffer.\nAqua 13: EventPacket fires for S07 in channelRead0.",
+        "anti_cheat_notes": "Cancelling S07 and preventing the world reload causes severe client-server desync — the server has already updated the player's dimension and will reject packets from the wrong world. Watchdog (Hypixel) uses the dimension change as a checkpoint to validate all previous movement — any desync in C03 position/onground history during the dimension change window will flag. Grim anti-cheat checks that the client properly resets all state after S07 — stale entities from the old dimension after respawn is a detectable pattern."
+      },
+      {
+        "name": "WorldChange Detector / Module Reset",
+        "found_in": ["Rise 6.0", "Sigma 4.11", "Tenacity 6.0", "Jigsaw 0.26"],
+        "purpose": "Detect world changes (dimension hop or death respawn) and reset all module state to prevent desync. Also used to automatically disable modules that shouldn't run in certain dimensions.",
+        "how_it_works": "When S07PacketRespawn arrives, the module triggers a 'worldChange' event that all modules listen to. Each module resets its internal state: KillAura clears its target list, Flight resets stage counters, Scaffold clears block placements, Speed resets bhop stages. This prevents modules from carrying over state from the old world/dimension and causing desync errors.",
+        "detailed_code": "// Rise 6.0 - S07PacketRespawn triggers state reset:\nif (packet instanceof S07PacketRespawn) {\n    S07PacketRespawn respawn = (S07PacketRespawn) packet;\n\n    // If dimension changed (portal), reset all movement modules\n    if (respawn.getDimensionID() != mc.thePlayer.dimension) {\n        // Disable modules that don't work in new dimension\n        if (respawn.getDimensionID() == -1) {\n            // Nether: disable water-based modules\n        }\n        if (respawn.getDimensionID() == 1) {\n            // End: disable bed-based modules, enable dragon modules\n        }\n        // Fire world change event for all modules\n        EventAPI.fire(new WorldChangeEvent(respawn.getDimensionID()));\n    }\n}\n\n// Jigsaw 0.26 - PreMotionEvent keeps player alive after death:\n// When S07PacketRespawn arrives, the player is re-created with full health\n// Modules that track health need to reset their health history\n\n// Sigma 4.11 - world change event handler:\n// Modules like Phase, Fly, Speed all reset state on S07",
+        "vanilla_hook": "NetHandlerPlayClient.handleRespawn(S07PacketRespawn) — the world recreation point. All modules must check mc.theWorld != null after this handler.",
+        "anti_cheat_notes": "Not an anti-cheat concern — this is client-side state management. However, failing to properly reset module state after S07 can result in sending invalid packets that get flagged by anti-cheats."
       }
-    ]
+    ],
+    "general_hooks": "Client-side: NetHandlerPlayClient.handleRespawn(S07PacketRespawn) — this is the full world reset handler. If the dimension changed, the WorldClient is recreated. The player is set alive with full health. A C00PacketKeepAlive(-1) is sent to re-sync timing. After this handler, the client expects S08PacketPlayerPosLook with the new spawn position.\n\nHook points:\n- EventReceivePacket/PacketInEvent: fires BEFORE handleRespawn, modules can cancel/modify the respawn\n- handleRespawn override: some clients override this method directly\n- Post-respawn hooks: after the world is recreated, modules check mc.theWorld != null\n\nServer-side: Sent by EntityPlayerMP when the player dies (respawn button) or when changing dimensions via portal. The server sends this, waits for client re-sync, then sends S08PacketPlayerPosLook for the new position.",
+    "client_variations": "Aqua 13: Disabler imports S07PacketRespawn and tracks worldChanges counter for state management across different disabler modes. Ghostly mode specifically handles dimension changes.\nRise 6.0: BlinkComponent exempts S07 from blink. Disabler uses world change as a state reset trigger.\nSigma 4.11: EventPacket fires; module state reset on world change.\nJigsaw 0.26: Jigsaw.onPacketRecieved fires; no specific module targets S07.\nRektSky B5: PacketReceiveEvent fires; Disabler may cancel S07 on specific servers."
   }
 }
