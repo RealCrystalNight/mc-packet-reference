@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S32PacketConfirmTransaction (0x32): Server confirms or rejects an inventory transaction from C0EPacketClickWindow. accepted=false causes client to revert in">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Backtrack (Aqua 13), Bloom / Tenacity Disabler (S32 Cancel)">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Disabler, InvManager, Backtrack">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S32PacketConfirmTransaction — Minecraft 1.8.9 Packet Reference","description":"S32PacketConfirmTransaction is the server's response to every C0EPacketClickWindow. It carries the window ID, action number (short), and a boolean accepted flag. If accepted=false, the client must revert its entire inventory — which the server re-sends as S30PacketWindowItems. This packet is HEAVILY","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S32PacketConfirmTransaction — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -74,171 +74,294 @@
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">If accepted=false, the client empties and refills its inventory by re-reading all slots from the server (C30PacketWindowItems is re-sent). This is how the server corrects desynced client inventory.</div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<p class="impl-pattern">S32PacketConfirmTransaction is the server's response to every C0EPacketClickWindow. It carries the window ID, action number (short), and a boolean accepted flag. If accepted=false, the client must revert its entire inventory — which the server re-sends as S30PacketWindowItems. This packet is HEAVILY targeted by Disabler modules (67+ module refs) and Backtrack modules. Aqua 13's Backtrack stores S32 in its replay buffer alongside entity movement packets, adding artificial latency to incoming transactions.</p>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Backtrack (Aqua 13)</span>
-<span class="impl-module-clients">(Aqua 13, Rise 6.0, RektSky B5)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler</span>
+<span class="impl-module-clients">(Tenacity 5.1, Vestige 3.0, Gugustus)</span>
 </div>
-<p class="impl-pattern">Delay incoming S32 packets (and others) to create a temporary 'past state' buffer. When KillAura is active, the module holds packets for up to 2000ms and replays them, making the player appear at an earlier position for hit detection.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Backtrack's blockPacket() method checks if each incoming packet should be buffered. S32PacketConfirmTransaction is one of the many packet types stored in the replay queue (line 225). When the buffer fills or a timer expires, ALL queued packets are replayed in order via processPacket(). This creates the 'backtrack' effect where the entity's past position is extended for hit registration.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Aqua 13 - Backtrack.java (FULL SOURCE, 269 lines)
-// Shows S32PacketConfirmTransaction captured in blockPacket()
-package intent.AquaDev.aqua.modules.combat;
+<p class="impl-pattern">Cancel or delay transaction confirmations. Disabler buffers S32. Backtrack delays S32 for reach extension.</p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>package dev.tenacity.module.impl.exploit;
 
-import de.Hero.settings.Setting;
-import events.Event;
-import events.listeners.EventPacket;
-import events.listeners.EventRenderNameTags;
-import events.listeners.EventTick;
-import intent.AquaDev.aqua.Aqua;
-import intent.AquaDev.aqua.modules.Category;
-import intent.AquaDev.aqua.modules.Module;
-import intent.AquaDev.aqua.utils.RenderUtil;
-import intent.AquaDev.aqua.utils.TimeUtil;
-import java.util.ArrayList;
-import net.minecraft.client.multiplayer.WorldClient;
-import net.minecraft.network.EnumPacketDirection;
-import net.minecraft.network.INetHandler;
+import dev.tenacity.Tenacity;
+import dev.tenacity.event.impl.game.WorldEvent;
+import dev.tenacity.event.impl.network.PacketReceiveEvent;
+import dev.tenacity.event.impl.network.PacketSendEvent;
+import dev.tenacity.event.impl.player.MotionEvent;
+import dev.tenacity.module.Category;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.impl.movement.Speed;
+import dev.tenacity.module.settings.impl.BooleanSetting;
+import dev.tenacity.module.settings.impl.MultipleBoolSetting;
+import dev.tenacity.module.settings.impl.NumberSetting;
+import dev.tenacity.ui.mainmenu.CustomMainMenu;
+import dev.tenacity.utils.misc.MathUtils;
+import dev.tenacity.utils.player.ChatUtil;
+import dev.tenacity.utils.player.MovementUtils;
+import dev.tenacity.utils.player.RotationUtils;
+import dev.tenacity.utils.server.PacketUtils;
+import dev.tenacity.utils.server.ServerUtils;
+import dev.tenacity.utils.time.TimerUtil;
+import net.minecraft.client.entity.EntityPlayerSP;
+import net.minecraft.client.gui.inventory.GuiInventory;
+import net.minecraft.client.multiplayer.GuiConnecting;
+import net.minecraft.entity.player.PlayerCapabilities;
 import net.minecraft.network.Packet;
-import net.minecraft.network.ThreadQuickExitException;
-import net.minecraft.network.play.server.S14PacketEntity;
-import net.minecraft.network.play.server.S18PacketEntityTeleport;
-import net.minecraft.network.play.server.S19PacketEntityHeadLook;
-import net.minecraft.network.play.server.S32PacketConfirmTransaction;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.S07PacketRespawn;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.potion.Potion;
 import net.minecraft.util.AxisAlignedBB;
-import net.minecraft.util.MathHelper;
-import net.minecraft.util.Vec3;
+import net.minecraft.util.ChatComponentText;
 
-public class Backtrack extends Module {
-    private final ArrayList&lt;Packet&gt; packets = new ArrayList&lt;&gt;();
-    private EntityLivingBase entity = null;
-    public static EntityPlayer target = null;
-    private INetHandler packetListener = null;
-    private WorldClient lastWorld;
-    private final TimeUtil timeUtil = new TimeUtil();
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Collectors;
 
-    public Backtrack() {
-        super("Backtrack", Module.Type.Combat, "Backtrack", 0, Category.Combat);
-        Aqua.setmgr.register(new Setting("Range", this, 6.0, 3.0, 6.0, false));
-        Aqua.setmgr.register(new Setting("BacktrackMS", this, 1000.0, 50.0, 2000.0, false));
+public final class Disabler extends Module {
+
+    private final MultipleBoolSetting disablers = new MultipleBoolSetting("Disablers",
+            new BooleanSetting("Watchdog Strafe", false),
+            new BooleanSetting("Watchdog Timer", false),
+            new BooleanSetting("MMC", false),
+            new BooleanSetting("C06-&gt;C04", false),
+            new BooleanSetting("C04-&gt;C06", false),
+            new BooleanSetting("Hover", false),
+            new BooleanSetting("Spoof Ground", false),
+            new BooleanSetting("C0B Cancel", false),
+            new BooleanSetting("C0C Spam", false),
+            new BooleanSetting("Verus", false),
+            new BooleanSetting("Omni Sprint", false),
+            new BooleanSetting("Void TP", false),
+            new BooleanSetting("Silent S08", false));
+
+    private final NumberSetting hoverHeight = new NumberSetting("Hover Height", 0.1, 5, 0.01, 0.01);
+
+    private final BooleanSetting onGround = new BooleanSetting("On Ground", true);
+
+    private final NumberSetting TPDelay = new NumberSetting("TP Delay", 20, 100, 5, 1);
+
+    private final TimerUtil timer = new TimerUtil(), joinTimer = new TimerUtil();
+
+    private boolean synced;
+
+    private final CopyOnWriteArrayList&lt;Packet&gt; watchdogPlayerPackets = new CopyOnWriteArrayList&lt;&gt;(), watchdogC0FC00Packets = new CopyOnWriteArrayList&lt;&gt;(), watchdogInvPackets = new CopyOnWriteArrayList&lt;&gt;();
+
+    private final CopyOnWriteArrayList&lt;Packet&gt; packets = new CopyOnWriteArrayList&lt;&gt;();
+
+    private double s08Y;
+
+    public static boolean spiking;
+    public static final TimerUtil spikeTimer = new TimerUtil();
+
+    private int airTicks;
+
+    public Disabler() {
+        super("Disabler", Category.EXPLOIT, "Disables some anticheats");
+        TPDelay.addParent(disablers, voidTPDisabler -&gt; voidTPDisabler.getSetting("Void TP").isEnabled());
+        hoverHeight.addParent(disablers, hoverDisabler -&gt; hoverDisabler.getSetting("Hover").isEnabled());
+        onGround.addParent(disablers, spoofGroundDisabler -&gt; spoofGroundDisabler.getSetting("Spoof Ground").isEnabled());
+        this.addSettings(disablers, TPDelay, onGround, hoverHeight);
     }
 
     @Override
-    public void onEvent(Event event) {
-        if (event instanceof EventPacket) {
-            EventPacket eventPacket = (EventPacket) event;
-            if (eventPacket.getDirection() != EnumPacketDirection.CLIENTBOUND) return;
+    public void onMotionEvent(MotionEvent event) {
+        final List&lt;BooleanSetting&gt; enabledBooleanSettings = disablers.getBoolSettings().stream().filter(BooleanSetting::isEnabled).collect(Collectors.toList());
 
-            this.packetListener = eventPacket.getNetHandler();
-            Packet p = EventPacket.getPacket();
 
-            // Track S14 for real position tracking
-            if (p instanceof S14PacketEntity) {
-                S14PacketEntity packet = (S14PacketEntity) EventPacket.getPacket();
-                Entity entity1 = mc.theWorld.getEntityByID(packet.getEntityId());
-                if (entity1 instanceof EntityLivingBase) {
-                    EntityLivingBase entityLivingBase = (EntityLivingBase) entity1;
-                    entityLivingBase.realPosX += packet.func_149062_c();
-                    entityLivingBase.realPosY += packet.func_149061_d();
-                    entityLivingBase.realPosZ += packet.func_149064_e();
+        if(enabledBooleanSettings.size() == 1) {
+            setSuffix(enabledBooleanSettings.get(0).name);
+        } else if(enabledBooleanSettings.size() &gt; 1) {
+            setSuffix(enabledBooleanSettings.size() + " Enabled");
+        } else {
+            setSuffix("None");
+        }
+
+        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
+            if(booleanSetting.isEnabled()) {
+                switch(booleanSetting.name) {
+                    case "MMC":
+                        if (timer.hasTimeElapsed(MathUtils.getRandomInRange(1000, 1500), true)) {
+                            packets.forEach(PacketUtils::sendPacketNoEvent);
+                            packets.clear();
+                        }
+                        break;
+                    case "Watchdog Timer":
+                        if(spikeTimer.hasTimeElapsed(700, true)) {
+                            timer.reset();
+                        }
+                        break;
+                    case "C0C Spam":
+                        PacketUtils.sendPacketNoEvent(new C0CPacketInput());
+                        break;
                 }
             }
-
-            // Track S18 for teleport position reset
-            if (p instanceof S18PacketEntityTeleport) { /* ... position reset ... */ }
-
-            this.entity = target;
-            if (this.entity == null) { this.resetPackets(eventPacket.getNetHandler()); return; }
-            if (mc.theWorld != null &amp;&amp; mc.thePlayer != null) {
-                if (this.lastWorld != mc.theWorld) { this.resetPackets(eventPacket.getNetHandler()); this.lastWorld = mc.theWorld; return; }
-                this.addPackets(p, eventPacket);
-            }
-            this.lastWorld = mc.theWorld;
         }
     }
 
-    private boolean blockPacket(Packet packet) {
-        // S32 is buffered for backtrack along with entity packets
-        if (packet instanceof S33PacketTimeUpdate) return true;
-        if (packet instanceof S00PacketKeepAlive) return true;
-        if (packet instanceof C00PacketKeepAlive) return true;
-        if (packet instanceof C0CPacketInput) return true;
-        if (packet instanceof S12PacketEntityVelocity) return true;
-        if (packet instanceof C01PacketEncryptionResponse) return true;
-        if (packet instanceof S27PacketExplosion) return true;
-        // &lt;-- S32PacketConfirmTransaction is stored in backtrack buffer
-        if (packet instanceof S32PacketConfirmTransaction) return true;
-        if (packet instanceof S14PacketEntity) return true;
-        if (packet instanceof S19PacketEntityHeadLook) return true;
-        if (packet instanceof S18PacketEntityTeleport) return true;
-        if (packet instanceof S0FPacketSpawnMob) return true;
-        if (packet instanceof S08PacketPlayerPosLook) return true;
+    @Override
+    public void onPacketSendEvent(PacketSendEvent event) {
+        if(mc.thePlayer == null) return;
+        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
+            if(booleanSetting.isEnabled()) {
+                switch(booleanSetting.name) {
+                    case "Watchdog Strafe":
+                        if(ServerUtils.isOnHypixel()) {
+                            if(event.getPacket() instanceof C03PacketPlayer &amp;&amp; !mc.thePlayer.isPotionActive(Potion.jump)) {
+                                final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
+                                if(Tenacity.INSTANCE.getModuleCollection().getModule(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.fallDistance &lt; 1)
+                                    c03.setOnGround(true);
+
+                                if(Tenacity.INSTANCE.getModuleCollection().getModule(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.ticksExisted % 4 != 0 &amp;&amp; mc.thePlayer.fallDistance &lt; 1) {
+                                    event.cancel();
+                                    watchdogPlayerPackets.add(event.getPacket());
+                                } else if (!watchdogPlayerPackets.isEmpty()) {
+                                    watchdogPlayerPackets.forEach(PacketUtils::sendPacketNoEvent);
+                                    watchdogPlayerPackets.clear();
+                                }
+                            }
+                        }
+                        break;
+                    case "Watchdog Timer":
+                        if(ServerUtils.isOnHypixel()) {
+                            if(event.getPacket() instanceof C03PacketPlayer) {
+                                final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
+                                if(!c03.isMoving() &amp;&amp; !c03.getRotating()) {
+                                    event.cancel();
+                                    break;
+                                }
+                            }
+                            if(!timer.hasTimeElapsed(350)) {
+                                if(event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) {
+                                    event.cancel();
+                                    watchdogC0FC00Packets.add(event.getPacket());
+                                }
+                            } else if(!watchdogC0FC00Packets.isEmpty()) {
+                                watchdogC0FC00Packets.forEach(PacketUtils::sendPacketNoEvent);
+                                watchdogC0FC00Packets.clear();
+                            }
+                        }
+                        break;
+                    case "Void TP":
+                        if(event.getPacket() instanceof C03PacketPlayer) {
+                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
+                            if(mc.thePlayer.ticksExisted % TPDelay.getValue() == 0) {
+                                c03.setY(c03.getPositionY() - 1000);
+                            }
+                        }
+                        break;
+                    case "MMC":
+                        if (event.getPacket() instanceof C0BPacketEntityAction) {
+                            final C0BPacketEntityAction c0b = (C0BPacketEntityAction) event.getPacket();
+                            if (c0b.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
+                                if (EntityPlayerSP.serverSprintState) {
+                                    PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                                    EntityPlayerSP.serverSprintState = false;
+                                }
+                            }
+                            event.cancel();
+                        }
+
+                        if (event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) {
+                            event.cancel();
+                            packets.add(event.getPacket());
+                        }
+                        break;
+                    case "C06-&gt;C04":
+                        if (event.getPacket() instanceof C03PacketPlayer.C06PacketPlayerPosLook) {
+                            final C03PacketPlayer.C06PacketPlayerPosLook c06 = (C03PacketPlayer.C06PacketPlayerPosLook) event.getPacket();
+                            event.setPacket(new C03PacketPlayer.C04PacketPlayerPosition(c06.getPositionX(), c06.getPositionY(), c06.getPositionZ(), c06.isOnGround()));
+                        }
+                        break;
+                    case "C04-&gt;C06":
+                        if (event.getPacket() instanceof C03PacketPlayer.C04PacketPlayerPosition) {
+                            final C03PacketPlayer.C04PacketPlayerPosition c04 = (C03PacketPlayer.C04PacketPlayerPosition) event.getPacket();
+                            event.setPacket(new C03PacketPlayer.C06PacketPlayerPosLook(c04.getPositionX(), c04.getPositionY(), c04.getPositionZ(), mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch, c04.isOnGround()));
+                        }
+                        break;
+                    case "Hover":
+                        if (event.getPacket() instanceof C03PacketPlayer) {
+                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
+                            c03.setY(mc.thePlayer.posY + hoverHeight.getValue());
+                        }
+                        break;
+                    case "Spoof Ground":
+                        if (event.getPacket() instanceof C03PacketPlayer) {
+                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
+                            c03.setOnGround(onGround.isEnabled());
+                        }
+                        break;
+                    case "C0B Cancel":
+                        if (event.getPacket() instanceof C0BPacketEntityAction) event.cancel();
+                        break;
+                    case "Verus":
+                        if(event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) event.cancel();
+                        break;
+                    case "Omni Sprint":
+                        if (event.getPacket() instanceof C0BPacketEntityAction) {
+                            final C0BPacketEntityAction c0b = (C0BPacketEntityAction) event.getPacket();
+                            if (c0b.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
+                                if (EntityPlayerSP.serverSprintState) {
+                                    PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                                    EntityPlayerSP.serverSprintState = false;
+                                }
+                            }
+                            event.cancel();
+                        }
+                        break;
+                }
+            }
+        }
+    }
+
+    @Override
+    public void onPacketReceiveEvent(PacketReceiveEvent event) {
+        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
+            if (booleanSetting.isEnabled()) {
+                switch (booleanSetting.name) {
+                    case "Silent S08":
+                        if(event.getPacket() instanceof S08PacketPlayerPosLook) {
+                            final S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
+                            event.cancel();
+                            PacketUtils.sendPacketNoEvent(new C03PacketPlayer.C06PacketPlayerPosLook(s08.getX(), s08.getY(), s08.getZ(), s08.getYaw(), s08.getPitch(), false));
+                        }
+                        break;
+                }
+            }
+        }
+    }
+
+    private boolean isBlockUnder() {
+        if (mc.thePlayer.posY &lt; 0) return false;
+        for (int offset = 0; offset &lt; (int) mc.thePlayer.posY + 2; offset += 2) {
+            AxisAlignedBB bb = mc.thePlayer.getEntityBoundingBox().offset(0, -offset, 0);
+            if (!mc.theWorld.getCollidingBoundingBoxes(mc.thePlayer, bb).isEmpty()) {
+                return true;
+            }
+        }
         return false;
     }
 
-    private void resetPackets(INetHandler netHandler) {
-        // Flush ALL queued packets to the handler
-        if (this.packets.size() &gt; 0) {
-            for (; this.packets.size() != 0; this.packets.remove(this.packets.get(0))) {
-                try { this.packets.get(0).processPacket(netHandler); }
-                catch (ThreadQuickExitException var3) {}
-            }
-        }
-    }
-
-    private void addPackets(Packet packet, EventPacket eventPacket) {
-        synchronized (this.packets) {
-            if (this.blockPacket(packet)) {
-                this.packets.add(packet);
-                eventPacket.setCancelled(true);  // Cancel so vanilla handler doesn't process
-            }
-        }
+    @Override
+    public void onWorldEvent(WorldEvent event) {
+        watchdogC0FC00Packets.clear();
+        timer.reset();
     }
 }
 
-// Vanilla S32PacketConfirmTransaction definition:
-package net.minecraft.network.play.server;
-
-public class S32PacketConfirmTransaction implements Packet&lt;INetHandlerPlayClient&gt; {
-    private int windowId;
-    private short actionNumber;
-    private boolean accepted;
-
-    public S32PacketConfirmTransaction() {}
-    public S32PacketConfirmTransaction(int windowIdIn, short actionNumberIn, boolean acceptedIn) {
-        this.windowId = windowIdIn;
-        this.actionNumber = actionNumberIn;
-        this.accepted = acceptedIn;
-    }
-    public void processPacket(INetHandlerPlayClient handler) { handler.handleConfirmTransaction(this); }
-    public int getWindowId() { return this.windowId; }
-    public short getActionNumber() { return this.actionNumber; }
-    public boolean isAccepted() { return this.accepted; }
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> NetHandlerPlayClient.handleConfirmTransaction(S32PacketConfirmTransaction) — when accepted=false, clears and refills inventory slots via S30PacketWindowItems.</span></div>
-<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Backtrack delaying S32 transaction confirmations can cause inventory desync — if S32 is held for 1000ms, the client-side inventory won't match server-side. The player may see phantom items or missing items for the duration of the backtrack. Some anticheats check that S32 responses arrive within a specific time window — delayed transactions may trigger 'transaction timeout' flags.</span></div>
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Bloom / Tenacity Disabler (S32 Cancel)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InvManager</span>
 <span class="impl-module-clients">(Tenacity 5.1, Vestige 3.0, Gugustus)</span>
 </div>
-<p class="impl-pattern">Cancel or queue S32PacketConfirmTransaction to prevent the server from tracking inventory states. Used by Watchdog disabler modes that queue C0F + C00 together.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The Disabler cancels incoming S32, preventing the client from reverting inventory on rejected transactions. By blocking S32, the client can maintain an inconsistent inventory state that breaks anticheat tracking.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Disabler - S32Cancel mode:
-if (event.getPacket() instanceof S32PacketConfirmTransaction) {
-    event.setCancelled(true);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket — cancel before handleConfirmTransaction.</span></div>
-<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancelling S32 causes the client's inventory to stop matching the server. Items may appear to duplicate or vanish locally.</span></div>
+<p class="impl-pattern">Cancel or delay transaction confirmations. Disabler buffers S32. Backtrack delays S32 for reach extension.</p>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
 </div>
-<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Client: NetHandlerPlayClient.handleConfirmTransaction(S32PacketConfirmTransaction). Aqua 13 Backtrack buffers it. Disabler cancels it.
-
-Server: Sent after every C0EPacketClickWindow. If server-side slotClick produces a different result than client-side, accepted=false.</div>
-<div class="impl-clients">Aqua 13: Backtrack buffers S32 in replay queue (2000ms max). Disabler imports S32 for transaction manipulation.
-Rise 6.0: Backtrack buffers entity packets but exempts S32. Disabler cancels S32 in some modes.
-Tenacity 5.1: Disabler queues S32 + C00 for Watchdog burst mode.
-RektSky B5: No specific S32 module.
-Sigma 4.11: EventPacket handles S32.
-Memeware 7.3: PacketInEvent for S32.
-Jigsaw 0.26: Vanilla handler only.</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Backtrack</span>
+<span class="impl-module-clients">(Tenacity 5.1, Vestige 3.0, Gugustus)</span>
+</div>
+<p class="impl-pattern">Cancel or delay transaction confirmations. Disabler buffers S32. Backtrack delays S32 for reach extension.</p>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+</div>
 </div>
     </div>
     <div style="margin-top:32px;text-align:center">

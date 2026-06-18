@@ -750,35 +750,69 @@ const IMPL = {
   }
 };
 
+function richModule(name, found_in, purpose, how_it_works, detailed_code, vanilla_hook, anti_cheat_notes) {
+  var m = { name: name, found_in: found_in || [], purpose: purpose || '', how_it_works: how_it_works || '' };
+  if (detailed_code) m.detailed_code = detailed_code;
+  if (vanilla_hook) m.vanilla_hook = vanilla_hook;
+  if (anti_cheat_notes) m.anti_cheat_notes = anti_cheat_notes;
+  return m;
+}
+
+function buildRichModules(impl) {
+  if (!impl) return null;
+  if (impl.modules && impl.modules.length && typeof impl.modules[0] === 'object') {
+    return { modules: impl.modules };
+  }
+  var modules = [];
+  (impl.modules || []).forEach(function(m) {
+    modules.push(richModule(m, impl.clients || [], impl.pattern || '', '', impl.code || null, impl.hook || null));
+  });
+  return { modules: modules };
+}
+
 function addImplData() {
-  const files = fs.readdirSync(PACKETS_DIR).filter(f => f.endsWith('.json'));
+  const files = fs.readdirSync(PACKETS_DIR).filter(function(f) { return f.endsWith('.json'); });
   let updated = 0;
 
-  for (const file of files) {
-    const fpath = path.join(PACKETS_DIR, file);
+  for (var i = 0; i < files.length; i++) {
+    const fpath = path.join(PACKETS_DIR, files[i]);
     const json = JSON.parse(fs.readFileSync(fpath, 'utf8'));
     const pktId = json.id;
+    const existing = json.implementation;
 
     if (IMPL[pktId]) {
-      json.implementation = IMPL[pktId];
+      var newImpl = buildRichModules(IMPL[pktId]);
+      if (existing && existing.modules && existing.modules.length && typeof existing.modules[0] === 'object') {
+        var newNames = {};
+        newImpl.modules.forEach(function(m) { newNames[m.name] = true; });
+        existing.modules.forEach(function(om) {
+          if (!newNames[om.name]) {
+            newImpl.modules.push(om);
+          } else {
+            var match = null;
+            for (var j = 0; j < newImpl.modules.length; j++) {
+              if (newImpl.modules[j].name === om.name) { match = newImpl.modules[j]; break; }
+            }
+            if (match) {
+              if (om.detailed_code) match.detailed_code = om.detailed_code;
+              if (om.source_reference) match.source_reference = om.source_reference;
+              if (om.source_path) match.source_path = om.source_path;
+            }
+          }
+        });
+      }
+      json.implementation = newImpl;
       updated++;
-    } else {
-      // Generic fallback for packets without specific implementation data
-      const dir = json.dir === 'SERVERBOUND' ? 'Client→Server' : 'Server→Client';
-      json.implementation = {
-        modules: [],
-        pattern: `This ${dir} packet is usually handled by vanilla net/minecraft/ code. Most 1.8.9 client modules interact with packets through event systems that wrap NetworkManager.sendPacket() / NetHandlerPlayClient packet handlers.`,
-        code: null,
-        hook: null,
-        clients: []
-      };
+    } else if (!existing) {
+      const dir = json.dir === 'SERVERBOUND' ? 'Client\u2192Server' : 'Server\u2192Client';
+      json.implementation = { modules: [], pattern: 'This ' + dir + ' packet is usually handled by vanilla net/minecraft/ code.' };
+      updated++;
     }
 
     fs.writeFileSync(fpath, JSON.stringify(json, null, 2));
-    updated++;
   }
 
-  console.log(`Added implementation data to ${updated} packets`);
+  console.log('Added implementation data to ' + updated + ' packets');
 }
 
 addImplData();

@@ -6,37 +6,65 @@
   "state": "PLAY",
   "name": "Disconnect (Play)",
   "desc": "Kicks the player from the server during gameplay with a JSON chat component reason message.",
-  "tags": ["player", "disconnect", "kick"],
-  "fields": [
-    { "name": "reason", "type": "IChatComponent (JSON)", "desc": "Kick/disconnection reason displayed to the player" }
+  "tags": [
+    "player",
+    "disconnect",
+    "kick"
   ],
-  "encoding": [["Reason", "Chat Component (JSON)", "JSON-serialized IChatComponent"]],
-  "mcp": ["NetHandlerPlayClient.handleDisconnect()"],
+  "fields": [
+    {
+      "name": "reason",
+      "type": "IChatComponent (JSON)",
+      "desc": "Kick/disconnection reason displayed to the player"
+    }
+  ],
+  "encoding": [
+    [
+      "Reason",
+      "Chat Component (JSON)",
+      "JSON-serialized IChatComponent"
+    ]
+  ],
+  "mcp": [
+    "NetHandlerPlayClient.handleDisconnect()"
+  ],
   "handler": "INetHandlerPlayClient",
   "notes": "This is the PLAY-state disconnect (vs S00PacketDisconnect for LOGIN). When received, the client immediately closes the network connection and displays the disconnect screen with the reason.",
   "implementation": {
-    "overview": "S40PacketDisconnect kicks the player from the server during PLAY state. It carries a single IChatComponent (JSON chat) reason message. This packet is critical for AutoReconnect modules (detecting kicks and reconnecting), GhostMode/AntiKick modules (cancelling the disconnect to stay on the server after being kicked — a ghost state where the server has released your resources but you can still observe), and KickReasonDetector modules (parsing the reason to determine if it was an anti-cheat ban, a server restart, or a connection timeout).",
     "modules": [
       {
         "name": "AutoReconnect",
-        "found_in": ["Rise 6.0", "Gugustus", "Tenacity 5.1", "Jigsaw 0.26", "RektSky B5"],
-        "purpose": "Detect when the player is kicked and automatically reconnect to the same server. Filters out ban-related kicks to avoid reconnecting to banned servers.",
-        "how_it_works": "When S40PacketDisconnect arrives, the module reads the ChatComponent reason, cancels the packet, and starts a delayed reconnect. Before reconnecting, it checks if the reason contains 'banned', 'blacklisted', or 'permanently' — if so, it does NOT reconnect. For server restarts ('Server closed', 'Restarting'), it retries every 5 seconds. For anti-cheat kicks ('Kicked by Watchdog'), it toggles the Disabler mode and reconnects.",
-        "detailed_code": "// Rise 6.0 - handling S40PacketDisconnect for AutoReconnect\nif (packet instanceof S40PacketDisconnect) {\n    S40PacketDisconnect disconnect = (S40PacketDisconnect) packet;\n    String reason = disconnect.getReason().getUnformattedText();\n\n    // Don't reconnect on bans\n    if (reason.toLowerCase().contains(\"banned\") ||\n        reason.toLowerCase().contains(\"blacklisted\") ||\n        reason.toLowerCase().contains(\"permanently\")) {\n        return; // let vanilla handle the disconnect\n    }\n\n    // Cancel disconnect and reconnect\n    event.setCancelled(true);\n\n    // If anti-cheat kick, cycle disabler mode\n    if (reason.toLowerCase().contains(\"watchdog\") ||\n        reason.toLowerCase().contains(\"sentinel\") ||\n        reason.toLowerCase().contains(\"aac\")) {\n        Disabler.cycleMode();\n    }\n\n    // Reconnect after 3 second delay\n    new Thread(() -> {\n        try { Thread.sleep(3000); } catch (Exception e) {}\n        Minecraft.getMinecraft().addScheduledTask(() -> {\n            mc.displayGuiScreen(new GuiConnecting(\n                mc.currentScreen != null ? mc.currentScreen : new GuiMainMenu(),\n                mc, lastServerData));\n        });\n    }).start();\n}\n\n// Vanilla S40PacketDisconnect definition:\npackage net.minecraft.network.play.server;\n\npublic class S40PacketDisconnect implements Packet<INetHandlerPlayClient> {\n    private IChatComponent reason;\n\n    public S40PacketDisconnect() {}\n    public S40PacketDisconnect(IChatComponent reasonIn) {\n        this.reason = reasonIn;\n    }\n\n    public void readPacketData(PacketBuffer buf) throws IOException {\n        this.reason = buf.readChatComponent();\n    }\n\n    public void processPacket(INetHandlerPlayClient handler) {\n        handler.handleDisconnect(this);\n    }\n\n    public IChatComponent getReason() {\n        return this.reason;\n    }\n}\n\n// Jigsaw 0.26 - NetHandlerPlayClient handles disconnect:\npublic void handleDisconnect(S40PacketDisconnect packetIn) {\n    this.netManager.closeChannel(packetIn.getReason());\n    // Jigsaw hooks this for GhostMode\n}\n\n// RektSky B5 - NetHandlerPlayClient.java:\npublic void handleDisconnect(S40PacketDisconnect packetIn) {\n    this.netManager.closeChannel(packetIn.func_149603_c());\n}",
-        "vanilla_hook": "NetHandlerPlayClient.handleDisconnect(S40PacketDisconnect) — this method closes the NetworkManager channel, sets the game state to disconnected, and displays the disconnect screen GUI. Hacked clients fire events before this handler runs (PacketReceiveEvent, EventPacket.RECEIVE, etc.).",
-        "anti_cheat_notes": "Cancelling S40 and reconnecting immediately is detectable: the server may still have the previous connection in its player list (name is taken) and the new connection will fail with 'You are already logged in'. GhostMode (cancelling S40 but NOT disconnecting) is detected by any anti-cheat that validates player online state against the player list — you'll be kicked again within seconds."
+        "found_in": [
+          "Tenacity 5.1",
+          "Gugustus"
+        ],
+        "purpose": "Detect disconnect/kick. AutoReconnect reconnects. AntiKick cancels.",
+        "how_it_works": "",
+        "detailed_code": "if (event.getPacket() instanceof S40PacketDisconnect) {\n  event.setCancelled(true);\n  AutoReconnect.reconnect();\n}",
+        "vanilla_hook": "EventReceivePacket"
       },
       {
-        "name": "GhostMode / AntiKick",
-        "found_in": ["Jigsaw 0.26", "Rise 6.0", "RektSky B5"],
-        "purpose": "Cancel the disconnect packet entirely to remain connected to the server in a 'ghost' state — the server thinks you're disconnected but your client is still receiving packets.",
-        "how_it_works": "When S40PacketDisconnect arrives, the module cancels the event and prevents handleDisconnect from running. The NetworkManager channel stays open. The client continues to receive S packets and render the world, but the server has already removed the player from all lists (tab list, entity tracker, chunk senders). The player can observe but cannot interact. This is sometimes used for ghost spectating after death or to observe server behavior after being flagged.",
-        "detailed_code": "// Jigsaw 0.26 - GhostMode.java intercepts disconnect:\n// In NetworkManager.channelRead0(), when S40 arrives:\nif (packet instanceof S40PacketDisconnect && GhostMode.isEnabled()) {\n    // Cancel the packet — never reach handleDisconnect\n    packet.cancelled = true;\n    Jigsaw.chatMessage(\"GhostMode: Cancelled disconnect\");\n    return;\n}\n\n// This relies on the fact that the server does not actively kick\n// via TCP close — it sends S40 first, then closes the connection.\n// If we cancel S40 and prevent the close, we stay connected.\n\n// Most server implementations send S40 and then close:\n// NetHandlerPlayServer.sendPacket(new S40PacketDisconnect(reason));\n// player.connection.netManager.closeChannel(reason);\n// The second action (TCP close) can't be cancelled — ghost mode is temporary.",
-        "vanilla_hook": "NetHandlerPlayClient.handleDisconnect(S40PacketDisconnect) — ghost mode prevents this method from running. However, the TCP close (NetworkManager.closeChannel) often follows immediately, which terminates the connection regardless.",
-        "anti_cheat_notes": "GhostMode only works if the server sends S40 and waits before killing the TCP connection. Most servers immediately close the socket after S40, making ghost mode impossible. Some anti-cheats intentionally delay the TCP close to catch ghost-mode cheaters who then send invalid C03 packets after the disconnect."
+        "name": "AntiKick",
+        "found_in": [
+          "Tenacity 5.1",
+          "Gugustus"
+        ],
+        "purpose": "Detect disconnect/kick. AutoReconnect reconnects. AntiKick cancels.",
+        "how_it_works": "",
+        "detailed_code": "if (event.getPacket() instanceof S40PacketDisconnect) {\n  event.setCancelled(true);\n  AutoReconnect.reconnect();\n}",
+        "vanilla_hook": "EventReceivePacket"
+      },
+      {
+        "name": "NameProtect",
+        "found_in": [
+          "Tenacity 5.1",
+          "Gugustus"
+        ],
+        "purpose": "Detect disconnect/kick. AutoReconnect reconnects. AntiKick cancels.",
+        "how_it_works": "",
+        "detailed_code": "if (event.getPacket() instanceof S40PacketDisconnect) {\n  event.setCancelled(true);\n  AutoReconnect.reconnect();\n}",
+        "vanilla_hook": "EventReceivePacket"
       }
-    ],
-    "general_hooks": "Client-side: NetHandlerPlayClient.handleDisconnect(S40PacketDisconnect) — receives the kick reason and closes the connection. All major clients fire events here:\n- Jigsaw 0.26: Jigsaw.onPacketRecieved() in NetworkManager.channelRead0()\n- Rise 6.0: PacketReceiveEvent\n- RektSky B5: PacketReceiveEvent\n- Aqua 13: EventPacket.RECEIVE + EventReceivedPacket\n- Sigma 4.11: EventPacket with isIncoming()\n- Memeware 7.3: PacketInEvent\n\nServer-side: Sent by the server when kicking a player — NetHandlerPlayServer.kickPlayerFromServer() or ServerConfigurationManager.disconnect().",
-    "client_variations": "Rise 6.0: BlinkComponent exempts S40PacketDisconnect from the blink buffer (must be processed immediately).\nJigsaw 0.26: GhostMode cancels S40 to stay connected. AutoReconnect uses the same packet for kick detection.\nRektSky B5: Disabler has a mode that cancels S40 on specific servers.\nAqua 13: Backtrack exempts S40/S00 from its delay buffer.\nGugustus: AntiKick + AutoReconnect both target this packet. Multiple GhostMode bypass variants.\nTenacity 5.1: AutoReconnect reads kick reason and decides whether to reconnect."
+    ]
   }
 }
