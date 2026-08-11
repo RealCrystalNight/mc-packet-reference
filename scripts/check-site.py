@@ -57,6 +57,19 @@ else:
     if 'rel="canonical" href="' + SITE + '/modules/"' not in mh:
         errors.append("modules/index.html canonical wrong")
 
+# packets index (static listing) must be current
+pkt_index = os.path.join(PAGES_DIR, "index.html")
+if not os.path.exists(pkt_index):
+    errors.append("missing packets/index.html")
+else:
+    pi = open(pkt_index, encoding="utf-8").read()
+    if 'rel="canonical" href="' + SITE + '/packets/"' not in pi:
+        errors.append("packets/index.html canonical wrong")
+    if str(len(pkt_ids)) not in pi:
+        errors.append("packets/index.html packet count out of date")
+    if "mc-packet-reference.github.io" in pi:
+        errors.append("packets/index.html still references the wrong domain")
+
 # brand assets
 for asset in ["assets/og-image.png", "assets/icon-192.png", "assets/icon-512.png", "assets/site.webmanifest"]:
     if not os.path.exists(os.path.join(BASE, asset)):

@@ -383,7 +383,64 @@ function main() {
     + '</body>\n</html>';
   fs.writeFileSync(path.join(modDir, 'index.html'), modHtml);
 
-  console.log('Generated ' + allPkts.length + ' standalone packet pages + module index (' + modNames.length + ' modules) + sitemap');
+  // ============================================================
+  // packets/index.html — static packet listing (kept in sync)
+  // ============================================================
+  const listSections = GROUPS.map(function(g) {
+    const pkts = allPkts.filter(function(p) { return p.state === g.state && p.dir === g.dir; });
+    if (!pkts.length) return '';
+    return '<div class="overview-section"><h2>' + g.label + ' <span style="font-size:0.7rem;color:var(--text-muted);font-weight:400;margin-left:6px">' + pkts.length + ' packets</span></h2>'
+      + '<div class="section-packet-list">'
+      + pkts.map(function(p) {
+          return '<a href="../packets/' + p.id + '/" class="section-packet-row">'
+            + '<span class="row-hex">' + p.id.substring(0, 3) + '</span>'
+            + '<span class="row-name">' + p.name + '</span>'
+            + '<span class="row-desc">' + esc(p.desc) + '</span></a>';
+        }).join('')
+      + '</div></div>';
+  }).join('');
+  const packetsIndex = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
+    + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+    + '<title>All Packets \u2014 Minecraft 1.8.9 Packet Reference</title>\n'
+    + '<meta name="description" content="Browse all 105 Minecraft 1.8.9 network packets organized by protocol state and direction: handshaking, login, status, and play. Fields, wire encoding, and implementation cases.">\n'
+    + '<meta name="robots" content="index, follow">\n'
+    + '<meta name="theme-color" content="#0a0a0a">\n'
+    + '<link rel="manifest" href="../assets/site.webmanifest">\n'
+    + '<link rel="canonical" href="' + SITE + '/packets/">\n'
+    + '<meta property="og:title" content="All Packets \u2014 Minecraft 1.8.9 Packet Reference">\n'
+    + '<meta property="og:type" content="website">\n'
+    + '<meta property="og:url" content="' + SITE + '/packets/">\n'
+    + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
+    + '<meta name="twitter:card" content="summary_large_image">\n'
+    + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
+    + '<link rel="stylesheet" href="../css/style.css">\n'
+    + '</head>\n<body>\n'
+    + '<aside class="sidebar" id="sidebar">\n'
+    + '  <div class="sidebar-header">\n'
+    + '    <a href="../" class="logo" style="text-decoration:none">\n'
+    + '      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 7h10M7 12h10M7 17h6"/></svg>\n'
+    + '      <span>MC <strong>1.8.9</strong></span>\n'
+    + '    </a>\n'
+    + '  </div>\n'
+    + '  <nav class="sidebar-nav">' + sidebarHtml + '</nav>\n'
+    + '</aside>\n'
+    + '<main class="main" id="main">\n'
+    + '  <div class="content-detail" style="display:block;max-width:960px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
+    + '    <div class="detail-header">\n'
+    + '      <h1>All Packets</h1>\n'
+    + '      <p class="detail-desc">Every Minecraft 1.8.9 network packet, organized by protocol state and direction. Click through for fields, wire encoding, server-side handling, and real client implementation cases.</p>\n'
+    + '    </div>\n'
+    + '    ' + listSections + '\n'
+    + '    <div style="margin-top:32px;text-align:center">\n'
+    + '      <a href="../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to home</a>\n'
+    + '    </div>\n'
+    + '  </div>\n'
+    + '</main>\n'
+    + '</body>\n</html>';
+  fs.writeFileSync(path.join(path.join(BASE, 'packets'), 'index.html'), packetsIndex);
+
+  console.log('Generated ' + allPkts.length + ' standalone packet pages + module index (' + modNames.length + ' modules) + packet listing + sitemap');
 }
 
 main();
