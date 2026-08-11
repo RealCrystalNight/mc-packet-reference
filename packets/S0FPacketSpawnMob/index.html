@@ -269,6 +269,1105 @@ public enum PacketType {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">No module-level hooks exist for S0F in the corpus; the only hook surface is Rise's TranslationComponent component consuming PacketReceiveEvent.</div>
 <div class="impl-clients">All other clients touch S0F only through the bundled vanilla handler; Rise additionally exposes it in NetworkAPI's script packet list.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The living-entity spawn packet carries the full state of a mob: type, position, rotations, velocity and the DataWatcher. Anticheats consume it on the send side to learn entity ids and types before any reach or hitbox measurement: Photon caches the entity type per id, TruthfulAC snapshots the spawn box into its compensation history, and Grim replicates the entity into the simulation used by reach and knockback checks. The type byte matters because hitbox dimensions depend on it, and a spawn without a tracker entry would leave every later entity packet orphaned.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Living-entity id lookup (Photon)</span>
+<span class="impl-module-clients">(Photon-GitHub-AntiCheatAddition)</span>
+</div>
+<p class="impl-pattern">Cache the entity type for every spawned living entity so later modules can resolve an entity id to its type without Bukkit lookups.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">LivingEntityIdLookup registers a PacketSendEvent listener for SPAWN_LIVING_ENTITY, wraps the packet as WrapperPlayServerSpawnLivingEntity and stores (entityId, entityType) in a Guava cache capped at one million entries with a five-second default expiry. A delayed task pre-warms the cache from all loaded worlds at startup, and getEntityType serves id-to-type lookups for modules that need hitbox or behavior data.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing: it is a utility cache. Modules such as the DamageIndicator and information hider consume it.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/util/protocol/LivingEntityIdLookup.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/util/protocol/LivingEntityIdLookup.java =====
+package de.photon.anticheataddition.util.protocol;
+
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketListenerAbstract;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityType;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnLivingEntity;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import de.photon.anticheataddition.AntiCheatAddition;
+import de.photon.anticheataddition.util.log.Log;
+import io.github.retrooper.packetevents.util.SpigotConversionUtil;
+import org.bukkit.Bukkit;
+import org.bukkit.World;
+import org.bukkit.entity.LivingEntity;
+import org.jspecify.annotations.NonNull;
+
+import javax.annotation.Nullable;
+
+public final class LivingEntityIdLookup
+{
+    // Track at most 1 millon entities
+    private static final long MAXIMUM_CACHE_CAPACITY = 1 &lt;&lt; 20;
+    private static final int MINIMUM_CACHE_CAPACITY = 1 &lt;&lt; 11;
+    private static final long CACHE_TIME = 20L * 5L;
+
+    public static final LivingEntityIdLookup INSTANCE = new LivingEntityIdLookup();
+
+    private final Cache&lt;Integer, EntityType&gt; entityTypeCache = CacheBuilder.newBuilder().initialCapacity(MINIMUM_CACHE_CAPACITY).concurrencyLevel(2).maximumSize(MAXIMUM_CACHE_CAPACITY).build();
+
+
+    private LivingEntityIdLookup()
+    {
+        PacketEvents.getAPI().getEventManager().registerListener(new PacketListenerAbstract()
+        {
+            @Override
+            public void onPacketSend(@NonNull PacketSendEvent event)
+            {
+                if (event.getPacketType() == PacketType.Play.Server.SPAWN_LIVING_ENTITY) {
+                    final WrapperPlayServerSpawnLivingEntity wrapper = new WrapperPlayServerSpawnLivingEntity(event);
+                    cacheEntityId(wrapper.getEntityId(), wrapper.getEntityType());
+                }
+            }
+        });
+
+        // Do not immediately loop through all entities to cache them, as Bukkit may not have loaded all entities yet which leads to connection errors when players try to join.
+        Bukkit.getScheduler().runTaskLater(AntiCheatAddition.getInstance(), this::cacheAllEntities, CACHE_TIME);
+    }
+
+    private void cacheAllEntities()
+    {
+        for (World world : Bukkit.getWorlds()) {
+            for (LivingEntity entity : world.getLivingEntities()) cacheEntity(entity);
+        }
+    }
+
+    private void cacheEntity(LivingEntity entity)
+    {
+        final int entityId = entity.getEntityId();
+        final var entityType = SpigotConversionUtil.fromBukkitEntityType(entity.getType());
+
+        if (entityType == null) {
+            Log.fine(() -&gt; "Attempted to cache null entityType: Entity ID " + entityId + " Raw type: " + entity.getType().name());
+            return;
+        }
+
+        entityTypeCache.put(entityId, entityType);
+    }
+
+    public void cacheEntityId(int entityId, EntityType entityType)
+    {
+        if (entityType == null) {
+            Log.fine(() -&gt; "Attempted to cache null entityType: Entity ID " + entityId);
+            return;
+        }
+
+        entityTypeCache.put(entityId, entityType);
+    }
+
+    /**
+     * Gets the EntityType from a valid entityId of a living entity.
+     */
+    @Nullable
+    public EntityType getEntityType(int entityId)
+    {
+        return entityTypeCache.getIfPresent(entityId);
+    }
+}
+
+// NOTE (AI): The SPAWN_LIVING_ENTITY branch is lines 40-43. The cache's five-second expiry is tuned to spawn traffic volume, and cacheEntityId also accepts manual feeds so replay-style spawns can be registered.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim replicates the full entity with metadata and rotations; Artemis resolves spawn ids through its EntityType registry; intave keeps EntityTypeDataRegistry with per-type hitbox sizes.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Spawn compensation (TruthfulAC)</span>
+<span class="impl-module-clients">(TawnyE-TruthfulAC)</span>
+</div>
+<p class="impl-pattern">Snapshot every spawned entity's position and hitbox into the compensation history so reach checks can backtrack against it.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">TruthfulPacketListener routes SPAWN_ENTITY (the 1.19+ living spawn) into CompensationTracker.handleSpawn, which stores a CompensatedEntity keyed by id with a ring of up to 30 tick snapshots and a base reach taken from the entity type (3.0 for players, 1.5 boats, 4.5 shulkers). handleEntitySnapshot re-stamps live Bukkit entities each tick, and getEntityData serves the backtracking reach check with up to 8 ticks of history.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly; it is the compensation data layer behind the reach and hitbox checks.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> TawnyE-TruthfulAC — src/main/java/ret/tawny/truthful/compensation/CompensationTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: TawnyE-TruthfulAC — src/main/java/ret/tawny/truthful/compensation/CompensationTracker.java =====
+package ret.tawny.truthful.compensation;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.World;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Player;
+import org.bukkit.util.BoundingBox;
+import ret.tawny.truthful.Truthful;
+import ret.tawny.truthful.utils.hitbox.SimpleHitbox;
+import ret.tawny.truthful.utils.tick.ITickable;
+
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+public final class CompensationTracker implements ITickable {
+
+    public int getCurrentTick() {
+        return tickCounter;
+    }
+
+    private static final int HISTORY_SIZE = 30;
+    public static final int MAX_BACKTRACK_TICKS = 8;
+    private static final int CLEANUP_INTERVAL = 100;
+    private static final int MAX_STALE_TICKS = 1200;
+    private static final int DESTROY_GRACE_TICKS = 6;
+    private static final double LIVE_RESYNC_DISTANCE_SQUARED = 4.0;
+
+    private final Map&lt;Integer, CompensatedEntity&gt; compensationMap = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;Integer, java.lang.ref.WeakReference&lt;Entity&gt;&gt; entityCache = new ConcurrentHashMap&lt;&gt;();
+    private volatile int tickCounter = 0;
+
+    @Override
+    public void tick() {
+        tickCounter++;
+        if (tickCounter % CLEANUP_INTERVAL == 0) {
+            int currentTick = this.tickCounter;
+            compensationMap.entrySet().removeIf(entry -&gt; {
+                if (entry.getValue().isExpired(currentTick)) {
+                    entityCache.remove(entry.getKey());
+                    return true;
+                }
+                return false;
+            });
+        }
+    }
+
+    public void handleSpawn(int id, UUID uuid, double x, double y, double z, double width, double height,
+                            boolean isPlayer) {
+        int currentTick = this.tickCounter;
+        CompensatedEntity data = new CompensatedEntity(id, uuid, isPlayer, 3.0);
+        compensationMap.put(id, data);
+        data.snapshot(currentTick, x, y, z, width, height);
+    }
+
+    public void handleEntitySnapshot(Entity entity) {
+        if (entity == null || !entity.isValid()) return;
+
+        int currentTick = this.tickCounter;
+        int entityId = entity.getEntityId();
+        entityCache.put(entityId, new java.lang.ref.WeakReference&lt;&gt;(entity));
+        EntityBox box = readEntityBox(entity);
+
+        double baseReach = getBaseReachForType(entity.getType(), entity instanceof Player);
+
+        CompensatedEntity data = compensationMap.computeIfAbsent(entityId,
+                id -&gt; new CompensatedEntity(id, entity.getUniqueId(), entity instanceof Player, baseReach));
+
+        data.snapshot(currentTick, box.x, box.y, box.z, box.width, box.height);
+    }
+
+    private static double getBaseReachForType(EntityType type, boolean isPlayer) {
+        if (isPlayer) return 3.0;
+        if (type == null) return 3.0;
+        return switch (type) {
+            case BOAT -&gt; 1.5;
+            case MINECART, CHEST_MINECART, HOPPER_MINECART, TNT_MINECART -&gt; 1.0;
+            case ITEM_FRAME, GLOW_ITEM_FRAME, ARMOR_STAND -&gt; 3.0;
+            case SHULKER -&gt; 4.5;
+            default -&gt; 3.0;
+        };
+    }
+
+    public void handleTeleport(int id, double x, double y, double z) {
+        int currentTick = this.tickCounter;
+        CompensatedEntity data = compensationMap.get(id);
+        if (data != null) {
+            data.snapshot(currentTick, x, y, z, data.lastWidth, data.lastHeight);
+        }
+    }
+
+    public void handleRelMove(int id, double dx, double dy, double dz) {
+        int currentTick = this.tickCounter;
+        CompensatedEntity data = compensationMap.get(id);
+        if (data != null) {
+            EntitySnapshot last = data.getLatest();
+            if (last != null) {
+                data.snapshot(currentTick, last.x + dx, last.y + dy, last.z + dz, data.lastWidth, data.lastHeight);
+            }
+        }
+    }
+
+    public void handleVelocity(int id, double vx, double vy, double vz) {
+        int currentTick = this.tickCounter;
+        CompensatedEntity data = compensationMap.get(id);
+        if (data != null) {
+            EntitySnapshot last = data.getLatest();
+            if (last != null) {
+                data.snapshot(currentTick, last.x + vx, last.y + vy, last.z + vz, data.lastWidth, data.lastHeight);
+            }
+        }
+    }
+
+    public void handleDestroy(int id) {
+        CompensatedEntity data = compensationMap.get(id);
+        if (data != null) {
+            data.markDestroyed(this.tickCounter);
+        }
+    }
+
+    public CompensatedEntity getEntityData(int entityId) {
+        CompensatedEntity data = compensationMap.get(entityId);
+        if (data == null)
+            return null;
+
+        int currentTick = this.tickCounter;
+        if (data.isExpired(currentTick)) {
+            compensationMap.remove(entityId, data);
+            return null;
+        }
+        syncFromLiveEntityIfNeeded(entityId, data, currentTick);
+        return data;
+    }
+
+    public boolean hasEntityData(int entityId) {
+        return getEntityData(entityId) != null;
+    }
+
+    public static final class CompensatedEntity {
+        public final int entityId;
+        public final UUID uuid;
+        public final boolean isPlayer;
+        public final double baseReach;
+        private volatile int lastSeenTick;
+        private volatile int destroyedTick = -1;
+        private final EntitySnapshot[] snapshots = new EntitySnapshot[HISTORY_SIZE];
+        private final int[] ticks = new int[HISTORY_SIZE];
+        private int head = 0;
+        private int count = 0;
+
+        protected double lastWidth = 0.6;
+        protected double lastHeight = 1.8;
+
+        public CompensatedEntity(int entityId, UUID uuid, boolean isPlayer, double baseReach) {
+            this.entityId = entityId;
+            this.uuid = uuid;
+            this.isPlayer = isPlayer;
+            this.baseReach = baseReach;
+        }
+
+        public synchronized void snapshot(int tick, double x, double y, double z, double width, double height) {
+            this.lastSeenTick = tick;
+            this.destroyedTick = -1;
+            this.lastWidth = width;
+            this.lastHeight = height;
+            snapshots[head] = new EntitySnapshot(x, y, z, width, height);
+            ticks[head] = tick;
+            head = (head + 1) % HISTORY_SIZE;
+            if (count &lt; HISTORY_SIZE)
+                count++;
+        }
+
+        public synchronized EntitySnapshot getLatest() {
+            if (count == 0)
+                return null;
+            return snapshots[(head - 1 + HISTORY_SIZE) % HISTORY_SIZE];
+        }
+
+        public void markDestroyed(int tick) {
+            this.destroyedTick = tick;
+        }
+
+        public boolean isExpired(int currentTick) {
+            int destroyedAt = this.destroyedTick;
+            if (destroyedAt &gt;= 0 &amp;&amp; currentTick - destroyedAt &gt; DESTROY_GRACE_TICKS) {
+                return true;
+            }
+            return currentTick - this.lastSeenTick &gt; MAX_STALE_TICKS;
+        }
+
+        public synchronized void snapshot(int tick, Location loc, double width, double height) {
+            snapshot(tick, loc.getX(), loc.getY(), loc.getZ(), width, height);
+        }
+
+        public synchronized SimpleHitbox getHitboxAt(int serverTickDelay) {
+            return getHitboxAt(serverTickDelay, Truthful.getInstance().getCompensationTracker().getCurrentTick());
+        }
+
+        public synchronized SimpleHitbox getHitboxAt(int serverTickDelay, int currentTick) {
+            if (serverTickDelay &gt; MAX_BACKTRACK_TICKS)
+                serverTickDelay = MAX_BACKTRACK_TICKS;
+            if (serverTickDelay &lt; 0)
+                serverTickDelay = 0;
+
+            int targetTick = currentTick - serverTickDelay;
+
+            EntitySnapshot bestPrev = null;
+            int bestPrevTick = Integer.MIN_VALUE;
+            EntitySnapshot bestNext = null;
+            int bestNextTick = Integer.MAX_VALUE;
+
+            for (int i = 0; i &lt; count; i++) {
+                int tick = ticks[i];
+                EntitySnapshot s = snapshots[i];
+
+                if (tick == targetTick)
+                    return s.toHitbox();
+
+                if (tick &lt; targetTick &amp;&amp; tick &gt; bestPrevTick) {
+                    bestPrevTick = tick;
+                    bestPrev = s;
+                } else if (tick &gt; targetTick &amp;&amp; tick &lt; bestNextTick) {
+                    bestNextTick = tick;
+                    bestNext = s;
+                }
+            }
+
+            if (bestPrev != null &amp;&amp; bestNext != null) {
+                int tickDelta = bestNextTick - bestPrevTick;
+                if (tickDelta &lt;= 0)
+                    return bestPrev.toHitbox();
+                double progress = (double) (targetTick - bestPrevTick) / (double) tickDelta;
+                return EntitySnapshot.interpolate(bestPrev, bestNext, progress);
+            }
+
+            if (count &gt; 0) {
+                int latestIdx = (head - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+                return snapshots[latestIdx].toHitbox();
+            }
+            return null;
+        }
+    }
+
+    private void syncFromLiveEntityIfNeeded(int entityId, CompensatedEntity data, int currentTick) {
+        if (!Bukkit.isPrimaryThread()) return;
+
+        Entity entity = findEntity(entityId);
+        if (entity == null || !entity.isValid()) return;
+
+        EntitySnapshot latest = data.getLatest();
+        if (latest == null) {
+            handleEntitySnapshot(entity);
+            return;
+        }
+
+        EntityBox live = readEntityBox(entity);
+        double dx = latest.x - live.x;
+        double dy = latest.y - live.y;
+        double dz = latest.z - live.z;
+        double distanceSquared = dx * dx + dy * dy + dz * dz;
+
+        if (distanceSquared &gt; LIVE_RESYNC_DISTANCE_SQUARED || currentTick - data.lastSeenTick &gt; MAX_STALE_TICKS) {
+            data.snapshot(currentTick, live.x, live.y, live.z, live.width, live.height);
+        }
+    }
+
+    private Entity findEntity(int entityId) {
+        java.lang.ref.WeakReference&lt;Entity&gt; ref = entityCache.get(entityId);
+        if (ref != null) {
+            Entity e = ref.get();
+            if (e != null &amp;&amp; e.isValid()) return e;
+        }
+
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity entity : world.getEntities()) {
+                if (entity.getEntityId() == entityId) {
+                    entityCache.put(entityId, new java.lang.ref.WeakReference&lt;&gt;(entity));
+                    return entity;
+                }
+            }
+        }
+        return null;
+    }
+
+    private EntityBox readEntityBox(Entity entity) {
+        try {
+            BoundingBox box = entity.getBoundingBox();
+            double width = Math.max(box.getMaxX() - box.getMinX(), box.getMaxZ() - box.getMinZ());
+            double height = box.getMaxY() - box.getMinY();
+            return new EntityBox(
+                    (box.getMinX() + box.getMaxX()) * 0.5,
+                    box.getMinY(),
+                    (box.getMinZ() + box.getMaxZ()) * 0.5,
+                    width,
+                    height
+            );
+        } catch (Throwable ignored) {
+            Location location = entity.getLocation();
+            return new EntityBox(location.getX(), location.getY(), location.getZ(), 0.6, 1.8);
+        }
+    }
+
+    private static final class EntityBox {
+        final double x, y, z, width, height;
+
+        EntityBox(double x, double y, double z, double width, double height) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.width = width;
+            this.height = height;
+        }
+    }
+
+    public static class EntitySnapshot {
+        final double x, y, z, width, height;
+
+        EntitySnapshot(double x, double y, double z, double width, double height) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.width = width;
+            this.height = height;
+        }
+
+        public SimpleHitbox toHitbox() {
+            return new SimpleHitbox(x, y, z, width, height);
+        }
+
+        static SimpleHitbox interpolate(EntitySnapshot from, EntitySnapshot to, double t) {
+            return new SimpleHitbox(
+                    from.x + (to.x - from.x) * t,
+                    from.y + (to.y - from.y) * t,
+                    from.z + (to.z - from.z) * t,
+                    from.width + (to.width - from.width) * t,
+                    from.height + (to.height - from.height) * t);
+        }
+    }
+}
+
+// NOTE (AI): handleSpawn is lines 50-56, and the destroy counterpart handleDestroy (116-121) marks the entity destroyed with a 6-tick grace so late attacks do not retroactively flag.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim replicates spawns into compensatedEntities; Hydro inserts a TrackedEntity; Tecnio and Artemis seed their reach trackers from the same packet family.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Entity replication (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Replicate every spawned entity, including mobs, into the compensated entity map so reach, hitbox and velocity checks see the client's view.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketEntityReplication.onPacketSend wraps SPAWN_LIVING_ENTITY as WrapperPlayServerSpawnLivingEntity and calls addEntity with entity id, uuid, type, position, rotations and the full metadata. The replicated entity then receives S14 relative moves and S18 teleports exactly like the client's copy, and DESTROY_ENTITIES removes it after the transaction that delivers the packet. Spawn velocity from the packet feeds knockback compensation without a separate S12.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly: it is the replication layer. Reach and velocity checks consume the map, and the firework-boost path even setbacks players who destroy a boosting firework entity early.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketEntityReplication.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketEntityReplication.java =====
+package ac.grim.grimac.events.packets;
+
+import ac.grim.grimac.GrimAPI;
+import ac.grim.grimac.api.config.ConfigManager;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.type.PacketReceiveListener;
+import ac.grim.grimac.checks.type.PacketSendListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.anticheat.LogUtil;
+import ac.grim.grimac.utils.data.SprintingState;
+import ac.grim.grimac.utils.data.TrackerData;
+import ac.grim.grimac.utils.data.packetentity.DashableEntity;
+import ac.grim.grimac.utils.data.packetentity.PacketEntity;
+import ac.grim.grimac.utils.data.packetentity.PacketEntityHook;
+import ac.grim.grimac.utils.data.packetentity.PacketEntityTrackXRot;
+import ac.grim.grimac.utils.enums.Pose;
+import ac.grim.grimac.utils.nmsutil.EntityMetadataPoseUtil;
+import ac.grim.grimac.utils.viaversion.ViaVersionUtil;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.entity.EntityPositionData;
+import com.github.retrooper.packetevents.protocol.entity.data.EntityData;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityType;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityTypes;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.player.InteractionHand;
+import com.github.retrooper.packetevents.protocol.player.UserProfile;
+import com.github.retrooper.packetevents.protocol.potion.PotionType;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerAttachEntity;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerDestroyEntities;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityEffect;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityEquipment;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityMetadata;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityPositionSync;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityRelativeMove;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityRelativeMoveAndRotation;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityRotation;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityStatus;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityTeleport;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerInfo;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerInfoRemove;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerInfoUpdate;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerRemoveEntityEffect;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSetPassengers;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSetSlot;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnEntity;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnLivingEntity;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnPainting;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnPlayer;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateAttributes;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerWindowItems;
+import org.jetbrains.annotations.NotNull;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public class PacketEntityReplication extends Check implements PacketReceiveListener, PacketSendListener {
+
+    private final AtomicBoolean hasSentPreWavePacket = new AtomicBoolean(true);
+
+    // Let's imagine the player is on a boat.
+    // The player breaks this boat
+    // If we were to despawn the boat without an extra transaction, then the boat would disappear before
+    // it disappeared on the client side, creating a ghost boat to flag checks with
+    //
+    // If we were to despawn the tick after, spawning must occur the transaction before to stop the same exact
+    // problem with ghost boats in reverse.
+    //
+    // Therefore, we despawn the transaction after, and spawn the tick before.
+    //
+    // If we despawn then spawn an entity in the same transaction, then this solution would despawn the new entity
+    // instead of the old entity, so we wouldn't see the boat at all
+    //
+    // Therefore, if the server sends a despawn and then a spawn in the same transaction for the same entity,
+    // We should simply add a transaction (which will clear this list!)
+    //
+    // Another valid solution is to simply spam more transactions, but let's not waste bandwidth.
+    private final List&lt;Integer&gt; despawnedEntitiesThisTransaction = new ArrayList&lt;&gt;();
+
+    // Maximum ping when a firework boost is removed from the player.
+    private int maxFireworkBoostPing = 1000;
+
+    public PacketEntityReplication(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketReceive(PacketReceiveEvent event) {
+        // Teleports don't interpolate, duplicate 1.17 packets don't interpolate
+        if (!isTickPacket(event.getPacketType())) return;
+        player.compensatedEntities.entitiesRemovedThisTick.clear();
+        boolean isTickingReliably = player.isTickingReliablyFor(3);
+
+        PacketEntity playerVehicle = player.compensatedEntities.self.getRiding();
+        for (PacketEntity entity : player.compensatedEntities.entityMap.values()) {
+            if (entity == playerVehicle &amp;&amp; !player.vehicleData.lastDummy) {
+                // The player has this as their vehicle, so they aren't interpolating it.
+                // And it isn't a dummy position
+                entity.setPositionRaw(player, entity.getPossibleLocationBoxes());
+            } else {
+                entity.onMovement(isTickingReliably);
+            }
+        }
+
+        if (player.vehicleData.camelSprintingState == SprintingState.STOPPING) {
+            player.vehicleData.camelSprintingState = SprintingState.STOPPED;
+        } else if (player.vehicleData.camelSprintingState == SprintingState.STOPPED &amp;&amp; player.isSprinting) { // For sprint desyncs
+            player.vehicleData.camelSprintingState = SprintingState.STARTED;
+        }
+    }
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+        // ensure grim is the one that sent the transaction
+        if ((event.getPacketType() == PacketType.Play.Server.PING || event.getPacketType() == PacketType.Play.Server.WINDOW_CONFIRMATION) &amp;&amp; player.packetStateData.lastServerTransWasValid) {
+            despawnedEntitiesThisTransaction.clear();
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_LIVING_ENTITY) {
+            WrapperPlayServerSpawnLivingEntity packetOutEntity = new WrapperPlayServerSpawnLivingEntity(event);
+            addEntity(packetOutEntity.getEntityId(), packetOutEntity.getEntityUUID(), packetOutEntity.getEntityType(), packetOutEntity.getPosition(), packetOutEntity.getYaw(), packetOutEntity.getPitch(), packetOutEntity.getEntityMetadata(), 0);
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_ENTITY) {
+            WrapperPlayServerSpawnEntity packetOutEntity = new WrapperPlayServerSpawnEntity(event);
+            addEntity(packetOutEntity.getEntityId(), packetOutEntity.getUUID().orElse(null), packetOutEntity.getEntityType(), packetOutEntity.getPosition(), packetOutEntity.getYaw(), packetOutEntity.getPitch(), null, packetOutEntity.getData());
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_PLAYER) {
+            WrapperPlayServerSpawnPlayer packetOutEntity = new WrapperPlayServerSpawnPlayer(event);
+            addEntity(packetOutEntity.getEntityId(), packetOutEntity.getUUID(), EntityTypes.PLAYER, packetOutEntity.getPosition(), packetOutEntity.getYaw(), packetOutEntity.getPitch(), packetOutEntity.getEntityMetadata(), 0);
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_PAINTING) {
+            WrapperPlayServerSpawnPainting packetOutEntity = new WrapperPlayServerSpawnPainting(event);
+            addEntity(packetOutEntity.getEntityId(), packetOutEntity.getUUID(), EntityTypes.PAINTING, packetOutEntity.getPosition().toVector3d(), 0, 0f, null, packetOutEntity.getDirection().getHorizontalIndex());
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_RELATIVE_MOVE) {
+            WrapperPlayServerEntityRelativeMove move = new WrapperPlayServerEntityRelativeMove(event);
+            handleMoveEntity(event, move.getEntityId(), move.getDeltaX(), move.getDeltaY(), move.getDeltaZ(), null, null, true, true);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_RELATIVE_MOVE_AND_ROTATION) {
+            WrapperPlayServerEntityRelativeMoveAndRotation move = new WrapperPlayServerEntityRelativeMoveAndRotation(event);
+            handleMoveEntity(event, move.getEntityId(), move.getDeltaX(), move.getDeltaY(), move.getDeltaZ(), move.getYaw() * 0.7111111F, move.getPitch() * 0.7111111F, true, true);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_TELEPORT) {
+            WrapperPlayServerEntityTeleport move = new WrapperPlayServerEntityTeleport(event);
+            Vector3d pos = move.getPosition();
+            handleMoveEntity(event, move.getEntityId(), pos.getX(), pos.getY(), pos.getZ(), move.getYaw(), move.getPitch(), false, true);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_POSITION_SYNC) {
+            // ENTITY_TELEPORT but without relative flags
+            WrapperPlayServerEntityPositionSync move = new WrapperPlayServerEntityPositionSync(event);
+            final EntityPositionData values = move.getValues();
+            final Vector3d pos = values.getPosition();
+            // TODO this isn't technically correct
+            // If the position sync is to a pos &gt; 4096 from the entity pos, client does some special stuff without interpolation
+            handleMoveEntity(event, move.getId(), pos.getX(), pos.getY(), pos.getZ(), values.getYaw(), values.getPitch(), false, true);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_ROTATION) { // Affects interpolation
+            WrapperPlayServerEntityRotation move = new WrapperPlayServerEntityRotation(event);
+            handleMoveEntity(event, move.getEntityId(), 0, 0, 0, move.getYaw() * 0.7111111F, move.getPitch() * 0.7111111F, true, false);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_METADATA) {
+            WrapperPlayServerEntityMetadata entityMetadata = new WrapperPlayServerEntityMetadata(event);
+            schedulePoseTransition(entityMetadata, event);
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.compensatedEntities.updateEntityMetadata(entityMetadata.getEntityId(), entityMetadata.getEntityMetadata()));
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_EQUIPMENT) {
+            WrapperPlayServerEntityEquipment equipment = new WrapperPlayServerEntityEquipment(event);
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.compensatedEntities.updateEntityEquipment(equipment.getEntityId(), equipment.getEquipment()));
+        }
+
+        // 1.19.3+
+        else if (event.getPacketType() == PacketType.Play.Server.PLAYER_INFO_UPDATE) {
+            WrapperPlayServerPlayerInfoUpdate info = new WrapperPlayServerPlayerInfoUpdate(event);
+            if (info.getActions().contains(WrapperPlayServerPlayerInfoUpdate.Action.ADD_PLAYER)) {
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                    for (WrapperPlayServerPlayerInfoUpdate.PlayerInfo entry : info.getEntries()) {
+                        final UserProfile gameProfile = entry.getGameProfile();
+                        final UUID uuid = gameProfile.getUUID();
+                        player.compensatedEntities.profiles.put(uuid, gameProfile);
+                    }
+                });
+            }
+        } else if (event.getPacketType() == PacketType.Play.Server.PLAYER_INFO_REMOVE) {
+            WrapperPlayServerPlayerInfoRemove remove = new WrapperPlayServerPlayerInfoRemove(event);
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; remove.getProfileIds().forEach(player.compensatedEntities.profiles::remove));
+        } else if (event.getPacketType() == PacketType.Play.Server.PLAYER_INFO) {
+            WrapperPlayServerPlayerInfo info = new WrapperPlayServerPlayerInfo(event);
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                if (info.getAction() == WrapperPlayServerPlayerInfo.Action.ADD_PLAYER) {
+                    for (WrapperPlayServerPlayerInfo.PlayerData entry : info.getPlayerDataList()) {
+                        final UserProfile gameProfile = entry.getUserProfile();
+                        final UUID uuid = gameProfile.getUUID();
+                        player.compensatedEntities.profiles.put(uuid, gameProfile);
+                    }
+                } else if (info.getAction() == WrapperPlayServerPlayerInfo.Action.REMOVE_PLAYER) {
+                    info.getPlayerDataList().forEach(profile -&gt; player.compensatedEntities.profiles.remove(profile.getUserProfile().getUUID()));
+                }
+            });
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_EFFECT) {
+            WrapperPlayServerEntityEffect effect = new WrapperPlayServerEntityEffect(event);
+
+            PotionType type = effect.getPotionType();
+
+            // ViaVersion tries faking levitation effects and fails badly lol, flagging the anticheat
+            // Block other effects just in case ViaVersion gets any ideas
+            //
+            // Set to 24 so ViaVersion blocks it
+            // 24 is the levitation effect
+            if (player.getClientVersion().isOlderThan(ClientVersion.V_1_9) &amp;&amp; ViaVersionUtil.isAvailable &amp;&amp; type.getId(player.getClientVersion()) &gt; 23) {
+                event.setCancelled(true);
+                return;
+            }
+
+            // ViaVersion dolphin's grace also messes us up, set it to a potion effect that doesn't exist on 1.12
+            // Effect 31 is bad omen
+            if (player.getClientVersion().isOlderThan(ClientVersion.V_1_13) &amp;&amp; ViaVersionUtil.isAvailable &amp;&amp; type.getId(player.getClientVersion()) == 30) {
+                event.setCancelled(true);
+                return;
+            }
+
+            if (isDirectlyAffectingPlayer(player, effect.getEntityId())) player.sendTransaction();
+
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                PacketEntity entity = player.compensatedEntities.getEntity(effect.getEntityId());
+                if (entity == null) return;
+
+                entity.addPotionEffect(type, effect.getEffectAmplifier());
+            });
+        } else if (event.getPacketType() == PacketType.Play.Server.REMOVE_ENTITY_EFFECT) {
+            WrapperPlayServerRemoveEntityEffect effect = new WrapperPlayServerRemoveEntityEffect(event);
+
+            if (isDirectlyAffectingPlayer(player, effect.getEntityId())) player.sendTransaction();
+
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                PacketEntity entity = player.compensatedEntities.getEntity(effect.getEntityId());
+                if (entity == null) return;
+
+                entity.removePotionEffect(effect.getPotionType());
+            });
+        } else if (event.getPacketType() == PacketType.Play.Server.UPDATE_ATTRIBUTES) {
+            WrapperPlayServerUpdateAttributes attributes = new WrapperPlayServerUpdateAttributes(event);
+
+            int entityID = attributes.getEntityId();
+
+            // The attributes for this entity is active, currently
+            if (isDirectlyAffectingPlayer(player, entityID)) player.sendTransaction();
+
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(),
+                    () -&gt; player.compensatedEntities.updateAttributes(entityID, attributes.getProperties()));
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_STATUS) {
+            WrapperPlayServerEntityStatus status = new WrapperPlayServerEntityStatus(event);
+            // This hasn't changed from 1.7.2 to 1.17
+            // Needed to exempt players on dead vehicles, as dead entities have strange physics.
+            if (status.getStatus() == 3) {
+                PacketEntity entity = player.compensatedEntities.getEntity(status.getEntityId());
+
+                if (entity == null) return;
+                entity.isDead = true;
+            }
+
+            if (status.getStatus() == 9) {
+                if (status.getEntityId() != player.entityID) return;
+
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+            }
+
+            if (status.getStatus() == 31) {
+                PacketEntity hook = player.compensatedEntities.getEntity(status.getEntityId());
+                if (!(hook instanceof PacketEntityHook hookEntity)) return;
+
+                if (hookEntity.attached == player.entityID) {
+                    player.sendTransaction();
+                    // We don't transaction sandwich this, it's too rare to be a real problem.
+                    player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.uncertaintyHandler.fishingRodPulls.add(hookEntity.owner));
+                }
+            }
+
+            if (status.getStatus() &gt;= 24 &amp;&amp; status.getStatus() &lt;= 28 &amp;&amp; status.getEntityId() == player.entityID) {
+                player.compensatedEntities.self.opLevel = status.getStatus() - 24;
+            }
+        } else if (event.getPacketType() == PacketType.Play.Server.SET_SLOT) {
+            WrapperPlayServerSetSlot slot = new WrapperPlayServerSetSlot(event);
+
+            if (slot.getWindowId() == 0) {
+                Runnable task = () -&gt; {
+                    if (slot.getSlot() - 36 == player.packetStateData.lastSlotSelected &amp;&amp; (
+                            !player.inventory.getHeldItem().is(slot.getItem().getType()) || player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_8)
+                    ) || slot.getSlot() == 45 &amp;&amp; !player.inventory.getOffHand().is(slot.getItem().getType())) {
+                        InteractionHand hand = slot.getSlot() == 45 ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND;
+                        if (hand == player.packetStateData.itemInUseHand) {
+                            player.packetStateData.setSlowedByUsingItem(false);
+                        }
+
+                        if (player.isResetItemUsageOnItemUpdate() &amp;&amp; hand == GrimAPI.INSTANCE.getItemResetHandler().getItemUsageHand(player.platformPlayer)) {
+                            GrimAPI.INSTANCE.getItemResetHandler().resetItemUsage(player.platformPlayer);
+                        }
+                    }
+                };
+
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), task);
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, task);
+            }
+        } else if (event.getPacketType() == PacketType.Play.Server.WINDOW_ITEMS) {
+            WrapperPlayServerWindowItems items = new WrapperPlayServerWindowItems(event);
+
+            if (items.getWindowId() == 0) { // Player inventory
+                Runnable task = () -&gt; {
+                    if (player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_8)) {
+                        player.packetStateData.setSlowedByUsingItem(false);
+                        if (player.isResetItemUsageOnItemUpdate()) {
+                            GrimAPI.INSTANCE.getItemResetHandler().resetItemUsage(player.platformPlayer);
+                        }
+                    } else {
+                        if (items.getItems().size() &gt; 45 &amp;&amp; !player.inventory.getOffHand().is(items.getItems().get(45).getType())) {
+                            if (player.packetStateData.itemInUseHand == InteractionHand.OFF_HAND) {
+                                player.packetStateData.setSlowedByUsingItem(false);
+                            }
+
+                            if (player.isResetItemUsageOnItemUpdate() &amp;&amp; GrimAPI.INSTANCE.getItemResetHandler().getItemUsageHand(player.platformPlayer) == InteractionHand.OFF_HAND) {
+                                GrimAPI.INSTANCE.getItemResetHandler().resetItemUsage(player.platformPlayer);
+                            }
+                        }
+
+                        if (!player.inventory.getHeldItem().is(items.getItems().get(player.packetStateData.lastSlotSelected + 36).getType())) {
+                            if (player.packetStateData.itemInUseHand == InteractionHand.MAIN_HAND) {
+                                player.packetStateData.setSlowedByUsingItem(false);
+                            }
+
+                            if (player.isResetItemUsageOnItemUpdate() &amp;&amp; GrimAPI.INSTANCE.getItemResetHandler().getItemUsageHand(player.platformPlayer) == InteractionHand.MAIN_HAND) {
+                                GrimAPI.INSTANCE.getItemResetHandler().resetItemUsage(player.platformPlayer);
+                            }
+                        }
+                    }
+                };
+
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), task);
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, task);
+            }
+        }
+
+        // 1.8 clients fail to send the RELEASE_USE_ITEM packet when a window is opened client sided while using an item
+        else if (event.getPacketType() == PacketType.Play.Server.OPEN_WINDOW) {
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+        } else if (event.getPacketType() == PacketType.Play.Server.OPEN_HORSE_WINDOW) {
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+        } else if (event.getPacketType() == PacketType.Play.Server.SET_PASSENGERS) {
+            WrapperPlayServerSetPassengers mount = new WrapperPlayServerSetPassengers(event);
+
+            int vehicleID = mount.getEntityId();
+            int[] passengers = mount.getPassengers();
+
+            handleMountVehicle(event, vehicleID, passengers);
+        } else if (event.getPacketType() == PacketType.Play.Server.ATTACH_ENTITY) {
+            WrapperPlayServerAttachEntity attach = new WrapperPlayServerAttachEntity(event);
+
+            // This packet was replaced by the mount packet on 1.9+ servers - to support multiple passengers on one vehicle
+            if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_9))
+                return;
+
+            // If this is mounting rather than leashing
+            if (!attach.isLeash()) {
+                // Alright, let's convert this to the 1.9+ format to make it easier for grim
+                int vehicleID = attach.getHoldingId();
+                int attachID = attach.getAttachedId();
+                TrackerData trackerData = player.compensatedEntities.getTrackedEntity(attachID);
+
+                if (trackerData != null) {
+                    // 1.8 sends a vehicle ID of -1 to dismount the entity from its vehicle
+                    // This is opposite of the 1.9+ format, which sends the vehicle ID and then an empty array.
+                    if (vehicleID == -1) { // Dismounting
+                        vehicleID = trackerData.getLegacyPointEightMountedUpon();
+                        handleMountVehicle(event, vehicleID, new int[]{}); // The vehicle is empty
+                    } else { // Mounting
+                        trackerData.setLegacyPointEightMountedUpon(vehicleID);
+                        handleMountVehicle(event, vehicleID, new int[]{attachID});
+                    }
+                } else {
+                    // I don't think we can recover from this... warn and move on as this shouldn't happen.
+                    LogUtil.warn("Server sent an invalid attach entity packet for entity " + attach.getHoldingId() + " with passenger " + attach.getAttachedId() + "! The client ignores this.");
+                }
+            }
+        } else if (event.getPacketType() == PacketType.Play.Server.DESTROY_ENTITIES) {
+            WrapperPlayServerDestroyEntities destroy = new WrapperPlayServerDestroyEntities(event);
+
+            int[] destroyEntityIds = destroy.getEntityIds();
+
+            for (int entityID : destroyEntityIds) {
+                despawnedEntitiesThisTransaction.add(entityID);
+                player.compensatedEntities.serverPositionsMap.remove(entityID);
+                // Remove the tracked vehicle (handling tracking knockback) if despawned
+                if (player.compensatedEntities.serverPlayerVehicle != null &amp;&amp; player.compensatedEntities.serverPlayerVehicle == entityID) {
+                    player.compensatedEntities.serverPlayerVehicle = null;
+                }
+            }
+
+            final int destroyTransaction = player.lastTransactionSent.get() + 1;
+            player.latencyUtils.addRealTimeTask(destroyTransaction, () -&gt; {
+                for (int entityId : destroyEntityIds) {
+                    player.compensatedEntities.removeEntity(entityId);
+                    player.dashableEntities.removeEntity(entityId);
+                    player.fireworks.removeFirework(entityId);
+                    player.compensatedEntities.entitiesRemovedThisTick.add(entityId);
+                }
+            });
+
+            // Don't let the player freeze transactions to keep the firework boost velocity + uncertainty
+            // Also generally prevents people with high ping gaining too high an advantage in firework use
+            if (maxFireworkBoostPing &gt; 0) {
+                player.runNettyTaskInMs(() -&gt; {
+                    if (player.lastTransactionReceived.get() &gt;= destroyTransaction) return;
+                    for (int entityID : destroyEntityIds) {
+                        // If the player has a firework boosting them, setback
+                        if (player.fireworks.hasFirework(entityID)) {
+                            player.getSetbackTeleportUtil().executeViolationSetback();
+                            break;
+                        }
+                    }
+                }, maxFireworkBoostPing);
+            }
+        }
+    }
+
+    private void handleMountVehicle(PacketSendEvent event, int vehicleID, int[] passengers) {
+        boolean wasInVehicle = player.compensatedEntities.serverPlayerVehicle != null &amp;&amp; player.compensatedEntities.serverPlayerVehicle == vehicleID;
+        boolean inThisVehicle = false;
+
+        for (int passenger : passengers) {
+            inThisVehicle = passenger == player.entityID;
+            if (inThisVehicle) break;
+        }
+
+        if (inThisVehicle &amp;&amp; !wasInVehicle) {
+            player.handleMountVehicle(vehicleID);
+        }
+
+        if (!inThisVehicle &amp;&amp; wasInVehicle) {
+            player.handleDismountVehicle(event);
+        }
+        // Better lag compensation if we were affected by this
+        if (wasInVehicle || inThisVehicle) {
+            player.sendTransaction();
+        }
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+            PacketEntity vehicle = player.compensatedEntities.getEntity(vehicleID);
+
+            // Vanilla likes sending null vehicles, so we must ignore those like the client ignores them
+            if (vehicle == null) return;
+
+            // Eject existing passengers for this vehicle
+            for (PacketEntity passenger : new ArrayList&lt;&gt;(vehicle.passengers)) {
+                passenger.eject();
+            }
+
+            // Add the entities as vehicles
+            for (int entityID : passengers) {
+                PacketEntity passenger = player.compensatedEntities.getEntity(entityID);
+                if (passenger == null) continue;
+                passenger.mount(vehicle);
+            }
+        });
+    }
+
+    private void handleMoveEntity(PacketSendEvent event, int entityId, double deltaX, double deltaY, double deltaZ, Float yaw, Float pitch, boolean isRelative, boolean hasPos) {
+        TrackerData data = player.compensatedEntities.getTrackedEntity(entityId);
+
+        final boolean didNotSendPreWave = hasSentPreWavePacket.compareAndSet(false, true);
+        if (didNotSendPreWave) player.sendTransaction();
+
+        if (data != null) {
+            // Update the tracked server's entity position
+            if (isRelative) {
+                // There is a bug where vehicles may start flying due to mojang setting packet position on the client
+                // (Works at 0 ping but causes funny bugs at any higher ping)
+                // As we don't want vehicles to fly, we need to replace it with a teleport if it is player vehicle
+                //
+                // Don't bother with client controlled vehicles though
+                boolean vanillaVehicleFlight = player.compensatedEntities.serverPlayerVehicle != null
+                        &amp;&amp; player.compensatedEntities.serverPlayerVehicle == entityId
+                        &amp;&amp; player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_9)
+                        // TODO: https://discord.com/channels/721686193061888071/721686193515003966/1310659538831020123
+                        // Why does the server now send an entity rel move packet matching the player's vehicle movement every time?
+                        &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_21_2)
+                        &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_9);
+
+                // ViaVersion sends two relative packets when moving more than 4 blocks
+                // This is broken and causes the client to interpolate like (0, 4) and (1, 3) instead of (1, 7)
+                // This causes impossible hits, so grim must replace this with a teleport entity packet
+                // Not ideal, but neither is 1.8 players on a 1.9+ server.
+                if (vanillaVehicleFlight ||
+                        ((Math.abs(deltaX) &gt;= 3.9375 || Math.abs(deltaY) &gt;= 3.9375 || Math.abs(deltaZ) &gt;= 3.9375) &amp;&amp; player.getClientVersion().isOlderThan(ClientVersion.V_1_9) &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_9))) {
+                    player.user.writePacket(new WrapperPlayServerEntityTeleport(entityId, new Vector3d(data.getX() + deltaX, data.getY() + deltaY, data.getZ() + deltaZ), yaw == null ? data.getXRot() : yaw, pitch == null ? data.getYRot() : pitch, false));
+                    event.setCancelled(true);
+                    return;
+                }
+
+                data.setX(data.getX() + deltaX);
+                data.setY(data.getY() + deltaY);
+                data.setZ(data.getZ() + deltaZ);
+            } else {
+                data.setX(deltaX);
+                data.setY(deltaY);
+                data.setZ(deltaZ);
+            }
+            if (yaw != null) {
+                data.setXRot(yaw);
+                data.setYRot(pitch);
+            }
+
+            // We can't hang two relative moves on one transaction
+            if (data.getLastTransactionHung() == player.lastTransactionSent.get()) {
+                player.sendTransaction();
+            }
+            data.setLastTransactionHung(player.lastTransactionSent.get());
+        }
+
+        int lastTrans = player.lastTransactionSent.get();
+
+        player.latencyUtils.addRealTimeTask(lastTrans, () -&gt; {
+            PacketEntity entity = player.compensatedEntities.getEntity(entityId);
+            if (entity == null) return;
+            if (entity instanceof PacketEntityTrackXRot xRotEntity &amp;&amp; yaw != null) {
+                xRotEntity.packetYaw = yaw;
+                xRotEntity.steps = entity.isBoat ? 10 : 3;
+            }
+
+            entity.onFirstTransaction(isRelative, hasPos, deltaX, deltaY, deltaZ, player);
+        });
+
+        player.latencyUtils.addRealTimeTask(lastTrans + 1, () -&gt; {
+            PacketEntity entity = player.compensatedEntities.getEntity(entityId);
+            if (entity == null) return;
+            entity.onSecondTransaction();
+        });
+    }
+
+    public void addEntity(int entityID, UUID uuid, EntityType type, Vector3d position, float xRot, float yRot, List&lt;EntityData&lt;?&gt;&gt; entityMetadata, int extraData) {
+        if (despawnedEntitiesThisTransaction.contains(entityID)) {
+            player.sendTransaction();
+        }
+
+        player.compensatedEntities.serverPositionsMap.put(entityID, new TrackerData(position.getX(), position.getY(), position.getZ(), xRot, yRot, type, player.lastTransactionSent.get()));
+
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+            PacketEntity entity = player.compensatedEntities.addEntity(entityID, uuid, type, position, xRot, extraData);
+            if (entity instanceof DashableEntity dashable) {
+                player.dashableEntities.addEntity(entityID, dashable);
+            }
+
+            if (entityMetadata != null) {
+                if (EntityMetadataPoseUtil.usesPoseMetadata(entity) &amp;&amp; player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_14)) {
+                    Pose initialPose = EntityMetadataPoseUtil.getPoseFromMetadata(entityMetadata);
+                    if (initialPose != null) {
+                        entity.currentPose = initialPose;
+                    }
+                }
+
+                player.compensatedEntities.updateEntityMetadata(entityID, entityMetadata);
+            }
+        });
+    }
+
+    private void schedulePoseTransition(WrapperPlayServerEntityMetadata entityMetadata, PacketSendEvent event) {
+        if (player.getClientVersion().isOlderThan(ClientVersion.V_1_14)) return;
+
+        int entityId = entityMetadata.getEntityId();
+        if (entityId == player.entityID) return;
+
+        Pose newPose = EntityMetadataPoseUtil.getPoseFromMetadata(entityMetadata.getEntityMetadata());
+        if (newPose == null) return;
+
+        boolean shouldTrackPoseTransition = false;
+        PacketEntity entity = player.compensatedEntities.getEntity(entityId);
+        if (entity != null) {
+            shouldTrackPoseTransition = EntityMetadataPoseUtil.usesPoseMetadata(entity);
+        } else {
+            // If the client didn't respond to the spawn packet yet, we need to check if we should track the pose transition based on the entity type
+            // is there a better way to do this?
+            TrackerData trackedEntity = player.compensatedEntities.getTrackedEntity(entityId);
+            if (trackedEntity != null) {
+                shouldTrackPoseTransition = EntityMetadataPoseUtil.usesPoseMetadata(trackedEntity.getEntityType());
+            }
+        }
+
+        if (!shouldTrackPoseTransition) return;
+
+        player.sendTransaction();
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+            PacketEntity target = player.compensatedEntities.getEntity(entityId);
+            if (target == null) {
+                return;
+            }
+
+            target.beginPoseTransition(newPose);
+        });
+
+        event.getTasksAfterSend().add(() -&gt; {
+            player.sendTransaction();
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                PacketEntity target = player.compensatedEntities.getEntity(entityId);
+                if (target == null) {
+                    return;
+                }
+
+                target.completePoseTransition(newPose);
+            });
+        });
+    }
+
+    private boolean isDirectlyAffectingPlayer(GrimPlayer player, int entityID) {
+        // The attributes for this entity is active, currently
+        return (player.compensatedEntities.serverPlayerVehicle == null &amp;&amp; entityID == player.entityID) ||
+                (player.compensatedEntities.serverPlayerVehicle != null &amp;&amp; entityID == player.compensatedEntities.serverPlayerVehicle);
+    }
+
+    public void onEndOfTickEvent(boolean async, boolean flush) {
+        // Only send a transaction at the end of the tick if we are tracking players
+        player.sendTransaction(async);
+        if (flush) player.user.flushPackets();
+    }
+
+    public void tickStartTick() {
+        hasSentPreWavePacket.set(false);
+    }
+
+    @Override
+    public void onReload(@NotNull ConfigManager config) {
+        maxFireworkBoostPing = config.getIntElse("max-ping-firework-boost", 1000);
+    }
+
+}
+
+// NOTE (AI): The SPAWN_LIVING_ENTITY branch is lines 123-125. The file also handles SPAWN_ENTITY, SPAWN_PLAYER and SPAWN_PAINTING in the same dispatch, and the DESTROY_ENTITIES branch (379-415) schedules removal on the destroy transaction.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Shard adds living spawns to compensatedEntities; Hydro tracks them in its entityMap; Kauri routes SPAWN_LIVING_ENTITY through its PacketHandler into the world tracker.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S0EPacketSpawnObject/">S0EPacketSpawnObject</a>
 <a class="related-chip" href="../S12PacketEntityVelocity/">S12PacketEntityVelocity</a>

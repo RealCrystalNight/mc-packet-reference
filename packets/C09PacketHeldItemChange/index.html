@@ -907,6 +907,370 @@ public class AutoSoup extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">MotionEvent/UpdateEvent for the switch decision; PacketSendEvent in silent-switch modules to cancel C09 echoes; sendQueue/PacketUtil for the actual send.</div>
 <div class="impl-clients">Tenacity uses addToSendQueueNoEvent to bypass its own event bus. Rise 5.99 uses PacketUtil.sendPacketWithoutEvent. Memeware/Sigma push raw packets to the send queue. Rise 6.x routes through PacketUtil.send and the Slot component, and its PingSpoofComponent parks C09 in the blink packet class list.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The held item change packet reports the new hotbar slot. It is a thin packet, but it is the trigger for autotool, fastswitch and slot desync checks. Autotool modules switch to the best tool right before a block break or attack, so the switch timing relative to dig and use-entity packets is the signal. The slot value itself must be in range 0 to 8, and the change must match the server's view of the player's inventory, which makes out-of-range and repeated-identical-slot checks cheap and effective.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Fastswitch (Photon)</span>
+<span class="impl-module-clients">(Photon-GitHub-AntiCheatAddition)</span>
+</div>
+<p class="impl-pattern">Flags hotbar switches that are faster than humanly possible while the player is in combat or using an item.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Listens to PlayerItemHeldEvent. It first allows scroll-like changes, adjacent slots or a 0 to 8 wrap, so fast scrolling is not flagged. If the switch is non-adjacent, TPS is at least 19, ping is below the max (default 400), the last switch happened within 50 ms, and the player did something combat- or item-related in the last 750 ms, it flags with +25 VL and cancels the event at 50 VL, otherwise syncing the inventory. Violation decays 25 per 120 seconds.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Fastswitch and autotool modules that swap to a tool and act within the same tick.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/checks/fastswitch/Fastswitch.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/checks/fastswitch/Fastswitch.java =====
+package de.photon.anticheataddition.modules.checks.fastswitch;
+
+import de.photon.anticheataddition.modules.ViolationModule;
+import de.photon.anticheataddition.user.User;
+import de.photon.anticheataddition.user.data.TimeKey;
+import de.photon.anticheataddition.util.inventory.InventoryUtil;
+import de.photon.anticheataddition.util.mathematics.MathUtil;
+import de.photon.anticheataddition.util.minecraft.ping.PingProvider;
+import de.photon.anticheataddition.util.minecraft.tps.TPSProvider;
+import de.photon.anticheataddition.util.violationlevels.Flag;
+import de.photon.anticheataddition.util.violationlevels.ViolationLevelManagement;
+import de.photon.anticheataddition.util.violationlevels.ViolationManagement;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerItemHeldEvent;
+
+public final class Fastswitch extends ViolationModule implements Listener
+{
+    public static final Fastswitch INSTANCE = new Fastswitch();
+
+    private final int cancelVl = loadInt(".cancel_vl", 50);
+    private final int maxPing = loadInt(".max_ping", 400);
+    private static final int MIN_SWITCH_DELAY = 50;
+
+    private Fastswitch()
+    {
+        super("Fastswitch");
+    }
+
+    /**
+     * Used to acknowledge if somebody can be legit.
+     * I.e. that players can scroll very fast, but then the neighbor slot is always the one that gets called next.
+     */
+    private static boolean canBeLegit(final int oldSlot, final int newHeldItemSlot)
+    {
+        return (oldSlot == 0 &amp;&amp; newHeldItemSlot == 8) ||
+               (oldSlot == 8 &amp;&amp; newHeldItemSlot == 0) ||
+               MathUtil.absDiff(oldSlot, newHeldItemSlot) &lt;= 1;
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onPlayerItemHeld(PlayerItemHeldEvent event)
+    {
+        final var user = User.getUser(event.getPlayer());
+        if (User.isUserInvalid(user, this) ||
+            // Tps are high enough
+            !TPSProvider.INSTANCE.atLeastTPS(19) ||
+            // Prevent the detection of scrolling
+            canBeLegit(event.getPreviousSlot(), event.getNewSlot())) return;
+
+        // Already switched in the given timeframe
+        if (user.getTimeMap().at(TimeKey.FASTSWITCH_HOTBAR_SWITCH).recentlyUpdated(MIN_SWITCH_DELAY) &amp;&amp;
+            // The ping is valid and in the borders that are set in the config.
+            PingProvider.INSTANCE.atMostMaxPing(user.getPlayer(), maxPing) &amp;&amp;
+            // User has done something except switching slots all the time.
+            (user.getTimeMap().at(TimeKey.COMBAT).recentlyUpdated(750) || user.getTimeMap().at(TimeKey.RIGHT_CLICK_ITEM_EVENT).recentlyUpdated(750)))
+        {
+            getManagement().flag(Flag.of(user)
+                                     .setAddedVl(25)
+                                     .setCancelAction(cancelVl, () -&gt; event.setCancelled(true))
+                                     .setEventNotCancelledAction(() -&gt; InventoryUtil.syncUpdateInventory(user.getPlayer())));
+        }
+
+        user.getTimeMap().at(TimeKey.FASTSWITCH_HOTBAR_SWITCH).update();
+    }
+
+    @Override
+    protected ViolationManagement createViolationManagement()
+    {
+        return ViolationLevelManagement.builder(this).loadThresholdsToManagement().withDecay(120, 25).build();
+    }
+}
+
+// NOTE (AI): Photon runs on the Bukkit PlayerItemHeldEvent, which fires from the same held-item packet the C09 carries.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Intave ToolSwitchHeuristic flags slot changes within one tick of a block break; Kauri SlotChange flags repeated identical slot packets; BetterAnticheat ImpossibleSlotCheck only checks the slot range.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">SlotChange (Kauri)</span>
+<span class="impl-module-clients">(funkemunky-KauriV3)</span>
+</div>
+<p class="impl-pattern">Flags client-held slot changes that repeat the same slot without a server-side slot change in between.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Two WActions: one on WrapperPlayClientHeldItemChange, one on WrapperPlayServerHeldItemChange. When the server sends a slot change, didServerSlot is set and the next client change is accepted as the echo. Otherwise a client change that equals the last slot increments a buffer that flags at 6 and decays by 3 on a legitimate change. This catches clients that spam the held-item packet to desync the server's hand tracking.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Slot desync abuse and clients that replay held-item packets to confuse inventory tracking.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/check/impl/packet/badpackets/SlotChange.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/check/impl/packet/badpackets/SlotChange.java =====
+package dev.brighten.ac.check.impl.packet.badpackets;
+
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientHeldItemChange;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerHeldItemChange;
+import dev.brighten.ac.api.check.CheckType;
+import dev.brighten.ac.check.Check;
+import dev.brighten.ac.check.CheckData;
+import dev.brighten.ac.check.WAction;
+import dev.brighten.ac.data.APlayer;
+import dev.brighten.ac.utils.annotation.Bind;
+
+@CheckData(name = "SlotChange", checkId = "slotchange", description = "Detects invalid slot changes.", type = CheckType.BADPACKETS)
+public class SlotChange extends Check {
+    public SlotChange(APlayer player) {
+        super(player);
+    }
+
+    private boolean didServerSlot = false;
+    private int lastSlot = -1, buffer;
+
+    private static final int BUFFER_MAX = 6;
+
+    @Bind
+    WAction&lt;WrapperPlayClientHeldItemChange&gt; heldItemSlot = packet -&gt; {
+        if(didServerSlot) {
+            didServerSlot = false;
+            lastSlot = packet.getSlot();
+            return;
+        }
+
+        if(packet.getSlot() == lastSlot) {
+            if(++buffer &gt; BUFFER_MAX) {
+                flag("Bad slot change detected at index %i", packet.getSlot());
+            }
+            debug("Invalid slot change detected! Slot: %i, buffer: %i/%i", packet.getSlot(), buffer, BUFFER_MAX);
+        } else if(buffer &gt; 0) {
+            buffer = Math.max(buffer - 3, 0);
+        }
+    };
+
+    @Bind
+    WAction&lt;WrapperPlayServerHeldItemChange&gt; serverSlot = packet -&gt; {
+        didServerSlot = true;
+    };
+}
+
+// NOTE (AI): The check listens to both the client and server held-item packets so a server-side forced switch is not mistaken for a repeated client change.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim BadPacketsY and BetterAnticheat ImpossibleSlotCheck only validate the range; Photon Fastswitch and Intave ToolSwitchHeuristic look at timing instead.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ImpossibleSlotCheck (BetterAnticheat)</span>
+<span class="impl-module-clients">(amnoah-BetterAnticheat)</span>
+</div>
+<p class="impl-pattern">Fails any held item change whose slot is outside the hotbar range 0 to 8.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">handleReceivePlayPacket matches HELD_ITEM_CHANGE, decodes WrapperPlayClientHeldItemChange and fails when the slot is below 0 or above 8. The comment notes those values are physically impossible to send from the vanilla client.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Out-of-range slot packets from modified clients or crash attempts.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/check/impl/misc/ImpossibleSlotCheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/check/impl/misc/ImpossibleSlotCheck.java =====
+package better.anticheat.core.check.impl.misc;
+
+import better.anticheat.core.BetterAnticheat;
+import better.anticheat.core.check.Check;
+import better.anticheat.core.check.CheckInfo;
+import better.anticheat.core.player.Player;
+import com.github.retrooper.packetevents.event.simple.PacketPlayReceiveEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientHeldItemChange;
+
+/**
+ * This check looks for impossible slot values.
+ */
+@CheckInfo(name = "ImpossibleSlot", category = "misc")
+public class ImpossibleSlotCheck extends Check {
+
+    public ImpossibleSlotCheck(BetterAnticheat plugin, Player player) {
+        super(plugin, player);
+    }
+
+    @Override
+    public void handleReceivePlayPacket(PacketPlayReceiveEvent event) {
+
+        /*
+         * Minecraft's hotbar slots are numbered 0-8 internally. Any value outside of these is physically impossible to
+         * send.
+         */
+
+        if (event.getPacketType() != PacketType.Play.Client.HELD_ITEM_CHANGE) return;
+        final WrapperPlayClientHeldItemChange wrapper = new WrapperPlayClientHeldItemChange(event);
+        final int slot = wrapper.getSlot();
+
+        if (slot &lt; 0 || slot &gt; 8) fail();
+    }
+}
+
+// NOTE (AI): The minimal form of the held-slot validity idea; no timing or inventory state is consulted.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim BadPacketsY is the same range check with packet cancellation; Kauri SlotChange and Photon Fastswitch check repetition and timing.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BadPacketsY (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Cancels held item change packets carrying out-of-bounds slot ids before they reach the server.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PreViaPacketReceiveListener on HELD_ITEM_CHANGE: decodes the slot and, if it is greater than 8 or below 0, flags with the slot in the verbose data, cancels the packet and calls onPacketCancel so the inventory state stays coherent.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Out-of-range slot ids from modified clients and crash attempts.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsY.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsY.java =====
+package ac.grim.grimac.checks.impl.badpackets;
+
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PreViaPacketReceiveListener;
+import ac.grim.grimac.player.GrimPlayer;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientHeldItemChange;
+
+@CheckData(name = "BadPacketsY", stableKey = "grim.badpackets.oob_slot", description = "Sent out of bounds slot id")
+public class BadPacketsY extends Check implements PreViaPacketReceiveListener {
+    private static final Verbose V = Verbose.of("slot={sint}");
+
+    public BadPacketsY(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPreViaPacketReceive(PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.HELD_ITEM_CHANGE) {
+            final int slot = new WrapperPlayClientHeldItemChange(event).getSlot();
+            if (slot &gt; 8 || slot &lt; 0) { // ban
+                if (flag(V.write(verbose()).sint(slot)) &amp;&amp; shouldModifyPackets()) {
+                    event.setCancelled(true);
+                    player.onPacketCancel();
+                }
+            }
+        }
+    }
+}
+
+// NOTE (AI): The pre-Via listener runs before protocol translation, which matters for ViaVersion rewrites of the held-item packet.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> BetterAnticheat ImpossibleSlotCheck flags the same condition; Kauri SlotChange targets repeated in-range slots instead.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ToolSwitchHeuristic (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Flags slot changes made within one tick of starting and stopping a block break, the autotool signature.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">ClassicHeuristic subscribed to movement packets, which tick counters, BLOCK_DIG for break start and stop, and HELD_ITEM_SLOT_IN. If a slot change arrives within one tick after START_DESTROY_BLOCK and the player stops digging within one tick, the heuristic marks it suspicious and, when the switched slot equals the last one, accumulates a violation that flags at 4. Repeated offenses apply the DMG_LIGHT attack nerf.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Autotool modules that swap to the correct tool exactly when breaking starts.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/check/combat/heuristics/other/ToolSwitchHeuristic.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/check/combat/heuristics/other/ToolSwitchHeuristic.java =====
+/*
+ * Copyright 2026 Intave
+ *
+ * This software is licensed under the PolyForm Perimeter License 1.0.0.
+ * You may use this software for any purpose, except for providing to
+ * others any product that competes with the software.
+ *
+ * A copy of the license is available at:
+ *   https://polyformproject.org/licenses/perimeter/1.0.0/
+ */
+
+package de.jpx3.intave.check.combat.heuristics.other;
+
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.wrappers.EnumWrappers;
+import de.jpx3.intave.check.combat.Heuristics;
+import de.jpx3.intave.check.combat.heuristics.ClassicHeuristic;
+import de.jpx3.intave.check.combat.heuristics.HeuristicsClassicType;
+import de.jpx3.intave.module.linker.packet.ListenerPriority;
+import de.jpx3.intave.module.linker.packet.PacketId;
+import de.jpx3.intave.module.linker.packet.PacketSubscription;
+import de.jpx3.intave.module.mitigate.AttackNerfStrategy;
+import de.jpx3.intave.user.User;
+import de.jpx3.intave.user.meta.CheckCustomMetadata;
+import org.bukkit.entity.Player;
+
+import static de.jpx3.intave.module.linker.packet.PacketId.Client.*;
+
+public class ToolSwitchHeuristic extends ClassicHeuristic&lt;ToolSwitchHeuristic.ToolSwitchHeuristicMeta&gt; {
+  public ToolSwitchHeuristic(Heuristics parentCheck) {
+    super(parentCheck, HeuristicsClassicType.TOOL_SWITCH, ToolSwitchHeuristicMeta.class);
+  }
+
+  @PacketSubscription(
+    priority = ListenerPriority.HIGH,
+    packetsIn = {
+      POSITION, POSITION_LOOK, LOOK, FLYING, VEHICLE_MOVE
+    }
+  )
+  public void receiveMovementPacket(PacketEvent event) {
+    Player player = event.getPlayer();
+    ToolSwitchHeuristicMeta meta = metaOf(player);
+    meta.ticksSinceLastBreak++;
+    meta.ticksSinceLastStop++;
+  }
+
+  @PacketSubscription(
+    priority = ListenerPriority.HIGH,
+    packetsIn = {
+      PacketId.Client.BLOCK_DIG
+    }
+  )
+  public void receiveBlockBreakAction(PacketEvent event) {
+    Player player = event.getPlayer();
+    PacketContainer packet = event.getPacket();
+    EnumWrappers.PlayerDigType digType = packet.getPlayerDigTypes().read(0);
+    ToolSwitchHeuristicMeta meta = metaOf(player);
+
+    // Update breaking state ticks
+    if (digType == EnumWrappers.PlayerDigType.START_DESTROY_BLOCK) {
+      meta.ticksSinceLastBreak = 0;
+    } else if (digType == EnumWrappers.PlayerDigType.STOP_DESTROY_BLOCK) {
+      meta.ticksSinceLastStop = 0;
+    }
+  }
+
+  @PacketSubscription(
+    priority = ListenerPriority.HIGH,
+    packetsIn = {
+      PacketId.Client.HELD_ITEM_SLOT_IN
+    }
+  )
+  public void receiveHeldItemSlotChange(PacketEvent event) {
+    Player player = event.getPlayer();
+    PacketContainer packet = event.getPacket();
+    User user = userOf(player);
+    int currentSlot = user.meta().inventory().handSlot();
+    Integer slot = packet.getIntegers().read(0);
+    ToolSwitchHeuristicMeta meta = metaOf(player);
+
+    // If a block break was recently started something is suspicious
+    if (meta.ticksSinceLastBreak &lt;= 1) {
+      meta.suspiciousBreakStart = true;
+      meta.lastSlot = currentSlot;
+    }
+
+    if (meta.suspiciousBreakStart &amp;&amp; meta.ticksSinceLastStop &lt;= 1 &amp;&amp; meta.lastSlot == slot) {
+      meta.suspiciousBreakStart = false;
+
+      // Violate if buffer is too high
+      if (++meta.vl &gt; 3) {
+        flag(
+          user,
+          "sent suspicious slot packets while breaking blocks",
+          meta.ticksSinceLastStop + " ticks since stopping"
+        );
+
+        // Apply damage cancel if this happens too often
+        if (++meta.cancelVl &gt; 1) {
+          user.nerf(AttackNerfStrategy.DMG_LIGHT, "205");
+        }
+
+        meta.vl = 0;
+      }
+    }
+  }
+
+  public static class ToolSwitchHeuristicMeta extends CheckCustomMetadata {
+    public int ticksSinceLastBreak;
+    public int ticksSinceLastStop;
+    public int lastSlot;
+    public boolean suspiciousBreakStart;
+    public int vl;
+    public int cancelVl;
+  }
+}
+
+// NOTE (AI): The heuristic counters advance on every movement packet, which is how the one-tick window is measured.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Photon Fastswitch detects the switch speed near combat actions; Kauri SlotChange detects desync spam; Grim tracks slot changes in CompensatedInventory for its break speed checks.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S09PacketHeldItemChange/">S09PacketHeldItemChange</a>
 <a class="related-chip" href="../S2FPacketSetSlot/">S2FPacketSetSlot</a>

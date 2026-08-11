@@ -446,6 +446,663 @@ if(event.isOnGround()){
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent on every client; the vanilla handler is the only consumer for most clients.</div>
 <div class="impl-clients">All 8 clients ship the vanilla NetHandlerPlayClient.handleBlockChange untouched. The only divergence is Rise 6.2.4's scaffold mode intercepting the packet on its own event bus; Rise 6.x also exposes S23 to its scripting API (NetworkAPI.java).</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S23 changes a single block and tells the client about it; it is the smallest world mutation in the protocol. For server-side anticheats it is still a compensated-world event: the cache must apply the change before checks judge the player, and scaffolding checks use the client-facing block state to validate placement supports. The corpus for S23 is the block-change pipeline again (Grim AirLiquidPlace and CompensatedWorld, NCP BlockChangeTracker and BlockChangeListener, Intave SingleBlockChangeReader, Kauri BlockUpdateHandler, FlopAC WrappedOutBlockChange), with the same world-cache pattern as S22 but per block.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AirLiquidPlace (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Flag block placements against air or liquid supports, which scaffolding and tower cheats produce.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">BlockPlaceListener reads the placement position and the compensated world's block state at the support location; it first checks blockHistory for recent START_DIGGING or netty-sync modifications at that position so instant-breaking plus placing in the same tick does not false. If the support is air or a no-place liquid, the check flags and resyncs the placed block. The file's comment documents years of false-positive archaeology around dig-then-place ordering.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Scaffold and tower modules that place against supports the client should not see as solid.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/scaffolding/AirLiquidPlace.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/scaffolding/AirLiquidPlace.java =====
+package ac.grim.grimac.checks.impl.scaffolding;
+
+import ac.grim.grimac.GrimAPI;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.BlockPlaceCheck;
+import ac.grim.grimac.checks.type.BlockPlaceListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.anticheat.update.BlockPlace;
+import ac.grim.grimac.utils.change.BlockModification;
+import ac.grim.grimac.utils.nmsutil.Materials;
+import com.github.retrooper.packetevents.protocol.player.GameMode;
+import com.github.retrooper.packetevents.protocol.world.states.type.StateType;
+import com.github.retrooper.packetevents.util.Vector3i;
+
+@CheckData(name = "AirLiquidPlace", stableKey = "grim.scaffolding.air_liquid_place", description = "Placed a block against an invalid support")
+public class AirLiquidPlace extends BlockPlaceCheck implements BlockPlaceListener {
+    public AirLiquidPlace(GrimPlayer player) {
+        super(player);
+    }
+
+    /*
+     * This check has been plagued by falses for ages, and I've finally figured it out.
+     * When breaking and placing on the same tick in the same tick, I believe the vanilla client always sends DIGGING ACTION packets first
+     * This check's falses all seem to stem from processing DiggingAction.START_DIGGING before PacketType.Play.Client.PLAYER_BLOCK_PLACEMENT in the same tick
+     * Since we process the break first, when we go to process the place it looks like the player placed against air in the async world
+     *
+     * We will often see:
+     *     Async world updated: short_grass -&gt; air at X: -32, Y: 69, Z: -240, tick 0, cause/source: DiggingAction.START_DIGGING
+     *     AirLiquidPlace Check: Block state at X: -32, Y: 69, Z: -240 is air (valid: false), tick +0-1, cause/source: PacketType.Play.Client.PLAYER_BLOCK_PLACEMENT &lt;---- previously falsed here
+     *     Async world updated: air -&gt; short_grass at X: -32, Y: 69, Z: -240, tick +3-4, cause: realtime task in applyBlockChanges(List&lt;Vector3i&gt; toApplyBlocks) source: PacketType.Play.Client.PONG
+     *     Async world updated: short_grass -&gt; air at X: -32, Y: 69, Z: -240, tick +0-1, cause: handleNettySyncTransaction(LatencyUtils.java:56) source: PacketType.Play.Client.PONG
+     *
+     * In addition, it is possible for:
+     *     Async world updated: short_grass -&gt; air at X: -49, Y: 69, Z: -190, tick 0, cause: realtime task in applyBlockChanges(List&lt;Vector3i&gt; toApplyBlocks) source: PacketType.Play.Client.PONG
+     *     AirLiquidPlace Check: Block state at X: -49, Y: 69, Z: -190 is air (valid=false), tick 0 &lt;--- false due to change from applyBlockChanges()
+     *     Async world updated: grass_block[snowy=false] -&gt; grass_block[snowy=false] at X: -49, Y: 69, Z: -189, tick 0, cause: handleNettySyncTransaction(LatencyUtils.java:56) source: PacketType.Play.Client.PONG
+     *
+     * And in even more rare cases:
+     *     Async world updated: air -&gt; air at X: -51, Y: 71, Z: -179, tick 0, cause: handleNettySyncTransaction(LatencyUtils.java:56) source: PacketType.Play.Client.PONG
+     *     AirLiquidPlace Check: Block state at X: -49, Y: 70, Z: -180 is short_grass (valid=true), tick 0
+     *     Async world updated: short_grass -&gt; air at X: -49, Y: 70, Z: -180, tick 1, cause/source: DiggingAction.START_DIGGING &lt;--- double dig here (see my AirLiquidBreak patch) this is legit behaviour. Can only be up to 2 in 1 tick though.
+     *     Async world updated: air -&gt; short_grass at X: -49, Y: 70, Z: -180, tick 1, cause/source: DiggingAction.START_DIGGING
+     *     Async world updated: short_grass -&gt; air at X: -51, Y: 70, Z: -179, tick 1, cause: realtime task in applyBlockChanges(List&lt;Vector3i&gt; toApplyBlocks) source: PacketType.Play.Client.PONG
+     *     AirLiquidPlace Check: Block state at X: -49, Y: 70, Z: -179 is air (valid=false), tick 2 &lt;--- falses here due to double dig if we only check the latest changed blockstate. We have to check all changes at the location in same tick.
+     *     AirLiquidPlace Check: Block state at X: -49, Y: 70, Z: -179 is air (valid=true), tick 2
+     *
+     *     All of which previously would've caused a false.
+     *     To solve this we store recently changed blocks caused by DiggingAction.START_DIGGING (instant breaking) and check against the old block.
+     *     Lots of other checks have similar issues, and with the new player.blockHistory we can patch those.
+     *
+     * So that's it right? It's unfalsable?
+     *     Very close but not quite. Vanilla's client game desyncs, especially on a laggy connection where a player is breaking and placing grass 20 cps/sec in the same tick
+     *     it is possible for short grass to be interacted with even if server-side the block is air much later, and it won't be accounted for because the modification isn't recent.
+     *     This is incredibly rare, unreliable and is only triggerable if you intentionally want to false the check. I consider a violation lvl of 2-3 to be reliable
+     *     and 5-6 to be autobannable (if you don't care about people who are deliberately trying to get themselves false banned)
+     */
+    @Override
+    public void onBlockPlace(final BlockPlace place) {
+        if (player.gamemode == GameMode.CREATIVE) return;
+
+        Vector3i blockPos = place.position;
+        StateType placeAgainst = player.compensatedWorld.getBlockType(blockPos.getX(), blockPos.getY(), blockPos.getZ());
+
+        int currentTick = GrimAPI.INSTANCE.getTickManager().currentTick;
+        // this is actual more lenient than we need to be, We can check up to 1 ticks for all changes at location sand up to 0 ticks for first change
+        // But for such tiny differences in legitness it's not worth it.
+        Iterable&lt;BlockModification&gt; blockModifications = player.blockHistory.getRecentModifications((blockModification) -&gt; currentTick - blockModification.tick() &lt; 2
+                &amp;&amp; blockPos.equals(blockModification.location())
+                &amp;&amp; (blockModification.cause() == BlockModification.Cause.START_DIGGING || blockModification.cause() == BlockModification.Cause.HANDLE_NETTY_SYNC_TRANSACTION));
+
+        // Check if old block from instant breaking in same tick as the current placement was valid
+        // There should only be one block here for legit clients
+        for (BlockModification blockModification : blockModifications) {
+            StateType stateType = blockModification.oldBlockContents().getType();
+            if (!stateType.isAir() &amp;&amp; !Materials.isNoPlaceLiquid(stateType)) {
+                return;
+            }
+        }
+
+        if (placeAgainst.isAir() || Materials.isNoPlaceLiquid(placeAgainst)) { // fail
+            if (flag() &amp;&amp; shouldModifyPackets() &amp;&amp; shouldCancel()) {
+                place.resync();
+            }
+        }
+    }
+
+    @Override
+    protected int getDefaultCancelVL() {
+        return 0;
+    }
+}
+// NOTE (AI): The S22 and S23 corpus hits are the compensated-world change paths this check depends on; the check itself is placement-triggered.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> NCP blockplace fastplace and Grim's other scaffolding checks handle adjacent placement abuse; Kauri BlockD applies the same support validation against its replicated world.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">SingleBlockChangeReader (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Decode the S23 packet into a single block position and block data for the block update tracker.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">AbstractPacketReader implementing BlockChanges: reads the BlockPosition field through a thread-local converter and returns the packet's block data as single-element lists, which the BlockUpdateTracker applies to the block cache and acknowledges.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Feeds the block cache for Intave's interaction ray-trace and physics checks; registered for BLOCK_CHANGE and BLOCK_BREAK in PacketReaders.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/packet/reader/SingleBlockChangeReader.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/packet/reader/SingleBlockChangeReader.java =====
+package de.jpx3.intave.packet.reader;
+
+import com.comphenix.protocol.wrappers.BlockPosition;
+import com.comphenix.protocol.wrappers.WrappedBlockData;
+import de.jpx3.intave.klass.Lookup;
+import de.jpx3.intave.packet.converter.BlockPositionConverter;
+
+import java.util.Collections;
+import java.util.List;
+
+public final class SingleBlockChangeReader extends AbstractPacketReader implements BlockChanges {
+  @Override
+  public List&lt;BlockPosition&gt; blockPositions() {
+    BlockPosition blockPosition = packet().getModifier()
+      .withType(Lookup.serverClass("BlockPosition"), BlockPositionConverter.threadConverter())
+      .read(0);
+    return Collections.singletonList(blockPosition);
+//    return Lists.newArrayList(packet.getBlockPositionModifier().readSafely(0));
+  }
+
+  @Override
+  public List&lt;WrappedBlockData&gt; blockDataList() {
+    return Collections.singletonList(packet().getBlockData().read(0));
+  }
+}
+// NOTE (AI): setup(BLOCK_CHANGE, SingleBlockChangeReader::new) is the S23 registration; the acknowledgeBlockChange sequence keeps 1.19+ sequenced changes in lockstep.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> FlopAC WrappedOutBlockChange wraps the same packet for the reach processor; Hydro WorldTracker handleBlockChange and Kauri runUpdate(WrapperPlayServerBlockChange) are the equivalent apply paths.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WrappedOutBlockChange (FlopAC)</span>
+<span class="impl-module-clients">(JTXOfficial-FlopAC)</span>
+</div>
+<p class="impl-pattern">Reflection wrapper for the S23 packet so FlopAC's processors can read block positions and data across 1.7-1.12 protocol versions.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Resolves the NMS PacketPlayOutBlockChange class and its fields: legacy 1.7.10 x/y/z ints plus block and data fields, or the 1.8+ BlockPosition and IBlockData fields. process() populates a BaseBlockPosition from whichever layout the server version uses, and the constructor can build the packet from a Bukkit Block for server-side resync.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Feeds the compensated world and reach processor; a thin protocol layer rather than a flagging check.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> JTXOfficial-FlopAC — src/main/java/me/jtx/flopac/tinyprotocol/packet/out/WrappedOutBlockChange.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: JTXOfficial-FlopAC — src/main/java/me/jtx/flopac/tinyprotocol/packet/out/WrappedOutBlockChange.java =====
+package me.jtx.flopac.tinyprotocol.packet.out;
+
+import lombok.Getter;
+import me.jtx.flopac.tinyprotocol.api.NMSObject;
+import me.jtx.flopac.tinyprotocol.api.Packet;
+import me.jtx.flopac.tinyprotocol.api.ProtocolVersion;
+import me.jtx.flopac.tinyprotocol.api.packets.reflections.Reflections;
+import me.jtx.flopac.tinyprotocol.api.packets.reflections.types.WrappedClass;
+import me.jtx.flopac.tinyprotocol.api.packets.reflections.types.WrappedField;
+import me.jtx.flopac.tinyprotocol.api.packets.reflections.types.WrappedMethod;
+import me.jtx.flopac.tinyprotocol.packet.types.BaseBlockPosition;
+import me.jtx.flopac.tinyprotocol.reflection.FieldAccessor;
+import me.jtx.flopac.util.box.ReflectionUtil;
+import org.bukkit.block.Block;
+import org.bukkit.entity.Player;
+
+@Getter
+public class WrappedOutBlockChange extends NMSObject {
+    private static final String packet = Packet.Server.BLOCK_CHANGE;
+
+    //1.7.10 and below
+    private static FieldAccessor&lt;Integer&gt; legacyX;
+    private static FieldAccessor&lt;Integer&gt; legacyY;
+    private static FieldAccessor&lt;Integer&gt; legacyZ;
+    private static WrappedField blockChangeBlockField;
+    private static WrappedField blockDataIntField;
+    private static WrappedMethod getDataMethod;
+
+    //1.8 and newer
+    private static FieldAccessor&lt;Object&gt; blockPosAccessor;
+    private static WrappedField iBlockDataField;
+
+
+    private static final WrappedClass blockChangeClass = Reflections.getNMSClass(packet);
+    private static final WrappedClass nmsBlockClass = Reflections.getNMSClass("Block");
+    private static final WrappedClass craftBlockClass = Reflections.getCBClass("CraftBlock");
+
+    private BaseBlockPosition position;
+
+    public WrappedOutBlockChange(Object packet) {
+        super(packet);
+    }
+
+    @Override
+    public void updateObject() {
+
+    }
+
+    public WrappedOutBlockChange(Block block) {
+        if(ProtocolVersion.getGameVersion().isAbove(ProtocolVersion.V1_7_10)) {
+            setPacket(packet, block.getX(), block.getY(), block.getZ(), ReflectionUtil.getWorldHandle(block.getWorld()));
+        } else {
+            setPacket(packet, ReflectionUtil.getWorldHandle(block.getWorld()), new BaseBlockPosition(block.getX(), block.getY(), block.getZ()).getAsBlockPosition());
+        }
+    }
+
+    @Override
+    public void process(Player player, ProtocolVersion version) {
+        if (ProtocolVersion.getGameVersion().isBelow(ProtocolVersion.V1_8)) {
+            position = new BaseBlockPosition(fetch(legacyX), fetch(legacyY), fetch(legacyZ));
+        } else {
+            position = new BaseBlockPosition(fetch(blockPosAccessor));
+        }
+    }
+
+    static {
+        if(ProtocolVersion.getGameVersion().isBelow(ProtocolVersion.V1_8)) {
+            legacyX = fetchField(packet, int.class, 0);
+            legacyY = fetchField(packet, int.class, 1);
+            legacyZ = fetchField(packet, int.class, 2);
+
+
+            blockChangeBlockField = blockChangeClass.getFirstFieldByType(nmsBlockClass.getParent());
+            blockDataIntField = blockChangeClass.getFieldByName("data");
+            getDataMethod = Reflections.getNMSClass("World").getMethod("getData", int.class, int.class, int.class);
+        } else {
+            blockPosAccessor = fetchField(packet, Object.class, 0);
+            iBlockDataField = blockChangeClass.getFieldByType(ReflectionUtil.iBlockData, 0);
+        }
+    }
+}
+// NOTE (AI): The S23 corpus hit is the BLOCK_CHANGE registration; FlopAC's WrappedOutMultiBlockChange covers S22.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Intave SingleBlockChangeReader and Kauri runUpdate(WrapperPlayServerBlockChange) do the same decode on different packet libraries.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BlockChangeListener (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">Ingest server block changes, including S23 single-block updates, into NCP's compensated BlockChangeTracker.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Registers Bukkit listeners for piston, redstone, entity block change, block form and player interact events and converts each into tracker.addBlockChange entries with tick and direction; the tracker's validity-interval model lets SurvivalFly, Passable and Visible ask whether a block existed at move time rather than now.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Feeds ground and passable decisions; the same cache that prevents false phase flags when explosions and pistons reshape the world.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/compat/blocks/changetracker/BlockChangeListener.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/compat/blocks/changetracker/BlockChangeListener.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.compat.blocks.changetracker;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
+import org.bukkit.block.data.Bisected.Half;
+import org.bukkit.block.data.BlockData;
+import org.bukkit.event.Event.Result;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.*;
+import org.bukkit.event.entity.EntityChangeBlockEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.material.Directional;
+import org.bukkit.material.Door;
+import org.bukkit.material.MaterialData;
+
+import fr.neatmonster.nocheatplus.NCPAPIProvider;
+import fr.neatmonster.nocheatplus.compat.bukkit.BridgeMaterial;
+import fr.neatmonster.nocheatplus.compat.versions.ServerVersion;
+import fr.neatmonster.nocheatplus.components.NoCheatPlusAPI;
+import fr.neatmonster.nocheatplus.components.registry.order.RegistrationOrder.RegisterMethodWithOrder;
+import fr.neatmonster.nocheatplus.event.mini.MiniListener;
+import fr.neatmonster.nocheatplus.logging.Streams;
+import fr.neatmonster.nocheatplus.utilities.ReflectionUtil;
+import fr.neatmonster.nocheatplus.utilities.map.BlockFlags;
+import fr.neatmonster.nocheatplus.utilities.map.BlockProperties;
+import fr.neatmonster.nocheatplus.utilities.map.BlockProperties.ToolProps;
+import fr.neatmonster.nocheatplus.utilities.map.BlockProperties.ToolType;
+
+
+public class BlockChangeListener implements Listener {
+
+    // TODO: Fine grained configurability (also switch flag in MovingListener to a sub-config).
+    // TODO: Coarse player activity filter?
+    public final boolean is1_13 = ServerVersion.compareMinecraftVersion("1.13") &gt;= 0;
+    public final boolean is1_9 = ServerVersion.compareMinecraftVersion("1.9") &gt;= 0;
+
+    /** These blocks certainly can't be pushed nor pulled. */
+    public static long F_MOVABLE_IGNORE = BlockFlags.F_LIQUID;
+    /** These blocks might be pushed or pulled. */
+    public static long F_MOVABLE = BlockFlags.F_GROUND | BlockFlags.F_SOLID;
+
+    private final BlockChangeTracker tracker;
+    private final boolean retractHasBlocks;
+    private boolean enabled = true;
+
+    /** Default tag for listeners. */
+    private final String defaultTag = "system.nocheatplus.blockchangetracker";
+
+    /** Properties by dirt block type.*/
+    protected final Map&lt;Material, ToolType&gt; dirtblocks = init();
+
+    /**
+     * NOTE: Using MiniListenerWithOrder (and @Override before @EventHandler)
+     * would make the registry attempt to register with Bukkit for 'Object'.
+     */
+    private final MiniListener&lt;?&gt;[] miniListeners = new MiniListener&lt;?&gt;[] {
+        new MiniListener&lt;BlockRedstoneEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(BlockRedstoneEvent event) {
+                if (enabled) {
+                    onBlockRedstone(event);
+                }
+            }
+        },
+        new MiniListener&lt;EntityChangeBlockEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(EntityChangeBlockEvent event) {
+                if (enabled) {
+                    onEntityChangeBlock(event);
+                }
+            }
+        },
+        new MiniListener&lt;BlockPistonExtendEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(BlockPistonExtendEvent event) {
+                if (enabled) {
+                    onPistonExtend(event);
+                }
+            }
+        },
+        new MiniListener&lt;BlockPistonRetractEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(BlockPistonRetractEvent event) {
+                if (enabled) {
+                    onPistonRetract(event);
+                }
+            }
+        },
+        new MiniListener&lt;PlayerInteractEvent&gt;() {
+            // Include cancelled events, due to the use-block part.
+            @EventHandler(ignoreCancelled = false, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(PlayerInteractEvent event) {
+                if (enabled) {
+                    onPlayerInteract(event);
+                }
+            }
+        },
+        new MiniListener&lt;BlockFormEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(BlockFormEvent event) {
+                if (enabled) {
+                    onBlockForm(event);
+                }
+            }
+        }
+        //        @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+        //        public void onBlockPhysics (final BlockPhysicsEvent event) {
+        //            if (!enabled) {
+        //                return;
+        //            }
+        //            // TODO: Fine grained enabling state (pistons, doors, other).
+        //            final Block block = event.getBlock();
+        //            if (block == null || !physicsMaterials.contains(block.getType())) {
+        //                return;
+        //            }
+        //            // TODO: MaterialData -&gt; Door, upper/lower half needed ?
+        //            tracker.addBlocks(block); // TODO: Skip too fast changing states?
+        //            DebugUtil.debug("BlockPhysics: " + block); // TODO: REMOVE
+        //        }
+    };
+
+    public BlockChangeListener(final BlockChangeTracker tracker) {
+        this.tracker = tracker;
+        if (ReflectionUtil.getMethodNoArgs(BlockPistonRetractEvent.class, "getBlocks") == null) {
+            retractHasBlocks = false;
+            NCPAPIProvider.getNoCheatPlusAPI().getLogManager().info(Streams.STATUS, "Assume legacy piston behavior.");
+        }
+        else {
+            retractHasBlocks = true;
+        }
+    }
+
+    private Map&lt;Material, ToolType&gt; init() {
+        Map&lt;Material, ToolType&gt; blocks = new HashMap&lt;Material, ToolType&gt;();
+        blocks.put(BridgeMaterial.GRASS_BLOCK, ToolType.HOE);
+        blocks.put(Material.DIRT, ToolType.HOE);
+        if (is1_13) {
+            blocks.put(Material.COARSE_DIRT, ToolType.SPADE);
+            blocks.put(Material.PODZOL, ToolType.SPADE);
+        }
+        if (ServerVersion.compareMinecraftVersion("1.17") &gt;= 0) {
+            blocks.put(Material.ROOTED_DIRT, ToolType.SPADE);
+        }
+        return blocks;
+    }
+
+    /**
+     * Register actual listener(s).
+     */
+    public void register() {
+        // TODO: Replace 'if (enabled)' by actually unregistering the listeners.
+        final NoCheatPlusAPI api = NCPAPIProvider.getNoCheatPlusAPI();
+        for (final MiniListener&lt;?&gt; listener : miniListeners) {
+            api.addComponent(listener);
+        }
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    private BlockFace getDirection(final Block pistonBlock) {
+        // TODO: Register/store a fetcher thing (DirectionalFromBlock)
+        if (is1_13) {
+            final BlockData data = pistonBlock.getState().getBlockData();
+            if (data instanceof org.bukkit.block.data.Directional) {
+                org.bukkit.block.data.Directional directional = (org.bukkit.block.data.Directional) data;
+                return directional.getFacing();
+            }
+            return null;
+        }
+        final MaterialData data = pistonBlock.getState().getData();
+        if (data instanceof Directional) {
+            Directional directional = (Directional) data;
+            return directional.getFacing();
+        }
+        return null;
+    }
+
+    /**
+     * Get the direction, in which blocks are or would be moved (towards the piston).
+     * 
+     * @param pistonBlock
+     * @param eventDirection
+     * @return
+     */
+    private BlockFace getRetractDirection(final Block pistonBlock, final BlockFace eventDirection) {
+        // Tested for pistons directed upwards.
+        // TODO: Test for pistons directed downwards, N, W, S, E.
+        // TODO: distinguish sticky vs. not sticky.
+        final BlockFace pistonDirection = getDirection(pistonBlock);
+        if (pistonDirection == null) {
+            return eventDirection;
+        }
+        else {
+            return eventDirection.getOppositeFace();
+        }
+    }
+
+    private void onPistonExtend(final BlockPistonExtendEvent event) {
+        final BlockFace direction = event.getDirection();
+        tracker.addPistonBlocks(event.getBlock().getRelative(direction), direction, event.getBlocks());
+    }
+
+    private void onPistonRetract(final BlockPistonRetractEvent event) {
+        final List&lt;Block&gt; blocks;
+        if (retractHasBlocks) {
+            blocks = event.getBlocks();
+        }
+        else {
+            @SuppressWarnings("deprecation")
+            final Location retLoc = event.getRetractLocation();
+            if (retLoc == null) {
+                blocks = null;
+            }
+            else {
+                final Block retBlock = retLoc.getBlock();
+                final long flags = BlockFlags.getBlockFlags(retBlock.getType());
+                if ((flags &amp; F_MOVABLE_IGNORE) == 0L &amp;&amp; (flags &amp; F_MOVABLE) != 0L) {
+                    blocks = new ArrayList&lt;Block&gt;(1);
+                    blocks.add(retBlock);
+                }
+                else {
+                    blocks = null;
+                }
+            }
+        }
+        // TODO: Special cases (don't push upwards on retract, with the resulting location being a solid block).
+        final Block pistonBlock = event.getBlock();
+        final BlockFace direction = getRetractDirection(pistonBlock, event.getDirection());
+        tracker.addPistonBlocks(pistonBlock.getRelative(direction.getOppositeFace()), direction, blocks);
+    }
+
+    private void onBlockRedstone(final BlockRedstoneEvent event) {
+        final int oldCurrent = event.getOldCurrent();
+        final int newCurrent = event.getNewCurrent();
+        if (oldCurrent == newCurrent || oldCurrent &gt; 0 &amp;&amp; newCurrent &gt; 0) {
+            return;
+        }
+        // TODO: Fine grained enabling state (pistons, doors, other).
+        final Block block = event.getBlock();
+        // TODO: Abstract method for a block and a set of materials (redstone, interact, ...).
+        if (block == null 
+            || (BlockFlags.getBlockFlags(block.getType()) &amp; BlockFlags.F_VARIABLE_REDSTONE) == 0) {
+            return;
+        }
+        addRedstoneBlock(block);
+    }
+
+    private void addRedstoneBlock(final Block block) {
+        addBlockWithAttachedPotential(block, BlockFlags.F_VARIABLE_REDSTONE);
+    }
+
+    private void onEntityChangeBlock(final EntityChangeBlockEvent event) {
+        final Block block = event.getBlock();
+        if (block != null) {
+            tracker.addBlocks(block); // E.g. falling blocks like sand.
+        }
+    }
+
+    private void onPlayerInteract(final PlayerInteractEvent event) {
+        // Check preconditions.
+        final org.bukkit.event.block.Action action = event.getAction();
+        if (action == org.bukkit.event.block.Action.RIGHT_CLICK_BLOCK) {
+            onRightClickBlock(event);
+        }
+        else if (!event.isCancelled()) {
+            if (action == org.bukkit.event.block.Action.PHYSICAL) {
+                onInteractPhysical(event);
+            }
+        }
+    }
+
+    private void onInteractPhysical(final PlayerInteractEvent event) {
+        final Block block = event.getClickedBlock();
+        if (block != null) {
+            final Material type = block.getType();
+            // TODO: Consider a flag.
+            if (type == BridgeMaterial.FARMLAND) {
+                tracker.addBlocks(block);
+            }
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private void onRightClickBlock(final PlayerInteractEvent event) {
+        final Result result = event.useInteractedBlock();
+        if ((result == Result.ALLOW 
+            || result == Result.DEFAULT &amp;&amp; !event.isCancelled())) {
+            final Block block = event.getClickedBlock();
+            if (block != null) {
+                final Material type = block.getType();
+                // Dirt
+                final ToolType blocktool = dirtblocks.get(type);
+                if (blocktool != null) {
+                    final ToolProps tool = BlockProperties.getToolProps(event.getItem());
+                    if (is1_13) {
+                        if (tool.toolType == ToolType.SPADE 
+                            || blocktool == tool.toolType) {
+                            tracker.addBlocks(block);
+                        }
+                    } 
+                    else {
+                        final boolean defdata = block.getData() == 0;
+                        if (is1_9 &amp;&amp; type == BridgeMaterial.GRASS_BLOCK &amp;&amp; tool.toolType == ToolType.SPADE 
+                            || defdata &amp;&amp; tool.toolType == ToolType.HOE) {
+                            tracker.addBlocks(block);
+                        }
+                    }
+                }
+
+                if ((BlockFlags.getBlockFlags(type) &amp; BlockFlags.F_VARIABLE_USE) != 0L) {
+                    addBlockWithAttachedPotential(block, BlockFlags.F_VARIABLE_USE);
+                }
+            }
+        }
+    }
+
+    private void onBlockForm(final BlockFormEvent event) {
+        final Block block = event.getBlock();
+        if (block != null) {
+            // TODO: Filter by player activity.
+            tracker.addBlocks(block);
+        }
+    }
+
+    /**
+     * Add a past state for this block, extending for the other block in case of
+     * doors. This is for the case of interaction or redstone level change.
+     * 
+     * @param block
+     * @param relevantFlags
+     */
+    private void addBlockWithAttachedPotential(final Block block, final long relevantFlags) {
+        if (is1_13) {
+            final BlockData data = block.getState().getBlockData();
+            if (data instanceof org.bukkit.block.data.type.Door) {
+                org.bukkit.block.data.type.Door door = (org.bukkit.block.data.type.Door) data;
+                final Block otherBlock = block.getRelative(door.getHalf() == Half.TOP ? BlockFace.DOWN : BlockFace.UP);
+                /*
+                 * TODO: In case of redstone: Double doors... detect those too? Is it still more
+                 * efficient than using BlockPhysics with lazy delayed updating
+                 * (TickListener...). Hinge corner... possibilities?
+                 */
+                if (otherBlock != null // Top of the map / special case.
+                    &amp;&amp; (BlockFlags.getBlockFlags(otherBlock.getType()) &amp; relevantFlags) != 0) {
+                    tracker.addBlocks(block, otherBlock);
+                    return;
+                }
+            }
+        } 
+        // Legacy
+        else {
+            final MaterialData materialData = block.getState().getData();
+            if (materialData instanceof Door) {
+                final Door door = (Door) materialData;
+                final Block otherBlock = block.getRelative(door.isTopHalf() ? BlockFace.DOWN : BlockFace.UP);
+                /*
+                 * TODO: In case of redstone: Double doors... detect those too? Is it still more
+                 * efficient than using BlockPhysics with lazy delayed updating
+                 * (TickListener...). Hinge corner... possibilities?
+                 */
+                if (otherBlock != null // Top of the map / special case.
+                    &amp;&amp; (BlockFlags.getBlockFlags(otherBlock.getType()) &amp; relevantFlags) != 0) {
+                    tracker.addBlocks(block, otherBlock);
+                    return;
+                }
+            }
+        }
+        // Only add the block in question itself.
+        tracker.addBlocks(block);
+    }
+
+}
+// NOTE (AI): The S22 and S23 corpus hits are shared: the listener feeds both packet-driven and event-driven changes into one tracker.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim CompensatedWorld and Hydro WorldTracker apply S23 changes with transaction accuracy; AntiHaxerman's NetworkFilter whitelists the S23 packet (GPacketPlayServerBlockChange) so its pipeline processes block changes while dropping other traffic.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S21PacketChunkData/">S21PacketChunkData</a>
 <a class="related-chip" href="../S22PacketMultiBlockChange/">S22PacketMultiBlockChange</a>

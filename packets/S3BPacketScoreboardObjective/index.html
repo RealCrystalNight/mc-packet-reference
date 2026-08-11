@@ -368,6 +368,271 @@ public class NetworkAPI extends API {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Spicy uses EventPacket pre; Rise 6.x script packets run through the NetworkAPI table.</div>
 <div class="impl-clients">Spicy mutates packet objects inside its EventPacket pre-phase. Rise 6.x routes packet awareness through the script API rather than module code.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S3B carries scoreboard objective lifecycle state, and only Shard touches it. The monitor HUD system consumes and emits the packet family: ScoreboardSlotObserver reads S3B REMOVE actions and S3D display binds to detect when its claimed sidebar slot is displaced, and ScoreboardPacketBridge builds the S3B objectives, S3D display binds and S3C score rows that render the monitor sidebar. Everything else in the corpus is plumbing or sibling-family noise: Negativity's SCOREBOARD_OBJECTIVE constant and Artemis' four scoreboard wrapper interfaces with their PacketRepository entries register the family, intave's ScoreboardAccessor and EntityCollisionDisabler build and read PacketPlayOutScoreboardTeam (S3E), NCP's CollisionUtil uses the Bukkit scoreboard API for team-collision lookups, and BetterAnticheat's ReloadCommand hits on a comment.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ScoreboardSlotObserver (Shard)</span>
+<span class="impl-module-clients">(KaelusAI-Shard)</span>
+</div>
+<p class="impl-pattern">Watches the scoreboard objective and display streams so the monitor HUD notices when its claimed sidebar slot is taken over or its objective is removed by the server or another plugin.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">MONITOR-priority PacketSendEvent listener active only while the slot registry holds claims. For S3B it wraps the event as WrapperPlayServerScoreboardObjective and, when the mode is REMOVE and the objective name matches a claim, fires the claim's onSlotLost callback; for S3D it compares the display slot against the claim and fires onSlotLost with a DISPLACED reason when a foreign objective binds there. The callback is deferred through tasksAfterSend onto the main thread.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> None; it is a coordination observer. It detects slot loss so the monitor view can re-assert its sidebar or fall back.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> KaelusAI-Shard — src/main/kotlin/ac/shard/monitor/core/ScoreboardSlotObserver.kt</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: KaelusAI-Shard — src/main/kotlin/ac/shard/monitor/core/ScoreboardSlotObserver.kt =====
+/*
+ * This file is part of Shard - https://github.com/KaelusAI/Shard
+ * Copyright (C) 2026 KaelusAI
+ *
+ * Shard is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Shard is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package ac.shard.monitor.core
+
+import ac.shard.scheduler.SchedulerService
+import com.github.retrooper.packetevents.event.PacketListenerAbstract
+import com.github.retrooper.packetevents.event.PacketListenerPriority
+import com.github.retrooper.packetevents.event.PacketSendEvent
+import com.github.retrooper.packetevents.protocol.packettype.PacketType
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerDisplayScoreboard
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerScoreboardObjective
+import org.bukkit.entity.Player
+
+class ScoreboardSlotObserver(
+  private val scheduler: SchedulerService,
+  private val registry: ScoreboardSlotRegistry,
+) : PacketListenerAbstract(PacketListenerPriority.MONITOR) {
+  override fun onPacketSend(event: PacketSendEvent) {
+    if (registry.isIdle()) {
+      return
+    }
+    val type = event.packetType
+    if (
+      type != PacketType.Play.Server.DISPLAY_SCOREBOARD &amp;&amp;
+        type != PacketType.Play.Server.SCOREBOARD_OBJECTIVE
+    ) {
+      return
+    }
+    inspect(event, type == PacketType.Play.Server.DISPLAY_SCOREBOARD)
+  }
+
+  private fun inspect(event: PacketSendEvent, isDisplay: Boolean) {
+    val viewer = event.getPlayer&lt;Any&gt;() as? Player ?: return
+    val claims = registry.claimsFor(viewer.uniqueId) ?: return
+    if (isDisplay) {
+      inspectDisplay(event, viewer, claims)
+    } else {
+      inspectObjective(event, viewer, claims)
+    }
+  }
+
+  private fun inspectDisplay(event: PacketSendEvent, viewer: Player, claims: List&lt;SlotClaim&gt;) {
+    val wrapper = WrapperPlayServerDisplayScoreboard(event)
+    val foreign = wrapper.scoreName
+    if (foreign.isBlank()) {
+      return
+    }
+    val claim = claims.firstOrNull { it.slot == wrapper.position &amp;&amp; it.objective != foreign }
+    claim?.let { defer(event, viewer, it, SlotLossReason.DISPLACED, foreign) }
+  }
+
+  private fun inspectObjective(event: PacketSendEvent, viewer: Player, claims: List&lt;SlotClaim&gt;) {
+    val wrapper = WrapperPlayServerScoreboardObjective(event)
+    if (wrapper.mode != WrapperPlayServerScoreboardObjective.ObjectiveMode.REMOVE) {
+      return
+    }
+    val claim = claims.firstOrNull { it.objective == wrapper.name }
+    claim?.let { defer(event, viewer, it, SlotLossReason.OBJECTIVE_REMOVED, wrapper.name) }
+  }
+
+  private fun defer(
+    event: PacketSendEvent,
+    viewer: Player,
+    claim: SlotClaim,
+    reason: SlotLossReason,
+    foreignObjective: String,
+  ) {
+    event.tasksAfterSend.add(
+      Runnable {
+        scheduler.runSync(
+          viewer,
+          Runnable { claim.onLost.onSlotLost(viewer, reason, foreignObjective) },
+        )
+      }
+    )
+  }
+}
+// NOTE (AI): inspectObjective (lines 67-74) is the S3B branch: a REMOVE-mode objective matching a claimed name fires the claim's onSlotLost callback. inspectDisplay (lines 57-65) is the S3D branch for display-slot displacement.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> ScoreboardPacketBridge is the emission half of the same monitor: it writes the objectives and display binds this observer reads.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ScoreboardPacketBridge (Shard)</span>
+<span class="impl-module-clients">(KaelusAI-Shard)</span>
+</div>
+<p class="impl-pattern">Emits the scoreboard objective, display and score packets that render Shard's monitor HUD sidebar for a viewer.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">createObjective sends an S3B CREATE objective (name, INTEGER render type, component title, optional fixed score format) followed by an S3D display bind to the target slot; removeObjective sends an S3B REMOVE. updateEntry and removeEntry maintain the S3C score rows, choosing reset-score packets on servers that support fancy text (1.20.3+). All packets go out through the PacketEvents player manager.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> None; it is the writer side of a HUD. The bridge is the emission half of the scoreboard observer's coordination loop.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> KaelusAI-Shard — src/main/kotlin/ac/shard/monitor/core/ScoreboardPacketBridge.kt</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: KaelusAI-Shard — src/main/kotlin/ac/shard/monitor/core/ScoreboardPacketBridge.kt =====
+/*
+ * This file is part of Shard - https://github.com/KaelusAI/Shard
+ * Copyright (C) 2026 KaelusAI
+ *
+ * Shard is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Shard is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package ac.shard.monitor.core
+
+import com.github.retrooper.packetevents.PacketEvents
+import com.github.retrooper.packetevents.manager.server.ServerVersion
+import com.github.retrooper.packetevents.protocol.score.ScoreFormat
+import com.github.retrooper.packetevents.wrapper.PacketWrapper
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerDisplayScoreboard
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerResetScore
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerScoreboardObjective
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateScore
+import java.util.Optional
+import net.kyori.adventure.text.Component
+import org.bukkit.entity.Player
+
+data class ObjectiveSpec(
+  val name: String,
+  val slot: Int,
+  val title: String,
+  val legacyTitleFallback: String,
+  val blankScoreText: String,
+)
+
+data class ScoreDisplay(val entryDisplay: String?, val scoreText: String?)
+
+class ScoreboardPacketBridge(private val cache: ComponentCache) {
+  fun supportsFancyText(viewer: Player): Boolean =
+    serverSupportsFancyText() &amp;&amp; clientVersion(viewer).isNewerThanOrEquals(ServerVersion.V_1_20_3)
+
+  fun createObjective(viewer: Player, spec: ObjectiveSpec) {
+    val fancy = supportsFancyText(viewer)
+    val title = if (fancy) spec.title else spec.title.ifBlank { spec.legacyTitleFallback }
+    val create =
+      if (fancy) {
+        WrapperPlayServerScoreboardObjective(
+          spec.name,
+          WrapperPlayServerScoreboardObjective.ObjectiveMode.CREATE,
+          cache.component(title),
+          WrapperPlayServerScoreboardObjective.RenderType.INTEGER,
+          ScoreFormat.fixedScore(cache.component(spec.blankScoreText)),
+        )
+      } else {
+        WrapperPlayServerScoreboardObjective(
+          spec.name,
+          WrapperPlayServerScoreboardObjective.ObjectiveMode.CREATE,
+          cache.component(title),
+          WrapperPlayServerScoreboardObjective.RenderType.INTEGER,
+        )
+      }
+    sendPacket(viewer, create)
+    sendPacket(viewer, WrapperPlayServerDisplayScoreboard(spec.slot, spec.name))
+  }
+
+  fun displayObjective(viewer: Player, name: String, slot: Int) {
+    sendPacket(viewer, WrapperPlayServerDisplayScoreboard(slot, name))
+  }
+
+  fun removeObjective(viewer: Player, name: String) {
+    sendPacket(
+      viewer,
+      WrapperPlayServerScoreboardObjective(
+        name,
+        WrapperPlayServerScoreboardObjective.ObjectiveMode.REMOVE,
+        Component.empty(),
+        null,
+      ),
+    )
+  }
+
+  fun updateEntry(
+    viewer: Player,
+    objective: String,
+    entry: String,
+    score: Int,
+    display: ScoreDisplay,
+  ) {
+    sendPacket(viewer, updateScorePacket(viewer, objective, entry, score, display))
+  }
+
+  fun removeEntry(viewer: Player, objective: String, entry: String) {
+    val packet =
+      if (supportsFancyText(viewer)) {
+        WrapperPlayServerResetScore(entry, objective)
+      } else {
+        WrapperPlayServerUpdateScore(
+          entry,
+          WrapperPlayServerUpdateScore.Action.REMOVE_ITEM,
+          objective,
+          Optional.empty(),
+        )
+      }
+    sendPacket(viewer, packet)
+  }
+
+  private fun updateScorePacket(
+    viewer: Player,
+    objective: String,
+    entry: String,
+    score: Int,
+    display: ScoreDisplay,
+  ): PacketWrapper&lt;*&gt; {
+    if (!supportsFancyText(viewer)) {
+      return WrapperPlayServerUpdateScore(
+        entry,
+        WrapperPlayServerUpdateScore.Action.CREATE_OR_UPDATE_ITEM,
+        objective,
+        Optional.of(score),
+      )
+    }
+    val format =
+      display.scoreText?.let { ScoreFormat.fixedScore(cache.component(it)) }
+        ?: ScoreFormat.blankScore()
+    return WrapperPlayServerUpdateScore(
+      entry,
+      WrapperPlayServerUpdateScore.Action.CREATE_OR_UPDATE_ITEM,
+      objective,
+      score,
+      display.entryDisplay?.let { cache.component(it) },
+      format,
+    )
+  }
+
+  fun serverSupportsFancyText(): Boolean =
+    PacketEvents.getAPI().serverManager.version.isNewerThanOrEquals(ServerVersion.V_1_20_3)
+
+  private fun clientVersion(viewer: Player): ServerVersion =
+    PacketEvents.getAPI().playerManager.getClientVersion(viewer).toServerVersion()
+
+  private fun sendPacket(viewer: Player, packet: PacketWrapper&lt;*&gt;) {
+    PacketEvents.getAPI().playerManager.sendPacket(viewer, packet)
+  }
+}
+// NOTE (AI): createObjective (lines 46-68) emits an S3B CREATE objective followed by an S3D display bind; removeObjective (lines 74-84) emits an S3B REMOVE. The remaining methods maintain the S3C score rows that populate the sidebar.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other anticheat emits or reads S3B; the rest of the corpus registers the family (Negativity, Artemis) or touches the sibling S3E team packet (intave).</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S3CPacketUpdateScore/">S3CPacketUpdateScore</a>
 <a class="related-chip" href="../S3DPacketDisplayScoreboard/">S3DPacketDisplayScoreboard</a>

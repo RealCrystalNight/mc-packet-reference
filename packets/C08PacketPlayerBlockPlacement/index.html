@@ -1591,6 +1591,783 @@ public final class AutoPot extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PreMotionEvent / UpdateEvent for the send loop; PacketSendEvent in Rise 5.99 Scaffold to silence C09; direct PacketUtil.sendPacket or sendQueue.addToSendQueue everywhere else.</div>
 <div class="impl-clients">Rise 5.99/6.x use PacketUtil.sendPacket and can replace packets on the event (event.setPacket). Memeware/Nekoware/Spicy construct C08 directly and push via sendQueue or PacketUtil. Sigma routes through playerController for clicks but constructs C08 raw for use spam. Tenacity sends via NetHandler.addToSendQueueNoEvent in ScaffoldModule and references C08 in PacketUtil.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The block placement packet reports a position, face, cursor vector and held item, and it doubles as the use-item packet. Anticheats use it to validate placement reach and rotation (Grim FarPlace), the hit vector of scaffold clicks (FlopAC ScaffoldA), placement speed and direction (NCP blockplace suite), and the item actually held (Negativity Scaffold). Because scaffolding cheats click the top face center of the block below at full speed, placement checks are the server-side counter to scaffold modules.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">FarPlace (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Reach check for block placement: verifies that the placed block is within the player's block interaction range.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A BlockPlaceCheck listening on the BlockPlace update produced from the packet. It iterates every possible eye height, cuts a collision box for the placed block to the player position vector, and takes the minimum squared distance. The threshold is the BLOCK_INTERACTION_RANGE attribute plus the movement threshold hypot component, with scaffolding blocks exempt. On a flag it resyncs the player when packet modification is allowed.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Scaffold and far-place cheats that place blocks beyond the interaction range, including clients that fake the placement position.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/scaffolding/FarPlace.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/scaffolding/FarPlace.java =====
+package ac.grim.grimac.checks.impl.scaffolding;
+
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.BlockPlaceCheck;
+import ac.grim.grimac.checks.type.BlockPlaceListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.anticheat.update.BlockPlace;
+import ac.grim.grimac.utils.collisions.datatypes.SimpleCollisionBox;
+import ac.grim.grimac.utils.math.Vector3dm;
+import ac.grim.grimac.utils.math.VectorUtils;
+import com.github.retrooper.packetevents.protocol.attribute.Attributes;
+import com.github.retrooper.packetevents.protocol.world.states.type.StateTypes;
+import com.github.retrooper.packetevents.util.Vector3i;
+
+@CheckData(name = "FarPlace", stableKey = "grim.scaffolding.far_place", description = "Placing blocks from too far away")
+public class FarPlace extends BlockPlaceCheck implements BlockPlaceListener {
+    public FarPlace(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onBlockPlace(final BlockPlace place) {
+        if (!player.cameraEntity.isSelf() || player.inVehicle()) return;
+
+        Vector3i blockPos = place.position;
+
+        if (place.material == StateTypes.SCAFFOLDING) return;
+
+        double min = Double.MAX_VALUE;
+        final double[] possibleEyeHeights = player.getPossibleEyeHeights();
+        for (double d : possibleEyeHeights) {
+            SimpleCollisionBox box = new SimpleCollisionBox(blockPos);
+            Vector3dm best = VectorUtils.cutBoxToVector(player.x, player.y + d, player.z, box);
+            min = Math.min(min, best.distanceSquared(player.x, player.y + d, player.z));
+        }
+
+        // getPickRange() determines this?
+        // With 1.20.5+ the new attribute determines creative mode reach using a modifier
+        double maxReach = player.compensatedEntities.self.getAttributeValue(Attributes.BLOCK_INTERACTION_RANGE);
+        double threshold = player.getMovementThreshold();
+        maxReach += Math.hypot(threshold, threshold);
+
+        if (min &gt; maxReach * maxReach) { // fail
+            if (flag() &amp;&amp; shouldModifyPackets() &amp;&amp; shouldCancel()) {
+                place.resync();
+            }
+        }
+    }
+}
+// NOTE (AI): FarPlace measures the distance from every possible eye height to the placed block against the block interaction range attribute; the scaffolding package adds rotation, position, invalid face and multi-place checks over the same BlockPlace pipeline.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The rest of Grim's scaffolding package (RotationPlace, PositionPlace, InvalidPlaceA/B, MultiPlace) validates the same packet on rotation, position and face; Kauri and Artemis run analogous placement checks through their emulator pipelines.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold (Negativity)</span>
+<span class="impl-module-clients">(Elikill58-Negativity)</span>
+</div>
+<p class="impl-pattern">Silent-scaffold detection through item mismatch: the placed block must match the block held at click time.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On BlockPlaceEvent it schedules a deferred task one tick later and compares the placed block type against the item in hand. If the hotbar slot changed or the held item is not a block matching the placement, it alerts with a confidence score derived from the player ping and, when a setback is configured, removes the placed block and refunds the item.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Silent scaffold and instant block placement cheats that place blocks without actually holding them, including rapid hotbar switching.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Elikill58-Negativity — src/com/elikill58/negativity/spigot/protocols/ScaffoldProtocol.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Elikill58-Negativity — src/com/elikill58/negativity/spigot/protocols/ScaffoldProtocol.java =====
+package com.elikill58.negativity.spigot.protocols;
+
+import java.util.Locale;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.inventory.ItemStack;
+
+import com.elikill58.negativity.spigot.SpigotNegativity;
+import com.elikill58.negativity.spigot.SpigotNegativityPlayer;
+import com.elikill58.negativity.spigot.utils.ItemUtils;
+import com.elikill58.negativity.universal.Cheat;
+import com.elikill58.negativity.universal.CheatKeys;
+import com.elikill58.negativity.universal.ReportType;
+import com.elikill58.negativity.universal.utils.UniversalUtils;
+
+public class ScaffoldProtocol extends Cheat implements Listener {
+
+	private ScaffoldProtocol instance;
+	
+	public ScaffoldProtocol() {
+		super(CheatKeys.SCAFFOLD, false, ItemUtils.GRASS, CheatCategory.WORLD, true);
+		instance = this;
+	}
+
+	@SuppressWarnings("deprecation")
+	@EventHandler (ignoreCancelled = true)
+	public void onBlockBreak(BlockPlaceEvent e) {
+		Player p = e.getPlayer();
+		SpigotNegativityPlayer np = SpigotNegativityPlayer.getNegativityPlayer(p);
+		if (!np.hasDetectionActive(this))
+			return;
+		int slot = p.getInventory().getHeldItemSlot();
+		if(np.ping &gt; 120)
+			return;
+		Bukkit.getScheduler().runTaskLater(SpigotNegativity.getInstance(), new Runnable() {
+			@Override
+			public void run() {
+				Material m = p.getItemInHand().getType(), placed = e.getBlockPlaced().getType();
+				if ((m == null || (!m.isBlock() &amp;&amp; !m.equals(placed))) &amp;&amp; slot != p.getInventory().getHeldItemSlot() &amp;&amp; !placed.equals(Material.AIR)) {
+					int localPing = np.ping;
+					if(localPing == 0)
+						localPing = 1;
+					boolean mayCancel = SpigotNegativity.alertMod(ReportType.WARNING, p, instance, UniversalUtils.parseInPorcent(120 / localPing),
+							"Item in hand: " + m.name() + " Block placed: " + placed.name(),
+							hoverMsg("main", "%item%", m.name().toLowerCase(Locale.ROOT), "%block%", placed.name().toLowerCase(Locale.ROOT)));
+					if(isSetBack() &amp;&amp; mayCancel) {
+						p.getInventory().addItem(new ItemStack(placed));
+						e.getBlockPlaced().setType(Material.AIR);
+					}
+				}
+			}
+		}, 0);
+	}
+}
+// NOTE (AI): Negativity's ScaffoldProtocol is a Bukkit-event listener keyed to PlayerInteractEvent/PlayerMoveEvent rather than raw packets; it tracks the number of blocks placed per second while moving and flags scaffold-style placement rates.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Negativity's FastPlaceProtocol and AirPlaceProtocol cover placement speed and placing against air; CheaterDeleter's VerifyBlockPlace module and Frequency's ScaffoldA cover the same domains on other stacks.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BlockPlaceListener suite (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">The classic dispatcher for NCP's placement checks: direction, fast place, reach, no swing and against-world.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Registers Direction, FastPlace, Reach, NoSwing and AgainstWorld checks with per-player config and data classes, listening to Bukkit placement events plus the PacketPlayInBlockPlace stream via the ProtocolLib UseItemAdapter. FastPlace tracks placement timing per block, Reach measures the distance to the placed position, and Direction validates the face against the player's look vector.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Fast place, scaffold, placement reach abuse, placing while looking away, and placement into invalid world state.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/BlockPlaceListener.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/BlockPlaceListener.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.checks.blockplace;
+
+import java.util.Arrays;
+import java.util.List;
+
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
+import org.bukkit.block.BlockState;
+import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Player;
+import org.bukkit.entity.Projectile;
+import org.bukkit.event.Event.Result;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.Action;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.block.SignChangeEvent;
+import org.bukkit.event.entity.ProjectileLaunchEvent;
+import org.bukkit.event.player.PlayerAnimationEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerSignOpenEvent;
+import org.bukkit.event.player.PlayerSignOpenEvent.Cause;
+import org.bukkit.inventory.ItemStack;
+
+import fr.neatmonster.nocheatplus.NCPAPIProvider;
+import fr.neatmonster.nocheatplus.checks.CheckListener;
+import fr.neatmonster.nocheatplus.checks.CheckType;
+import fr.neatmonster.nocheatplus.checks.blockinteract.BlockInteractData;
+import fr.neatmonster.nocheatplus.checks.blockinteract.BlockInteractListener;
+import fr.neatmonster.nocheatplus.checks.combined.Combined;
+import fr.neatmonster.nocheatplus.checks.combined.CombinedConfig;
+import fr.neatmonster.nocheatplus.checks.combined.Improbable;
+import fr.neatmonster.nocheatplus.checks.moving.MovingConfig;
+import fr.neatmonster.nocheatplus.checks.moving.MovingData;
+import fr.neatmonster.nocheatplus.checks.moving.model.PlayerMoveData;
+import fr.neatmonster.nocheatplus.checks.net.FlyingQueueHandle;
+import fr.neatmonster.nocheatplus.checks.net.model.DataPacketFlying;
+import fr.neatmonster.nocheatplus.compat.bukkit.BridgeEntityType;
+import fr.neatmonster.nocheatplus.compat.Bridge1_9;
+import fr.neatmonster.nocheatplus.compat.BridgeMisc;
+import fr.neatmonster.nocheatplus.components.NoCheatPlusAPI;
+import fr.neatmonster.nocheatplus.components.data.ICheckData;
+import fr.neatmonster.nocheatplus.components.data.IData;
+import fr.neatmonster.nocheatplus.components.registry.factory.IFactoryOne;
+import fr.neatmonster.nocheatplus.permissions.Permissions;
+import fr.neatmonster.nocheatplus.players.DataManager;
+import fr.neatmonster.nocheatplus.players.IPlayerData;
+import fr.neatmonster.nocheatplus.players.PlayerFactoryArgument;
+import fr.neatmonster.nocheatplus.stats.Counters;
+import fr.neatmonster.nocheatplus.utilities.ReflectionUtil;
+import fr.neatmonster.nocheatplus.utilities.TickTask;
+import fr.neatmonster.nocheatplus.utilities.map.BlockFlags;
+import fr.neatmonster.nocheatplus.utilities.map.BlockProperties;
+import fr.neatmonster.nocheatplus.utilities.map.MaterialUtil;
+import fr.neatmonster.nocheatplus.utilities.math.TrigUtil;
+import fr.neatmonster.nocheatplus.utilities.moving.MovingUtil;
+import fr.neatmonster.nocheatplus.worlds.WorldFactoryArgument;
+
+/**
+ * Central location to listen to events that are relevant for the block place checks.
+ * 
+ * @see BlockPlaceEvent
+ */
+public class BlockPlaceListener extends CheckListener {
+
+    /** Surrounding material check. */
+    private final Against against = addCheck(new Against());
+
+    /** AutoSign hack check. */
+    private final AutoSign autoSign = addCheck(new AutoSign());
+
+    /** The direction check. */
+    private final Direction direction = addCheck(new Direction());
+
+    /** The fast place check. */
+    private final FastPlace fastPlace = addCheck(new FastPlace());
+
+    /** The no swing check. */
+    private final NoSwing noSwing = addCheck(new NoSwing());
+
+    /** The reach check. */
+    private final Reach reach = addCheck(new Reach());
+
+    /** The scaffold check. */
+    private final Scaffold scaffold = addCheck(new Scaffold());
+
+    /** The speed check. */
+    private final Speed speed = addCheck(new Speed());
+
+    /** For temporary use: LocUtil.clone before passing deeply, call setWorld(null) after use. */
+    private final Location useLoc = new Location(null, 0, 0, 0);
+    private final Location useLoc2 = new Location(null, 0, 0, 0);
+    
+    // Counter/debug stuff
+    private final Counters counters = NCPAPIProvider.getNoCheatPlusAPI().getGenericInstance(Counters.class);
+    private final int idBoatsOnWaterOnly = counters.registerKey("boatsonwateronly");
+    private final int idEnderPearl = counters.registerKey("throwenderpearl");
+    
+    // Reflection stuff
+    private final Class&lt;?&gt; blockMultiPlaceEvent = ReflectionUtil.getClass("org.bukkit.event.block.BlockMultiPlaceEvent");
+    private final boolean hasPlayerSignOpenEvent = ReflectionUtil.getClass("org.bukkit.event.player.PlayerSignOpenEvent") != null;
+    private final boolean hasGetReplacedState = ReflectionUtil.getMethodNoArgs(BlockPlaceEvent.class, "getReplacedState", BlockState.class) != null;
+
+    public final List&lt;BlockFace&gt; faces = Arrays.asList(new BlockFace[] {BlockFace.SOUTH, BlockFace.WEST, BlockFace.EAST, BlockFace.NORTH});
+
+    @SuppressWarnings("unchecked")
+    public BlockPlaceListener() {
+        super(CheckType.BLOCKPLACE);
+        final NoCheatPlusAPI api = NCPAPIProvider.getNoCheatPlusAPI();
+        if (hasPlayerSignOpenEvent) {
+            queuedComponents.add(new Listener() {
+                @EventHandler(ignoreCancelled = true, priority = EventPriority.LOWEST)
+                public void onOpeningSign1_20(final PlayerSignOpenEvent event) {
+                    handleSignOpenEvent(event.getPlayer(), event.getCause());
+                }
+            });
+        }
+        api.register(api.newRegistrationContext()
+                // BlockPlaceConfig
+                .registerConfigWorld(BlockPlaceConfig.class)
+                .factory(new IFactoryOne&lt;WorldFactoryArgument, BlockPlaceConfig&gt;() {
+                    @Override
+                    public BlockPlaceConfig getNewInstance(WorldFactoryArgument arg) {
+                        return new BlockPlaceConfig(arg.worldData);
+                    }
+                })
+                .registerConfigTypesPlayer()
+                .context() //
+                // BlockPlaceData
+                .registerDataPlayer(BlockPlaceData.class)
+                .factory(new IFactoryOne&lt;PlayerFactoryArgument, BlockPlaceData&gt;() {
+                    @Override
+                    public BlockPlaceData getNewInstance(
+                            PlayerFactoryArgument arg) {
+                        return new BlockPlaceData();
+                    }
+                })
+                .addToGroups(CheckType.BLOCKPLACE, true, IData.class, ICheckData.class)
+                .context() //
+                );
+    }
+
+    public static int getBlockPlaceHash(final Block block, final Material mat) {
+        int hash = fr.neatmonster.nocheatplus.utilities.ds.map.CoordHash.hashCode3DPrimes(block.getX(), block.getY(), block.getZ());
+        if (mat != null) {
+            hash |= mat.name().hashCode();
+        }
+        hash |= block.getWorld().getName().hashCode();
+        return hash;
+    }
+    
+    /** Mechanic introduced with 1.20. The event itself was introduced around 1.20.1 */
+    private void handleSignOpenEvent(final Player player, Cause cause) {
+        if (cause != Cause.INTERACT) {
+            return;
+        }
+        // Always set this to 0 on opening a sign. We don't need to check for hashing here, only time.
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final BlockPlaceData data = pData.getGenericInstance(BlockPlaceData.class);
+        data.autoSignPlacedHash = 0;
+        data.signOpenTime = System.currentTimeMillis();
+    }
+
+    @EventHandler(ignoreCancelled = true, priority = EventPriority.LOWEST)
+    public void onBlockPlace(final BlockPlaceEvent event) {
+        if (!DataManager.getPlayerData(event.getPlayer()).isCheckActive(CheckType.BLOCKPLACE, event.getPlayer())) {
+            return;
+        }
+        final Block block = event.getBlockPlaced();
+        final Block blockAgainst = event.getBlockAgainst();
+        // Skip any null blocks.
+        if (block == null || blockAgainst == null) {
+            return;
+        }
+        final Player player = event.getPlayer();
+        final Material placedMat;
+        if (hasGetReplacedState) {
+            placedMat = event.getBlockPlaced().getType();
+        }
+        else if (Bridge1_9.hasGetItemInOffHand()) {
+            placedMat = BlockProperties.isAir(event.getItemInHand()) ? Material.AIR : event.getItemInHand().getType();
+        }
+        else placedMat = Bridge1_9.getItemInMainHand(player).getType(); // Safety first.
+        boolean cancelled = false;
+        int skippedRedundantChecks = 0;
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final BlockPlaceData data = pData.getGenericInstance(BlockPlaceData.class);
+        final BlockPlaceConfig cc = pData.getGenericInstance(BlockPlaceConfig.class);
+        final BlockInteractData biData = pData.getGenericInstance(BlockInteractData.class);
+        // isInteractBlock - the block placed against is the block last interacted with.
+        final boolean isInteractBlock = !biData.getLastIsCancelled() &amp;&amp; biData.matchesLastBlock(TickTask.getTick(), blockAgainst);
+        final BlockFace placedFace = event.getBlock().getFace(blockAgainst);
+        final Block blockPlaced = event.getBlockPlaced();
+        final boolean shouldSkipSome;
+        if (blockMultiPlaceEvent != null &amp;&amp; event.getClass() == blockMultiPlaceEvent) {
+            if (placedMat == Material.BEDROCK || Bridge1_9.hasEndCrystalItem() &amp;&amp; placedMat == Bridge1_9.END_CRYSTAL_ITEM) {
+                shouldSkipSome = true;
+            }
+            else {
+                if (pData.isDebugActive(CheckType.BLOCKPLACE)) {
+                    debug(player, "Block place " + event.getClass().getName() + " " + placedMat);
+                }
+                shouldSkipSome = false;
+            }
+        } 
+        else shouldSkipSome = BlockProperties.isScaffolding(placedMat);
+
+        if (MaterialUtil.isAnySign(placedMat)) {
+            // To be checkde on SignChangeEvents
+            data.signOpenTime = System.currentTimeMillis();
+            data.autoSignPlacedHash = getBlockPlaceHash(block, placedMat);
+            if (pData.isDebugActive(CheckType.BLOCKPLACE_AUTOSIGN)) {
+                debug(player, "Register time and hash for this placed sign: h= " + data.autoSignPlacedHash + " / t= " + data.signOpenTime);
+            }
+        }
+
+        // Don't run checks, if a set back is scheduled.
+        if (pData.isPlayerSetBackScheduled()) {
+            cancelled = true;
+            if (pData.isDebugActive(CheckType.BLOCKPLACE)) {
+                debug(player, "Prevent block place due to a scheduled set back.");
+            }
+        }
+        
+        // Surrounding material first.
+        if (!cancelled &amp;&amp; against.isEnabled(player, pData) &amp;&amp; !BlockProperties.isScaffolding(placedMat)
+            &amp;&amp; against.check(player, block, placedMat, blockAgainst, isInteractBlock, data, cc, pData)) {
+            cancelled = true;
+        }
+
+        // No swing check (player doesn't swing their arm when placing a lily pad).
+        if (!cancelled &amp;&amp; !cc.noSwingExceptions.contains(placedMat) 
+            &amp;&amp; noSwing.isEnabled(player, pData) &amp;&amp; noSwing.check(player, data, cc)) {
+            cancelled = true;
+        }
+
+        // Fast place check.
+        if (!cancelled &amp;&amp; fastPlace.isEnabled(player, pData)) {
+            if (fastPlace.check(player, block, TickTask.getTick(), data, cc, pData)) {
+                cancelled = true;
+            }
+            // Check for Improbable, whatever FastPlace says, provided the feature is enabled at all.
+            if (cc.fastPlaceImprobableWeight &gt; 0.0f) {
+                if (cc.fastPlaceImprobableFeedOnly) {
+                    Improbable.feed(player, cc.fastPlaceImprobableWeight, System.currentTimeMillis());
+                }
+                else if (data.fastPlaceVL &gt; 25 &amp;&amp; Improbable.check(player, cc.fastPlaceImprobableWeight, System.currentTimeMillis(), "blockplace.fastplace", pData)) {
+                    // Only check on decently high frequencies
+                    cancelled = true;
+                }
+                // Feed for lower frequencies.
+                else Improbable.feed(player, cc.fastPlaceImprobableWeight, System.currentTimeMillis());
+            }
+        }
+
+        // Scaffold Check
+        if (scaffold.isEnabled(player, pData) &amp;&amp; placedFace != null) {
+            final PlayerMoveData thisMove = pData.getGenericInstance(MovingData.class).playerMoves.getCurrentMove();
+            if (faces.contains(placedFace) 
+                &amp;&amp; thisMove.from.getY() - blockPlaced.getY() &lt; 2.0
+                &amp;&amp; thisMove.from.getY() - blockPlaced.getY() &gt;= 1.0
+                &amp;&amp; blockPlaced.getType().isSolid() 
+                &amp;&amp; TrigUtil.distance(player.getLocation(), blockPlaced.getLocation()) &lt; 2.0) {
+
+                // Monitor yawrate before feeding Improbable or checking for Scaffold
+                if (Combined.checkYawRate(player, thisMove.from.getYaw(), System.currentTimeMillis(), thisMove.from.getWorldName(), pData)) {
+                    cancelled = true;
+                }
+                // Always check for Scaffold whatever yawrate says. 
+                if (data.cancelNextPlace &amp;&amp; (Math.abs(data.currentTick - TickTask.getTick()) &lt; 10)
+                    || scaffold.check(player, placedFace, pData, data, cc, event.isCancelled(), thisMove.yDistance, pData.getGenericInstance(MovingData.class).sfJumpPhase)) {
+                    cancelled = true;
+                }
+                // If not cancelled, do feed the Improbable.
+                else if (cc.scaffoldImprobableWeight &gt; 0.0f) {
+                    if (cc.scaffoldImprobableFeedOnly) {
+                        Improbable.feed(player, cc.scaffoldImprobableWeight, System.currentTimeMillis());
+                    } 
+                    else if (Improbable.check(player, cc.scaffoldImprobableWeight, System.currentTimeMillis(), "blockplace.scaffold", pData)) {
+                        cancelled = true;
+                    }
+                }
+                if (!cancelled) data.scaffoldVL *= 0.98;
+            }
+            // Cleanup
+            data.cancelNextPlace = false;
+        }
+
+        final FlyingQueueHandle flyingHandle = new FlyingQueueHandle(pData);
+        final boolean reachCheck = pData.isCheckActive(CheckType.BLOCKPLACE_REACH, player);
+        final boolean directionCheck = pData.isCheckActive(CheckType.BLOCKPLACE_DIRECTION, player);
+        if (reachCheck || directionCheck) {
+            final Location loc = player.getLocation(useLoc);
+            final double eyeHeight = MovingUtil.getEyeHeight(player);
+            // Reach check (distance).
+            if (!cancelled &amp;&amp; !shouldSkipSome) {
+                if (isInteractBlock &amp;&amp; biData.isPassedCheck(CheckType.BLOCKINTERACT_REACH)) {
+                    skippedRedundantChecks++;
+                }
+                else if (reachCheck &amp;&amp; reach.check(player, eyeHeight, block, data, cc)) {
+                    cancelled = true;
+                }
+            }
+            // Direction check.
+            if (!cancelled &amp;&amp; !shouldSkipSome) {
+                if (isInteractBlock &amp;&amp; biData.isPassedCheck(CheckType.BLOCKINTERACT_DIRECTION)) {
+                    skippedRedundantChecks++;
+                }
+                else if (directionCheck) {
+                    if (blockAgainst.getType() == Material.LADDER || BlockProperties.isCarpet(blockAgainst.getType())) {
+                        // TODO: Actually fix this, don't just ignore it.
+                        // ISSUE: https://github.com/NoCheatPlus/Issues/issues/524
+                    } 
+                    else if (direction.check(player, loc, eyeHeight, block, null, flyingHandle, data, cc, pData)) {
+                        cancelled = true;
+                    }
+                }
+            }
+            useLoc.setWorld(null);
+        }
+
+        // If one of the checks requested to cancel the event, do so.
+        if (cancelled) {
+            event.setCancelled(true);
+            // We need to do this because block-place cancelling can easily desync the player.
+            pData.requestUpdateInventory();
+        }
+        if (pData.isDebugActive(CheckType.BLOCKPLACE)) {
+            debugBlockPlace(player, placedMat, block, blockAgainst, skippedRedundantChecks, flyingHandle, pData);
+        }
+        // Cleanup
+        // Reminder(currently unused): useLoc.setWorld(null);
+    }
+    
+    /** We listen to sign change events for the autosign check */
+    @EventHandler(priority = EventPriority.LOWEST, ignoreCancelled = true)
+    public void onSignChange(final SignChangeEvent event) {
+        if (!DataManager.getPlayerData(event.getPlayer()).isCheckActive(CheckType.BLOCKPLACE, event.getPlayer())) {
+            return;
+        }
+        if (event.getClass() != SignChangeEvent.class) {
+            // Built in plugin compatibility.
+            // (Don't understand why two consecutive events editing the same block are a problem)
+            return;
+        }
+        final Player player = event.getPlayer();
+        final Block block = event.getBlock();
+        final String[] lines = event.getLines();
+        if (block == null || lines == null || player == null) {
+            return;
+        }
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final BlockPlaceData data = pData.getGenericInstance(BlockPlaceData.class);
+        if (autoSign.isEnabled(player, pData) &amp;&amp; autoSign.check(player, block, lines, pData)) {
+            event.setCancelled(true);
+        }
+    }
+    
+    /** We listen to this event for the swining animation */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPlayerAnimation(final PlayerAnimationEvent event) {
+        final BlockPlaceData data = DataManager.getGenericInstance(event.getPlayer(), BlockPlaceData.class);
+        data.noSwingCount = Math.max(data.noSwingCount - 1, 0);
+    } 
+    
+    /** We listen to interact events for some misc checks */
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onPlayerInteract(final PlayerInteractEvent event) {
+        if (!DataManager.getPlayerData(event.getPlayer()).isCheckActive(CheckType.BLOCKPLACE, event.getPlayer())) {
+            return;
+        }
+        if (event.getAction() != Action.RIGHT_CLICK_BLOCK) {
+            return;
+        }
+        final Player player = event.getPlayer();
+        final ItemStack stack = Bridge1_9.getUsedItem(player, event);
+        if (stack == null) {
+            return;
+        }
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final BlockPlaceConfig cc = pData.getGenericInstance(BlockPlaceConfig.class);
+        final Material type = stack.getType();
+        if (MaterialUtil.isBoat(type)) {
+            if (cc.boatsOnWaterOnly) {
+                denyOrAllowBoatPlacement(player, event, pData);
+            }
+        }
+        else if (MaterialUtil.isSpawnEgg(type)) {
+            if (speed.isEnabled(player, pData) &amp;&amp; speed.check(player, cc, pData)) {
+                event.setCancelled(true);
+            }
+        }
+    }
+    
+    /**
+     * Check if the boat can be placed on ground, provided CachedConfig.boatsOnWaterOnly returned true.
+     * 
+     * @param player
+     * @param event
+     * @param pData
+     */
+    private void denyOrAllowBoatPlacement(final Player player, final PlayerInteractEvent event, final IPlayerData pData) {
+        final Block block = event.getClickedBlock();
+        final Material mat = block.getType();
+        if (BlockProperties.isWater(mat)) {
+            // Allow placement
+            return;
+        }
+        // TODO: Shouldn't this be the opposite face?
+        final BlockFace blockFace = event.getBlockFace();
+        final Block relBlock = block.getRelative(blockFace);
+        final Material relMat = relBlock.getType();
+        // TODO: Placing inside of water, but not "against" ?
+        if (BlockProperties.isWater(relMat)) {
+            // Allow placement
+            return;
+        }
+        // Interacted with a non-water block, deny.
+        if (!pData.hasPermission(Permissions.BLOCKPLACE_BOATSONWATERONLY, player)) {
+            final Result previousUseBlock = event.useInteractedBlock();
+            event.setCancelled(true);
+            event.setUseItemInHand(Result.DENY);
+            event.setUseInteractedBlock(previousUseBlock == Result.DEFAULT ? Result.ALLOW : previousUseBlock);
+            counters.addPrimaryThread(idBoatsOnWaterOnly, 1);
+            // Attempt to refresh the inventory in order to workaround possible ghost items.
+            pData.requestUpdateInventory();
+        }
+    }
+
+    @EventHandler(ignoreCancelled = true, priority = EventPriority.LOWEST)
+    public void onProjectileLaunch(final ProjectileLaunchEvent event) {
+        // The shooter needs to be a player.
+        final Projectile projectile = event.getEntity();
+        final Player player = BridgeMisc.getShooterPlayer(projectile);
+        if (player == null) {
+            return;
+        }
+        if (!DataManager.getPlayerData(player).isCheckActive(CheckType.BLOCKPLACE, player)) {
+            return;
+        }
+        if (MovingUtil.hasScheduledPlayerSetBack(player)) {
+            event.setCancelled(true);
+            return;
+        }
+        // And the projectile must be one the following:
+        EntityType type = event.getEntityType();
+        if (!BridgeEntityType.PROJECTILE_CHECK_LIST.contains(type)) return;
+
+        // Do the actual check...
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final BlockPlaceConfig cc = pData.getGenericInstance(BlockPlaceConfig.class);
+        boolean cancel = false;
+        if (speed.isEnabled(player, pData)) {
+            final long now = System.currentTimeMillis();
+            final Location loc = player.getLocation(useLoc2);
+            if (Combined.checkYawRate(player, loc.getYaw(), now, loc.getWorld().getName(), pData)) {
+                // Yawrate (checked extra).
+                cancel = true;
+            }
+            if (speed.check(player, cc, pData)) {
+                // If the check was positive, cancel the event.
+                cancel = true;
+            }
+            else if (cc.speedImprobableWeight &gt; 0.0f) {
+                if (cc.speedImprobableFeedOnly) {
+                    Improbable.feed(player, cc.speedImprobableWeight, now);
+                } 
+                else if (Improbable.check(player, cc.speedImprobableWeight, now, "blockplace.speed", pData)) {
+                    cancel = true;
+                }
+            }
+        }
+
+        // Ender pearl glitch (ab-) use.
+        if (!cancel &amp;&amp; type == EntityType.ENDER_PEARL &amp;&amp; pData.getGenericInstance(CombinedConfig.class).enderPearlCheck) {
+            if (!BlockProperties.isPassable(projectile.getLocation(useLoc2))) {
+                // Launch into a block.
+                cancel = true;
+            }
+            else {
+                if (!BlockProperties.isPassable(player.getEyeLocation(), projectile.getLocation(useLoc2))) {
+                    // (Spare a useLoc2, for this is seldom rather.)
+                    // Something between player 
+                    cancel = true;
+                }
+                else {
+                    final Material mat = player.getLocation(useLoc2).getBlock().getType();
+                    final long flags = BlockFlags.F_CLIMBABLE | BlockFlags.F_LIQUID | BlockFlags.F_IGN_PASSABLE_CHECK;
+                    if (!BlockProperties.isAir(mat) &amp;&amp; (BlockFlags.getBlockFlags(mat) &amp; flags) == 0 &amp;&amp; !mcAccess.getHandle().hasGravity(mat)) {
+                        // Still fails on piston traps etc.
+                        if (!BlockProperties.isPassable(player.getLocation(), projectile.getLocation()) 
+                            &amp;&amp; !BlockProperties.isOnGroundOrResetCond(player, player.getLocation(), pData.getGenericInstance(MovingConfig.class).yOnGround)) {
+                            cancel = true;
+                        }
+                    }
+                }
+            }
+            if (cancel) {
+                counters.addPrimaryThread(idEnderPearl, 1);
+            }
+        }
+
+        if (cancel) {
+            event.setCancelled(true);
+        }
+        // Cleanup.
+        useLoc2.setWorld(null);
+    }
+
+    // TODO: remove this
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onMove(PlayerMoveEvent event) {
+        Player player = event.getPlayer();
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final BlockPlaceData data = pData.getGenericInstance(BlockPlaceData.class);
+
+        if (!pData.isCheckActive(CheckType.BLOCKPLACE, player)) return;
+
+        if (player.isSprinting()) {
+            data.sprintTime = TickTask.getTick();
+        } else if (player.isSneaking()) {
+            data.sneakTime = TickTask.getTick();
+        }
+    }
+
+    private void debugBlockPlace(final Player player, final Material placedMat, final Block block, final Block blockAgainst, 
+                                 final int skippedRedundantChecks, final FlyingQueueHandle flyingHandle, final IPlayerData pData) {
+        debug(player, "Block place(" + placedMat + "): " + block.getX() + ", " + block.getY() + ", " + block.getZ());
+        BlockInteractListener.debugBlockVSBlockInteract(player, checkType, blockAgainst, "onBlockPlace(blockAgainst)", Action.RIGHT_CLICK_BLOCK, pData);
+        if (skippedRedundantChecks &gt; 0) {
+            debug(player, "Skipped redundant checks: " + skippedRedundantChecks);
+        }
+        if (flyingHandle != null &amp;&amp; flyingHandle.isFlyingQueueFetched()) {
+            final int flyingIndex = flyingHandle.getFirstIndexWithContentIfFetched();
+            final DataPacketFlying packet = flyingHandle.getIfFetched(flyingIndex);
+            if (packet != null) {
+                debug(player, "Flying packet queue used at index " + flyingIndex + ": pitch=" + packet.getPitch() + ",yaw=" + packet.getYaw());
+                return;
+            }
+        }
+     } 
+}
+// NOTE (AI): NCP's blockplace listener dispatches Bukkit block-place events into the Direction, FastPlace, Reach, NoSwing and AgainstWorld checks; the ProtocolLib UseItemAdapter feeds it from PacketPlayInBlockPlace.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> AntiCheatPlus and DynamicDev's BlockListener expose the same fastplace/direction checks; Rammelkast's BlockListener and Arc's BlockActionListener are the 1.8-generation equivalents.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ScaffoldA (FlopAC)</span>
+<span class="impl-module-clients">(JTXOfficial-FlopAC)</span>
+</div>
+<p class="impl-pattern">Hit-vector scaffold check: a real scaffold click sequence must vary the face and cursor vector as the player moves.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On BLOCK_PLACE it reads the cursor vector (vecX, vecY, vecZ) and the face ordinal from the wrapped packet. When the yaw is changing and the block below the target position is air, it expects a non-constant click pattern: a face between 0 and 3 with a perpetual 0.5/0.5 vector is the scaffold signature, accumulating a violation level that flags at 4 consecutive hits, otherwise the level decays.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Scaffold cheats that always click the same face center, and tower/scaffold modules that keep a constant hit vector while moving.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> JTXOfficial-FlopAC — src/main/java/me/jtx/flopac/checks/misc/scaffold/ScaffoldA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: JTXOfficial-FlopAC — src/main/java/me/jtx/flopac/checks/misc/scaffold/ScaffoldA.java =====
+package me.jtx.flopac.checks.misc.scaffold;
+
+import me.jtx.flopac.base.check.api.Check;
+import me.jtx.flopac.base.check.api.CheckInformation;
+import me.jtx.flopac.base.event.PacketEvent;
+import me.jtx.flopac.base.user.User;
+import me.jtx.flopac.tinyprotocol.api.Packet;
+import me.jtx.flopac.tinyprotocol.packet.in.WrappedInBlockPlacePacket;
+import org.bukkit.Material;
+
+@CheckInformation(checkName = "Scaffold", lagBack = false, punishmentVL = 10)
+public class ScaffoldA extends Check {
+
+    private double vl;
+
+    @Override
+    public void onPacket(PacketEvent event) {
+        switch (event.getType()) {
+            case Packet.Client.BLOCK_PLACE: {
+                User user = event.getUser();
+
+                WrappedInBlockPlacePacket blockPlace =
+                        new WrappedInBlockPlacePacket(event.getPacket(), user.getPlayer());
+
+                if (user.shouldCancel() || user.getTick() &lt; 60) {
+                    vl = 0;
+                    return;
+                }
+
+                float vecX = blockPlace.getVecX();
+                float vecY = blockPlace.getVecY();
+                float vecZ = blockPlace.getVecZ();
+
+
+                int faceInt = blockPlace.getFace().b();
+
+                double yaw = Math.abs(user.getCurrentLocation().getYaw() - user.getLastLocation().getYaw());
+
+                if (yaw &gt; 0) {
+                    if (user.getBlockPlaced().getLocation().add(0, -1, 0).getBlock().getType() == Material.AIR) {
+                        if (faceInt &gt;= 0 &amp;&amp; faceInt &lt;= 3) {
+                            if (vecX == 0.5 &amp;&amp; vecY == 0.5 || vecZ == 0.5 &amp;&amp; vecY == 0.5) {
+                                if (++vl &gt; 4) {
+                                    flag(user, "Constant HitVec");
+                                }
+                            } else {
+                                vl -= Math.min(vl, 0.5f);
+                            }
+                        } else {
+                            vl -= Math.min(vl, 0.72f);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+// NOTE (AI): FlopAC ScaffoldA is a 1.8 hit-vector check: with a moving yaw and an air block below the target position, it expects the place face and vector to change; a constant 0.5/0.5 hit vector on horizontal faces is the scaffold signature.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The ScaffoldB through ScaffoldM checks in the same package add rotation, position, speed and raycast variants; Frequency ScaffoldA and Truthful's scaffold family use the same hit-vector idea on their own wrappers.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S23PacketBlockChange/">S23PacketBlockChange</a>
 <a class="related-chip" href="../S2FPacketSetSlot/">S2FPacketSetSlot</a>

@@ -232,6 +232,748 @@ public final class PingSpoofComponent extends Component {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Rise 6.x component system: @EventLink listeners on PacketReceiveEvent, PacketSendEvent, PostMotionEvent and WorldChangeEvent. Modules request spoofing via PingSpoofComponent.spoof(amount, ...) and blink().</div>
 <div class="impl-clients">Rise 6.1.30 and 6.2.4 are the only reference clients with non-vanilla S20 code, both through the component plus NetworkAPI registration. Classic clients (Memeware, Nekoware, Sigma, Spicy, Tenacity) ship the stock handler.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The attribute snapshot packet is the server's only channel for entity attribute state, and anticheats treat it as authoritative input for movement simulation. Trackers capture the movement-speed attribute and its modifiers (Hydro, AntiHaxerman, intave), Grim clamps attribute values to the wiki-defined client bounds and excludes the sprinting modifier from the base value, TruthfulAC records attribute snapshots from the Bukkit API that mirrors the S20 state, and Photon rewrites the max-health attribute. Knockback resistance is present in the packet but no check in the corpus consumes it.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ValuedAttribute (attribute range validation)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Model one server-sent attribute with wiki-defined min/max bounds and recompute its value from the S20 property, so the simulation never trusts an out-of-range base or modifier sum.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">with() recomputes the value as (base + addition sum) x (1 + multiply-base sum) x product of (1 + multiply-total) and clamps to [min, max]; the sprinting modifier is removed first because Grim tracks sprint separately in CompensatedEntities. requiredVersion gates value changes behind a client version, and setRewriter/getRewriter adapt the value per client and server version. The constructor rejects defaults outside the range.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Attribute abuse where the server sends values the client would clamp, and version-dependent attribute quirks that would otherwise desync the simulation.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/utils/data/attribute/ValuedAttribute.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/utils/data/attribute/ValuedAttribute.java =====
+package ac.grim.grimac.utils.data.attribute;
+
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.math.GrimMath;
+import com.github.retrooper.packetevents.protocol.attribute.Attribute;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateAttributes;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.function.DoubleBinaryOperator;
+import java.util.function.DoubleUnaryOperator;
+
+import static ac.grim.grimac.utils.latency.CompensatedEntities.SPRINTING_MODIFIER_UUID;
+
+public final class ValuedAttribute {
+
+    private static final DoubleUnaryOperator DEFAULT_GET_REWRITE = DoubleUnaryOperator.identity();
+
+    private final Attribute attribute;
+    // Attribute limits defined by https://minecraft.wiki/w/Attribute
+    // These seem to be clamped on the client, but not the server
+    private final double min, max;
+    private final double defaultValue;
+    private WrapperPlayServerUpdateAttributes.Property lastProperty;
+    private double value;
+
+    // This allows us to rewrite the value based on client &amp; server version
+    private DoubleBinaryOperator setRewriter;
+    private DoubleUnaryOperator getRewriter;
+
+    private ValuedAttribute(Attribute attribute, double defaultValue, double min, double max) {
+        if (defaultValue &lt; min || defaultValue &gt; max) {
+            throw new IllegalArgumentException("Default value must be between min and max!");
+        }
+
+        this.attribute = attribute;
+        this.defaultValue = defaultValue;
+        this.value = defaultValue;
+        this.min = min;
+        this.max = max;
+        this.getRewriter = DEFAULT_GET_REWRITE;
+    }
+
+    public static ValuedAttribute ranged(Attribute attribute, double defaultValue, double min,
+                                         double max) {
+        return new ValuedAttribute(attribute, defaultValue, min, max);
+    }
+
+    public ValuedAttribute withSetRewriter(DoubleBinaryOperator rewriteFunction) {
+        this.setRewriter = rewriteFunction;
+        return this;
+    }
+
+    /**
+     * Creates a rewriter that prevents the value from ever being modified unless the player meets the required version.
+     * @param player the player
+     * @param requiredVersion the required version for the attribute
+     * @return this instance for chaining
+     */
+    public ValuedAttribute requiredVersion(GrimPlayer player, ClientVersion requiredVersion) {
+        withSetRewriter((oldValue, newValue) -&gt; {
+            if (player.getClientVersion().isOlderThan(requiredVersion)) {
+                return oldValue;
+            }
+            return newValue;
+        });
+        return this;
+    }
+
+    public ValuedAttribute withGetRewriter(DoubleUnaryOperator getRewriteFunction) {
+        this.getRewriter = getRewriteFunction;
+        return this;
+    }
+
+    public Attribute attribute() {
+        return attribute;
+    }
+
+    public void reset() {
+        this.value = defaultValue;
+        this.lastProperty =
+                null; // Remove the old property with its modifiers so we don't accidentally use it again, messing up the calculation.
+    }
+
+    public double get() {
+        return getRewriter.applyAsDouble(this.value);
+    }
+
+    public void override(double value) {
+        this.value = value;
+    }
+
+    @Deprecated // Avoid using this, it only exists for special cases
+    public Optional&lt;WrapperPlayServerUpdateAttributes.Property&gt; property() {
+        return Optional.ofNullable(lastProperty);
+    }
+
+    public void recalculate() {
+        with(lastProperty);
+    }
+
+    public double with(WrapperPlayServerUpdateAttributes.Property property) {
+        double baseValue = property.getValue();
+        double additionSum = 0;
+        double multiplyBaseSum = 0;
+        double multiplyTotalProduct = 1.0;
+
+        List&lt;WrapperPlayServerUpdateAttributes.PropertyModifier&gt; modifiers =
+                property.getModifiers();
+        modifiers.removeIf(modifier -&gt; modifier.getUUID().equals(SPRINTING_MODIFIER_UUID) ||
+                modifier.getName().getKey().equals("sprinting"));
+
+        for (WrapperPlayServerUpdateAttributes.PropertyModifier modifier : modifiers) {
+            switch (modifier.getOperation()) {
+                case ADDITION:
+                    additionSum += modifier.getAmount();
+                    break;
+                case MULTIPLY_BASE:
+                    multiplyBaseSum += modifier.getAmount();
+                    break;
+                case MULTIPLY_TOTAL:
+                    multiplyTotalProduct *= (1.0 + modifier.getAmount());
+                    break;
+            }
+        }
+
+        double newValue = GrimMath.clamp((baseValue + additionSum) * (1 + multiplyBaseSum) * multiplyTotalProduct, min, max);
+        if (setRewriter != null) {
+            newValue = setRewriter.applyAsDouble(this.value, newValue);
+        }
+
+        if (newValue &lt; min || newValue &gt; max) {
+            throw new IllegalArgumentException("New value must be between min and max!");
+        }
+
+        this.lastProperty = property;
+        return this.value = newValue;
+    }
+}
+// NOTE (AI): The min/max clamps mirror the client-side clamp the wiki documents; the comment in the source notes the server does not clamp, which is the exact hole this class closes.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> CompensatedEntities.updateAttributes feeds the same property list into per-entity attribute maps, watching specifically for the movement-speed sprint modifier and horse jump strength; PlayerBaseTick consumes the resulting movement speed and scale during simulation.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AttributeTracker (movement speed tracking)</span>
+<span class="impl-module-clients">(Incognitolol-Hydro)</span>
+</div>
+<p class="impl-pattern">Capture the player's walk speed from the S20 update, combine it with speed and slowness potion effects, and expose the effective move speed the simulation checks use.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">handleAttributeUpdate matches generic.movementSpeed in the property list and stores the base value inside the transaction-confirm window. Entity-effect packets feed speed, slowness and jump boost levels, and getMoveSpeed(sprint) composes walk speed with the 0.3 sprint modifier and 0.2/-0.15 potion modifiers.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Speed-state desync between the server's attributes and the movement the player reports; feeds speed and flight simulation.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/AttributeTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/AttributeTracker.java =====
+package integral.studios.hydro.model.tracker.impl;
+
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.server.*;
+import integral.studios.hydro.model.tracker.Tracker;
+import integral.studios.hydro.model.PlayerData;
+import integral.studios.hydro.util.lag.ConfirmedAbilities;
+import lombok.Getter;
+
+
+@Getter
+public class AttributeTracker extends Tracker {
+
+    private static final double DEFAULT_WALK_SPEED = 0.1;
+    private static final double SPRINT_MODIFIER = 0.3;
+    private static final double SPEED_EFFECT_MODIFIER = 0.2;
+    private static final double SLOWNESS_EFFECT_MODIFIER = -0.15;
+
+    private static final int SPEED_EFFECT_ID = 1;
+    private static final int SLOWNESS_EFFECT_ID = 2;
+    private static final int JUMP_BOOST_EFFECT_ID = 8;
+
+    private double walkSpeed = DEFAULT_WALK_SPEED;
+    private int jumpBoost = 0;
+    private int speedBoost = 0;
+    private int slowness = 0;
+
+    private ConfirmedAbilities abilities = new ConfirmedAbilities();
+    private final ConfirmedAbilities lastAbilities = new ConfirmedAbilities();
+
+    public AttributeTracker(PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void registerOutgoingPreHandler(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.PLAYER_ABILITIES) {
+            handlePlayerAbilities(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.UPDATE_ATTRIBUTES) {
+            handleAttributeUpdate(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_EFFECT) {
+            handleEntityEffect(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.REMOVE_ENTITY_EFFECT) {
+            handleRemoveEntityEffect(event);
+        }
+    }
+
+    private void handlePlayerAbilities(PacketSendEvent event) {
+        final WrapperPlayServerPlayerAbilities wrapper = new WrapperPlayServerPlayerAbilities(event);
+
+        playerData.getTransactionTracker().confirmPre(() -&gt; {
+            abilities = new ConfirmedAbilities(
+                    wrapper.isInGodMode(),
+                    wrapper.isFlying(),
+                    wrapper.isFlightAllowed(),
+                    wrapper.isInCreativeMode(),
+                    wrapper.getFOVModifier(),
+                    wrapper.getFlySpeed()
+            );
+        });
+    }
+
+    private void handleAttributeUpdate(PacketSendEvent event) {
+        WrapperPlayServerUpdateAttributes updateAttributes = new WrapperPlayServerUpdateAttributes(event);
+
+        for (WrapperPlayServerUpdateAttributes.Property property : updateAttributes.getProperties()) {
+            if ("generic.movementSpeed".equals(property.getKey())) {
+                playerData.getTransactionTracker().confirmPre(() -&gt; {
+                    walkSpeed = property.getValue();
+                });
+                break;
+            }
+        }
+    }
+
+    private void handleEntityEffect(PacketSendEvent event) {
+        WrapperPlayServerEntityEffect entityEffect = new WrapperPlayServerEntityEffect(event);
+
+        if (entityEffect.getEntityId() != playerData.getEntityId()) {
+            return;
+        }
+
+        int amplifier = entityEffect.getEffectAmplifier();
+        int effectId = entityEffect.getPotionType().getId(playerData.getClientVersion());
+
+        playerData.getTransactionTracker().confirmPre(() -&gt; {
+            applyEffect(effectId, amplifier + 1);
+        });
+    }
+
+    private void handleRemoveEntityEffect(PacketSendEvent event) {
+        WrapperPlayServerRemoveEntityEffect removeEntityEffect = new WrapperPlayServerRemoveEntityEffect(event);
+
+        if (removeEntityEffect.getEntityId() != playerData.getEntityId()) {
+            return;
+        }
+
+        int effectId = removeEntityEffect.getPotionType().getId(playerData.getClientVersion());
+
+        playerData.getTransactionTracker().confirmPre(() -&gt; {
+            removeEffect(effectId);
+        });
+    }
+
+    private void applyEffect(int effectId, int level) {
+        switch (effectId) {
+            case SPEED_EFFECT_ID:
+                speedBoost = level;
+                break;
+            case SLOWNESS_EFFECT_ID:
+                slowness = level;
+                break;
+            case JUMP_BOOST_EFFECT_ID:
+                jumpBoost = level;
+                break;
+        }
+    }
+
+    private void removeEffect(int effectId) {
+        switch (effectId) {
+            case SPEED_EFFECT_ID:
+                speedBoost = 0;
+                break;
+            case SLOWNESS_EFFECT_ID:
+                slowness = 0;
+                break;
+            case JUMP_BOOST_EFFECT_ID:
+                jumpBoost = 0;
+                break;
+        }
+    }
+
+    public double getMoveSpeed(boolean sprint) {
+        double baseSpeed = walkSpeed;
+
+        // Apply sprint modifier
+        if (sprint) {
+            baseSpeed *= (1.0 + SPRINT_MODIFIER);
+        }
+
+        // Apply potion effects
+        if (speedBoost &gt; 0) {
+            baseSpeed *= (1.0 + (speedBoost * SPEED_EFFECT_MODIFIER));
+        }
+
+        if (slowness &gt; 0) {
+            baseSpeed *= (1.0 + (slowness * SLOWNESS_EFFECT_MODIFIER));
+        }
+
+        return baseSpeed;
+    }
+
+    public double getJumpVelocityModifier() {
+        return jumpBoost * 0.1;
+    }
+
+
+    public void reset() {
+        walkSpeed = DEFAULT_WALK_SPEED;
+        jumpBoost = 0;
+        speedBoost = 0;
+        slowness = 0;
+        abilities = new ConfirmedAbilities();
+    }
+}
+// NOTE (AI): Hydro keys on the raw key string generic.movementSpeed, which is the 1.8-era key format the S20 packet carries.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> AntiHaxerman's AttributeTracker keeps a full snapshot list of the player's attributes on connection confirm; intave's AttributeTracker stores modifier sets and derives the sprint flag from the presence of the sprinting modifier.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AttributeTracker (attribute snapshot)</span>
+<span class="impl-module-clients">(Tecnio-AntiHaxerman)</span>
+</div>
+<p class="impl-pattern">Keep the player's current attribute snapshot and potion levels, refreshed on connection confirm, so movement checks know the exact speed and effect state.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The tracker handles GPacketPlayServerUpdateAttributes for the player's own entity id and stores the full Snapshot list inside a connection-confirm action; entity-effect packets update the potion map the same way. getPotionLevel and hasPotion expose the effect state.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly; feeds speed, flight and velocity checks with the confirmed attribute state.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tecnio-AntiHaxerman — src/main/java/me/tecnio/ahm/data/tracker/impl/AttributeTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tecnio-AntiHaxerman — src/main/java/me/tecnio/ahm/data/tracker/impl/AttributeTracker.java =====
+package me.tecnio.ahm.data.tracker.impl;
+
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntityEffect;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntityEffectRemove;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerUpdateAttributes;
+import lombok.Getter;
+import me.tecnio.ahm.data.PlayerData;
+import me.tecnio.ahm.data.tracker.Tracker;
+import org.bukkit.potion.PotionEffectType;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Getter
+public final class AttributeTracker extends Tracker {
+
+    private final Map&lt;PotionEffectType, Integer&gt; potions = new HashMap&lt;&gt;();
+
+    private List&lt;GPacketPlayServerUpdateAttributes.Snapshot&gt; attributes = new ArrayList&lt;&gt;();
+
+    public AttributeTracker(final PlayerData data) {
+        super(data);
+    }
+
+    @Override
+    public void handle(final GPacket packet) {
+        if (packet instanceof GPacketPlayServerEntityEffect) {
+            final GPacketPlayServerEntityEffect wrapper = ((GPacketPlayServerEntityEffect) packet);
+
+            if (wrapper.getEntityId() == data.getPlayer().getEntityId()) {
+                final PotionEffectType type = PotionEffectType.getById(wrapper.getEffectId());
+                final int amplifier = wrapper.getAmplifier();
+
+                data.getConnectionTracker().confirm(() -&gt; this.potions.put(type, amplifier + 1));
+            }
+        } else if (packet instanceof GPacketPlayServerEntityEffectRemove) {
+            final GPacketPlayServerEntityEffectRemove wrapper = ((GPacketPlayServerEntityEffectRemove) packet);
+
+            if (wrapper.getEntityId() == data.getPlayer().getEntityId()) {
+                final PotionEffectType type = PotionEffectType.getById(wrapper.getEffectId());
+
+                data.getConnectionTracker().confirm(() -&gt; this.potions.remove(type));
+            }
+        } else if (packet instanceof GPacketPlayServerUpdateAttributes) {
+            final GPacketPlayServerUpdateAttributes wrapper = ((GPacketPlayServerUpdateAttributes) packet);
+
+            if (wrapper.getEntityId() == data.getPlayer().getEntityId()) {
+                data.getConnectionTracker().confirm(() -&gt; this.attributes = wrapper.getAttributes());
+            }
+        }
+    }
+
+    public int getPotionLevel(final PotionEffectType type) {
+        return this.potions.getOrDefault(type, 0);
+    }
+
+    public boolean hasPotion(final PotionEffectType type) {
+        return this.potions.containsKey(type);
+    }
+}
+// NOTE (AI): The confirm() wrapping means the snapshot applies at the player's confirmed tick, matching the tracker pattern used across the corpus.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro keeps only the movement-speed value plus potion levels; intave additionally derives the sprint state from the modifier set.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AttributeTracker (sprint speed detection)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Read the S20 attribute collection for the player, store the server's modifier set, and derive whether the player has the sprinting modifier active.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">sentAttributes reads the attribute collection modifier of the UPDATE_ATTRIBUTES packet for the player's own entity id, converts each WrappedAttribute into intave's Attribute model, clears the stored modifiers, then stores the server's modifier set and sets movement.hasSprintSpeed when the SPRINTING_MODIFIER is present. Base values update the ability metadata.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Speed-state desync where the client moves as if sprinting while the server attributes say otherwise.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/module/tracker/player/AttributeTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/module/tracker/player/AttributeTracker.java =====
+package de.jpx3.intave.module.tracker.player;
+
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.reflect.StructureModifier;
+import com.comphenix.protocol.wrappers.WrappedAttribute;
+import de.jpx3.intave.module.Module;
+import de.jpx3.intave.module.linker.packet.ListenerPriority;
+import de.jpx3.intave.module.linker.packet.PacketSubscription;
+import de.jpx3.intave.player.attribute.Attribute;
+import de.jpx3.intave.player.attribute.AttributeModifier;
+import de.jpx3.intave.user.User;
+import de.jpx3.intave.user.UserRepository;
+import de.jpx3.intave.user.meta.AbilityMetadata;
+import de.jpx3.intave.user.meta.MovementMetadata;
+import org.bukkit.entity.Player;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+import static de.jpx3.intave.module.linker.packet.PacketId.Server.UPDATE_ATTRIBUTES;
+
+public final class AttributeTracker extends Module {
+  @PacketSubscription(
+    priority = ListenerPriority.HIGH,
+    packetsOut = {
+      UPDATE_ATTRIBUTES
+    }
+  )
+  public void sentAttributes(PacketEvent event) {
+    Player player = event.getPlayer();
+    User user = UserRepository.userOf(player);
+    PacketContainer packet = event.getPacket();
+    if (packet.getIntegers().read(0) == player.getEntityId()) {
+      StructureModifier&lt;List&lt;WrappedAttribute&gt;&gt; mod = packet.getAttributeCollectionModifier();
+      List&lt;WrappedAttribute&gt; attributes = mod.read(0);
+      mod.write(0, attributes);
+      user.tickFeedback(() -&gt; {
+        attributes.forEach(attribute -&gt; receivedAttribute(user, attribute));
+      });
+    }
+  }
+
+  private void receivedAttribute(User user, WrappedAttribute attribute) {
+    AbilityMetadata abilities = user.meta().abilities();
+    MovementMetadata movement = user.meta().movement();
+    String attributeKey = attribute.getAttributeKey();
+    if (abilities.findAttribute(attributeKey) != null) {
+      Attribute intaveAttribute = Attribute.fromProtocolLib(attribute);
+      List&lt;AttributeModifier&gt; intaveAttributes = abilities.modifiersOf(intaveAttribute);
+      intaveAttributes.clear();
+      Set&lt;AttributeModifier&gt; serverAttributes = intaveAttribute.modifiers();
+      movement.hasSprintSpeed = serverAttributes.contains(MovementMetadata.SPRINTING_MODIFIER);
+      intaveAttributes.addAll(new HashSet&lt;&gt;(serverAttributes));
+      abilities.modifyBaseValue(attributeKey, attribute.getBaseValue());
+    }
+  }
+}
+// NOTE (AI): The sprinting modifier has a fixed UUID in vanilla, which is how intave recognizes it in the raw modifier set.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro and AntiHaxerman track the same attribute stream with simpler base-value snapshots; Grim goes further and recomputes the full value with range clamps.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AttributeEngine (simulation attribute history)</span>
+<span class="impl-module-clients">(TawnyE-TruthfulAC)</span>
+</div>
+<p class="impl-pattern">Record walk speed, gravity, jump strength, step height, movement efficiency and potion levels over a 1.5 second window so the simulation checks bound their physics assumptions.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">updateStateCache in PlayerData reads the Bukkit attribute API (generic.movementSpeed, generic.gravity, generic.jumpStrength, generic.stepHeight, generic.movementEfficiency, player.sneakingSpeed) and potion levels, then calls attributeEngine.record. The engine keeps a timestamped deque, exposes max walk speed, min gravity, max jump strength and step height, and hasAttributeTransition detects attribute changes within the window. The debug tags (ATTR_LOW_GRAVITY, ATTR_SPEED, ATTR_JUMP, ATTR_STEP) label the active conditions.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Physics assumptions violated by attribute changes; the recorded history lets the simulation checks tolerate legitimate speed and jump changes instead of flagging them.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> TawnyE-TruthfulAC — src/main/java/ret/tawny/truthful/attributes/AttributeEngine.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: TawnyE-TruthfulAC — src/main/java/ret/tawny/truthful/attributes/AttributeEngine.java =====
+package ret.tawny.truthful.attributes;
+
+import org.bukkit.potion.PotionEffectType;
+import ret.tawny.truthful.data.PlayerData;
+import java.util.Deque;
+import java.util.concurrent.ConcurrentLinkedDeque;
+
+public final class AttributeEngine {
+
+    private static final long HISTORY_DURATION_MS = 1500L;
+    private static final double EPSILON = 1.0E-4D;
+
+    private final PlayerData data;
+    private final Deque&lt;AttributeSnapshot&gt; history = new ConcurrentLinkedDeque&lt;&gt;();
+
+    private static final class AttributeSnapshot {
+        final double walkSpeed;
+        final double gravity;
+        final double jumpStrength;
+        final double stepHeight;
+        final double movementEfficiency;
+        final double waterMovementEfficiency;
+        final double sneakingSpeed;
+        final int speedLevel;
+        final int slownessLevel;
+        final int jumpBoostLevel;
+        final long timestamp;
+
+        AttributeSnapshot(double walkSpeed, int speedLevel, int slownessLevel, int jumpBoostLevel) {
+            this(walkSpeed, 0.08D, 0.42D, 0.6D, 0.0D, 0.0D, 0.3D,
+                    speedLevel, slownessLevel, jumpBoostLevel);
+        }
+
+        AttributeSnapshot(double walkSpeed, double gravity, double jumpStrength, double stepHeight,
+                          double movementEfficiency, double waterMovementEfficiency, double sneakingSpeed,
+                          int speedLevel, int slownessLevel, int jumpBoostLevel) {
+            this.walkSpeed = walkSpeed;
+            this.gravity = gravity;
+            this.jumpStrength = jumpStrength;
+            this.stepHeight = stepHeight;
+            this.movementEfficiency = movementEfficiency;
+            this.waterMovementEfficiency = waterMovementEfficiency;
+            this.sneakingSpeed = sneakingSpeed;
+            this.speedLevel = speedLevel;
+            this.slownessLevel = slownessLevel;
+            this.jumpBoostLevel = jumpBoostLevel;
+            this.timestamp = System.currentTimeMillis();
+        }
+    }
+
+    public AttributeEngine(final PlayerData data) {
+        this.data = data;
+    }
+
+    /**
+     * Records a new snapshot of the player's current attributes and speed-affecting potions.
+     */
+    public void record(final double walkSpeed, final int speedLevel, final int slownessLevel, final int jumpBoostLevel) {
+        history.addLast(new AttributeSnapshot(walkSpeed, speedLevel, slownessLevel, jumpBoostLevel));
+        cleanUp();
+    }
+
+    public void record(final double walkSpeed, final double gravity, final double jumpStrength,
+                       final double stepHeight, final double movementEfficiency,
+                       final double waterMovementEfficiency, final double sneakingSpeed,
+                       final int speedLevel, final int slownessLevel, final int jumpBoostLevel) {
+        history.addLast(new AttributeSnapshot(walkSpeed, gravity, jumpStrength, stepHeight,
+                movementEfficiency, waterMovementEfficiency, sneakingSpeed,
+                speedLevel, slownessLevel, jumpBoostLevel));
+        cleanUp();
+    }
+
+    /**
+     * Cleans up snapshots older than the configured duration window.
+     */
+    private void cleanUp() {
+        final long now = System.currentTimeMillis();
+        while (!history.isEmpty()) {
+            final AttributeSnapshot snap = history.peekFirst();
+            if (snap == null || now - snap.timestamp &lt;= HISTORY_DURATION_MS) {
+                break;
+            }
+            history.pollFirst();
+        }
+    }
+
+    /**
+     * Gets the maximum walk speed attribute recorded in the history window.
+     */
+    public double getMaxWalkSpeed() {
+        cleanUp();
+        double maxSpeed = 0.1D;
+        boolean hasElements = false;
+        for (final AttributeSnapshot snap : history) {
+            hasElements = true;
+            if (snap.walkSpeed &gt; maxSpeed) {
+                maxSpeed = snap.walkSpeed;
+            }
+        }
+        // Fall back to current cached value if no snapshots exist yet
+        return hasElements ? maxSpeed : data.getWalkSpeedCacheRaw();
+    }
+
+    public double getMinGravity() {
+        cleanUp();
+        if (history.isEmpty()) return 0.08D;
+        double min = Double.MAX_VALUE;
+        for (final AttributeSnapshot snap : history) {
+            min = Math.min(min, snap.gravity);
+        }
+        return min == Double.MAX_VALUE ? 0.08D : min;
+    }
+
+    public double getMaxJumpStrength() {
+        cleanUp();
+        double max = 0.42D;
+        for (final AttributeSnapshot snap : history) {
+            max = Math.max(max, snap.jumpStrength);
+        }
+        return max;
+    }
+
+    public double getMaxStepHeight() {
+        cleanUp();
+        double max = 0.6D;
+        for (final AttributeSnapshot snap : history) {
+            max = Math.max(max, snap.stepHeight);
+        }
+        return max;
+    }
+
+    public double getMaxMovementEfficiency() {
+        cleanUp();
+        double max = 0.0D;
+        for (final AttributeSnapshot snap : history) {
+            max = Math.max(max, snap.movementEfficiency);
+        }
+        return max;
+    }
+
+    public double getMaxWaterMovementEfficiency() {
+        cleanUp();
+        double max = 0.0D;
+        for (final AttributeSnapshot snap : history) {
+            max = Math.max(max, snap.waterMovementEfficiency);
+        }
+        return max;
+    }
+
+    public double getMaxSneakingSpeed() {
+        cleanUp();
+        double max = 0.3D;
+        for (final AttributeSnapshot snap : history) {
+            max = Math.max(max, snap.sneakingSpeed);
+        }
+        return max;
+    }
+
+    /**
+     * Gets the maximum speed potion level recorded in the history window.
+     */
+    public int getMaxSpeedLevel() {
+        cleanUp();
+        int maxLevel = 0;
+        for (final AttributeSnapshot snap : history) {
+            if (snap.speedLevel &gt; maxLevel) {
+                maxLevel = snap.speedLevel;
+            }
+        }
+        return maxLevel;
+    }
+
+    /**
+     * Gets the minimum slowness level recorded in the history window.
+     * Prevents false positives during transition where slowness is applied.
+     */
+    public int getMinSlownessLevel() {
+        cleanUp();
+        if (history.isEmpty()) return 0;
+        int minLevel = Integer.MAX_VALUE;
+        for (final AttributeSnapshot snap : history) {
+            if (snap.slownessLevel &lt; minLevel) {
+                minLevel = snap.slownessLevel;
+            }
+        }
+        return minLevel == Integer.MAX_VALUE ? 0 : minLevel;
+    }
+
+    /**
+     * Gets the maximum jump boost level recorded in the history window.
+     */
+    public int getMaxJumpBoostLevel() {
+        cleanUp();
+        int maxLevel = 0;
+        for (final AttributeSnapshot snap : history) {
+            if (snap.jumpBoostLevel &gt; maxLevel) {
+                maxLevel = snap.jumpBoostLevel;
+            }
+        }
+        return maxLevel;
+    }
+
+    public boolean hasAttributeTransition() {
+        cleanUp();
+        if (history.size() &lt; 2) return false;
+
+        double minWalk = Double.MAX_VALUE, maxWalk = 0.0D;
+        double minGravity = Double.MAX_VALUE, maxGravity = 0.0D;
+        double minJump = Double.MAX_VALUE, maxJump = 0.0D;
+        int minSpeed = Integer.MAX_VALUE, maxSpeed = 0;
+        int minSlow = Integer.MAX_VALUE, maxSlow = 0;
+        int minJumpBoost = Integer.MAX_VALUE, maxJumpBoost = 0;
+
+        for (final AttributeSnapshot snap : history) {
+            minWalk = Math.min(minWalk, snap.walkSpeed);
+            maxWalk = Math.max(maxWalk, snap.walkSpeed);
+            minGravity = Math.min(minGravity, snap.gravity);
+            maxGravity = Math.max(maxGravity, snap.gravity);
+            minJump = Math.min(minJump, snap.jumpStrength);
+            maxJump = Math.max(maxJump, snap.jumpStrength);
+            minSpeed = Math.min(minSpeed, snap.speedLevel);
+            maxSpeed = Math.max(maxSpeed, snap.speedLevel);
+            minSlow = Math.min(minSlow, snap.slownessLevel);
+            maxSlow = Math.max(maxSlow, snap.slownessLevel);
+            minJumpBoost = Math.min(minJumpBoost, snap.jumpBoostLevel);
+            maxJumpBoost = Math.max(maxJumpBoost, snap.jumpBoostLevel);
+        }
+
+        return maxWalk - minWalk &gt; 0.005D
+                || maxGravity - minGravity &gt; 0.002D
+                || maxJump - minJump &gt; 0.01D
+                || maxSpeed != minSpeed
+                || maxSlow != minSlow
+                || maxJumpBoost != minJumpBoost;
+    }
+
+    public String getDebugTags() {
+        cleanUp();
+        if (history.isEmpty()) return "ATTR_DEFAULT";
+        StringBuilder builder = new StringBuilder();
+        if (hasAttributeTransition()) append(builder, "ATTR_TRANSITION");
+        if (getMaxWalkSpeed() &gt; 0.100D + EPSILON) append(builder, "ATTR_SPEED");
+        if (getMinGravity() &lt; 0.080D - EPSILON) append(builder, "ATTR_LOW_GRAVITY");
+        if (getMaxJumpStrength() &gt; 0.420D + EPSILON) append(builder, "ATTR_JUMP");
+        if (getMaxStepHeight() &gt; 0.600D + EPSILON) append(builder, "ATTR_STEP");
+        if (getMaxMovementEfficiency() &gt; EPSILON) append(builder, "ATTR_TERRAIN");
+        if (getMaxWaterMovementEfficiency() &gt; EPSILON) append(builder, "ATTR_WATER");
+        if (getMaxSneakingSpeed() &gt; 0.300D + EPSILON) append(builder, "ATTR_SNEAK");
+        return builder.length() == 0 ? "ATTR_VANILLA" : builder.toString();
+    }
+
+    private void append(StringBuilder builder, String value) {
+        if (builder.length() &gt; 0) builder.append(',');
+        builder.append(value);
+    }
+}
+// NOTE (AI): This entry is included on the attribute domain: the file matches the corpus through the attribute keyword, and the engine consumes the state that S20 carries rather than the packet itself.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The engine is fed from the Bukkit API rather than parsing S20 directly, but it mirrors the same server-side attribute state the packet announces. Grim and Hydro feed their simulations from the packet stream itself.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S14PacketEntity/">S14PacketEntity</a>
 <a class="related-chip" href="../S18PacketEntityTeleport/">S18PacketEntityTeleport</a>

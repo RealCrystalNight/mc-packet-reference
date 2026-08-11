@@ -323,6 +323,275 @@ public class AntiExploit extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Receive-path filtering: Rise 6.x runs it as a SecurityFeature over the incoming packet stream; Tenacity hooks PacketReceiveEvent. Both reply C19PacketResourcePackStatus FAILED_DOWNLOAD instead of dropping silently.</div>
 <div class="impl-clients">Rise implements it outside the module system (SecurityFeature with a handle() contract); Tenacity implements it as a normal module with a chat notification. Both reject the same URL classes: non-http(s)/level schemes and level:// paths with .. or a non-/resources.zip suffix.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">Artemis is the only anticheat with logic on the send side of the resource-pack flow. Its PingSpoofProtocol pushes a fake S48 offer whose URL encodes a keepalive id and validates the client's C19 FAILED_DOWNLOAD reply, and ResourcePackTickHandler uses a level:// offer with a numeric hash as a tick-confirmation channel. These are the OUT-side arms of the same two checks documented on the C19PacketResourcePackStatus page. FlopAC's WrappedOutResourcePackSend and the Negativity RESOURCE_PACK_SEND constant are wrappers and registrations only.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoofProtocol (Artemis)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Detect ping spoofing with a resource-pack offer as the probe: the server sends S48 with an id-encoded URL and verifies the client's C19 answer.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On 1.9 and older servers the check builds a GPacketPlayServerResourcePackSend whose URL is a generated numeric id (line 175) and pushes it to the client. It then expects the C19 response: FAILED_DOWNLOAD with a matching numeric URL, followed by the next keepalive echo. Missing, out-of-order or non-numeric responses log violations. On 1.10+ it switches to fake teleports because the packet's hash field was removed there.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping spoofers that suppress or reorder keepalives, and clients that answer resource-pack offers they were never sent.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.checks.enterprise/src/main/java/ac/artemis/checks/enterprise/spoof/PingSpoofProtocol.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.checks.enterprise/src/main/java/ac/artemis/checks/enterprise/spoof/PingSpoofProtocol.java =====
+package ac.artemis.checks.enterprise.spoof;
+
+import ac.artemis.core.v4.check.ArtemisCheck;
+import ac.artemis.core.v4.check.FastProcessHandler;
+import ac.artemis.core.v4.check.PacketHandler;
+import ac.artemis.core.v4.check.annotations.Check;
+import ac.artemis.anticheat.api.check.type.Type;
+import ac.artemis.core.v4.check.exempt.type.ExemptType;
+import ac.artemis.core.v4.check.settings.CheckInformation;
+import ac.artemis.core.v4.data.PlayerData;
+import ac.artemis.core.v4.utils.chat.StringUtil;
+import ac.artemis.packet.PacketManager;
+import cc.ghast.packet.PacketAPI;
+import ac.artemis.packet.protocol.ProtocolVersion;
+import cc.ghast.packet.wrapper.mc.PlayerEnums;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientCustomPayload;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientKeepAlive;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientResourcePackStatus;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerKeepAlive;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerResourcePackSend;
+import java.util.Deque;
+import java.util.LinkedList;
+
+/**
+ * @author Ghast
+ * @since 25/03/2021
+ * Artemis © 2021
+ *
+ * This is most effectively the best antibot protection I've got on Artemis. By combining the
+ * concept of checking a random resource pack link and the usage of keep alives, we can pretty
+ * much capture whether or not a player is a bot or has a broken client misplacing keep-alives/
+ * resource packs.
+ */
+@Check(type = Type.PINGSPOOF, var = "Protocol")
+public class PingSpoofProtocol extends ArtemisCheck implements PacketHandler, FastProcessHandler {
+    public PingSpoofProtocol(PlayerData data, CheckInformation info) {
+        super(data, info);
+    }
+
+    private final Deque&lt;Long&gt; ids = new LinkedList&lt;&gt;();
+    private Long next;
+
+    @Override
+    public void handle(GPacket packet) {
+        final boolean exempt = this.isExempt(ExemptType.JOIN);
+
+        /*
+         * They removed the hash :(. We can't use it to identify packet order. How unlucky. This would mean
+         * this would false on laggy and latter clients; We can instead from 1.9+ use fake teleports.
+         */
+        if (data.getVersion().isOrAbove(ProtocolVersion.V1_10))
+            return;
+
+        /*
+         * Lets handle resource pack status. Since we flush the channel before, theoretically this should be processed
+         * beforehand?
+         */
+        if (packet instanceof GPacketPlayClientResourcePackStatus) {
+            final GPacketPlayClientResourcePackStatus sts = (GPacketPlayClientResourcePackStatus) packet;
+            /*
+             * Lets not interfere with real resource pack requests alright?
+             */
+            if (!StringUtil.isNumeric(sts.getUrl().get())) {
+                this.debug("Invalid id");
+                return;
+            }
+
+            /*
+             * Theoretically speaking, the client can ONLY respond with FAILED_DOWNLOAD. Anything other
+             * than that is completely invalid. Hence we can just skip over it.
+             */
+            if (!sts.getStatus().equals(PlayerEnums.ResourcePackStatus.FAILED_DOWNLOAD) &amp;&amp; !exempt) {
+                this.log("Successfully downloaded - Invalid");
+                this.debug("[FLAG] Successfully downloaded - Invalid");
+                return;
+            }
+
+            /*
+             * Both resource pack and keep alive packets are async to the threading. Meaning they aren't ticked.
+             * This means these are synchronous but not correlated to other packets. Perfect for a pingspoof check.
+             * If no response is received, it's invalid
+             */
+            if (ids.isEmpty() &amp;&amp; !exempt) {
+                this.log("Packet coming from idk where");
+                this.debug("[FLAG] Packet coming from idk where");
+                return;
+            }
+
+            /*
+             * Alrighty lets get decoding.
+             */
+            final long var = Long.decode(sts.getUrl().get());
+
+            /*
+             * No clue where tf this keep alive coming from hommie, but it defo ain't ours, so it's a bad
+             * packet.
+             */
+            if (!ids.contains(var) &amp;&amp; !exempt) {
+                this.log("Keep alive does not exist bruh");
+                this.debug("[FLAG] Keep alive does not exist bruh");
+                return;
+            }
+
+            long id = ids.poll();
+
+            /*
+             * Well this is awkward. We're receiving the wrong... packet id?
+             * Hence, this is deemed as a bad packet.
+             */
+            if (id != var &amp;&amp; ids.contains(var)) {
+
+                while (id != var &amp;&amp; !ids.isEmpty()) {
+                    id = ids.poll();
+
+                    if (exempt)
+                        continue;
+
+                    this.log("Invalid identifier, polling queue...");
+                }
+            }
+
+            /*
+             * Nice alright, valid keep alive, lets mark the next id to receive.
+             */
+            else {
+                next = var;
+                ids.remove(var);
+
+                this.debug("resource=" + var);
+            }
+        }
+
+        /*
+         * Since the keep alive flushed out a resource pack status packet, the next packet received should be the
+         * resource pack denial then only the keep alive.
+         */
+        else if (packet instanceof GPacketPlayClientKeepAlive) {
+            final GPacketPlayClientKeepAlive ka = (GPacketPlayClientKeepAlive) packet;
+
+            if (next == null) {
+                if (!exempt)
+                    this.log("No confirmation");
+                return;
+            }
+
+            if (next == ka.getId()) {
+                this.debug("ka=" + ka.getId());
+            } else if (!exempt) {
+                this.log("Packet order 0x1");
+                this.debug("[FLAG] Packet order 0x1");
+            }
+        }
+    }
+
+    @Override
+    public void fastHandle(GPacket packet) {
+        /*
+         * They removed the hash :(. We can't use it to identify packet order. How unlucky. This would mean
+         * this would false on laggy and latter clients; We can instead from 1.9+ use fake teleports.
+         */
+        if (data.getVersion().isOrAbove(ProtocolVersion.V1_10))
+            return;
+
+        /*
+         * Only handle server keep alives because uhhh
+         */
+        if (packet instanceof GPacketPlayServerKeepAlive) {
+            final GPacketPlayServerKeepAlive ka = (GPacketPlayServerKeepAlive) packet;
+
+            this.ids.add(ka.getId());
+            final String encoded = Long.toString(ka.getId());
+            PacketManager.getApi().sendPacket(
+                    data.getPlayer().getUniqueId(),
+                    new GPacketPlayServerResourcePackSend(
+                            "level://" + Math.random() + "/resources.zip", encoded
+                    )
+            );
+        }
+    }
+}
+// NOTE (AI): The S48 side is the probe construction at line 175 (GPacketPlayServerResourcePackSend with an id-encoded URL); the C19 validation in the same file is documented on the C19PacketResourcePackStatus page.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> ResourcePackTickHandler is the non-flagging sibling that reuses the probe as a tick counter; FlopAC and Negativity only register the packet.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ResourcePackTickHandler (Artemis)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Use a level:// resource-pack offer as a tick-confirmation channel on 1.8 servers.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On 1.8.9 and below it sends a GPacketPlayServerResourcePackSend whose hash encodes a numeric tick id (line 57), then accepts only C19 FAILED_DOWNLOAD replies whose URL is numeric and contains the player name. The parsed id is stored as the player's resourcePackTick and feeds the tick-confirmation infrastructure other Artemis checks use to measure connection state.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly. It feeds connection-state measurement rather than flagging a behavior.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v5/features/tick/impl/ResourcePackTickHandler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v5/features/tick/impl/ResourcePackTickHandler.java =====
+package ac.artemis.core.v5.features.tick.impl;
+
+import ac.artemis.core.v4.data.PlayerData;
+import ac.artemis.core.v4.utils.chat.StringUtil;
+import ac.artemis.packet.PacketManager;
+import cc.ghast.packet.PacketAPI;
+import ac.artemis.packet.protocol.ProtocolVersion;
+import cc.ghast.packet.wrapper.mc.PlayerEnums;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientResourcePackStatus;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerResourcePackSend;
+
+public class ResourcePackTickHandler extends AbstractTickHandler&lt;GPacketPlayClientResourcePackStatus&gt; {
+    public ResourcePackTickHandler(final PlayerData data) {
+        super(data);
+    }
+
+    @Override
+    public boolean canReceive() {
+        return data.getVersion().isOrBelow(ProtocolVersion.V1_8_9);
+    }
+
+    @Override
+    public boolean isPacket(final GPacket packet) {
+        if (!(packet instanceof GPacketPlayClientResourcePackStatus))
+        return false;
+
+        final GPacketPlayClientResourcePackStatus wrapper = (GPacketPlayClientResourcePackStatus) packet;
+        /*
+         * Theoretically speaking, the client can ONLY respond with FAILED_DOWNLOAD. Anything other
+         * than that is completely invalid. Hence we can just skip over it.
+         */
+        if (!wrapper.getStatus().equals(PlayerEnums.ResourcePackStatus.FAILED_DOWNLOAD))
+            return false;
+
+        if (!wrapper.getUrl().isPresent())
+            return false;
+
+        if (!wrapper.getUrl().get().contains(data.getPlayer().getName()))
+            return false;
+
+        return StringUtil.isNumeric(wrapper.getUrl().get());
+    }
+
+    @Override
+    public short getPacketId(final GPacket packet) {
+        return Short.parseShort(((GPacketPlayClientResourcePackStatus) packet).getUrl().get());
+    }
+
+    @Override
+    public void onConsume(final GPacketPlayClientResourcePackStatus packet) {
+        data.connection.resourcePackTick = Integer.parseInt(packet.getUrl().get());
+    }
+
+    @Override
+    public void onPush(final boolean flush, final short id) {
+        final GPacket packet = new GPacketPlayServerResourcePackSend(
+                "level://" + data.getPlayer().getName() + "_" + Math.random() + "/resources.zip",
+                Short.toString(id)
+        );
+        PacketManager.getApi().sendPacket(data.getPlayer().getUniqueId(), packet);
+    }
+}
+// NOTE (AI): The S48 side is the probe send in onPush (lines 56-62); the C19 validation is the isPacket gate. The same mechanism is documented from the C19 side on the C19PacketResourcePackStatus page. ConnectionHolder registers this handler (line 26, commented out in the clone).</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> PingSpoofProtocol is the flagging version of the same mechanism; FlopAC WrappedOutResourcePackSend is a plain wrapper over the packet fields.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../C19PacketResourcePackStatus/">C19PacketResourcePackStatus</a>
 <a class="related-chip" href="../S3FPacketCustomPayload/">S3FPacketCustomPayload</a>

@@ -1028,6 +1028,595 @@ public class AntiVoid extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent on every client, with the vanilla handler applying the mutation afterwards. Rise 6.x processes S08 in components (PingSpoofComponent, EntityTickComponent, TeleportCheck security) before modules see it.</div>
 <div class="impl-clients">Classic clients (Memeware, Nekoware, Sigma, Spicy) mutate or cancel the packet object inside the event, so the vanilla handler then applies the modified values. Rise 5.99 and 6.x call event.setCancelled on the receive event; Rise 6.x additionally re-arms component state (PingSpoofComponent spoof windows) from the same packet.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S08 is the server's authoritative position correction and the landing pad for every movement flag: setback, phase and speed checks all terminate in a rubberband teleport. On the OUT side, anticheats do three things with it: record the exact teleported coordinates and the teleport id, bracket the teleport between transaction packets so the confirm can be time-ordered, and verify that the client's C06 confirm matches the coordinates the server actually sent. The four checks below cover that full pipeline, from the packet listener that converts relative flags to absolute positions (Grim) to the confirm verifier that kicks on a mismatch (CheaterDeleter).</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PacketServerTeleport (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Tracks every outgoing player teleport so the simulation knows the client's authoritative position and can enforce it in later movement checks.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Listens on the OUT side for the player position-and-look packet, seeds the player's tracked position on join, converts relative flags to absolute coordinates (rewriting the packet for 1.8-era clients), and brackets the teleport with a transaction sandwich so the exact arrival tick is known. Vehicle teleports are recorded against the same transaction stream.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Teleport-based desync where the client's reported position diverges from the server's authoritative teleport target.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketServerTeleport.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketServerTeleport.java =====
+package ac.grim.grimac.events.packets;
+
+import ac.grim.grimac.GrimAPI;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.data.IntToObjectPair;
+import ac.grim.grimac.utils.math.Location;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketListenerAbstract;
+import com.github.retrooper.packetevents.event.PacketListenerPriority;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.teleport.RelativeFlag;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerPositionAndLook;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerVehicleMove;
+
+public class PacketServerTeleport extends PacketListenerAbstract {
+
+    private static final boolean STUPID_TELEPORT_SYSTEM = PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_21_2);
+
+    public PacketServerTeleport() {
+        super(PacketListenerPriority.LOW);
+    }
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.PLAYER_POSITION_AND_LOOK) {
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+
+            WrapperPlayServerPlayerPositionAndLook teleport = new WrapperPlayServerPlayerPositionAndLook(event);
+
+            Vector3d pos = new Vector3d(teleport.getX(), teleport.getY(), teleport.getZ());
+
+            // This is the first packet sent to the client which we need to track
+            if (player.getSetbackTeleportUtil().getRequiredSetBack() == null) {
+                // Player teleport event gets called AFTER player join event
+                player.x = teleport.getX();
+                player.y = teleport.getY();
+                player.z = teleport.getZ();
+                player.yaw = teleport.getYaw();
+                player.pitch = teleport.getPitch();
+
+                player.lastX = teleport.getX();
+                player.lastY = teleport.getY();
+                player.lastZ = teleport.getZ();
+                player.lastYaw = teleport.getYaw();
+                player.lastPitch = teleport.getPitch();
+
+                player.pollData();
+            }
+
+            // Convert relative teleports to normal teleports
+            // We have to do this because 1.8 players on 1.9+ get teleports changed by ViaVersion
+            // Additionally, velocity is kept after relative teleports making predictions difficult
+            // The added complexity isn't worth a feature that I have never seen used
+            //
+            // If you do actually need this make an issue on GitHub with an explanation for why
+            if (player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_8) || player.inVehicle()) {
+                boolean relativeX = teleport.isRelativeFlag(RelativeFlag.X),
+                        relativeY = teleport.isRelativeFlag(RelativeFlag.Y),
+                        relativeZ = teleport.isRelativeFlag(RelativeFlag.Z);
+
+                if (relativeX) {
+                    pos = pos.add(new Vector3d(player.x, 0, 0));
+                    teleport.setRelative(RelativeFlag.X, false);
+                }
+
+                if (relativeY) {
+                    pos = pos.add(new Vector3d(0, player.y, 0));
+                    teleport.setRelative(RelativeFlag.Y, false);
+                }
+
+                if (relativeZ) {
+                    pos = pos.add(new Vector3d(0, 0, player.z));
+                    teleport.setRelative(RelativeFlag.Z, false);
+                }
+
+                if (relativeX || relativeY || relativeZ) {
+                    teleport.setX(pos.getX());
+                    teleport.setY(pos.getY());
+                    teleport.setZ(pos.getZ());
+
+                    event.markForReEncode(true);
+                }
+            }
+
+            if (STUPID_TELEPORT_SYSTEM &amp;&amp; player.inVehicle()) {
+                boolean relativeDeltaX = teleport.isRelativeFlag(RelativeFlag.DELTA_X),
+                        relativeDeltaY = teleport.isRelativeFlag(RelativeFlag.DELTA_Y),
+                        relativeDeltaZ = teleport.isRelativeFlag(RelativeFlag.DELTA_Z);
+
+                if (relativeDeltaX) {
+                    teleport.setRelative(RelativeFlag.DELTA_X, false);
+                }
+
+                if (relativeDeltaY) {
+                    teleport.setRelative(RelativeFlag.DELTA_Y, false);
+                }
+
+                if (relativeDeltaZ) {
+                    teleport.setRelative(RelativeFlag.DELTA_Z, false);
+                }
+
+                if (relativeDeltaX || relativeDeltaY || relativeDeltaZ) {
+                    teleport.setDeltaMovement(Vector3d.zero());
+                    event.markForReEncode(true);
+                }
+            }
+
+            // 1.21.2+ client ignore teleports if player is inside vehicle, ABSOLUTE CINEMA MOJANG
+            if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_21_2) &amp;&amp; player.compensatedEntities.serverPlayerVehicle != null) {
+                pos = player.getSetbackTeleportUtil().lastKnownGoodPosition.getPos();
+            }
+
+            player.sendTransaction();
+            final int lastTransactionSent = player.lastTransactionSent.get();
+            event.getTasksAfterSend().add(player::sendTransaction);
+
+            if (teleport.isDismountVehicle()) {
+                // Remove player from vehicle
+                event.getTasksAfterSend().add(() -&gt; player.compensatedEntities.self.eject());
+            }
+
+            // For some reason, teleports on 1.7 are offset by 1.62?
+            if (event.getServerVersion().isOlderThan(ServerVersion.V_1_8))
+                pos = pos.withY(pos.getY() - 1.62);
+
+            Location target = new Location(null, pos.getX(), pos.getY(), pos.getZ(), teleport.getYaw(), teleport.getPitch());
+            player.getSetbackTeleportUtil().addSentTeleport(target, teleport.getDeltaMovement(), lastTransactionSent, teleport.getRelativeFlags(), true, teleport.getTeleportId());
+        }
+
+        if (event.getPacketType() == PacketType.Play.Server.VEHICLE_MOVE) {
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+
+            player.sendTransaction();
+            event.getTasksAfterSend().add(player::sendTransaction);
+            player.vehicleData.vehicleTeleports.add(new IntToObjectPair&lt;&gt;(
+                    player.lastTransactionSent.get(),
+                    new WrapperPlayServerVehicleMove(event).getPosition()
+            ));
+        }
+    }
+}
+// NOTE (AI): Grim converts relative teleports to absolute ones because ViaVersion can rewrite them for 1.8 players, which would break prediction; the transaction sandwich around the teleport is what lets the setback system order it against movement.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis and CheaterDeleter record the same OUT teleport event; Grim additionally re-encodes the packet so its own simulation never sees relative coordinates.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TeleportVerifierCheck (CheaterDeleter)</span>
+<span class="impl-module-clients">(CoolMineman-CheaterDeleter)</span>
+</div>
+<p class="impl-pattern">Verifies that the client's teleport confirm returns the exact coordinates the server sent, kicking on any mismatch.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Stores the target position (resolving relative flags against the player's current position) keyed by the S08 teleport id. When the client sends the matching teleport-confirm packet, the check compares each axis of the attached movement packet against the stored target: absolute axes must match exactly, relative axes must be within 10 blocks. Any disagreement kicks the player.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Cancel-and-spoof teleport bypasses where a client accepts the teleport id but reports a different position, and disabler-style teleport manipulation.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> CoolMineman-CheaterDeleter — src/main/java/io/github/coolmineman/cheaterdeleter/modules/movement/TeleportVerifierCheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: CoolMineman-CheaterDeleter — src/main/java/io/github/coolmineman/cheaterdeleter/modules/movement/TeleportVerifierCheck.java =====
+package io.github.coolmineman.cheaterdeleter.modules.movement;
+
+import java.util.Objects;
+
+import io.github.coolmineman.cheaterdeleter.events.OutgoingTeleportListener;
+import io.github.coolmineman.cheaterdeleter.events.TeleportConfirmListener;
+import io.github.coolmineman.cheaterdeleter.modules.CDModule;
+import io.github.coolmineman.cheaterdeleter.objects.PlayerMoveC2SPacketView;
+import io.github.coolmineman.cheaterdeleter.objects.PlayerPositionLookS2CPacketView;
+import io.github.coolmineman.cheaterdeleter.objects.entity.CDPlayer;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMaps;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import net.minecraft.network.packet.c2s.play.TeleportConfirmC2SPacket;
+import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket.Flag;
+
+public class TeleportVerifierCheck extends CDModule implements TeleportConfirmListener, OutgoingTeleportListener {
+
+    public TeleportVerifierCheck() {
+        super("teleport_verifier_check");
+        TeleportConfirmListener.EVENT.register(this);
+        OutgoingTeleportListener.EVENT.register(this);
+    }
+
+    private static class TeleportVerifierCheckData {
+        public Int2ObjectMap&lt;TeleportInfo&gt; teleports = Int2ObjectMaps.synchronize(new Int2ObjectOpenHashMap&lt;&gt;());
+    }
+
+    private static class TeleportInfo {
+        public final double x;
+        public final double y;
+        public final double z;
+        public final boolean exactX;
+        public final boolean exactY;
+        public final boolean exactZ;
+
+        public TeleportInfo(CDPlayer player, PlayerPositionLookS2CPacketView view) {
+            if (view.getFlags().contains(Flag.X)) {
+                exactX = false;
+                x = view.getX() + player.getX();
+            } else {
+                exactX = true;
+                x = view.getX();
+            }
+            if (view.getFlags().contains(Flag.Y)) {
+                exactY = false;
+                y = view.getY() + player.getY();
+            } else {
+                exactY = true;
+                y = view.getY();
+            }
+            if (view.getFlags().contains(Flag.Z)) {
+                exactZ = false;
+                z = view.getZ() + player.getZ();
+            } else {
+                exactZ = true;
+                z = view.getZ();
+            }
+        }
+    }
+
+    @Override
+    public void onTeleportConfirm(CDPlayer player, TeleportConfirmC2SPacket teleportConfirmC2SPacket, PlayerMoveC2SPacketView playerMoveC2SPacketView) {
+        TeleportInfo teleport = player.getData(TeleportVerifierCheckData.class).teleports.get(teleportConfirmC2SPacket.getTeleportId());
+        player.getData(TeleportVerifierCheckData.class).teleports.remove(teleportConfirmC2SPacket.getTeleportId());
+        if (enabledFor(player)) {
+            Objects.requireNonNull(teleport, "If this is null and player is not cheating you should panic");
+            assertAxis(player, "x", teleport.exactX, playerMoveC2SPacketView.getX(), teleport.x);
+            assertAxis(player, "y", teleport.exactY, playerMoveC2SPacketView.getY(), teleport.y);
+            assertAxis(player, "z", teleport.exactZ, playerMoveC2SPacketView.getZ(), teleport.z);
+        }
+    }
+
+    private void assertAxis(CDPlayer player, String axis, boolean exact, double obtained, double target) {
+        if (exact) {
+            assertOrKick(obtained == target, player, "Bad Teleport " + axis + " expected: " + target + " got: " + obtained);
+        } else {
+            assertOrKick(Math.abs(target - obtained) &lt; 10, player, "Bad Teleport " + axis + " expected: " + target + " got: " + obtained); // TODO this is bad
+        }
+    }
+
+    @Override
+    public void onOutgoingTeleport(CDPlayer player, PlayerPositionLookS2CPacketView packet) {
+        TeleportVerifierCheckData data = player.getOrCreateData(TeleportVerifierCheckData.class, TeleportVerifierCheckData::new);
+        data.teleports.put(packet.getTeleportId(), new TeleportInfo(player, packet));
+    }
+}
+// NOTE (AI): This is the strict end of the spectrum: a single wrong coordinate kicks, with no buffer or violation counter.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim instead flags and sets back; BetterAnticheat resolves teleports inside its confirmation tracker before comparing movement.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TeleportTracker (BetterAnticheat)</span>
+<span class="impl-module-clients">(amnoah-BetterAnticheat)</span>
+</div>
+<p class="impl-pattern">Compensates outgoing teleport packets so movement checks can distinguish a teleport from an illegal position jump.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On the OUT side it wraps the position-and-look packet (plus entity teleport and rotation packets for the player) into a Teleport record that is only added to the eligible list after the confirmation tracker's pre-transaction fires. On the IN side, every flying packet is matched against eligible teleports: onGround flag, absolute coordinates and rotations must line up, with a 2.0E-4 leniency for relative axes when the player did not send a position packet the previous tick. Teleports that never match become a missedTeleport state for the checks.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Movement spoofing that fakes teleport confirms, and the desync that follows when a client skips or reorders teleport confirmation.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/player/tracker/impl/teleport/TeleportTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/player/tracker/impl/teleport/TeleportTracker.java =====
+package better.anticheat.core.player.tracker.impl.teleport;
+
+import better.anticheat.core.player.Player;
+import better.anticheat.core.player.tracker.Tracker;
+import com.github.retrooper.packetevents.event.simple.PacketPlayReceiveEvent;
+import com.github.retrooper.packetevents.event.simple.PacketPlaySendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.teleport.RelativeFlag;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerFlying;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityTeleport;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerPositionAndLook;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerRotation;
+import lombok.Getter;
+import wtf.spare.sparej.Pair;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * This tracker compensates teleportation packets and checks whether a player's movement matches an eligible teleport.
+ */
+public class TeleportTracker extends Tracker {
+
+    private final List&lt;Teleport&gt; eligibleTeleports = new ArrayList&lt;&gt;(), remove = new ArrayList&lt;&gt;();
+
+    @Getter
+    private boolean teleported = true, positionTeleported = true, rotationTeleported = true, missedTeleport = false;
+    private boolean positionLastTick = false, positionThisTick = false;
+
+    private final boolean supportsTickEnd;
+
+    public TeleportTracker(Player player) {
+        super(player);
+        this.supportsTickEnd = player.getUser().getClientVersion()
+                .isNewerThanOrEquals(ClientVersion.V_1_21_2);
+    }
+
+    @Override
+    public void handlePacketPlayReceive(PacketPlayReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.CLIENT_TICK_END) handleTickEnd();
+
+        if (!WrapperPlayClientPlayerFlying.isFlying(event.getPacketType())) return;
+        final var wrapper = new WrapperPlayClientPlayerFlying(event);
+
+        if (!supportsTickEnd) handleTickEnd();
+
+        if (wrapper.hasPositionChanged()) positionThisTick = true;
+
+        for (final var teleport : eligibleTeleports) {
+            if (match(teleport, wrapper)) {
+                if (teleport.getPosition() != null) positionTeleported = true;
+                if (teleport.getRotation() != null) rotationTeleported = true;
+                teleported = true;
+                teleport.setHandled(true);
+            }
+
+            /*
+             * Players receive teleports sequentially, so if they haven't handled this teleport yet then they can't
+             * handle any future ones.
+             * Another intended feature: we allow players to potentially qualify for a teleport multiple times. We could
+             * be wrong and they hadn't actually teleported (such as the scenario a player is standing still, teleports
+             * to themself, they have a network lag spike after confirming the pre, and then they start moving. Once
+             * their network resumes they would teleport but we would have already wrongly assumed they had teleported).
+             * This could allow for potential exploitation of the anticheat, but it can be fixed by lag compensating
+             * more. The more things we have lag compensated, the more harmful it is for a player to modify this
+             * behavior.
+             * This could also be fixed with a prediction system, but that's a long ways out.
+             */
+            // Note: Commented out for now to try to increase handler performance!
+            //if (!teleport.isHandled()) break;
+        }
+    }
+
+    /**
+     * Handle compensating different types of teleport packets.
+     */
+    @Override
+    public void handlePacketPlaySend(PacketPlaySendEvent event) {
+        switch (event.getPacketType()) {
+            case ENTITY_TELEPORT -&gt; {
+                WrapperPlayServerEntityTeleport wrapper = new WrapperPlayServerEntityTeleport(event);
+                if (wrapper.getEntityId() != player.getUser().getEntityId()) return;
+                Teleport teleport = new Teleport(wrapper.getPosition(), new Pair&lt;&gt;(wrapper.getPitch(), wrapper.getYaw()), wrapper.getRelativeFlags(), wrapper.isOnGround());
+                handleTeleport(teleport);
+            }
+            case PLAYER_ROTATION -&gt; {
+                WrapperPlayServerPlayerRotation wrapper = new WrapperPlayServerPlayerRotation(event);
+                Teleport teleport = new Teleport(null, new Pair&lt;&gt;(wrapper.getPitch(), wrapper.getYaw()), null, null);
+                handleTeleport(teleport);
+            }
+            case PLAYER_POSITION_AND_LOOK -&gt; {
+                WrapperPlayServerPlayerPositionAndLook wrapper = new WrapperPlayServerPlayerPositionAndLook(event);
+                Teleport teleport = new Teleport(wrapper.getPosition(), new Pair&lt;&gt;(wrapper.getPitch(), wrapper.getYaw()), wrapper.getRelativeFlags(), null);
+                handleTeleport(teleport);
+            }
+        }
+    }
+
+    /**
+     * Handles a tickend. Is a separate method for compatibility so we can support pre 1.21.2.
+     */
+    private void handleTickEnd() {
+        positionTeleported = rotationTeleported = missedTeleport = teleported = false;
+        positionLastTick = positionThisTick;
+        positionThisTick = false;
+
+        /*
+         * Due to the current design of our confirmation system, teleports do not actually resolve within our
+         * confirmation window. Rather, they resolve in the tick following the post transaction (apart from world
+         * change teleports! Which resolve in time for some reason?). So, we handle it here in the following tick if
+         * needed.
+         */
+        for (Teleport teleport : remove) {
+            eligibleTeleports.remove(teleport);
+            if (!teleport.isHandled()) missedTeleport = true;
+        }
+        remove.clear();
+    }
+
+    /**
+     * Handle compensating teleports. When the initial confirmation returns, we start including the teleport. When the
+     * post confirmation returns, we remove the teleport.
+     */
+    private void handleTeleport(Teleport teleport) {
+        var confirm = player.getConfirmationTracker().confirm();
+        confirm.onBegin(() -&gt; {
+            eligibleTeleports.add(teleport);
+        });
+        confirm.onAfterConfirm(() -&gt; {
+            remove.add(teleport);
+        });
+    }
+
+    /**
+     * This method checks whether the given Teleport matches the player's current Flying packet. To check this, we see
+     * if the onGround status, position, and rotation matches. We also account for relative movements,
+     */
+    private boolean match(Teleport teleport, WrapperPlayClientPlayerFlying wrapper) {
+        /*
+         * Player Rotations and Player Position and Look packets don't define a ground status.
+         * Entity Teleport define a ground status.
+         */
+        ground:
+        {
+            if (teleport.getOnGround() == null) break ground;
+            if (!teleport.getOnGround().equals(wrapper.isOnGround())) return false;
+        }
+
+        /*
+         * Entity Teleport and Player Position and Look define a position.
+         * Player Rotations don't define a position.
+         */
+        position:
+        {
+            if (teleport.getPosition() == null) break position;
+            if (!wrapper.hasPositionChanged()) return false;
+            double x = teleport.getPosition().getX(), y = teleport.getPosition().getY(), z = teleport.getPosition().getZ();
+            boolean relX = false, relY = false, relZ = false;
+
+            if (teleport.getRelativeFlags() != null) {
+                if (teleport.getRelativeFlags().has(RelativeFlag.X)) {
+                    x += player.getPositionTracker().getLastX();
+                    relX = true;
+                }
+                if (teleport.getRelativeFlags().has(RelativeFlag.Y)) {
+                    y += player.getPositionTracker().getLastY();
+                    relY = true;
+                }
+                if (teleport.getRelativeFlags().has(RelativeFlag.Z)) {
+                    z += player.getPositionTracker().getLastZ();
+                    relZ = true;
+                }
+            }
+
+            if (!compareCoordinate(x, wrapper.getLocation().getX(), relX)) return false;
+            if (!compareCoordinate(y, wrapper.getLocation().getY(), relY)) return false;
+            if (!compareCoordinate(z, wrapper.getLocation().getZ(), relZ)) return false;
+        }
+
+        /*
+         * Currently no teleport packets don't include a rotation, but I don't trust Mojang so we futureproof!
+         */
+        rotation:
+        {
+            if (teleport.getRotation() == null) break rotation;
+            if (!wrapper.hasRotationChanged()) return false;
+
+            float pitch = teleport.getRotation().getX(), yaw = teleport.getRotation().getY();
+
+            if (teleport.getRelativeFlags() != null) {
+                if (teleport.getRelativeFlags().has(RelativeFlag.YAW) || teleport.getRelativeFlags().has(RelativeFlag.PITCH))
+                    break rotation;
+
+                /*
+                // Rotation relatives seems to be messing up a lot right now. So, we don't care about it until we figure
+                // out.
+                if (teleport.getRelativeFlags().has(RelativeFlag.PITCH)) {
+                    // Pitch is bounded -90 to 90
+                    if (pitch &lt; 0) {
+                        pitch = Math.max(-90, player.getRotationTracker().getLastPitch() + pitch);
+                    } else {
+                        pitch = Math.min(90, player.getRotationTracker().getLastPitch() + pitch);
+                    }
+                }
+                if (teleport.getRelativeFlags().has(RelativeFlag.YAW)) yaw += player.getRotationTracker().getLastYaw();
+                 */
+            }
+
+            // Verify equality.
+            if (pitch != wrapper.getLocation().getPitch() || yaw != wrapper.getLocation().getYaw()) return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * See ArtificialPositionCheck.java for an explanation behind the value used here.
+     * Check if the player's coordinate is accurate for their teleport.
+     */
+    private boolean compareCoordinate(double first, double second, boolean relative) {
+        /*
+         * If the teleport is not a relative, it must be an exact match to the teleport.
+         * If a teleport is relative, it means that it is based on the previous position.
+         * If the player did not send a position packet in their last tick, it means they could have desynced and their
+         * movement could be off by up to 2.0E-4 (see ArtificialPositionCheck.java for an explanation on the value).
+         */
+        if (relative) {
+            double leniency;
+            if (positionLastTick) leniency = 0;
+            else leniency = 2.0E-4;
+            return Math.abs(first - second) &lt;= leniency;
+        } else return first == second;
+    }
+}
+// NOTE (AI): Teleports resolve in the tick after the post transaction rather than inside the confirmation window, which the tracker handles explicitly for pre-1.21.2 clients.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim's SetbackTeleportUtil keeps an explicit queue of sent teleports; CheaterDeleter verifies confirms immediately and kicks.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TeleportPreProcessor (Artemis)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Feeds server teleport and entity-teleport packets into the movement holder so position checks run against the post-teleport state.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Handles the OUT position packet and the player's entity-teleport packet. For entity teleports it registers a transaction-confirmed action: on the pre side it moves the last velocity into lastVelocity, installs the teleported position as the current movement and location, and marks the movement as teleport-processed; the post side clears that flag once the client confirms.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Cheats that depend on the anticheat not knowing the server moved the player, and velocity residue that should be cleared by a teleport.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/teleport/TeleportPreProcessor.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/teleport/TeleportPreProcessor.java =====
+package ac.artemis.core.v4.processor.teleport;
+
+import ac.artemis.core.v4.data.holders.ConnectionHolder;
+import ac.artemis.core.v4.processor.AbstractHandler;
+import ac.artemis.core.v4.data.PlayerData;
+import ac.artemis.core.v4.utils.function.PacketAction;
+import cc.ghast.packet.PacketAPI;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import ac.artemis.core.v4.utils.position.PlayerMovement;
+import ac.artemis.core.v4.utils.position.PlayerRotation;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntityTeleport;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerPosition;
+
+import java.util.Map;
+import java.util.Random;
+import java.util.WeakHashMap;
+
+public class TeleportPreProcessor extends AbstractHandler {
+    public TeleportPreProcessor(PlayerData data) {
+        super("Teleport [0x01]", data);
+    }
+
+    @Override
+    public void handle(final GPacket packet) {
+        if (packet instanceof GPacketPlayServerPosition) {
+            final GPacketPlayServerPosition pos = (GPacketPlayServerPosition) packet;
+
+
+        }
+        else if (packet instanceof GPacketPlayServerEntityTeleport) {
+            final GPacketPlayServerEntityTeleport pos = (GPacketPlayServerEntityTeleport) packet;
+
+            if (pos.getEntityId() != data.getPlayer().getEntityId()) {
+                return;
+            }
+
+            data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                @Override
+                public void pre() {
+                    data.connection.setLastEntityTeleport(pos);
+                    final PlayerMovement movement = new PlayerMovement(
+                            data.getPlayer().getWorld(),
+                            pos.getValueX(),
+                            pos.getValueY(),
+                            pos.getValueZ(),
+                            pos.getValueYaw(),
+                            pos.getValuePitch(),
+                            pos.getTimestamp()
+                    );
+
+                    if (data.movement.getVelocity() != null)
+                        data.movement.setLastVelocity(data.movement.getVelocity());
+
+                    data.movement.setMovement(movement.setWorld(data.getPlayer().getWorld()));
+                    data.movement.setLocation(movement.setWorld(data.getPlayer().getWorld()));
+
+                    data.movement.setRotation(new PlayerRotation(data.getPlayer(),
+                            movement.getYaw(),
+                            movement.getPitch(),
+                            movement.getTimestamp())
+                    );
+
+                    data.movement.setProcessedEntityTeleport(true);
+                }
+
+                @Override
+                public void post() {
+                    data.movement.setProcessedEntityTeleport(false);
+                }
+            });
+        }
+    }
+}
+// NOTE (AI): The transaction confirmation is what makes the teleport apply in the correct tick relative to the client's own processing.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim uses a transaction sandwich on the OUT packet itself; Artemis applies the teleport on the confirm instead of at send time.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../C03PacketPlayer/">C03PacketPlayer</a>
 <a class="related-chip" href="../S12PacketEntityVelocity/">S12PacketEntityVelocity</a>

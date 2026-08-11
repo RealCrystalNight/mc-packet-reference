@@ -1250,6 +1250,734 @@ if( mc.thePlayer.isSwingInProgress &amp;&amp; distance&gt;3.1&amp;&amp; distance
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent across all consumers; the Rise 5.99 anticheat consumes S18 inside PlayerData.handle.</div>
 <div class="impl-clients">Rise 6.x uses getX()/getY()/getZ() double accessors and divides by 32.0; Rise 5.99 and Sigma use the MCP-style func_149449_d/func_149451_c accessors; Tenacity reads getX() directly on the fixed-point ints (no /32), which is fine for the magnitude check. Only Rise 5.99 tracks ticksSinceLastTeleport as state.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S18 is the clientbound absolute-position correction for one entity, and server anticheats consume it on the send side as the reset point of entity state. Trackers re-anchor their replicated entity positions on it (Hydro, AntiHaxerman), teleport processors re-sync the player's own movement state when the teleport targets the checked player (Artemis, Frequency, BetterAnticheat), and the same packet is what makes reach verification and phase checks trust the server's entity locations. Because the packet is clientbound, no anticheat validates its contents; they only timestamp and consume it.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">EntityTracker (teleport re-anchoring)</span>
+<span class="impl-module-clients">(Incognitolol-Hydro)</span>
+</div>
+<p class="impl-pattern">Re-anchor the replicated position of a tracked entity when the server sends its absolute teleport, so reach checks keep measuring against the corrected location.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">handleEntityTeleport wraps the ENTITY_TELEPORT packet in WrapperPlayServerEntityTeleport, looks up the entity, and applies handleTeleport(x, y, z) inside the transaction tracker's confirm-pre window, with confirm-post advancing all entity queues. The same tracker handles spawn, relative moves and destroy packets, so the entity map mirrors the full server-side entity stream.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Entity position desync after teleports; provides the corrected entity location used by Hydro's reach and combat checks.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/EntityTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/EntityTracker.java =====
+package integral.studios.hydro.model.tracker.impl;
+
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.*;
+import integral.studios.hydro.model.PlayerData;
+import integral.studios.hydro.model.tracker.Tracker;
+import integral.studios.hydro.util.player.tracker.entity.TrackedEntity;
+import integral.studios.hydro.util.packet.PacketUtil;
+import lombok.Getter;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+
+@Getter
+public class EntityTracker extends Tracker {
+    // Thread-safe entity storage
+    private final Map&lt;Integer, TrackedEntity&gt; entityMap = new ConcurrentHashMap&lt;&gt;();
+
+    public EntityTracker(PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void registerOutgoingPreHandler(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.SPAWN_LIVING_ENTITY) {
+            handleSpawnLivingEntity(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_PLAYER) {
+            handleSpawnPlayer(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_RELATIVE_MOVE) {
+            handleEntityRelativeMove(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_RELATIVE_MOVE_AND_ROTATION) {
+            handleEntityRelativeMoveAndRotation(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_TELEPORT) {
+            handleEntityTeleport(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.DESTROY_ENTITIES) {
+            handleDestroyEntities(event);
+        }
+    }
+
+    @Override
+    public void registerIncomingPostHandler(PacketReceiveEvent event) {
+        if (PacketUtil.isFlying(event.getPacketType())) {
+            handleFlyingPacket();
+        }
+    }
+
+    private void handleSpawnLivingEntity(PacketSendEvent event) {
+        WrapperPlayServerSpawnLivingEntity wrapper = new WrapperPlayServerSpawnLivingEntity(event);
+        Vector3d position = wrapper.getPosition();
+        int entityId = wrapper.getEntityId();
+
+        TrackedEntity entity = new TrackedEntity(entityId, position.x, position.y, position.z);
+        entityMap.put(entityId, entity);
+    }
+
+    private void handleSpawnPlayer(PacketSendEvent event) {
+        WrapperPlayServerSpawnPlayer wrapper = new WrapperPlayServerSpawnPlayer(event);
+        Vector3d position = wrapper.getPosition();
+        int entityId = wrapper.getEntityId();
+
+        TrackedEntity entity = new TrackedEntity(entityId, position.x, position.y, position.z);
+        entityMap.put(entityId, entity);
+    }
+
+    private void handleEntityRelativeMove(PacketSendEvent event) {
+        WrapperPlayServerEntityRelativeMove wrapper = new WrapperPlayServerEntityRelativeMove(event);
+
+        TrackedEntity entity = entityMap.get(wrapper.getEntityId());
+        if (entity == null) {
+            return;
+        }
+
+        playerData.getTransactionTracker().confirmPre(() -&gt; {
+            entity.handleMovement(wrapper.getDeltaX(), wrapper.getDeltaY(), wrapper.getDeltaZ());
+        });
+
+        playerData.getTransactionTracker().confirmPost(this::updateAllEntitiesPostTransaction);
+    }
+
+    private void handleEntityRelativeMoveAndRotation(PacketSendEvent event) {
+        WrapperPlayServerEntityRelativeMoveAndRotation wrapper = new WrapperPlayServerEntityRelativeMoveAndRotation(event);
+
+        TrackedEntity entity = entityMap.get(wrapper.getEntityId());
+        if (entity == null) {
+            return;
+        }
+
+        playerData.getTransactionTracker().confirmPre(() -&gt; {
+            entity.handleMovement(wrapper.getDeltaX(), wrapper.getDeltaY(), wrapper.getDeltaZ());
+        });
+
+        playerData.getTransactionTracker().confirmPost(this::updateAllEntitiesPostTransaction);
+    }
+
+    private void handleEntityTeleport(PacketSendEvent event) {
+        WrapperPlayServerEntityTeleport wrapper = new WrapperPlayServerEntityTeleport(event);
+
+        TrackedEntity entity = entityMap.get(wrapper.getEntityId());
+        if (entity == null) {
+            return;
+        }
+
+        Vector3d position = wrapper.getPosition();
+
+        playerData.getTransactionTracker().confirmPre(() -&gt; {
+            entity.handleTeleport(position.x, position.y, position.z);
+        });
+
+        playerData.getTransactionTracker().confirmPost(this::updateAllEntitiesPostTransaction);
+    }
+
+    private void handleDestroyEntities(PacketSendEvent event) {
+        WrapperPlayServerDestroyEntities wrapper = new WrapperPlayServerDestroyEntities(event);
+
+        for (int entityId : wrapper.getEntityIds()) {
+            entityMap.remove(entityId);
+        }
+    }
+
+    private void handleFlyingPacket() {
+        entityMap.values().forEach(TrackedEntity::handlePostFlying);
+    }
+
+    private void updateAllEntitiesPostTransaction() {
+        entityMap.values().forEach(TrackedEntity::handlePostTransaction);
+    }
+
+    public TrackedEntity get(int entityId) {
+        return entityMap.get(entityId);
+    }
+
+    public boolean isTracking(int entityId) {
+        return entityMap.containsKey(entityId);
+    }
+
+    public int getTrackedEntityCount() {
+        return entityMap.size();
+    }
+
+
+    public TrackedEntity removeEntity(int entityId) {
+        return entityMap.remove(entityId);
+    }
+
+
+    public void clearEntities() {
+        entityMap.clear();
+    }
+
+
+    public double getDistanceToEntity(int entityId) {
+        TrackedEntity entity = entityMap.get(entityId);
+        if (entity == null) {
+            return -1;
+        }
+
+        double dx = entity.getX() - playerData.getPositionTracker().getX();
+        double dy = entity.getY() - playerData.getPositionTracker().getY();
+        double dz = entity.getZ() - playerData.getPositionTracker().getZ();
+
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    public TrackedEntity getClosestEntity() {
+        TrackedEntity closest = null;
+        double minDistance = Double.MAX_VALUE;
+
+        for (Map.Entry&lt;Integer, TrackedEntity&gt; entry : entityMap.entrySet()) {
+            TrackedEntity entity = entry.getValue();
+            double distance = getDistanceToEntity(entry.getKey());
+
+            if (distance &gt;= 0 &amp;&amp; distance &lt; minDistance) {
+                minDistance = distance;
+                closest = entity;
+            }
+        }
+
+        return closest;
+    }
+
+
+    public Map&lt;Integer, TrackedEntity&gt; getEntitiesWithinDistance(double maxDistance) {
+        Map&lt;Integer, TrackedEntity&gt; nearbyEntities = new ConcurrentHashMap&lt;&gt;();
+
+        for (Map.Entry&lt;Integer, TrackedEntity&gt; entry : entityMap.entrySet()) {
+            double distance = getDistanceToEntity(entry.getKey());
+            if (distance &gt;= 0 &amp;&amp; distance &lt;= maxDistance) {
+                nearbyEntities.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        return nearbyEntities;
+    }
+
+    public int getEntityId(TrackedEntity entity) {
+        if (entity == null) return -1;
+
+        for (Map.Entry&lt;Integer, TrackedEntity&gt; entry : entityMap.entrySet()) {
+            if (entry.getValue() == entity) {
+                return entry.getKey();
+            }
+        }
+
+        return -1;
+    }
+}
+// NOTE (AI): The transaction-confirm wrapping is what distinguishes these trackers from naive packet handlers: the entity position advances only when the player's own connection state confirms the tick.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> AntiHaxerman's EntityTracker sets the absolute coordinates the same way but keeps the vanilla epsilon check (0.03125 for x/z, 0.015625 for y) so micro-teleports keep the old position. Kauri's EntityTrackHandler interpolates the new absolute location with increment 3 instead of snapping.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TeleportPreProcessor (self entity teleport)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Treat an S18 targeting the checked player as a movement reset: rebuild the player's movement, location and rotation from the teleport coordinates on transaction confirm.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The processor matches GPacketPlayServerEntityTeleport, ignores it unless the entity id equals the player's own id, then schedules a transaction-confirmed action. The pre phase stores the last entity teleport, copies the current velocity into lastVelocity, rebuilds PlayerMovement and PlayerRotation from the teleport values, and sets processedEntityTeleport true; the post phase clears the flag.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Position desync caused by the server teleporting the player; the processedEntityTeleport flag lets downstream checks skip the teleport tick.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/teleport/TeleportPreProcessor.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/teleport/TeleportPreProcessor.java =====
+package ac.artemis.core.v4.processor.teleport;
+
+import ac.artemis.core.v4.data.holders.ConnectionHolder;
+import ac.artemis.core.v4.processor.AbstractHandler;
+import ac.artemis.core.v4.data.PlayerData;
+import ac.artemis.core.v4.utils.function.PacketAction;
+import cc.ghast.packet.PacketAPI;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import ac.artemis.core.v4.utils.position.PlayerMovement;
+import ac.artemis.core.v4.utils.position.PlayerRotation;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntityTeleport;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerPosition;
+
+import java.util.Map;
+import java.util.Random;
+import java.util.WeakHashMap;
+
+public class TeleportPreProcessor extends AbstractHandler {
+    public TeleportPreProcessor(PlayerData data) {
+        super("Teleport [0x01]", data);
+    }
+
+    @Override
+    public void handle(final GPacket packet) {
+        if (packet instanceof GPacketPlayServerPosition) {
+            final GPacketPlayServerPosition pos = (GPacketPlayServerPosition) packet;
+
+
+        }
+        else if (packet instanceof GPacketPlayServerEntityTeleport) {
+            final GPacketPlayServerEntityTeleport pos = (GPacketPlayServerEntityTeleport) packet;
+
+            if (pos.getEntityId() != data.getPlayer().getEntityId()) {
+                return;
+            }
+
+            data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                @Override
+                public void pre() {
+                    data.connection.setLastEntityTeleport(pos);
+                    final PlayerMovement movement = new PlayerMovement(
+                            data.getPlayer().getWorld(),
+                            pos.getValueX(),
+                            pos.getValueY(),
+                            pos.getValueZ(),
+                            pos.getValueYaw(),
+                            pos.getValuePitch(),
+                            pos.getTimestamp()
+                    );
+
+                    if (data.movement.getVelocity() != null)
+                        data.movement.setLastVelocity(data.movement.getVelocity());
+
+                    data.movement.setMovement(movement.setWorld(data.getPlayer().getWorld()));
+                    data.movement.setLocation(movement.setWorld(data.getPlayer().getWorld()));
+
+                    data.movement.setRotation(new PlayerRotation(data.getPlayer(),
+                            movement.getYaw(),
+                            movement.getPitch(),
+                            movement.getTimestamp())
+                    );
+
+                    data.movement.setProcessedEntityTeleport(true);
+                }
+
+                @Override
+                public void post() {
+                    data.movement.setProcessedEntityTeleport(false);
+                }
+            });
+        }
+    }
+}
+// NOTE (AI): The player-position variants (GPacketPlayServerPosition) and the entity-teleport variant share the same processor; only the S18 branch is shown in context here.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Frequency's OutgoingPacketProcessor calls the action manager's onTeleport() for a self S18 without rebuilding movement state; BetterAnticheat's TeleportTracker queues the teleport and matches it against the player's next flying packet, flagging missed teleports.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">OutgoingPacketProcessor (self teleport action)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency, MinecraftUserHAN1110-FrequencyPlus, splatboydev-Degrade)</span>
+</div>
+<p class="impl-pattern">Detect when the server teleports the checked player and reset the action manager state so movement checks exempt the teleport tick.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketPlayOutEntityTeleport the processor wraps the packet, and when the entity id matches the player it calls playerData.getActionManager().onTeleport(). The same processor feeds S12 velocity into the velocity manager for the self entity, and treats PacketPlayOutPosition as a teleport too.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing by itself; it feeds the action manager that movement checks consult to exempt legitimate teleports.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/processor/impl/OutgoingPacketProcessor.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/processor/impl/OutgoingPacketProcessor.java =====
+package xyz.elevated.frequency.processor.impl;
+
+import net.minecraft.server.v1_8_R3.*;
+import xyz.elevated.frequency.data.PlayerData;
+import xyz.elevated.frequency.processor.type.Processor;
+import xyz.elevated.frequency.wrapper.impl.server.WrappedPlayOutKeepAlive;
+import xyz.elevated.frequency.wrapper.impl.server.WrappedPlayOutEntityVelocity;
+import xyz.elevated.frequency.wrapper.impl.server.WrappedPlayOutTeleport;
+import xyz.elevated.frequency.wrapper.impl.server.WrappedPlayOutTransaction;
+
+public final class OutgoingPacketProcessor implements Processor&lt;Packet&lt;PacketListenerPlayOut&gt;&gt; {
+
+    @Override
+    public void process(final PlayerData playerData, final Packet&lt;PacketListenerPlayOut&gt; packet) {
+        if (packet instanceof PacketPlayOutEntityVelocity) {
+            final WrappedPlayOutEntityVelocity wrapper = new WrappedPlayOutEntityVelocity(packet);
+
+            final int packetEntityId = wrapper.getEntityId();
+            final int playerEntityId = playerData.getBukkitPlayer().getEntityId();
+
+            if (packetEntityId == playerEntityId) {
+                final double velocityX = wrapper.getX();
+                final double velocityY = wrapper.getY();
+                final double velocityZ = wrapper.getZ();
+
+                playerData.getVelocityManager().addVelocityEntry(velocityX, velocityY, velocityZ);
+            }
+        } else if (packet instanceof PacketPlayOutEntityTeleport) {
+            final WrappedPlayOutTeleport wrapper = new WrappedPlayOutTeleport(packet);
+
+            final int entityId = wrapper.getEntityId();
+            final int playerId = playerData.getBukkitPlayer().getEntityId();
+
+            if (entityId == playerId) {
+                playerData.getActionManager().onTeleport();
+            }
+        } else if (packet instanceof PacketPlayOutPosition) {
+            playerData.getActionManager().onTeleport();
+        }
+    }
+}
+// NOTE (AI): The S18 branch handles the entity-teleport case only for the self entity; teleports of other entities are ignored, matching the tracker pattern in Hydro and AntiHaxerman.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical copies ship in FrequencyPlus and Degrade. Artemis rebuilds full movement state for the same event; Frequency only resets the action flag.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">EntityTracker (absolute teleport snap)</span>
+<span class="impl-module-clients">(Tecnio-AntiHaxerman)</span>
+</div>
+<p class="impl-pattern">Snap a tracked entity's replicated position to the S18 absolute coordinates so reach and hitbox checks use the corrected server location.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On GPacketPlayServerEntityTeleport the tracker overwrites serverPosX/Y/Z with the absolute fixed-point values and computes the new position by dividing by 32.0, but only if at least one axis differs by more than the vanilla epsilon (0.03125 for x/z, 0.015625 for y); otherwise the current position is kept. The update runs inside a connection-confirm action, so it applies at the player's confirmed tick.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Entity position desync after teleports; the epsilon branch mirrors the vanilla client's micro-jitter suppression on repeated teleports.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tecnio-AntiHaxerman — src/main/java/me/tecnio/ahm/data/tracker/impl/EntityTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tecnio-AntiHaxerman — src/main/java/me/tecnio/ahm/data/tracker/impl/EntityTracker.java =====
+package me.tecnio.ahm.data.tracker.impl;
+
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import ac.artemis.packet.wrapper.client.PacketPlayClientFlying;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntity;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntityDestroy;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntityTeleport;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerSpawnNamedEntity;
+import lombok.Getter;
+import me.tecnio.ahm.data.PlayerData;
+import me.tecnio.ahm.data.tracker.Tracker;
+import me.tecnio.ahm.util.player.TrackerEntity;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Getter
+public final class EntityTracker extends Tracker {
+
+    private final Map&lt;Integer, TrackerEntity&gt; trackerMap = new HashMap&lt;&gt;();
+
+    public EntityTracker(final PlayerData data) {
+        super(data);
+    }
+
+    @Override
+    public void handle(final GPacket packet) {
+        if (packet instanceof GPacketPlayServerEntity) {
+            final GPacketPlayServerEntity wrapper = ((GPacketPlayServerEntity) packet);
+            final int id = wrapper.getEntityId();
+
+            if (this.trackerMap.containsKey(id)) {
+                final TrackerEntity trackerEntity = this.trackerMap.get(id);
+                if (trackerEntity == null) return;
+
+                data.getConnectionTracker().confirm(() -&gt; {
+                    final double x = wrapper.getX();
+                    final double y = wrapper.getY();
+                    final double z = wrapper.getZ();
+
+                    trackerEntity.serverPosX += x;
+                    trackerEntity.serverPosY += y;
+                    trackerEntity.serverPosZ += z;
+
+                    trackerEntity.setPosition2(
+                            trackerEntity.serverPosX / 32.0D,
+                            trackerEntity.serverPosY / 32.0D,
+                            trackerEntity.serverPosZ / 32.0D
+                    );
+                });
+            }
+        } else if (packet instanceof GPacketPlayServerEntityTeleport) {
+            final GPacketPlayServerEntityTeleport wrapper = ((GPacketPlayServerEntityTeleport) packet);
+            final int id = wrapper.getEntityId();
+
+            if (this.trackerMap.containsKey(id)) {
+                final TrackerEntity trackerEntity = this.trackerMap.get(id);
+                if (trackerEntity == null) return;
+
+                data.getConnectionTracker().confirm(() -&gt; {
+                    trackerEntity.serverPosX = wrapper.getX();
+                    trackerEntity.serverPosY = wrapper.getY();
+                    trackerEntity.serverPosZ = wrapper.getZ();
+
+                    final double d0 = (double) trackerEntity.serverPosX / 32.0D;
+                    final double d1 = (double) trackerEntity.serverPosY / 32.0D;
+                    final double d2 = (double) trackerEntity.serverPosZ / 32.0D;
+
+                    final double deltaX = Math.abs(trackerEntity.getPosX() - d0);
+                    final double deltaY = Math.abs(trackerEntity.getPosY() - d1);
+                    final double deltaZ = Math.abs(trackerEntity.getPosZ() - d2);
+
+                    if (deltaX &lt; 0.03125D
+                            &amp;&amp; deltaY &lt; 0.015625D
+                            &amp;&amp; deltaZ &lt; 0.03125D) {
+                        trackerEntity.setPosition2(trackerEntity.getPosX(), trackerEntity.getPosY(), trackerEntity.getPosZ());
+                    } else {
+                        trackerEntity.setPosition2(d0, d1, d2);
+                    }
+                });
+            }
+        } else if (packet instanceof GPacketPlayServerSpawnNamedEntity) {
+            final GPacketPlayServerSpawnNamedEntity wrapper = ((GPacketPlayServerSpawnNamedEntity) packet);
+
+            data.getConnectionTracker().confirm(() -&gt; {
+                final TrackerEntity trackerEntity = new TrackerEntity(wrapper.getEntityId(),
+                        // Thank you artemis packet api for being shit and dividing my shit.
+                        (int) Math.round(wrapper.getX() * 32.0D),
+                        (int) Math.round(wrapper.getY() * 32.0D),
+                        (int) Math.round(wrapper.getZ() * 32.0D)
+                );
+                trackerEntity.setPosition(wrapper.getX(), wrapper.getY(), wrapper.getZ());
+
+                this.trackerMap.put(wrapper.getEntityId(), trackerEntity);
+            });
+        } else if (packet instanceof GPacketPlayServerEntityDestroy) {
+            final GPacketPlayServerEntityDestroy wrapper = ((GPacketPlayServerEntityDestroy) packet);
+
+            for (final int entity : wrapper.getEntities()) {
+                this.trackerMap.remove(entity);
+            }
+        }
+    }
+
+    @Override
+    public void handlePost(final GPacket packet) {
+        if (packet instanceof PacketPlayClientFlying) {
+            this.trackerMap.values().forEach(TrackerEntity::update);
+        }
+    }
+}
+// NOTE (AI): The epsilon check reproduces NetHandlerPlayClient.handleEntityTeleport, which keeps the current position when the entity is already within a 32nd of a block, so the replicated state stays faithful to what the client does.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro's EntityTracker snaps unconditionally; Kauri interpolates to the new location over three ticks. Both share the transaction-anchored application model.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TeleportTracker (teleport confirmation)</span>
+<span class="impl-module-clients">(amnoah-BetterAnticheat)</span>
+</div>
+<p class="impl-pattern">Queue every teleport sent to the player, including S18 self teleports, and verify that the player's next flying packet rejoins the teleported position, rotation and ground state.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">handlePacketPlaySend wraps ENTITY_TELEPORT for the player's own entity id into a Teleport record (position, rotation, relative flags, onGround) and adds it to eligibleTeleports when the confirmation begins. On each flying packet, match() compares onGround, then the absolute or relative position coordinate by coordinate, then rotation; a teleport still eligible at tick end sets missedTeleport. The strictness depends on whether the player sent a position in the previous tick (2.0E-4 leniency when not).</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Teleport desync, clients that ignore or delay server teleports, and position spoofing that fails to rejoin the teleported location.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/player/tracker/impl/teleport/TeleportTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/player/tracker/impl/teleport/TeleportTracker.java =====
+package better.anticheat.core.player.tracker.impl.teleport;
+
+import better.anticheat.core.player.Player;
+import better.anticheat.core.player.tracker.Tracker;
+import com.github.retrooper.packetevents.event.simple.PacketPlayReceiveEvent;
+import com.github.retrooper.packetevents.event.simple.PacketPlaySendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.teleport.RelativeFlag;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerFlying;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityTeleport;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerPositionAndLook;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerRotation;
+import lombok.Getter;
+import wtf.spare.sparej.Pair;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * This tracker compensates teleportation packets and checks whether a player's movement matches an eligible teleport.
+ */
+public class TeleportTracker extends Tracker {
+
+    private final List&lt;Teleport&gt; eligibleTeleports = new ArrayList&lt;&gt;(), remove = new ArrayList&lt;&gt;();
+
+    @Getter
+    private boolean teleported = true, positionTeleported = true, rotationTeleported = true, missedTeleport = false;
+    private boolean positionLastTick = false, positionThisTick = false;
+
+    private final boolean supportsTickEnd;
+
+    public TeleportTracker(Player player) {
+        super(player);
+        this.supportsTickEnd = player.getUser().getClientVersion()
+                .isNewerThanOrEquals(ClientVersion.V_1_21_2);
+    }
+
+    @Override
+    public void handlePacketPlayReceive(PacketPlayReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.CLIENT_TICK_END) handleTickEnd();
+
+        if (!WrapperPlayClientPlayerFlying.isFlying(event.getPacketType())) return;
+        final var wrapper = new WrapperPlayClientPlayerFlying(event);
+
+        if (!supportsTickEnd) handleTickEnd();
+
+        if (wrapper.hasPositionChanged()) positionThisTick = true;
+
+        for (final var teleport : eligibleTeleports) {
+            if (match(teleport, wrapper)) {
+                if (teleport.getPosition() != null) positionTeleported = true;
+                if (teleport.getRotation() != null) rotationTeleported = true;
+                teleported = true;
+                teleport.setHandled(true);
+            }
+
+            /*
+             * Players receive teleports sequentially, so if they haven't handled this teleport yet then they can't
+             * handle any future ones.
+             * Another intended feature: we allow players to potentially qualify for a teleport multiple times. We could
+             * be wrong and they hadn't actually teleported (such as the scenario a player is standing still, teleports
+             * to themself, they have a network lag spike after confirming the pre, and then they start moving. Once
+             * their network resumes they would teleport but we would have already wrongly assumed they had teleported).
+             * This could allow for potential exploitation of the anticheat, but it can be fixed by lag compensating
+             * more. The more things we have lag compensated, the more harmful it is for a player to modify this
+             * behavior.
+             * This could also be fixed with a prediction system, but that's a long ways out.
+             */
+            // Note: Commented out for now to try to increase handler performance!
+            //if (!teleport.isHandled()) break;
+        }
+    }
+
+    /**
+     * Handle compensating different types of teleport packets.
+     */
+    @Override
+    public void handlePacketPlaySend(PacketPlaySendEvent event) {
+        switch (event.getPacketType()) {
+            case ENTITY_TELEPORT -&gt; {
+                WrapperPlayServerEntityTeleport wrapper = new WrapperPlayServerEntityTeleport(event);
+                if (wrapper.getEntityId() != player.getUser().getEntityId()) return;
+                Teleport teleport = new Teleport(wrapper.getPosition(), new Pair&lt;&gt;(wrapper.getPitch(), wrapper.getYaw()), wrapper.getRelativeFlags(), wrapper.isOnGround());
+                handleTeleport(teleport);
+            }
+            case PLAYER_ROTATION -&gt; {
+                WrapperPlayServerPlayerRotation wrapper = new WrapperPlayServerPlayerRotation(event);
+                Teleport teleport = new Teleport(null, new Pair&lt;&gt;(wrapper.getPitch(), wrapper.getYaw()), null, null);
+                handleTeleport(teleport);
+            }
+            case PLAYER_POSITION_AND_LOOK -&gt; {
+                WrapperPlayServerPlayerPositionAndLook wrapper = new WrapperPlayServerPlayerPositionAndLook(event);
+                Teleport teleport = new Teleport(wrapper.getPosition(), new Pair&lt;&gt;(wrapper.getPitch(), wrapper.getYaw()), wrapper.getRelativeFlags(), null);
+                handleTeleport(teleport);
+            }
+        }
+    }
+
+    /**
+     * Handles a tickend. Is a separate method for compatibility so we can support pre 1.21.2.
+     */
+    private void handleTickEnd() {
+        positionTeleported = rotationTeleported = missedTeleport = teleported = false;
+        positionLastTick = positionThisTick;
+        positionThisTick = false;
+
+        /*
+         * Due to the current design of our confirmation system, teleports do not actually resolve within our
+         * confirmation window. Rather, they resolve in the tick following the post transaction (apart from world
+         * change teleports! Which resolve in time for some reason?). So, we handle it here in the following tick if
+         * needed.
+         */
+        for (Teleport teleport : remove) {
+            eligibleTeleports.remove(teleport);
+            if (!teleport.isHandled()) missedTeleport = true;
+        }
+        remove.clear();
+    }
+
+    /**
+     * Handle compensating teleports. When the initial confirmation returns, we start including the teleport. When the
+     * post confirmation returns, we remove the teleport.
+     */
+    private void handleTeleport(Teleport teleport) {
+        var confirm = player.getConfirmationTracker().confirm();
+        confirm.onBegin(() -&gt; {
+            eligibleTeleports.add(teleport);
+        });
+        confirm.onAfterConfirm(() -&gt; {
+            remove.add(teleport);
+        });
+    }
+
+    /**
+     * This method checks whether the given Teleport matches the player's current Flying packet. To check this, we see
+     * if the onGround status, position, and rotation matches. We also account for relative movements,
+     */
+    private boolean match(Teleport teleport, WrapperPlayClientPlayerFlying wrapper) {
+        /*
+         * Player Rotations and Player Position and Look packets don't define a ground status.
+         * Entity Teleport define a ground status.
+         */
+        ground:
+        {
+            if (teleport.getOnGround() == null) break ground;
+            if (!teleport.getOnGround().equals(wrapper.isOnGround())) return false;
+        }
+
+        /*
+         * Entity Teleport and Player Position and Look define a position.
+         * Player Rotations don't define a position.
+         */
+        position:
+        {
+            if (teleport.getPosition() == null) break position;
+            if (!wrapper.hasPositionChanged()) return false;
+            double x = teleport.getPosition().getX(), y = teleport.getPosition().getY(), z = teleport.getPosition().getZ();
+            boolean relX = false, relY = false, relZ = false;
+
+            if (teleport.getRelativeFlags() != null) {
+                if (teleport.getRelativeFlags().has(RelativeFlag.X)) {
+                    x += player.getPositionTracker().getLastX();
+                    relX = true;
+                }
+                if (teleport.getRelativeFlags().has(RelativeFlag.Y)) {
+                    y += player.getPositionTracker().getLastY();
+                    relY = true;
+                }
+                if (teleport.getRelativeFlags().has(RelativeFlag.Z)) {
+                    z += player.getPositionTracker().getLastZ();
+                    relZ = true;
+                }
+            }
+
+            if (!compareCoordinate(x, wrapper.getLocation().getX(), relX)) return false;
+            if (!compareCoordinate(y, wrapper.getLocation().getY(), relY)) return false;
+            if (!compareCoordinate(z, wrapper.getLocation().getZ(), relZ)) return false;
+        }
+
+        /*
+         * Currently no teleport packets don't include a rotation, but I don't trust Mojang so we futureproof!
+         */
+        rotation:
+        {
+            if (teleport.getRotation() == null) break rotation;
+            if (!wrapper.hasRotationChanged()) return false;
+
+            float pitch = teleport.getRotation().getX(), yaw = teleport.getRotation().getY();
+
+            if (teleport.getRelativeFlags() != null) {
+                if (teleport.getRelativeFlags().has(RelativeFlag.YAW) || teleport.getRelativeFlags().has(RelativeFlag.PITCH))
+                    break rotation;
+
+                /*
+                // Rotation relatives seems to be messing up a lot right now. So, we don't care about it until we figure
+                // out.
+                if (teleport.getRelativeFlags().has(RelativeFlag.PITCH)) {
+                    // Pitch is bounded -90 to 90
+                    if (pitch &lt; 0) {
+                        pitch = Math.max(-90, player.getRotationTracker().getLastPitch() + pitch);
+                    } else {
+                        pitch = Math.min(90, player.getRotationTracker().getLastPitch() + pitch);
+                    }
+                }
+                if (teleport.getRelativeFlags().has(RelativeFlag.YAW)) yaw += player.getRotationTracker().getLastYaw();
+                 */
+            }
+
+            // Verify equality.
+            if (pitch != wrapper.getLocation().getPitch() || yaw != wrapper.getLocation().getYaw()) return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * See ArtificialPositionCheck.java for an explanation behind the value used here.
+     * Check if the player's coordinate is accurate for their teleport.
+     */
+    private boolean compareCoordinate(double first, double second, boolean relative) {
+        /*
+         * If the teleport is not a relative, it must be an exact match to the teleport.
+         * If a teleport is relative, it means that it is based on the previous position.
+         * If the player did not send a position packet in their last tick, it means they could have desynced and their
+         * movement could be off by up to 2.0E-4 (see ArtificialPositionCheck.java for an explanation on the value).
+         */
+        if (relative) {
+            double leniency;
+            if (positionLastTick) leniency = 0;
+            else leniency = 2.0E-4;
+            return Math.abs(first - second) &lt;= leniency;
+        } else return first == second;
+    }
+}
+// NOTE (AI): ENTITY_TELEPORT only counts for the player's own entity id, and the match tolerates relative-flag coordinates by folding in the last confirmed position.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis and Frequency reset movement state on self teleports without verifying the rejoining position; BetterAnticheat's ArtificialPositionCheck consumes the missedTeleport signal to flag impossible position jumps.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S14PacketEntity/">S14PacketEntity</a>
 <a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>

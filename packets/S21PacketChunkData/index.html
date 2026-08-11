@@ -110,6 +110,482 @@
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">No module in the 8 clients registers a receive handler for S21. Rise 6.x exposes the class to scripts via NetworkAPI; all other references are vanilla net/minecraft files.</div>
 <div class="impl-clients">All 8 clients ship the vanilla handleChunkData. Rise 6.1.30/6.2.4 additionally list the class in NetworkAPI; Memeware, Nekoware, Sigma, Spicy and Tenacity differ only in the bundled vanilla source revision.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S21 delivers a full chunk column to the client, and it is the transport that makes xray and world-downloader cheating possible. Server-side anticheats approach it from two directions: xray checks score ore-breaking behavior (BAC XRayCheck, AntiCheatPlus XRayListener, Negativity XRayProtocol), sentinel modules neutralize world downloaders at the plugin-message level (Photon WorldDownloaderSentinel), and simulation anticheats parse the chunk bytes into a compensated world so their movement and phase checks see the same blocks the client sees (Grim PacketWorldReaderEight, Hydro WorldTracker, Truthful CompensatedWorld, Kauri Chunk and World, Intave block caches). The corpus for S21 is dominated by the replication side, because every block-based check depends on it.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">XRayCheck (BasicAntiCheat)</span>
+<span class="impl-module-clients">(MC-Jinky-BasicAntiCheat)</span>
+</div>
+<p class="impl-pattern">Ghost-block xray heuristic: spawn fake ore blocks in front of the player and flag anyone who breaks them.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On BlockBreakEvent, when the player breaks an ore, the check walks up to 9 blocks in the player's facing direction and replaces a buried stone block with the same ore type, recording it as a ghost block with a proximity counter. On PlayerMoveEvent, ghost blocks that the player approaches too often and then breaks (5 or more close encounters) fail the check; sneaking while standing over a block also registers it. The check is marked as heavy beta in the config.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Xray users who path straight to ores through solid rock and break ghost blocks that were never visible.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> MC-Jinky-BasicAntiCheat — src/me/jinky/checks/world/XRayCheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: MC-Jinky-BasicAntiCheat — src/me/jinky/checks/world/XRayCheck.java =====
+package me.jinky.checks.world;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+
+import org.bukkit.Material;
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
+import org.bukkit.entity.Player;
+import org.bukkit.event.Event;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+
+import me.jinky.checks.Check;
+import me.jinky.checks.CheckResult;
+import me.jinky.logger.User;
+import me.jinky.util.UtilBlock;
+
+public class XRayCheck extends Check {
+
+	public static Map&lt;Player, HashMap&lt;Block, Long&gt;&gt; ghostblocks = new HashMap&lt;Player, HashMap&lt;Block, Long&gt;&gt;();
+	public static Map&lt;Player, HashMap&lt;Block, Integer&gt;&gt; ghostblocks_closecount = new HashMap&lt;Player, HashMap&lt;Block, Integer&gt;&gt;();
+	public static Map&lt;Player, Long&gt; lastcheck = new HashMap&lt;Player, Long&gt;();
+	public static Map&lt;Player, HashMap&lt;Block, Double&gt;&gt; ghostblocks_lastcheckloc = new HashMap&lt;Player, HashMap&lt;Block, Double&gt;&gt;();
+
+	@Override
+	public String getName() {
+		return "XRay";
+	}
+
+	@Override
+	public String getEventCall() {
+		return "PlayerMoveEvent";
+	}
+
+	@Override
+	public String getSecondaryEventCall() {
+		return "BlockBreakEvent";
+	}
+
+	@Override
+	public CheckResult performCheck(User u, Event ev) {
+		Player p = u.getPlayer();
+		if (ev.getEventName().equalsIgnoreCase("PlayerMoveEvent")) {
+			if (!lastcheck.containsKey(p)) {
+				lastcheck.put(p, 1L);
+			}
+			PlayerMoveEvent e = (PlayerMoveEvent) ev;
+			Long math = System.currentTimeMillis() - lastcheck.get(p);
+			if (e.getTo().getWorld() != e.getFrom().getWorld()) {
+				if (ghostblocks.containsKey(p)) {
+					for (Block b : ghostblocks.get(p).keySet()) {
+						b.setType(Material.STONE);
+					}
+					ghostblocks.remove(p);
+				}
+				if (ghostblocks_closecount.containsKey(p))
+					ghostblocks_closecount.remove(p);
+				if (ghostblocks_lastcheckloc.containsKey(p))
+					ghostblocks_lastcheckloc.remove(p);
+				lastcheck.put(p, System.currentTimeMillis());
+				return new CheckResult("XRay", true, "WorldChange");
+			}
+			if (math &gt; 1750 &amp;&amp; ghostblocks_closecount.containsKey(p) &amp;&amp; e.getFrom().distance(e.getTo()) &gt; 0.1) {
+				Iterator&lt;Block&gt; i = ghostblocks_closecount.get(p).keySet().iterator();
+				List&lt;Block&gt; remove = new ArrayList&lt;Block&gt;();
+				while (i.hasNext()) {
+					Block b = i.next();
+					if (b != null &amp;&amp; b.getType() != null &amp;&amp; !b.getType().toString().contains("ORE")) {
+						remove.add(b);
+						return new CheckResult("XRay", true, "pass");
+					}
+					Integer count = ghostblocks_closecount.get(p).get(b);
+
+					if (b.getLocation().getWorld() != e.getTo().getWorld()) {
+						return new CheckResult("XRay", true, "WorldChange");
+					}
+					if (e.getTo().distance(b.getLocation()) &lt; ghostblocks_lastcheckloc.get(p).get(b)) {
+						count++;
+						ghostblocks_closecount.get(p).put(b, count);
+					} else {
+						count--;
+						if (count &lt; 0) {
+							remove.add(b);
+							b.setType(Material.STONE);
+						} else {
+							ghostblocks_closecount.get(p).put(b, count);
+						}
+					}
+				}
+				if (remove.size() &gt; 0) {
+					for (Block b : remove) {
+						ghostblocks_closecount.get(p).remove(b);
+						ghostblocks.get(p).remove(b);
+						ghostblocks_lastcheckloc.get(p).remove(b);
+					}
+				}
+				lastcheck.put(p, System.currentTimeMillis());
+			}
+
+		} else {
+			if (!ghostblocks.containsKey(p)) {
+				ghostblocks.put(p, new HashMap&lt;Block, Long&gt;());
+			}
+			if (!ghostblocks_closecount.containsKey(p)) {
+				ghostblocks_closecount.put(p, new HashMap&lt;Block, Integer&gt;());
+			}
+			if (p.isSneaking()) {
+				ghostblocks.get(p).put(p.getLocation().getBlock().getRelative(BlockFace.DOWN),
+						System.currentTimeMillis());
+			}
+
+			BlockBreakEvent e = (BlockBreakEvent) ev;
+
+			if (e.getBlock().getType().toString().contains("ORE")) {
+				if (ghostblocks.get(p).containsKey(e.getBlock())) {
+					Integer count = ghostblocks_closecount.get(p).get(e.getBlock());
+					ghostblocks.get(p).remove(e.getBlock());
+					ghostblocks_closecount.get(p).remove(e.getBlock());
+					if (count &gt; 4) {
+						return new CheckResult("XRay", false, "broke ghostblocks 5+ blocks ret");
+					}
+				} else {
+					BlockFace opposite = getopposite(p);
+					Block target = e.getBlock();
+					Integer g = 0;
+					for (int i = 0; i &lt; 9; i++) {
+						target = target.getRelative(opposite);
+						if (i &gt; 4) {
+							if (UtilBlock.xraysafe(target, target.getType()).size() == 0) {
+								g++;
+								if (g == 2 &amp;&amp; target.getLocation().getWorld().equals(p.getLocation().getWorld())) {
+									target.setType(e.getBlock().getType());
+									ghostblocks.get(p).put(target, System.currentTimeMillis());
+									ghostblocks_closecount.get(p).put(target, 4);
+									if (!ghostblocks_lastcheckloc.containsKey(p)) {
+										ghostblocks_lastcheckloc.put(p, new HashMap&lt;Block, Double&gt;());
+									}
+									ghostblocks_lastcheckloc.get(p).put(target,
+											p.getLocation().distance(target.getLocation()));
+									break;
+								}
+
+							}
+						}
+					}
+				}
+				return new CheckResult("XRay", true, "pass");
+			}
+
+			return new CheckResult("XRay", true, "pass");
+		}
+		return new CheckResult("XRay", true, "pass");
+	}
+
+	public static BlockFace getopposite(Player player) {
+		float yaw = player.getLocation().getYaw();
+		if (yaw &lt; 0) {
+			yaw += 360;
+		}
+		if (yaw &gt;= 315 || yaw &lt; 45) {
+			return BlockFace.NORTH;
+		} else if (yaw &lt; 135) {
+			return BlockFace.EAST;
+		} else if (yaw &lt; 225) {
+			return BlockFace.SOUTH;
+		} else if (yaw &lt; 315) {
+			return BlockFace.WEST;
+		}
+		return BlockFace.NORTH;
+	}
+
+}
+// NOTE (AI): The check is event-based (PlayerMoveEvent and BlockBreakEvent), so the S21 hit is a domain match: the chunk data packet is what makes the buried ores visible to the cheater in the first place.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> AntiCheatPlus XRayListener and XRayTracker score ore ratios per player instead of ghost blocks; Negativity XRayProtocol runs a similar ore-ratio heuristic; Observer ChestESP is the render-side cousin of the same idea.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">XRayListener and XRayTracker (AntiCheatPlus)</span>
+<span class="impl-module-clients">(m1enkrafftman-AntiCheatPlus)</span>
+</div>
+<p class="impl-pattern">Ore-ratio xray detection: players who mine far more ores per total blocks than the server average are flagged.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">BlockBreakEvent feeds per-ore counters (diamond, iron, gold, lapis, redstone) and a total block counter into XRayTracker for every checked player; creative players are skipped unless checkCreativeXRay is enabled. XRayStats snapshots the counts and the scheduled XRay checker compares ratios against the server baseline at the configured alert interval.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Xray users whose ore-to-block ratio is statistically above legitimate mining.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> m1enkrafftman-AntiCheatPlus — src/main/java/net/dynamicdev/anticheat/xray/XRayListener.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: m1enkrafftman-AntiCheatPlus — src/main/java/net/dynamicdev/anticheat/xray/XRayListener.java =====
+/*
+ * AntiCheat for Bukkit.
+ * Copyright (C) 2012-2014 AntiCheat Team | http://gravitydevelopment.net
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+
+package net.dynamicdev.anticheat.xray;
+
+import net.dynamicdev.anticheat.AntiCheat;
+import net.dynamicdev.anticheat.check.CheckType;
+import net.dynamicdev.anticheat.config.Configuration;
+import net.dynamicdev.anticheat.manage.CheckManager;
+
+import org.bukkit.GameMode;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.BlockBreakEvent;
+
+public class XRayListener implements Listener {
+    private XRayTracker tracker = AntiCheat.getManager().getXRayTracker();
+    private Configuration config = AntiCheat.getManager().getConfiguration();
+    private CheckManager checkManager = AntiCheat.getManager().getCheckManager();
+
+    @EventHandler
+    public void onBlockBreak(BlockBreakEvent event) {
+        if (config.getConfig().checkXRay.getValue()) {
+            Player p = event.getPlayer();
+            if (p.getGameMode() == GameMode.CREATIVE &amp;&amp; !config.getConfig().checkCreativeXRay.getValue()) {
+                return;
+            }
+            String player = p.getName();
+            if (checkManager.willCheck(p, CheckType.XRAY)) {
+                Material m = event.getBlock().getType();
+                if (m == Material.DIAMOND_ORE) {
+                    tracker.addDiamond(player);
+                } else if (m == Material.IRON_ORE) {
+                    tracker.addIron(player);
+                } else if (m == Material.GOLD_ORE) {
+                    tracker.addGold(player);
+                } else if (m == Material.LAPIS_ORE) {
+                    tracker.addLapis(player);
+                } else if (m == Material.REDSTONE_ORE || m == Material.GLOWING_REDSTONE_ORE) {
+                    tracker.addRedstone(player);
+                } else if (m == Material.GOLD_ORE) {
+                    tracker.addGold(player);
+                } else {
+                    tracker.addBlock(player);
+                }
+                tracker.addTotal(player);
+            }
+        }
+    }
+}
+// NOTE (AI): The S21 corpus hit for this file is the XRay keyword family; the chunk data packet is what makes the ores visible to the cheater, and the check scores the resulting behavior.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Negativity XRayProtocol uses the same ratio idea; BAC XRayCheck detects via ghost blocks instead; LightAntiCheat hooks unloaded-chunk movement (UnloadedChunkListener) to catch players walking through terrain that should not exist.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PacketWorldReaderEight (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Parse the raw S21 chunk data bytes into Grim's compensated world so simulation checks see the exact blocks the client received.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">BasePacketWorldReader dispatches the outbound chunk packets: handleMapChunk reads the chunk x/z, ground-up flag, section mask and size, decodes each 16-section column with the 1.8 endian-flipped palette reader, skips biome and light arrays, and merges the result into the compensated world cache with the transaction id. The 1.9+ and 1.18 readers are separate implementations; unloads are queued via removeChunkLater.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Feeds ground, collision and phase simulation; without it, ghost-block and phase cheats would read a stale world.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/worldreader/PacketWorldReaderEight.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/worldreader/PacketWorldReaderEight.java =====
+package ac.grim.grimac.events.packets.worldreader;
+
+import ac.grim.grimac.player.GrimPlayer;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.world.chunk.impl.v1_16.Chunk_v1_9;
+import com.github.retrooper.packetevents.protocol.world.chunk.palette.DataPalette;
+import com.github.retrooper.packetevents.protocol.world.chunk.palette.ListPalette;
+import com.github.retrooper.packetevents.protocol.world.chunk.palette.PaletteType;
+import com.github.retrooper.packetevents.protocol.world.chunk.storage.BitStorage;
+import com.github.retrooper.packetevents.wrapper.PacketWrapper;
+import io.netty.buffer.ByteBuf;
+
+import java.util.BitSet;
+
+public class PacketWorldReaderEight extends BasePacketWorldReader {
+    @Override
+    public void handleMapChunkBulk(final GrimPlayer player, final PacketSendEvent event) {
+        PacketWrapper&lt;?&gt; wrapper = new PacketWrapper&lt;&gt;(event);
+        ByteBuf buffer = (ByteBuf) wrapper.getBuffer();
+
+        boolean skylight = wrapper.readBoolean();
+        int columns = wrapper.readVarInt();
+        int[] x = new int[columns];
+        int[] z = new int[columns];
+        int[] mask = new int[columns];
+
+        for (int column = 0; column &lt; columns; column++) {
+            x[column] = wrapper.readInt();
+            z[column] = wrapper.readInt();
+            mask[column] = wrapper.readUnsignedShort();
+        }
+
+        for (int column = 0; column &lt; columns; column++) {
+            BitSet bitset = BitSet.valueOf(new long[]{mask[column]});
+            Chunk_v1_9[] chunkSections = new Chunk_v1_9[16];
+            readChunk(buffer, chunkSections, bitset);
+
+            // 256 is the biome data at the end of the array
+            // 2048 is blocklight
+            // 2048 is skylight, which is determined by the first boolean sent
+            int chunks = Integer.bitCount(mask[column]);
+            buffer.readerIndex(buffer.readerIndex() + 256 + (chunks * 2048) + (skylight ? (chunks * 2048) : 0));
+
+            addChunkToCache(event, player, chunkSections, true, x[column], z[column], null);
+        }
+    }
+
+    @Override
+    public void handleMapChunk(final GrimPlayer player, final PacketSendEvent event) {
+        PacketWrapper&lt;?&gt; wrapper = new PacketWrapper&lt;&gt;(event);
+
+        final int chunkX = wrapper.readInt();
+        final int chunkZ = wrapper.readInt();
+        boolean groundUp = wrapper.readBoolean();
+
+        BitSet mask = BitSet.valueOf(new long[]{(long) wrapper.readUnsignedShort()});
+        int size = wrapper.readVarInt(); // Ignore size
+
+        final Chunk_v1_9[] chunks = new Chunk_v1_9[16];
+        this.readChunk((ByteBuf) event.getByteBuf(), chunks, mask);
+
+        this.addChunkToCache(event, player, chunks, groundUp, chunkX, chunkZ, null);
+
+        event.setLastUsedWrapper(null); // Make sure this incomplete packet isn't sent
+    }
+
+    private void readChunk(final ByteBuf buf, final Chunk_v1_9[] chunks, final BitSet set) {
+        for (int ind = 0; ind &lt; 16; ++ind) {
+            if (set.get(ind)) {
+                chunks[ind] = readChunk(buf);
+            }
+        }
+    }
+
+    public Chunk_v1_9 readChunk(final ByteBuf in) {
+        ListPalette palette = new ListPalette(4);
+        BitStorage storage = new BitStorage(4, 4096);
+        DataPalette dataPalette = new DataPalette(palette, storage, PaletteType.CHUNK);
+
+        palette.stateToId(0); // Make sure to init chunk as air
+
+        int lastNext = -1;
+        int lastID = -1;
+        int blockCount = 0;
+
+        for (int i = 0; i &lt; 4096; ++i) {
+            int next = in.readShort();
+
+            if (next != 0) { // If not air, doesn't need any endian flip
+                blockCount++;
+            }
+
+            // 0111 0000 0000 0000
+            // First byte of block type, followed by data, followed by second and third byte of block data
+            //
+            // This is bedrock
+            //
+            // Due to endian weirdness, it must be turned into
+            // 0000 0000 01110 0000
+            if (next != lastNext) { // If same, then couldn't have changed palette size, optimization
+                lastNext = next;
+                next = (short) (((next &amp; 0xFF00) &gt;&gt; 8) | (next &lt;&lt; 8)); // Flip endian bytes, computations are cheap compared to memory access
+                dataPalette.set(i &amp; 15, (i &gt;&gt; 8) &amp; 15, (i &gt;&gt; 4) &amp; 15, next); // Allow it to resize
+                lastID = dataPalette.storage.get(i); // Get stored ID
+                continue;
+            }
+
+            dataPalette.storage.set(i, lastID);
+        }
+
+        return new Chunk_v1_9(blockCount, dataPalette);
+    }
+}
+// NOTE (AI): This is the 1.8 protocol reader; the sibling PacketWorldReaderEighteen handles 1.18 chunk sections, and the dispatch lives in BasePacketWorldReader.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro WorldTracker and Truthful CompensatedWorld keep the same compensated cache with chunk snapshots; Kauri World and Chunk classes store WrappedBlock arrays; Intave BlockCaches and ChunkAccessPatcher build the block cache for its physics simulator; Artemis CachedWorld does the same for its emulator.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WorldDownloaderSentinel (Photon)</span>
+<span class="impl-module-clients">(Photon-GitHub-AntiCheatAddition)</span>
+</div>
+<p class="impl-pattern">Detect WorldDownloader mods and disable their chunk caching, entity saving and container saving over the wdl plugin-message channel.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Registers the wdl/init and wdl/control plugin-message channels. When a client announces itself on wdl|INIT, the module answers on wdl|CONTROL with two packets that disable future functionality, general saving, chunk caching, entity and tile-entity saving and container saving per config, then runs the standard sentinel detection. Chunk data (S21 and S26) is the mod's raw material, so the module closes the hole at the channel handshake.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> WorldDownloader clients that would otherwise persist every chunk the server sends.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/sentinel/mods/WorldDownloaderSentinel.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/sentinel/mods/WorldDownloaderSentinel.java =====
+package de.photon.anticheataddition.modules.sentinel.mods;
+
+import com.google.common.io.ByteStreams;
+import de.photon.anticheataddition.AntiCheatAddition;
+import de.photon.anticheataddition.modules.ModuleLoader;
+import de.photon.anticheataddition.modules.sentinel.SentinelModule;
+import de.photon.anticheataddition.util.pluginmessage.MessageChannel;
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.messaging.PluginMessageListener;
+import org.jetbrains.annotations.NotNull;
+
+public final class WorldDownloaderSentinel extends SentinelModule implements PluginMessageListener
+{
+    public static final WorldDownloaderSentinel INSTANCE = new WorldDownloaderSentinel();
+
+    private static final MessageChannel WDL_CONTROL_CHANNEL = MessageChannel.of("wdl", "control", "WDL|CONTROL");
+    public static final MessageChannel WDL_INIT_CHANNEL = MessageChannel.of("wdl", "init", "WDL|INIT");
+
+    private final boolean disable = loadBoolean(".disable.general", true);
+    private final boolean disableFuture = loadBoolean(".disable.future", true);
+    private final int saveRadius = loadInt(".disable.save_radius", 0);
+    private final boolean disableChunkCaching = loadBoolean(".disable.chunk_caching", true);
+    private final boolean disableEntitySaving = loadBoolean(".disable.entity_saving", true);
+    private final boolean disableTileEntitySaving = loadBoolean(".disable.tile_entity_saving", true);
+    private final boolean disableContainerSaving = loadBoolean(".disable.container_saving", true);
+
+    private WorldDownloaderSentinel()
+    {
+        super("WorldDownloader");
+    }
+
+    @Override
+    public void onPluginMessageReceived(@NotNull final String channel, @NotNull final Player player, final byte[] message)
+    {
+        // This must not be empty as we defined our channel with both a full key and a legacy string.
+        final var sendChannel = WDL_CONTROL_CHANNEL.getChannel().orElseThrow();
+
+        /*Documentation:
+         * https://github.com/Pokechu22/WorldDownloader-Serverside-Companion/blob/master/src/main/java/wdl/WDLPackets.java
+         *
+         * and
+         *
+         * https://wiki.vg/User:Pokechu22/World_downloader
+         *
+         * The first packet specifies, whether new functions are allowed, the second what current functions are allowed.*/
+        final var packetZero = ByteStreams.newDataOutput();
+        packetZero.writeInt(0);
+        packetZero.writeBoolean(!disableFuture);
+        player.sendPluginMessage(AntiCheatAddition.getInstance(), sendChannel, packetZero.toByteArray());
+
+        final var packetOne = ByteStreams.newDataOutput();
+        packetOne.writeInt(1);
+
+        packetOne.writeBoolean(!disable);
+        packetOne.writeInt(saveRadius);
+        packetOne.writeBoolean(!disableChunkCaching);
+        packetOne.writeBoolean(!disableEntitySaving);
+        packetOne.writeBoolean(!disableTileEntitySaving);
+        packetOne.writeBoolean(!disableContainerSaving);
+        player.sendPluginMessage(AntiCheatAddition.getInstance(), sendChannel, packetOne.toByteArray());
+
+        detection(player);
+    }
+
+    @Override
+    protected ModuleLoader createModuleLoader()
+    {
+        return ModuleLoader.builder(this)
+                           .addIncomingMessageChannel(WDL_INIT_CHANNEL)
+                           .addOutgoingMessageChannel(WDL_CONTROL_CHANNEL)
+                           .build();
+    }
+}
+// NOTE (AI): The S21 and S26 corpus hits are the disableChunkCaching flags and the isChunkLoaded helpers in WorldUtil; the module itself is channel-based, not packet-based.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other anticheat in the corpus speaks the wdl channels; Negativity (WorldRegionBypass) and LightAntiCheat approximate the same protection with region bypass and unloaded-chunk checks.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S26PacketMapChunkBulk/">S26PacketMapChunkBulk</a>
 <a class="related-chip" href="../S23PacketBlockChange/">S23PacketBlockChange</a>

@@ -632,6 +632,719 @@ public enum PacketType {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent on every corpus hit; the module-level hook appears only in Sigma's Ranking (EventPacket), while Rise processes S13 through components (PingSpoofComponent, TranslationComponent).</div>
 <div class="impl-clients">Sigma cancels nothing and only reads ids. Rise does not read the ids at all in PingSpoofComponent (the packet is buffered by class) and reads them only in TranslationComponent. Memeware, Nekoware, Spicy and Tenacity touch S13 solely through bundled vanilla code.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The destroy packet removes entity ids from the client's world, and server-side anticheats mirror that removal in their entity trackers. Because reach and hitbox checks must never measure against an entity the client no longer sees, destroy handling is data hygiene: Kauri removes fake-mob state on the confirming keepalive, intave decodes the destroy payload across three protocol layouts, and Hydro deletes the tracked entity on the send side. The packet is never flagged; keeping the tracker in sync with it is what keeps entity checks honest.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Destroy handling (Kauri)</span>
+<span class="impl-module-clients">(funkemunky-KauriV3)</span>
+</div>
+<p class="impl-pattern">Remove fake-mob state for destroyed entities on the keepalive that confirms the destroy packet reached the client.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketHandler routes DESTROY_ENTITIES (both modern and legacy wrappers) to EntityTrackHandler.onEntityDestroy, which schedules a keepalive action: for each destroyed id it calls removeFakeMob, despawning any fake mobs the anticheat placed next to the tracked entity and clearing the client-has-entity flag. Fake mobs are the anti-hitbox probes Kauri spawns around combat entities, so their lifecycle must mirror real despawns exactly or reach checks would measure against ghosts.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly; the removal prevents ghost-entity false flags in the hitbox-based reach checks that use fake mobs.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/handler/EntityTrackHandler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/handler/EntityTrackHandler.java =====
+package dev.brighten.ac.handler;
+
+import com.github.retrooper.packetevents.protocol.attribute.Attribute;
+import com.github.retrooper.packetevents.protocol.attribute.Attributes;
+import com.github.retrooper.packetevents.protocol.entity.data.EntityData;
+import com.github.retrooper.packetevents.protocol.entity.data.EntityDataTypes;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityType;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityTypes;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerDestroyEntities;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityPositionSync;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityTeleport;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateAttributes;
+import dev.brighten.ac.data.APlayer;
+import dev.brighten.ac.handler.entity.FakeMob;
+import dev.brighten.ac.handler.entity.TrackedEntity;
+import dev.brighten.ac.packet.WPacketPlayOutEntity;
+import dev.brighten.ac.utils.EntityLocation;
+import dev.brighten.ac.utils.KLocation;
+import dev.brighten.ac.utils.timer.Timer;
+import dev.brighten.ac.utils.timer.impl.MillisTimer;
+import dev.brighten.ac.utils.world.types.RayCollision;
+import lombok.RequiredArgsConstructor;
+
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+@RequiredArgsConstructor
+public class EntityTrackHandler {
+
+    private final APlayer data;
+    private final Timer lastFlying = new MillisTimer();
+
+    public Set&lt;Integer&gt; canCreateMob = new HashSet&lt;&gt;();
+    public int streak;
+    public AtomicBoolean clientHasEntity = new AtomicBoolean(false);
+
+    private final Set&lt;EntityType&gt; allowedEntityTypes = Set.of(EntityTypes.ZOMBIE, EntityTypes.SHEEP,
+            EntityTypes.BLAZE, EntityTypes.SKELETON, EntityTypes.PLAYER, EntityTypes.VILLAGER, EntityTypes.IRON_GOLEM,
+            EntityTypes.WITCH, EntityTypes.COW, EntityTypes.CREEPER);
+
+    public Optional&lt;Integer&gt; getTargetOfFakeMob(int fakeMobId) {
+        for (TrackedEntity value : data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntities().values()) {
+            if(value.getFakeMobs().stream().anyMatch(mob -&gt; mob.getEntityId() == fakeMobId)) {
+                return Optional.of(value.getEntityId());
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     *
+     * We are processing PacketPlayInFlying to iterate the tracked entity locations
+     *
+     */
+    void onFlying() {
+        if(lastFlying.isNotPassed(1)) streak++;
+        else {
+            streak = 1;
+        }
+
+        processZombie();
+
+        data.getWorldTracker().getCurrentWorld().get().getTrackedEntities().values().forEach(entity -&gt; {
+            var oldLoc = entity.getOldEntityLocation();
+            var newLoc = entity.getNewEntityLocation();
+
+            if(oldLoc != null) {
+                if(oldLoc.interpolatedLocations.size() &gt; 1 &amp;&amp; oldLoc.increment == 0) {
+                    oldLoc.interpolatedLocations.removeFirst();
+                }
+                oldLoc.interpolateLocation();
+            }
+            if(newLoc != null) {
+                if(newLoc.interpolatedLocations.size() &gt; 1 &amp;&amp; newLoc.increment == 0) {
+                    newLoc.interpolatedLocations.removeFirst();
+                }
+                newLoc.interpolateLocation();
+            }
+        });
+
+        lastFlying.reset();
+    }
+
+    /**
+     *
+     * Processing PacketPlayOutRelativePosition for updating entity locations in a relative manner.
+     *
+     * @param packet WrappedOutRelativePosition
+     */
+    void onRelPosition(WPacketPlayOutEntity packet) {
+        Optional&lt;TrackedEntity&gt; entity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(packet.getId());
+
+        if(entity.isEmpty() || !allowedEntityTypes.contains(entity.get().getEntityType())) return;
+
+        processFakeMobs(packet.getId(), true, packet.getX(), packet.getY(), packet.getZ());
+
+        EntityLocation eloc = entity.get().getNewEntityLocation();
+
+        entity.get().setOldEntityLocation(entity.get().getNewEntityLocation().clone());
+
+        runAction(entity.get(), () -&gt; {
+            //We don't need to do version checking here. Atlas handles this for us.
+            eloc.newX += packet.getX();
+            eloc.newY += packet.getY();
+            eloc.newZ += packet.getZ();
+            eloc.newYaw += packet.getYaw();
+            eloc.newPitch += packet.getPitch();
+
+            eloc.increment = 3;
+        });
+    }
+
+    void onPositionSync(WrapperPlayServerEntityPositionSync packet) {
+        Optional&lt;TrackedEntity&gt; entity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(packet.getId());
+
+        if(entity.isEmpty() || !allowedEntityTypes.contains(entity.get().getEntityType())) return;
+
+        processFakeMobs(packet.getId(), false, packet.getValues().getPosition().getX(),
+                packet.getValues().getPosition().getY(), packet.getValues().getPosition().getZ());
+
+        EntityLocation eloc = entity.get().getNewEntityLocation();
+
+        entity.get().setOldEntityLocation(entity.get().getNewEntityLocation().clone());
+
+        runAction(entity.get(), () -&gt; {
+            //We don't need to do version checking here. Atlas handles this for us.
+            eloc.newX = packet.getValues().getPosition().getX();
+            eloc.newY = packet.getValues().getPosition().getY();
+            eloc.newZ = packet.getValues().getPosition().getZ();
+            eloc.newYaw = packet.getValues().getYaw();
+            eloc.newPitch = packet.getValues().getPitch();
+
+            eloc.increment = 3;
+        });
+    }
+    /**
+     *
+     * Processing PacketPlayOutEntityTeleport to update locations in a non-relative manner.
+     *
+     * @param packet WrappedOutEntityTeleportPacket
+     */
+    void onTeleportSent(WrapperPlayServerEntityTeleport packet) {
+        Optional&lt;TrackedEntity&gt; entity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(packet.getEntityId());
+
+        if(entity.isEmpty() || !allowedEntityTypes.contains(entity.get().getEntityType())) return;
+
+        processFakeMobs(packet.getEntityId(), false, packet.getPosition().getX(), packet.getPosition().getY(), packet.getPosition().getZ());
+
+        EntityLocation eloc = entity.get().getNewEntityLocation();
+
+        entity.get().setOldEntityLocation(entity.get().getNewEntityLocation().clone());
+
+        runAction(entity.get(), () -&gt; {
+            if(data.getPlayerVersion().isNewerThanOrEquals(ClientVersion.V_1_9)) {
+                if (!(Math.abs(eloc.x - packet.getPosition().getX()) &gt;= 0.03125D)
+                        &amp;&amp; !(Math.abs(eloc.y - packet.getPosition().getY()) &gt;= 0.015625D)
+                        &amp;&amp; !(Math.abs(eloc.z - packet.getPosition().getZ()) &gt;= 0.03125D)) {
+                    eloc.increment = 0;
+                    //We don't need to do version checking here. Atlas handles this for us.
+                    eloc.newX = eloc.x = packet.getPosition().getX();
+                    eloc.newY = eloc.y = packet.getPosition().getY();
+                    eloc.newZ = eloc.z = packet.getPosition().getZ();
+                    eloc.newYaw = eloc.yaw = packet.getYaw();
+                    eloc.newPitch = eloc.pitch = packet.getPitch();
+                } else {
+                    eloc.newX = packet.getPosition().getX();
+                    eloc.newY = packet.getPosition().getY();
+                    eloc.newZ = packet.getPosition().getZ();
+                    eloc.newYaw = packet.getYaw();
+                    eloc.newPitch = packet.getPitch();
+
+                    eloc.increment = 3;
+                }
+            } else {
+                //We don't need to do version checking here. Atlas handles this for us.
+                eloc.newX = packet.getPosition().getX();
+                eloc.newY = packet.getPosition().getY();
+                eloc.newZ = packet.getPosition().getZ();
+                eloc.newYaw = packet.getYaw();
+                eloc.newPitch = packet.getPitch();
+
+                eloc.increment = 3;
+            }
+        });
+    }
+
+    void updateAttributes(WrapperPlayServerUpdateAttributes attributes) {
+        data.runKeepaliveAction(ka -&gt; {
+            TrackedEntity tracked = data.getWorldTracker().getCurrentWorld().get()
+                    .getTrackedEntity(attributes.getEntityId()).orElse(null);
+
+            if(tracked == null) return;
+
+            for (WrapperPlayServerUpdateAttributes.Property property : attributes.getProperties()) {
+                Attribute attribute = property.getAttribute();
+
+                if(attributes.getEntityId() == data.getBukkitPlayer().getEntityId() &amp;&amp; attribute == Attributes.MOVEMENT_SPEED) {
+                    ValuedAttribute value = tracked.getAttribute(attribute);
+
+                    value.updateAttribute(property);
+                    data.getInfo().setWalkSpeed(value.getValue());
+                }
+
+                tracked.updateAttribute(property);
+            }
+        });
+    }
+
+    /**
+     *
+     * We are running an action when a transaction is received. If the Entity provided is currently a target,
+     * we want to send a tranasction on this method being run and use that to more accurately get an estimate of when
+     * the client receives the transaction relative to what we want in the action. If not the target, then we use our
+     * transaction system which sends one transaction every tick, and then on return runs a list of Runnables which
+     * may be less accurate in some situations, but uses less processing and network resources.
+     *
+     * @param entity Entity
+     * @param action Runnable
+     */
+    private void runAction(TrackedEntity entity, Runnable action) {
+        if(data.getInfo().getTarget() != null &amp;&amp; data.getInfo().getTarget().getEntityId() == entity.getEntityId()) {
+            data.runInstantAction(ia -&gt; {
+                if(!ia.isEnd()) {
+                    action.run();
+                } else entity.setOldEntityLocation(null);
+            }, true);
+        } else {
+            data.runKeepaliveAction(keepalive -&gt; action.run());
+            data.runKeepaliveAction(keepalive -&gt;
+                    entity.setOldEntityLocation(null), 1);
+        }
+    }
+
+    public void onEntityDestroy(WrapperPlayServerDestroyEntities packet) {
+        data.runKeepaliveAction(ka -&gt; {
+            for(int id : packet.getEntityIds()) {
+                removeFakeMob(id);
+            }
+        });
+    }
+
+    public void removeFakeMob(int id) {
+        if(data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntities().containsKey(id)) {
+            List&lt;FakeMob&gt; mobs = data.getWorldTracker().getCurrentWorld().get()
+                    .getTrackedEntity(id).map(TrackedEntity::getFakeMobs).orElse(new ArrayList&lt;&gt;());
+
+            for (FakeMob mob : mobs) {
+                mob.despawn();
+            }
+
+            mobs.clear();
+        }
+        clientHasEntity.set(false);
+    }
+
+    private static final double[] offsets = new double[]{-1.25, 0, 1.25};
+
+    private void createFakeMob(int entityId, KLocation location) {
+        if (!canCreateMob.contains(entityId)) return;
+
+        Optional&lt;TrackedEntity&gt; trackedEntity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(entityId);
+
+        Optional&lt;TrackedEntity&gt; playerEntity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(data.getBukkitPlayer().getEntityId());
+
+        if(trackedEntity.isEmpty() || playerEntity.isEmpty()) return;
+
+        for (double offset : offsets) {
+            FakeMob mob = new FakeMob(EntityTypes.MAGMA_CUBE);
+
+            List&lt;EntityData&lt;?&gt;&gt; types = new ArrayList&lt;&gt;();
+            EntityData&lt;?&gt; entityData = new EntityData&lt;&gt;(16, EntityDataTypes.BYTE, (byte)10);
+            types.add(entityData);
+
+            // Setting Magma cube size to size 10
+            mob.spawn(true, location.clone().add(offset, offset, offset),
+                    types, data);
+
+            trackedEntity.get().getFakeMobs().add(mob);
+        }
+
+        KLocation eyeLoc = data.getMovement().getTo().getLoc().clone()
+                .add(0, data.getEyeHeight() / 2.5, 0);
+
+        RayCollision collision = new RayCollision(eyeLoc.toVector(), eyeLoc.getDirection());
+
+        Vector3d point = collision.collisionPoint(0.4);
+
+        FakeMob mob = new FakeMob(EntityTypes.SLIME);
+        List&lt;EntityData&lt;?&gt;&gt; types = new ArrayList&lt;&gt;();
+        EntityData&lt;?&gt; entityData = new EntityData&lt;&gt;(16, EntityDataTypes.BYTE, (byte)5);
+
+        types.add(entityData);
+        mob.spawn(true, new KLocation(point.getX(), point.getY(), point.getZ()), types, data);
+
+        playerEntity.get().getFakeMobs().add(mob);
+
+        canCreateMob.remove(entityId);
+
+        data.runKeepaliveAction(ka -&gt; clientHasEntity.set(true));
+    }
+
+    public void processZombie() {
+        List&lt;FakeMob&gt; fakeMobs = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(data.getBukkitPlayer().getEntityId())
+                .map(TrackedEntity::getFakeMobs)
+                .orElse(new ArrayList&lt;&gt;());
+
+        if(fakeMobs.size() &gt; 1) {
+            fakeMobs.forEach(fakeMob -&gt; removeFakeMob(fakeMob.getEntityId()));
+        }
+
+        for (FakeMob fakeMob : fakeMobs) {
+            if(fakeMob.getType() == EntityTypes.SLIME) {
+                KLocation eyeLoc = data.getMovement().getTo().getLoc().clone().add(0, 0.6, 0);
+
+                RayCollision collision = new RayCollision(eyeLoc.toVector(), eyeLoc.getDirection());
+
+                Vector3d point = collision.collisionPoint(0.4);
+
+                fakeMob.teleport(point.getX(), point.getY(), point.getZ(), 0 ,0);
+                break;
+            }
+        }
+    }
+
+    public void processFakeMobs(int entityId, boolean rel, double x, double y, double z) {
+        List&lt;FakeMob&gt; fakeMobs = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(entityId).map(TrackedEntity::getFakeMobs).orElse(new ArrayList&lt;&gt;());
+
+        if(fakeMobs.isEmpty()) {
+            if(!rel) {
+                createFakeMob(entityId, new KLocation(x, y, z));
+            }
+
+            if(data.getInfo().getTarget() != null &amp;&amp; data.getInfo().getTarget().getEntityId() == entityId) {
+                clientHasEntity.set(false);
+            }
+            return;
+        }
+
+        if(fakeMobs.size() != offsets.length + 1) {
+            fakeMobs.forEach(fakeMob -&gt; removeFakeMob(fakeMob.getEntityId()));
+        }
+
+        int current = 0;
+        for (FakeMob fakeMob : fakeMobs) {
+            double offset = offsets[current++];
+
+            if(rel) {
+                fakeMob.move(x, y, z);
+            } else {
+                fakeMob.teleport(x + offset, y + offset, z + offset, 0, 0);
+            }
+        }
+    }
+}
+
+// NOTE (AI): onEntityDestroy is lines 240-246; removeFakeMob (248-261) does the actual cleanup. The keepalive deferral means removal lands only after the client acknowledges, matching the client's own despawn timing.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim schedules entity removal on the destroy transaction and also clears serverPositionsMap and dashable and firework state; Tecnio and Hydro just remove the ids from their tracker maps; Artemis ReachPreProcessor drops the entity from reach tracking on the same packet.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Destroy reader (intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Decode the destroy payload across all protocol layouts and feed each entity id to the entity tracker.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">EntityDestroyReader implements EntityIterable over the destroy packet. It branches on protocol era: an int list on 1.17.1+, a single int on 1.17.0, and an int array on 1.16 and below, exposing both forEach and a substitution iterator so the tracker can read or rewrite ids. PacketReaders registers it under ENTITY_DESTROY, and EntityTracker.receiveEntityDestroy processes each id, dismounting riders and marking destroyed entities so AttackRaytrace can ignore them.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly; the reader is the decode layer. The tracker's destroyed-entity marker (Entity.Destroyed) is what lets hitbox checks ignore dead entities.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/packet/reader/EntityDestroyReader.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/packet/reader/EntityDestroyReader.java =====
+package de.jpx3.intave.packet.reader;
+
+import de.jpx3.intave.adapter.MinecraftVersions;
+import org.jetbrains.annotations.NotNull;
+
+import java.util.List;
+import java.util.function.Consumer;
+
+public final class EntityDestroyReader extends AbstractPacketReader implements EntityIterable {
+  private final boolean INT_LIST_ENTITY_DESTROY = MinecraftVersions.VER1_17_1.atOrAbove();
+  private final boolean SINGLE_INT_ENTITY_DESTROY = !INT_LIST_ENTITY_DESTROY &amp;&amp; MinecraftVersions.VER1_17_0.atOrAbove();
+  private final boolean INT_ARRAY_ENTITY_DESTROY = !SINGLE_INT_ENTITY_DESTROY;
+
+  @Override
+  public void forEach(Consumer&lt;? super Integer&gt; action) {
+    if (INT_LIST_ENTITY_DESTROY) {
+      List&lt;Integer&gt; entityIds = packet().getIntLists().read(0);
+      entityIds.forEach(action);
+    } else if (INT_ARRAY_ENTITY_DESTROY) {
+      int[] entityIDs = packet().getIntegerArrays().read(0);
+      for (int entityID : entityIDs) {
+        action.accept(entityID);
+      }
+    } else {
+      action.accept(packet().getIntegers().read(0));
+    }
+  }
+
+  @NotNull
+  @Override
+  public SubstitutionIterator&lt;Integer&gt; iterator() {
+    if (INT_LIST_ENTITY_DESTROY) {
+      List&lt;Integer&gt; entityIDs = packet().getIntLists().read(0);
+      return new SubstitutionIterator&lt;Integer&gt;() {
+        int index = 0;
+
+        @Override
+        public void set(Integer integer) {
+          entityIDs.set(index - 1, integer);
+        }
+
+        @Override
+        public boolean hasNext() {
+          return index &lt; entityIDs.size();
+        }
+
+        @Override
+        public Integer next() {
+          return entityIDs.get(index++);
+        }
+      };
+    } else if (INT_ARRAY_ENTITY_DESTROY) {
+      int[] entityIDs = packet().getIntegerArrays().read(0);
+      return new SubstitutionIterator&lt;Integer&gt;() {
+        int index = 0;
+
+        @Override
+        public void set(Integer integer) {
+          entityIDs[index - 1] = integer;
+//          packet().getIntegerArrays().write(0, entityIDs);
+        }
+
+        @Override
+        public boolean hasNext() {
+          return index &lt; entityIDs.length;
+        }
+
+        @Override
+        public Integer next() {
+          return entityIDs[index++];
+        }
+      };
+    } else {
+      int id = packet().getIntegers().read(0);
+      return new SubstitutionIterator&lt;Integer&gt;() {
+        @Override
+        public void set(Integer integer) {
+          packet().getIntegers().write(0, integer);
+        }
+
+        boolean hasNext = true;
+
+        @Override
+        public boolean hasNext() {
+          return hasNext;
+        }
+
+        @Override
+        public Integer next() {
+          hasNext = false;
+          return id;
+        }
+      };
+    }
+  }
+}
+
+// NOTE (AI): The layout branch (lines 10-27) shows the 1.17 protocol split: int list, single int, then the legacy int array. The substitution iterator lets the anticheat rewrite ids in place, used by the EntityIdFilter module.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim and Hydro wrap WrapperPlayServerDestroyEntities directly; FlopAC's WrappedOutEntityDestroy is the same idea on its tinyprotocol reflection layer.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Destroy tracking (Hydro)</span>
+<span class="impl-module-clients">(Incognitolol-Hydro)</span>
+</div>
+<p class="impl-pattern">Remove destroyed entities from the tracked-entity map so reach and entity queries never see despawned ids.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">EntityTracker.registerOutgoingPreHandler routes DESTROY_ENTITIES to handleDestroyEntities, which wraps WrapperPlayServerDestroyEntities and removes each id from the concurrent entityMap. Because insertion happens on spawn and removal on destroy, the map always mirrors the client's visible entity set; getDistanceToEntity and getClosestEntity simply cannot return a destroyed entity.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly; it is the cleanup half of the tracker. Without it, reach checks would measure against entities the client no longer renders, producing false flags.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/EntityTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/EntityTracker.java =====
+package integral.studios.hydro.model.tracker.impl;
+
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.*;
+import integral.studios.hydro.model.PlayerData;
+import integral.studios.hydro.model.tracker.Tracker;
+import integral.studios.hydro.util.player.tracker.entity.TrackedEntity;
+import integral.studios.hydro.util.packet.PacketUtil;
+import lombok.Getter;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+
+@Getter
+public class EntityTracker extends Tracker {
+    // Thread-safe entity storage
+    private final Map&lt;Integer, TrackedEntity&gt; entityMap = new ConcurrentHashMap&lt;&gt;();
+
+    public EntityTracker(PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void registerOutgoingPreHandler(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.SPAWN_LIVING_ENTITY) {
+            handleSpawnLivingEntity(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_PLAYER) {
+            handleSpawnPlayer(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_RELATIVE_MOVE) {
+            handleEntityRelativeMove(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_RELATIVE_MOVE_AND_ROTATION) {
+            handleEntityRelativeMoveAndRotation(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_TELEPORT) {
+            handleEntityTeleport(event);
+        } else if (event.getPacketType() == PacketType.Play.Server.DESTROY_ENTITIES) {
+            handleDestroyEntities(event);
+        }
+    }
+
+    @Override
+    public void registerIncomingPostHandler(PacketReceiveEvent event) {
+        if (PacketUtil.isFlying(event.getPacketType())) {
+            handleFlyingPacket();
+        }
+    }
+
+    private void handleSpawnLivingEntity(PacketSendEvent event) {
+        WrapperPlayServerSpawnLivingEntity wrapper = new WrapperPlayServerSpawnLivingEntity(event);
+        Vector3d position = wrapper.getPosition();
+        int entityId = wrapper.getEntityId();
+
+        TrackedEntity entity = new TrackedEntity(entityId, position.x, position.y, position.z);
+        entityMap.put(entityId, entity);
+    }
+
+    private void handleSpawnPlayer(PacketSendEvent event) {
+        WrapperPlayServerSpawnPlayer wrapper = new WrapperPlayServerSpawnPlayer(event);
+        Vector3d position = wrapper.getPosition();
+        int entityId = wrapper.getEntityId();
+
+        TrackedEntity entity = new TrackedEntity(entityId, position.x, position.y, position.z);
+        entityMap.put(entityId, entity);
+    }
+
+    private void handleEntityRelativeMove(PacketSendEvent event) {
+        WrapperPlayServerEntityRelativeMove wrapper = new WrapperPlayServerEntityRelativeMove(event);
+
+        TrackedEntity entity = entityMap.get(wrapper.getEntityId());
+        if (entity == null) {
+            return;
+        }
+
+        playerData.getTransactionTracker().confirmPre(() -&gt; {
+            entity.handleMovement(wrapper.getDeltaX(), wrapper.getDeltaY(), wrapper.getDeltaZ());
+        });
+
+        playerData.getTransactionTracker().confirmPost(this::updateAllEntitiesPostTransaction);
+    }
+
+    private void handleEntityRelativeMoveAndRotation(PacketSendEvent event) {
+        WrapperPlayServerEntityRelativeMoveAndRotation wrapper = new WrapperPlayServerEntityRelativeMoveAndRotation(event);
+
+        TrackedEntity entity = entityMap.get(wrapper.getEntityId());
+        if (entity == null) {
+            return;
+        }
+
+        playerData.getTransactionTracker().confirmPre(() -&gt; {
+            entity.handleMovement(wrapper.getDeltaX(), wrapper.getDeltaY(), wrapper.getDeltaZ());
+        });
+
+        playerData.getTransactionTracker().confirmPost(this::updateAllEntitiesPostTransaction);
+    }
+
+    private void handleEntityTeleport(PacketSendEvent event) {
+        WrapperPlayServerEntityTeleport wrapper = new WrapperPlayServerEntityTeleport(event);
+
+        TrackedEntity entity = entityMap.get(wrapper.getEntityId());
+        if (entity == null) {
+            return;
+        }
+
+        Vector3d position = wrapper.getPosition();
+
+        playerData.getTransactionTracker().confirmPre(() -&gt; {
+            entity.handleTeleport(position.x, position.y, position.z);
+        });
+
+        playerData.getTransactionTracker().confirmPost(this::updateAllEntitiesPostTransaction);
+    }
+
+    private void handleDestroyEntities(PacketSendEvent event) {
+        WrapperPlayServerDestroyEntities wrapper = new WrapperPlayServerDestroyEntities(event);
+
+        for (int entityId : wrapper.getEntityIds()) {
+            entityMap.remove(entityId);
+        }
+    }
+
+    private void handleFlyingPacket() {
+        entityMap.values().forEach(TrackedEntity::handlePostFlying);
+    }
+
+    private void updateAllEntitiesPostTransaction() {
+        entityMap.values().forEach(TrackedEntity::handlePostTransaction);
+    }
+
+    public TrackedEntity get(int entityId) {
+        return entityMap.get(entityId);
+    }
+
+    public boolean isTracking(int entityId) {
+        return entityMap.containsKey(entityId);
+    }
+
+    public int getTrackedEntityCount() {
+        return entityMap.size();
+    }
+
+
+    public TrackedEntity removeEntity(int entityId) {
+        return entityMap.remove(entityId);
+    }
+
+
+    public void clearEntities() {
+        entityMap.clear();
+    }
+
+
+    public double getDistanceToEntity(int entityId) {
+        TrackedEntity entity = entityMap.get(entityId);
+        if (entity == null) {
+            return -1;
+        }
+
+        double dx = entity.getX() - playerData.getPositionTracker().getX();
+        double dy = entity.getY() - playerData.getPositionTracker().getY();
+        double dz = entity.getZ() - playerData.getPositionTracker().getZ();
+
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    public TrackedEntity getClosestEntity() {
+        TrackedEntity closest = null;
+        double minDistance = Double.MAX_VALUE;
+
+        for (Map.Entry&lt;Integer, TrackedEntity&gt; entry : entityMap.entrySet()) {
+            TrackedEntity entity = entry.getValue();
+            double distance = getDistanceToEntity(entry.getKey());
+
+            if (distance &gt;= 0 &amp;&amp; distance &lt; minDistance) {
+                minDistance = distance;
+                closest = entity;
+            }
+        }
+
+        return closest;
+    }
+
+
+    public Map&lt;Integer, TrackedEntity&gt; getEntitiesWithinDistance(double maxDistance) {
+        Map&lt;Integer, TrackedEntity&gt; nearbyEntities = new ConcurrentHashMap&lt;&gt;();
+
+        for (Map.Entry&lt;Integer, TrackedEntity&gt; entry : entityMap.entrySet()) {
+            double distance = getDistanceToEntity(entry.getKey());
+            if (distance &gt;= 0 &amp;&amp; distance &lt;= maxDistance) {
+                nearbyEntities.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        return nearbyEntities;
+    }
+
+    public int getEntityId(TrackedEntity entity) {
+        if (entity == null) return -1;
+
+        for (Map.Entry&lt;Integer, TrackedEntity&gt; entry : entityMap.entrySet()) {
+            if (entry.getValue() == entity) {
+                return entry.getKey();
+            }
+        }
+
+        return -1;
+    }
+}
+
+// NOTE (AI): handleDestroyEntities is lines 116-122, directly after the spawn handlers in the same dispatch, which is why the S0C, S0F and S13 corpora all reference this one file.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Tecnio removes ids from trackerMap on GPacketPlayServerEntityDestroy; Shard ejects riders before removing ids; Kauri defers cleanup to the confirming keepalive; TruthfulAC marks the entity destroyed with a grace window instead of deleting it outright.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S0EPacketSpawnObject/">S0EPacketSpawnObject</a>
 <a class="related-chip" href="../S0FPacketSpawnMob/">S0FPacketSpawnMob</a>

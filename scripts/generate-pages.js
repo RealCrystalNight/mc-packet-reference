@@ -162,6 +162,26 @@ function renderDetail(p) {
     if (impl.general_hooks) parts.push('<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">' + impl.general_hooks + '</div>');
     if (impl.client_variations) parts.push('<div class="impl-clients">' + impl.client_variations + '</div>');
     parts.push('</div>');
+    if (impl.anticheat) {
+      var ac = impl.anticheat;
+      parts.push('<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>');
+      if (ac.overview) parts.push('<p class="impl-pattern">' + ac.overview + '</p>');
+      if (ac.checks && ac.checks.length) {
+        ac.checks.forEach(function(c) {
+          parts.push('<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">' + c.name + '</span>');
+          if (c.found_in && c.found_in.length) parts.push('<span class="impl-module-clients">(' + c.found_in.join(', ') + ')</span>');
+          parts.push('</div>');
+          if (c.purpose) parts.push('<p class="impl-pattern">' + c.purpose + '</p>');
+          if (c.how_it_works) parts.push('<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">' + c.how_it_works + '</p>');
+          if (c.detects) parts.push('<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> ' + c.detects + '</span></p>');
+          if (c.code_source) parts.push('<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ' + esc(c.code_source) + '</span></p>');
+          if (c.detailed_code) parts.push('<div class="impl-code-wrap collapsed"><div class="impl-code"><code>' + esc(c.detailed_code) + '</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle(\'collapsed\');w.classList.toggle(\'expanded\');this.querySelector(\'.expand-label\').textContent=w.classList.contains(\'collapsed\')?\'Show more\':\'Show less\'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>');
+          if (c.variations) parts.push('<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> ' + c.variations + '</span></div>');
+          parts.push('</div>');
+        });
+      }
+      parts.push('</div>');
+    }
     if (impl.related && impl.related.length) parts.push(renderRelated(impl.related));
   }
   return parts.join('\n');

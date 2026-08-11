@@ -1106,6 +1106,585 @@ public class Disabler extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Every client intercepts C03 at the outgoing packet event (PacketOutEvent, PacketSendEvent, EventSendPacket) and matches instanceof C03PacketPlayer, which also catches the C04/C05/C06 subclasses. Movement engines hook UpdateEvent or PreMotionEvent to alter position, ground and rotation before the vanilla emitter builds the packet; Rise 6.x additionally routes through TeleportEvent for S08 responses.</div>
 <div class="impl-clients">Vanilla emission differs per client: Memeware and Nekoware patch EntityPlayerSP.onUpdateWalkingPlayer to fire a custom UpdateEvent that carries setY/setGround, Sigma and Spicy do the same with their motion events, while Rise 5.99 and Tenacity rewrite the emitter to consume their own event objects. Send paths diverge the same way: sendQueue.addToSendQueue (Memeware, Nekoware, Sigma, Spicy, Tenacity), PacketUtil.sendPacket and sendPacketWithoutEvent (Rise 5.99), PacketUtil.send and sendNoEvent (Rise 6.x). Bus-bypassing sends (sendPacketSilent, sendPacketNoEvent, sendPacketWithoutEvent, sendNoEvent) are universal and used whenever a module must not re-trigger its own packet listener.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The position packet family (flying, position, position-look, look) is the heart of every movement anticheat: it is the only stream that tells the server where the player is. All 50 cloned anticheats key their motion checks off it. The corpus splits into classic statistical checks (Frequency FlyA, Arc NoFall, Hydro GroundA) that score deltas against expected physics, and modern simulation checks (Grim PredictionRunner, Photon MovementSimulator) that predict the next position from client inputs and flag the residual. Ground-spoofing, fly, speed, phase, step, timer and blink are all detected from this one packet family.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">MovingFlying adapter (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">The classic 1.8 ProtocolLib adapter that feeds every C03 variant into NCP's moving checks.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Wraps PacketPlayInFlying, PacketPlayInPosition, PacketPlayInPositionLook and PacketPlayInLook through ProtocolLib, builds a MovingData context (position, rotation, ground flag, exact move vector), and dispatches to the full moving check set: survivalfly, morepackets (timer), noswing, nofall, and the passable/phase checks. Handles 1.7-1.8 protocol differences and the -999 teleport sentinel.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Fly, speed, timer, nofall, phase/clip, blink, and every movement-based cheat that alters the position stream.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/MovingFlying.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/MovingFlying.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.checks.net.protocollib;
+
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
+import java.util.List;
+
+import org.bukkit.Bukkit;
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.Plugin;
+
+import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.PacketType.Protocol;
+import com.comphenix.protocol.PacketType.Sender;
+import com.comphenix.protocol.events.ListenerPriority;
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.reflect.StructureModifier;
+
+import fr.neatmonster.nocheatplus.NCPAPIProvider;
+import fr.neatmonster.nocheatplus.checks.CheckType;
+import fr.neatmonster.nocheatplus.checks.moving.MovingData;
+import fr.neatmonster.nocheatplus.checks.net.FlyingFrequency;
+import fr.neatmonster.nocheatplus.checks.net.Moving;
+import fr.neatmonster.nocheatplus.checks.net.NetConfig;
+import fr.neatmonster.nocheatplus.checks.net.NetData;
+import fr.neatmonster.nocheatplus.checks.net.WrongTurn;
+import fr.neatmonster.nocheatplus.checks.net.model.DataPacketFlying;
+import fr.neatmonster.nocheatplus.checks.net.model.DataPacketFlying.PACKET_CONTENT;
+import fr.neatmonster.nocheatplus.checks.net.model.TeleportQueue.AckReference;
+import fr.neatmonster.nocheatplus.compat.AlmostBoolean;
+import fr.neatmonster.nocheatplus.compat.versions.ServerVersion;
+import fr.neatmonster.nocheatplus.logging.StaticLog;
+import fr.neatmonster.nocheatplus.logging.Streams;
+import fr.neatmonster.nocheatplus.players.DataManager;
+import fr.neatmonster.nocheatplus.players.IPlayerData;
+import fr.neatmonster.nocheatplus.time.monotonic.Monotonic;
+import fr.neatmonster.nocheatplus.utilities.CheckUtils;
+import fr.neatmonster.nocheatplus.utilities.StringUtil;
+import fr.neatmonster.nocheatplus.utilities.TickTask;
+import fr.neatmonster.nocheatplus.utilities.ds.count.ActionFrequency;
+import fr.neatmonster.nocheatplus.utilities.location.LocUtil;
+
+/**
+ * Run checks related to moving (pos/look/flying). Skip packets that shouldn't
+ * get processed anyway due to a teleport. Also update lastKeepAliveTime.
+ * 
+ * @author asofold
+ *
+ */
+public class MovingFlying extends BaseAdapter {
+
+    private static final boolean isServerAtLeast1_21_3 = ServerVersion.isAtLeast("1.21.3");
+    // Setup for flying packets.
+    public static final int indexOnGround = 0;
+    public static final int indexhorizontalCollision = isServerAtLeast1_21_3 ? 1 : 0;
+    public static final int indexhasPos = 1 + indexhorizontalCollision;
+    public static final int indexhasLook = 2 + indexhorizontalCollision;
+    public static final int indexX = 0;
+    public static final int indexY = 1;
+    public static final int indexZ = 2;
+    public static final int indexStance = 3; // 1.7.10
+    public static final int indexYaw = 0;
+    public static final int indexPitch = 1;
+
+    // Setup for teleport accept packet.
+    private static PacketType confirmTeleportType;
+    private static boolean acceptConfirmTeleportPackets;
+
+    private final Plugin plugin = Bukkit.getPluginManager().getPlugin("NoCheatPlus");
+    private static PacketType[] initPacketTypes() {
+        final List&lt;PacketType&gt; types = new LinkedList&lt;PacketType&gt;(Arrays.asList(PacketType.Play.Client.LOOK, PacketType.Play.Client.POSITION, PacketType.Play.Client.POSITION_LOOK));
+        if (ServerVersion.isLowerThan("1.17")) {
+            types.add(PacketType.Play.Client.FLYING);
+            StaticLog.logInfo("Add listener for legacy PlayInFlying packet.");
+        } 
+        else types.add(PacketType.Play.Client.GROUND);
+        // Add confirm teleport.
+        // PacketPlayInTeleportAccept
+        confirmTeleportType = ProtocolLibComponent.findPacketTypeByName(Protocol.PLAY, Sender.CLIENT, "AcceptTeleportation");
+        if (confirmTeleportType == null) { // Fallback check for the old packet name.
+            confirmTeleportType = ProtocolLibComponent.findPacketTypeByName(Protocol.PLAY, Sender.CLIENT, "TeleportAccept");
+        }
+        if (confirmTeleportType != null &amp;&amp; ServerVersion.isAtLeast("1.9")) {
+            StaticLog.logInfo("Confirm teleport packet available (via name): " + confirmTeleportType);
+            types.add(confirmTeleportType);
+            acceptConfirmTeleportPackets = true;
+        } 
+        else acceptConfirmTeleportPackets = false;
+        return types.toArray(new PacketType[types.size()]);
+    }
+
+    /** Frequency check for flying packets. */
+    private final FlyingFrequency flyingFrequency = new FlyingFrequency();
+    /** Other checks related to packet content. */
+    private final Moving moving = new Moving();
+    /** Ilegal pitch check */
+    private final WrongTurn wrongTurn = new WrongTurn(); 
+
+    private final int idFlying = counters.registerKey("packet.flying");
+    private final int idAsyncFlying = counters.registerKey("packet.flying.asynchronous");
+
+    /** If a packet can't be parsed, this time stamp is set for occasional logging. */
+    private long packetMismatch = Long.MIN_VALUE;
+    /** Every minute max, good for updating :).*/
+    private long packetMismatchLogFrequency = 60000;
+
+    private final HashSet&lt;PACKET_CONTENT&gt; validContent = new LinkedHashSet&lt;PACKET_CONTENT&gt;();
+    
+    public MovingFlying(Plugin plugin) {
+        // PacketPlayInFlying[3, legacy: 10]
+        super(plugin, ListenerPriority.LOW, initPacketTypes());
+        // Keep the CheckType NET for now.
+        // Add feature tags for checks.
+        if (NCPAPIProvider.getNoCheatPlusAPI().getWorldDataManager().isActiveAnywhere(CheckType.NET_FLYINGFREQUENCY)) {
+            NCPAPIProvider.getNoCheatPlusAPI().addFeatureTags( "checks", Arrays.asList(FlyingFrequency.class.getSimpleName()));
+        }
+        NCPAPIProvider.getNoCheatPlusAPI().addComponent(flyingFrequency);
+    }
+
+    @Override
+    public void onPacketReceiving(final PacketEvent event) {
+        try {
+            if (event.isPlayerTemporary()) return;
+        } 
+        catch (NoSuchMethodError e) {
+            if (event.getPlayer() == null) {
+                return;
+            }
+            if (DataManager.getPlayerDataSafe(event.getPlayer()) == null) {
+                return;
+            }
+        }
+        if (event.getPacketType().equals(confirmTeleportType)) {
+            if (acceptConfirmTeleportPackets) {
+                onConfirmTeleportPacket(event);
+            }
+        }
+        else onFlyingPacket(event);
+    }
+
+    private void onConfirmTeleportPacket(final PacketEvent event) {
+        try {
+            processConfirmTeleport(event);
+        }
+        catch (Throwable t) {
+            noConfirmTeleportPacket();
+        }
+    }
+
+    private void processConfirmTeleport(final PacketEvent event) {
+        final PacketContainer packet = event.getPacket();
+        final StructureModifier&lt;Integer&gt; integers = packet.getIntegers();
+        if (integers.size() != 1) {
+            noConfirmTeleportPacket();
+            return;
+        }
+        // TODO: Cross check legacy types (if they even had an integer).
+        Integer teleportId = integers.read(0);
+        if (teleportId == null) {
+            // TODO: Not sure ...
+            return;
+        }
+        final Player player = event.getPlayer();
+        final IPlayerData pData = DataManager.getPlayerDataSafe(player);
+        final NetData data = pData.getGenericInstance(NetData.class);
+        final AlmostBoolean matched = data.teleportQueue.processAck(teleportId);
+        if (matched.decideOptimistically()) {
+            ActionFrequency.subtract(System.currentTimeMillis(), 1, data.flyingFrequencyAll);
+        }
+        if (pData.isDebugActive(this.checkType)) { 
+            debug(player, "Confirm teleport packet" + (matched.decideOptimistically() ? (" (matched=" + matched + ")") : "") + ": " + teleportId);
+        }
+    }
+
+    private void noConfirmTeleportPacket() {
+        acceptConfirmTeleportPackets = false;
+        // TODO: Attempt to unregister.
+        NCPAPIProvider.getNoCheatPlusAPI().getLogManager().info(Streams.STATUS, "Confirm teleport packet not available.");
+    }
+
+    private void onFlyingPacket(final PacketEvent event) {
+        final boolean primaryThread = Bukkit.isPrimaryThread(); 
+        counters.add(idFlying, 1, primaryThread);
+        if (event.isAsync() == primaryThread) {
+            counters.add(ProtocolLibComponent.idInconsistentIsAsync, 1, primaryThread);
+        }
+        if (!primaryThread) {
+            // Count all asynchronous events extra.
+            counters.addSynchronized(idAsyncFlying, 1);
+            // TODO: Detect game phase for the player?
+        }
+
+        final long time =  System.currentTimeMillis();
+        final Player player = event.getPlayer();
+        if (player == null) {
+            // TODO: Need config?
+            counters.add(ProtocolLibComponent.idNullPlayer, 1, primaryThread);
+            event.setCancelled(true);
+            return;
+        }
+
+        final IPlayerData pData = DataManager.getPlayerDataSafe(player);
+        // Always update last received time.
+        final NetData data = pData.getGenericInstance(NetData.class);
+        data.lastKeepAliveTime = time; // Update without much of a contract.
+        // TODO: Leniency options too (packet order inversion). -&gt; current: flyingQueue is fetched.
+        final NetConfig cc = pData.getGenericInstance(NetConfig.class);
+        boolean cancel = false;
+        // Interpret the packet content.
+        final DataPacketFlying packetData = interpretPacket(event, time);
+        // Early return tests, if the packet can be interpreted.
+        boolean skipChecks = false;
+        if (packetData != null) {
+            // Prevent processing packets with obviously malicious content.
+            if (isInvalidContent(packetData)) {
+                event.setCancelled(true);
+                // Do request and improbable update here for good measure.
+                TickTask.requestImprobableUpdate(player.getUniqueId(), 1.0f);
+                if (pData.isDebugActive(this.checkType)) {
+                    debug(player, "Incoming flying packet, cancel due to malicious content: " + packetData.toString());
+                }
+                return;
+            }
+
+            switch (data.teleportQueue.processAck(packetData)) {
+                case WAITING: {
+                    if (pData.isDebugActive(this.checkType)) {
+                        debug(player, "Incoming flying packet, still waiting for ACK on outgoing position.");
+                    }
+                    if (confirmTeleportType != null &amp;&amp; cc.supersededFlyingCancelWaiting) {
+                        // Don't add to the flying queue for now (assumed invalid).
+                        final AckReference ackReference = data.teleportQueue.getLastAckReference();
+                        if (ackReference.lastOutgoingId != Integer.MIN_VALUE &amp;&amp; ackReference.lastOutgoingId != ackReference.maxConfirmedId) {
+                            // Still waiting for a 'confirm teleport' packet. More or less safe to cancel this out.
+                            /*
+                             * TODO: The actual issue with this, apart from
+                             * potential freezing, also concerns gameplay experience
+                             * in case of minor set backs, which also could be
+                             * caused by the server, e.g. with 'moved wrongly' or
+                             * setting players outside of blocks. In this case the
+                             * moves sent before teleport ack would still be valid
+                             * after the teleport, because distances are small. The
+                             * actual solution should still be to a) not have false
+                             * positives b) somehow get rid all the
+                             * position-correction teleporting the server does, for
+                             * the cases a plugin can handle.
+                             */
+                             // See todo below on if (cancel) {...}
+                             cancel = true;
+                        }
+                    }
+                    break;
+                }
+                case ACK: {
+                    // Skip processing ACK packets, no cancel.
+                    skipChecks = true;
+                    if (pData.isDebugActive(this.checkType)) {
+                        debug(player, "Incoming flying packet, interpret as ACK for outgoing position. Skip checks.");
+                    }
+                }
+                default: {
+                    // Continue.
+                    data.addFlyingQueue(packetData); // TODO: Not the optimal position, perhaps.
+                }
+            }
+            // Add as valid packet (exclude invalid coordinates etc. for now).
+            validContent.add(packetData.getSimplifiedContentType());
+        }
+
+        // Actual packet frequency check.
+        // TODO: Consider using the NetStatic check.
+        if (!cancel &amp;&amp; !skipChecks 
+            &amp;&amp; flyingFrequency.check(player, packetData, time, data, cc, pData)
+            &amp;&amp; !pData.hasBypass(CheckType.NET_FLYINGFREQUENCY, player)) {
+            cancel = true;
+        }
+        // More packet checks.
+        if (!cancel &amp;&amp; !skipChecks &amp;&amp; pData.isCheckActive(CheckType.NET_MOVING, player) 
+            &amp;&amp; moving.check(player, packetData, data, cc, pData, plugin)
+            &amp;&amp; !pData.hasBypass(CheckType.NET_MOVING, player)) {
+            cancel = true;
+        }
+        // Illegal pitch check
+        if (!cancel &amp;&amp; pData.isCheckActive(CheckType.NET_WRONGTURN, player) 
+            &amp;&amp; wrongTurn.check(player, packetData.getPitch(), data, cc)
+            &amp;&amp; !pData.hasBypass(CheckType.NET_WRONGTURN, player)) {
+            cancel = true; // Is it a good idea to cancel or should we just reset the players pitch?
+        }
+        if (!cancel &amp;&amp; pData.isCheckActive(CheckType.MOVING_NOFALL, player)) {
+            final MovingData mData = pData.getGenericInstance(MovingData.class);
+            final float noFallFallDistance = mData.noFallFallDistance;
+            if (mData.requestTrueForGround) {
+                // If damage has already dealt
+                if (noFallFallDistance &gt; 0.0) {
+                    player.setFallDistance(noFallFallDistance);
+                    event.getPacket().getBooleans().write(indexOnGround, mData.requestTrueForGround);
+                }
+                mData.requestTrueForGround = false;
+            }
+        }
+
+        // Process cancel and debug log.
+        if (cancel) {
+            /*
+             * TODO: Test if this can fix packet fly exploits; it will also cause set backs on flying packets awaiting ACK(s)
+             *  Previously, NCP would simply cancel these flying packets out, without really restricting movement.
+             */
+            data.requestSetBack(player, this, plugin, CheckType.NET);
+            event.setCancelled(true);
+        }
+        
+        if (pData.isDebugActive(this.checkType)) {
+            debug(player, (packetData == null ? "(Incompatible data)" : packetData.toString()) + (event.isCancelled() ? " CANCEL" : ""));
+        }
+    }
+    
+    /**
+     * Checks if the given {@link DataPacketFlying} contains invalid position or look data. &lt;br&gt;
+     * Delegates to {@link LocUtil#isBadCoordinate(double...)} and {@link LocUtil#isBadCoordinate(float...)}.&lt;br&gt;
+     * If this returns true, invalid packets won't be added to the flying queue, and will be cancelled immediately.
+     *
+     * @param packetData the flying packet data to validate
+     * @return true if the packet contains invalid position or look data, false otherwise
+     */
+    private boolean isInvalidContent(final DataPacketFlying packetData) {
+        if (packetData.hasPos &amp;&amp; LocUtil.isBadCoordinate(packetData.getX(), packetData.getY(), packetData.getZ())) {
+            return true;
+        }
+        if (packetData.hasLook &amp;&amp; LocUtil.isBadCoordinate(packetData.getYaw(), packetData.getPitch())) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Interpret the packet content and do with it whatever is suitable.
+     * @param event
+     * @param time
+     * @return Packet data if successful, or null on packet mismatch.
+     */
+    private DataPacketFlying interpretPacket(final PacketEvent event, final long time) {
+        final PacketContainer packet = event.getPacket();
+        final List&lt;Boolean&gt; booleans = packet.getBooleans().getValues();
+        if (booleans.size() != (isServerAtLeast1_21_3 ? 4 : 3)) {
+            packetMismatch(event);
+            return null;
+        }
+        final boolean onGround = booleans.get(MovingFlying.indexOnGround).booleanValue();
+        final boolean horizontalCollision = isServerAtLeast1_21_3 &amp;&amp; booleans.get(MovingFlying.indexhorizontalCollision).booleanValue();
+        final boolean hasPos = booleans.get(MovingFlying.indexhasPos).booleanValue();
+        final boolean hasLook = booleans.get(MovingFlying.indexhasLook).booleanValue();
+
+        if (!hasPos &amp;&amp; !hasLook) {
+            return new DataPacketFlying(onGround, horizontalCollision, time);
+        }
+        final List&lt;Double&gt; doubles;
+        final List&lt;Float&gt; floats;
+
+        if (hasPos) {
+            doubles = packet.getDoubles().getValues();
+            if (doubles.size() != 3 &amp;&amp; doubles.size() != 4) {
+                // 3: 1.8, 4: 1.7.10 and before (stance).
+                packetMismatch(event);
+                return null;
+            }
+            // TODO: before 1.8: stance (should make possible to reject in isInvalidContent).
+        }
+        else {
+            doubles = null;
+        }
+
+        if (hasLook) {
+            floats = packet.getFloat().getValues();
+            if (floats.size() != 2) {
+                packetMismatch(event);
+                return null;
+            }
+        }
+        else {
+            floats = null;
+        }
+        if (hasPos &amp;&amp; hasLook) {
+            return new DataPacketFlying(onGround, horizontalCollision, doubles.get(indexX), doubles.get(indexY), doubles.get(indexZ), floats.get(indexYaw), floats.get(indexPitch), time);
+        }
+        else if (hasLook) {
+            return new DataPacketFlying(onGround, horizontalCollision, floats.get(indexYaw), floats.get(indexPitch), time);
+        }
+        else if (hasPos) {
+            return new DataPacketFlying(onGround, horizontalCollision, doubles.get(indexX), doubles.get(indexY), doubles.get(indexZ), time);
+        }
+        else {
+            throw new IllegalStateException("Can't be, it can't be!");
+        }
+    }
+
+    /**
+     * Log warning to console, stop interpreting packet content.
+     */
+    private void packetMismatch(final PacketEvent packetEvent) {
+        final long time = Monotonic.synchMillis();
+        if (time - packetMismatchLogFrequency &gt; packetMismatch) {
+            packetMismatch = time;
+            StringBuilder builder = new StringBuilder(512);
+            builder.append(CheckUtils.getLogMessagePrefix(packetEvent.getPlayer(), checkType));
+            builder.append("Incoming packet could not be interpreted. Are server and plugins up to date (NCP/ProtocolLib...)? This message is logged every ");
+            builder.append(Long.toString(packetMismatchLogFrequency / 1000));
+            builder.append(" seconds, disregarding for which player this happens.");
+            if (!validContent.isEmpty()) {
+                builder.append(" On other occasion, valid content was received for: ");
+                StringUtil.join(validContent, ", ", builder);
+            }
+            NCPAPIProvider.getNoCheatPlusAPI().getLogManager().warning(Streams.STATUS, builder.toString());
+        }
+    }
+}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Frequency and Degrade use WrappedPlayInFlying on their own event bus; CloudAC ships WrapperPlayClientFlying; CheaterDeleter hooks PlayerMoveC2SPacket via a Fabric mixin.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">FlyA (Frequency)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency, MinecraftUserHAN1110-FrequencyPlus)</span>
+</div>
+<p class="impl-pattern">Classic 1.8 fly check: vertical motion must match gravity and jump physics.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PostCheck on WrappedPlayInFlying: tracks the y delta and ground flag, compares against expected gravity, jump momentum and piston/water modifiers, accumulates a buffer and fails on persistent impossible vertical motion. Small, event-driven, representative of the 1.8 generation.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Fly modules, vertical speed, highjump, and any vertical motion that ignores gravity.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/fly/FlyA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/fly/FlyA.java =====
+package xyz.elevated.frequency.check.impl.fly;
+
+import net.minecraft.server.v1_8_R3.EntityPlayer;
+import org.bukkit.Location;
+import xyz.elevated.frequency.check.CheckData;
+import xyz.elevated.frequency.check.type.PositionCheck;
+import xyz.elevated.frequency.data.PlayerData;
+import xyz.elevated.frequency.update.PositionUpdate;
+import xyz.elevated.frequency.util.NmsUtil;
+
+@CheckData(name = "Fly (A)")
+public final class FlyA extends PositionCheck {
+
+    private double buffer = 0.0d;
+
+    public FlyA(final PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void process(final PositionUpdate positionUpdate) {
+        // Get the locations from the position update
+        final Location from = positionUpdate.getFrom();
+        final Location to = positionUpdate.getTo();
+
+        // Get the entity player from the nms util
+        final EntityPlayer entityPlayer = NmsUtil.getEntityPlayer(playerData);
+
+        // If the posY of the player is modulo by (1/64) he's on ground.
+        final boolean clientGround = entityPlayer.onGround;
+        final boolean serverGround = to.getY() % 0.015625 == 0.0 &amp;&amp; from.getY() % 0.015625 == 0.0;
+
+        final boolean illegal = playerData.getPositionManager().getTouchingClimbable().get() || playerData.getPositionManager().getTouchingLiquid().get();
+
+        if (!illegal &amp;&amp; clientGround != serverGround) {
+            if (++buffer &gt; 4) fail();
+        } else {
+            buffer = 0;
+        }
+    }
+}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Azure Fly, Hydro FlightA, FlopAC FlightA/B, Truthful BFlyA and MC-Jinky FlightFCheck are the same statistical pattern on different bases.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoFall (Arc v2)</span>
+<span class="impl-module-clients">(Vrekt-Arc-v2, Vrekt-Arc)</span>
+</div>
+<p class="impl-pattern">Ground-spoof check: onGround=true while the fall distance says the player is airborne.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On the flying packet, reads the ground flag and the accumulated fall distance; if the player reports onGround while their vertical velocity and fall distance are inconsistent with landing, the check fails. Directly targets the C03 onGround spoof used by nofall modules.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> NoFall ground spoofing, small-fall exploitation.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Vrekt-Arc-v2 — src/main/java/me/vrekt/arc/check/moving/NoFall.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Vrekt-Arc-v2 — src/main/java/me/vrekt/arc/check/moving/NoFall.java =====
+package me.vrekt.arc.check.moving;
+
+import me.vrekt.arc.check.Check;
+import me.vrekt.arc.check.CheckType;
+import me.vrekt.arc.data.moving.MovingData;
+import me.vrekt.arc.utilties.LocationHelper;
+import org.bukkit.Location;
+import org.bukkit.entity.Player;
+
+public class NoFall extends Check {
+
+    public NoFall() {
+        super(CheckType.NOFALL);
+    }
+
+    public void check(Player player, MovingData data) {
+        if (data.getGroundLocation() == null) {
+            return;
+        }
+
+        Location location = data.getCurrentLocation();
+        Location ground = data.getGroundLocation();
+
+        double toGround = LocationHelper.distanceVertical(ground, location);
+        boolean isDescending = toGround &gt;= 3.0 &amp;&amp; data.isDescending() &amp;&amp; !data.isOnGround();
+
+        // make sure we meet the req.
+        if (isDescending &amp;&amp; !data.isClimbing()) {
+            boolean ccOnGround = data.isFlyingClientOnGround();
+            // we're not on ground but the client is?
+            if (ccOnGround &amp;&amp; player.getFallDistance() == 0.0) {
+                boolean cancel = checkViolation(player, "Fall distance is 0 while not onGround. (Client faked)");
+                // if we cancel damage the player. (not accurate)
+                // TODO: Make accurate
+                if (cancel) {
+                    player.damage(toGround);
+                }
+            }
+        }
+
+    }
+
+}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim NoFall (groundspoof package) predicts landing from the simulation; Hydro GroundA compares the ground flag to collision results.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">GroundA (Hydro)</span>
+<span class="impl-module-clients">(Incognitolol-Hydro)</span>
+</div>
+<p class="impl-pattern">Ground-flag consistency check against server-side collision state.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On each position packet, compares the client's onGround flag with the server's own collision check at the reported position; a mismatch between the flag and the block below is a ground-spoof flag. 20-line check, the minimal form of the ground consistency idea.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> NoFall and ground spoofing where onGround does not match the terrain.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/check/impl/movement/ground/GroundA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/check/impl/movement/ground/GroundA.java =====
+package integral.studios.hydro.model.check.impl.movement.ground;
+
+import integral.studios.hydro.model.check.type.PositionCheck;
+import integral.studios.hydro.model.check.violation.category.Category;
+import integral.studios.hydro.model.check.violation.category.SubCategory;
+import integral.studios.hydro.model.check.violation.handler.ViolationHandler;
+import integral.studios.hydro.model.PlayerData;
+import integral.studios.hydro.util.chat.CC;
+import integral.studios.hydro.model.check.violation.impl.DetailedPlayerViolation;
+
+public class GroundA extends PositionCheck {
+    private int groundSpoofTicks;
+
+    public GroundA(PlayerData playerData) {
+        super(playerData, "Ground A", "Yes check", new ViolationHandler(20, 300L), Category.MOVEMENT, SubCategory.GROUND);
+    }
+
+    @Override
+    public void handle() {
+    }
+}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Negativity NegativityPlayerMoveEvent runs the same comparison on Bukkit's PlayerMoveEvent instead of raw packets.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
 <a class="related-chip" href="../C00PacketKeepAlive/">C00PacketKeepAlive</a>

@@ -846,6 +846,425 @@ public final class Disabler extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent on Rise 5.99. The single real module hit for this packet is a cancel inside a multi-mode disabler, not a dedicated XP module.</div>
 <div class="impl-clients">Rise 5.99 uses a boolean-toggle mode matrix inside one Disabler class. Rise 6.x replaces the module structure entirely (component system) and only lists the packet in NetworkAPI.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The experience packet has no detection story. The corpus shows one functional use: Intave writes S1F itself as a telemetry channel, packing ping and simulation data into the level field, and Artemis registers a PacketPlayServerExperience interface in its wrapper tree. The other hits are incidental: Negativity lists the packet in a type enum, NCP prints the player's exp in an admin inspect command, and the Photon hit is a keyword collision with SPAWN_EXPERIENCE_ORB (S11), not S1F. No anticheat reads S1F to detect anything.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Experience telemetry channel (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Reuse the experience packet as a covert data channel: Intave sends S1F with the level field packed with telemetry instead of real XP.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">sendPacketWithExperience builds an EXPERIENCE packet with progress 0 and total XP 0, writes the level field to a packed value, and sends it to the player. ConnectionMetadata encodes ping averages (ping times 1000 plus short ping) when LATENCY_PING_AS_XP_LEVEL is on; Physics.java sends the simulation rate limiter counter; StorageLoader replays a storage tag as a recurring level set.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing. This is the only functional S1F usage in the corpus and it is outbound telemetry, not detection.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/user/meta/ConnectionMetadata.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/user/meta/ConnectionMetadata.java =====
+package de.jpx3.intave.user.meta;
+
+import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.ProtocolLibrary;
+import com.comphenix.protocol.events.PacketContainer;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.gson.JsonObject;
+import de.jpx3.intave.IntaveControl;
+import de.jpx3.intave.annotate.DispatchTarget;
+import de.jpx3.intave.annotate.Nullable;
+import de.jpx3.intave.executor.RateLimiter;
+import de.jpx3.intave.math.Occurrences;
+import de.jpx3.intave.module.feedback.DelayedPacket;
+import de.jpx3.intave.module.feedback.FeedbackQueue;
+import de.jpx3.intave.module.feedback.FeedbackRequest;
+import de.jpx3.intave.module.feedback.PendingCountingFeedbackObserver;
+import de.jpx3.intave.module.tracker.entity.Entity;
+import de.jpx3.intave.packet.PacketSender;
+import org.bukkit.entity.Player;
+
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.DelayQueue;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+public final class ConnectionMetadata {
+  private final Player player;
+  private final FeedbackQueue feedbackQueue = new FeedbackQueue();
+  public final ReentrantLock feedbackLock = new ReentrantLock();
+  private final Map&lt;Long, Queue&lt;FeedbackRequest&lt;?&gt;&gt;&gt; transactionOptionalAppendMap = Maps.newConcurrentMap();
+  private final Map&lt;Integer, Entity&gt; entitiesById = Maps.newConcurrentMap();
+  private final Map&lt;Integer, Integer&gt; entityVehicles = Maps.newConcurrentMap();
+  private final Map&lt;Integer, Set&lt;Integer&gt;&gt; entityMounts = Maps.newConcurrentMap();
+
+  private final Set&lt;Integer&gt; entityIds = new HashSet&lt;&gt;();
+  private final List&lt;Entity&gt; synchronizedEntities = Lists.newCopyOnWriteArrayList();
+  public PendingCountingFeedbackObserver pendingBlockUpdates;
+  private List&lt;Entity&gt; tickedEntities = new CopyOnWriteArrayList&lt;&gt;();
+  private final Map&lt;Long, Long&gt; remainingPingPacketTimestamps = Maps.newConcurrentMap();
+  private final List&lt;Long&gt; latencyDifferenceBalance = Lists.newCopyOnWriteArrayList();
+
+  // not used
+  private final Map&lt;Integer, Integer&gt; localEntityIdsToGlobalIds = Maps.newConcurrentMap();
+  private final Map&lt;Integer, Integer&gt; globalEntityIdsToLocalIds = Maps.newConcurrentMap();
+  private final Set&lt;Integer&gt; globalEntityIdsForRemoval = new HashSet&lt;&gt;();
+
+  public final Queue&lt;Runnable&gt; nextFeedbackSubscribers = new LinkedList&lt;&gt;();
+
+  public final Map&lt;Integer, Integer&gt; duplicationOwners = new HashMap&lt;&gt;();
+  public final Map&lt;Integer, DecoySide&gt; decoySides = new HashMap&lt;&gt;();
+  public final Set&lt;Integer&gt; duplicatedEntityIds = new HashSet&lt;&gt;();
+  public final Set&lt;Integer&gt; shouldNotBeAttacked = new HashSet&lt;&gt;();
+  @Deprecated
+  public boolean markAttackInvalid;
+
+  public boolean debugEntityTracing = false;
+
+  public RateLimiter refreshBlockRatelimit = new RateLimiter(400, 2, TimeUnit.SECONDS);
+
+  public final Random feedbackUserKeyRandom = new Random();
+  public int lastFeedbackUserKey = Integer.MIN_VALUE;
+  public int generatorRunningNum = 0;
+
+  public int simulatedBlockAckNum;
+
+  public int windowClickId;
+  public int transactionKeepAliveInvalidOrderVL;
+
+  public enum DecoySide {
+    FIRST_IS_DECOY,
+    SECOND_IS_DECOY,
+  }
+
+//  private final Set&lt;Integer&gt; takenLocalEntityIds = new HashSet&lt;&gt;();
+  private int localEntityIdCounter = 1;
+  public long lastCCCInfoMessageSent = 0;
+  public boolean sendAsyncMessage = false;
+  public boolean eligibleForTransactionTimeout = false;
+  public int speculativeMovementTicks = 0;
+  public int randomTransactionIdShift = ThreadLocalRandom.current().nextInt(1, 2000);
+  public int attacksQueued;
+  public long lastAttackQueueRequest;
+
+  private final Deque&lt;Object&gt; bufferEnqueue = new ArrayDeque&lt;&gt;(8500);
+  private final DelayQueue&lt;DelayedPacket&gt; delayQueue = new DelayQueue&lt;&gt;();
+  public long lastBufferNotification = 0;
+  public long lastDelayNotification = 0;
+  public long lastDelaySlot = 0;
+  public long lastBufferEnqueue = 0;
+  public long timestampRequiredForAttack = 0;
+  public boolean ignorePacketEnqueue;
+  public long delayedPackets = 0;
+  public long lastDelayRequest = 0;
+  public long blinkDeactivated = 0;
+  public long lastRespawn = 0;
+  public long firstEnqueue = 0;
+  public boolean lastBlinkState = false;
+
+  // Client Synchronization
+  public int latency;
+  public long lastKeepAliveDifference;
+  public int latencyJitter;
+  public long transactionNumCounter = 0;
+  public long lastReceivedTransactionNum = -1;
+  public long lastSynchronization = System.nanoTime();
+  public long transactionPacketCounter;
+  public long transactionPacketCounterReset;
+
+  public long feedbackFaults = 0;
+
+  public int nextWindowOpenSlots = 0;
+  public boolean assumeWindowOpen = false;
+
+  // Lag identification
+  private long lastMovementTimestamps;
+  private final List&lt;Long&gt; movementLagSpikeHistory = new ArrayList&lt;&gt;();
+
+  private static final long DELAY_PURGE_INTERVAL = 1000 * 60;
+  public final Occurrences&lt;Integer&gt; attackDelays = new Occurrences&lt;&gt;(DELAY_PURGE_INTERVAL);
+  public final Occurrences&lt;Integer&gt; feedbackDelays = new Occurrences&lt;&gt;(DELAY_PURGE_INTERVAL);
+
+  // labymod data
+  public JsonObject labyModData = new JsonObject();
+
+  public ConnectionMetadata(Player player) {
+    this.player = player;
+
+    this.globalEntityIdsToLocalIds.put(-1, -1);
+    this.localEntityIdsToGlobalIds.put(-1, -1);
+    this.globalEntityIdsToLocalIds.put(0, 0);
+    this.localEntityIdsToGlobalIds.put(0, 0);
+    if (player != null) {
+      int entityId = player.getEntityId();
+      this.globalEntityIdsToLocalIds.put(entityId, entityId);
+      this.localEntityIdsToGlobalIds.put(entityId, entityId);
+    }
+  }
+
+  @DispatchTarget
+  public void receiveMovement() {
+    long now = System.currentTimeMillis();
+    if (this.lastMovementTimestamps != 0) {
+      long difference = now - lastMovementTimestamps;
+      movementLagSpikeHistory.add(difference);
+      if (movementLagSpikeHistory.size() &gt; 3) {
+        movementLagSpikeHistory.remove(0);
+      }
+    }
+    this.lastMovementTimestamps = now;
+  }
+
+  public long lastMovementPacket() {
+    return lastMovementTimestamps;
+  }
+
+  public double averageMovementPacketTimestamp() {
+    return averageOf(movementLagSpikeHistory);
+  }
+
+  private double averageOf(List&lt;? extends Number&gt; data) {
+    double sum = 0;
+    for (Number element : data) {
+      sum += element.doubleValue();
+    }
+    if (sum == 0) {
+      return 0;
+    }
+    return sum / data.size();
+  }
+
+  private long transactionSum = 0;
+  private long transactionNum = 0;
+
+  private long shortTransactionSum = 0;
+  private long shortTransactionNum = 0;
+  private long lastShortReset = System.currentTimeMillis();
+
+  public void receivedTransactionAfter(long milliseconds) {
+    long cappedMillis = Math.min(milliseconds, 1000);
+    transactionSum += cappedMillis;
+    transactionNum++;
+    shortTransactionSum += cappedMillis;
+    shortTransactionNum++;
+    if (transactionNum &gt; 4096) {
+      transactionSum /= 2;
+      transactionNum /= 2;
+    }
+    if (System.currentTimeMillis() - lastShortReset &gt; 4000) {
+      shortTransactionSum /= 2;
+      shortTransactionNum /= 2;
+      lastShortReset = System.currentTimeMillis();
+    }
+    feedbackDelays.occurred(Math.min(40, (int) milliseconds / 50));
+    if (IntaveControl.LATENCY_PING_AS_XP_LEVEL &amp;&amp; transactionNum % 10 == 0) {
+      sendPacketWithExperience(player, (int) ((int) transactionPingAverage() * 1000 + shortTransactionPingAverage()));
+    }
+  }
+
+  private void sendPacketWithExperience(Player player, int level) {
+    PacketContainer packet = ProtocolLibrary.getProtocolManager().createPacket(PacketType.Play.Server.EXPERIENCE);
+    packet.getFloat().write(0, 0f);
+    packet.getIntegers().write(0, 0);
+    packet.getIntegers().write(1, level);
+    PacketSender.sendServerPacket(player, packet);
+  }
+
+  public long transactionPingAverage() {
+    return transactionNum == 0 ? 0 : transactionSum / transactionNum;
+  }
+
+  public long shortTransactionPingAverage() {
+    return shortTransactionNum == 0 ? 0 : shortTransactionSum / shortTransactionNum;
+  }
+
+//  public void receivedTransactionAfter(long milliseconds) {
+//    if (transactionPings.size() &gt; 1024 * 8) {
+//      transactionPings.remove(0);
+//    }
+//    transactionPings.add(milliseconds);
+//  }
+//
+//  private long transactionPingCache = -1;
+//  private long lastTPCRefresh = 0;
+//
+//  public long transactionPingAverage() {
+//    if (System.currentTimeMillis() - lastTPCRefresh &gt; 5000) {
+//      long sum = 0;
+//      for (Long transactionPing : transactionPings) {
+//        sum += Math.min(transactionPing, 500);
+//      }
+//      lastTPCRefresh = System.currentTimeMillis();
+//      transactionPingCache = sum / transactionPings.size();
+//    }
+//    return transactionPingCache;
+//  }
+
+
+  public FeedbackQueue feedbackQueue() {
+    return feedbackQueue;
+  }
+
+  public Map&lt;Long, Queue&lt;FeedbackRequest&lt;?&gt;&gt;&gt; transactionAppendMap() {
+    return transactionOptionalAppendMap;
+  }
+
+  public Integer globalEntityIdFromLocal(Integer localEntityId) {
+    return localEntityIdsToGlobalIds.getOrDefault(localEntityId, -1);
+  }
+
+  public Integer localEntityIdFromGlobal(Integer globalEntityId) {
+    return globalEntityIdsToLocalIds.getOrDefault(globalEntityId, -1);
+  }
+
+  public Map&lt;Integer, Integer&gt; globalEntityIdsToLocalIds() {
+    return new HashMap&lt;&gt;(globalEntityIdsToLocalIds);
+  }
+
+  public void insertIdTranslations(Map&lt;Integer, Integer&gt; globalToLocal) {
+    int highestLocalId = 0;
+    for (Map.Entry&lt;Integer, Integer&gt; entry : globalToLocal.entrySet()) {
+      globalEntityIdsToLocalIds.put(entry.getKey(), entry.getValue());
+      localEntityIdsToGlobalIds.put(entry.getValue(), entry.getKey());
+      if (entry.getValue() &gt; highestLocalId) {
+        highestLocalId = entry.getValue();
+      }
+    }
+    localEntityIdCounter = highestLocalId + 1;
+  }
+
+  public synchronized Integer newLocalIdFor(int globalEntityId) {
+    int localEntityId = localEntityIdCounter++;
+    int attempt = 0;
+    while (localEntityIdsToGlobalIds.containsKey(localEntityId)) {
+      localEntityId = localEntityIdCounter += 7;
+      if (attempt++ &gt; 50) {
+        localEntityId = localEntityIdCounter += 100;
+      }
+    }
+    globalEntityIdsForRemoval.remove(globalEntityId);
+    localEntityIdsToGlobalIds.put(localEntityId, globalEntityId);
+    globalEntityIdsToLocalIds.put(globalEntityId, localEntityId);
+    return localEntityId;
+  }
+
+  public synchronized void markIdAsDeprecated(int globalEntityId) {
+    globalEntityIdsForRemoval.add(globalEntityId);
+  }
+
+  public synchronized void removeId(int globalEntityId) {
+    if (globalEntityId == -1 || globalEntityId == 0 || player == null || globalEntityId == player.getEntityId()) {
+      return;
+    }
+    if (!globalEntityIdsForRemoval.remove(globalEntityId)) {
+      return;
+    }
+    Integer localEntityId = globalEntityIdsToLocalIds.remove(globalEntityId);
+    if (localEntityId != null) {
+      localEntityIdsToGlobalIds.remove(localEntityId);
+//      localEntityIdCounter = Math.min(localEntityIdCounter, localEntityId);
+    }
+  }
+
+  public void noteMount(int entityId, int vehicleId) {
+    entityVehicles.put(entityId, vehicleId);
+    entityMounts.computeIfAbsent(vehicleId, k -&gt; new HashSet&lt;&gt;()).add(entityId);
+  }
+
+  public void noteDismount(int entityId) {
+    Integer vehicleId = entityVehicles.remove(entityId);
+    if (vehicleId != null) {
+      Set&lt;Integer&gt; mounts = entityMounts.get(vehicleId);
+      if (mounts != null) {
+        mounts.remove(entityId);
+        if (mounts.isEmpty()) {
+          entityMounts.remove(vehicleId);
+        }
+      }
+    }
+  }
+
+  public Integer vehicleOf(int entityId) {
+    return entityVehicles.get(entityId);
+  }
+
+  public List&lt;Integer&gt; sittingOn(int entityId) {
+    return entityMounts.get(entityId) == null ? Collections.emptyList() : new ArrayList&lt;&gt;(entityMounts.get(entityId));
+  }
+
+  @Deprecated
+  public Collection&lt;Entity&gt; entities() {
+    return entitiesById.values();
+  }
+
+  @Nullable
+  public Entity entityBy(int identifier) {
+    return entitiesById.get(identifier);
+  }
+
+  public void enterEntity(Entity entity) {
+    entitiesById.put(entity.entityId(), entity);
+    entityIds.add(entity.entityId());
+//    entities.add(entity);
+//    tickedEntities.add(entity);
+  }
+
+  public Entity markForDeletion(int entityId) {
+    Entity old = entitiesById.put(entityId, Entity.destroyedEntity());
+    entityIds.remove(entityId);
+    // we will not override the entity collection, as it would require a lot of performance and seems quite redundant in the first place
+//    for (int i = 0, entitiesSize = entities.size(); i &lt; entitiesSize; i++) {
+//      EntityShade entity = entities.get(i);
+//      if (entity.entityId() == entityId) {
+//        entities.set(i, EntityShade.destroyedEntity());
+//      }
+//    }
+    // using removeIf requires the least amount of locking and array modifications for CopyOnWriteArrayLists
+//    entities.removeIf(entity -&gt; entity.entityId() == entityId);
+    return old;
+  }
+
+  public void removeEntityIfMarked(int entityId) {
+    if (entitiesById.get(entityId) instanceof Entity.Destroyed) {
+      entitiesById.remove(entityId);
+    }
+  }
+
+  public void queueToNextTransaction(Runnable runnable) {
+    nextFeedbackSubscribers.add(runnable);
+  }
+
+  public DelayQueue&lt;DelayedPacket&gt; delayedPackets() {
+    return delayQueue;
+  }
+
+  public List&lt;Entity&gt; tracedEntities() {
+    return synchronizedEntities;
+  }
+
+  public List&lt;Entity&gt; tickedEntities() {
+    return tickedEntities;
+  }
+
+  public void setTickedEntities(List&lt;Entity&gt; ticked) {
+    this.tickedEntities = ticked;
+  }
+
+  public Map&lt;Long, Long&gt; pingPackets() {
+    return remainingPingPacketTimestamps;
+  }
+
+  public List&lt;Long&gt; latencyDifferenceBalance() {
+    return latencyDifferenceBalance;
+  }
+
+  public Deque&lt;Object&gt; enqueuedPackets() {
+    return bufferEnqueue;
+  }
+
+  public Set&lt;Integer&gt; entityIds() {
+    return entityIds;
+  }
+}
+// NOTE (AI): sendPacketWithExperience (lines 202-208) and the LATENCY_PING_AS_XP_LEVEL branch (lines 197-199) are the S1F-relevant parts; the rest of the file is transaction ping bookkeeping.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis registers PacketPlayServerExperience as a wrapper interface (repository entry at SERVER_PLAY + 34); Negativity lists EXPERIENCE in its packet-type enum; NCP prints the player's exp in the admin inspect command; the Photon corpus hit is a keyword collision with SPAWN_EXPERIENCE_ORB, which is S11, not S1F.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S11PacketSpawnExperienceOrb/">S11PacketSpawnExperienceOrb</a>
 <a class="related-chip" href="../S06PacketUpdateHealth/">S06PacketUpdateHealth</a>

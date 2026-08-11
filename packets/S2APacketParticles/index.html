@@ -769,6 +769,297 @@ public class Criticals extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Every handler sits on the packet receive path: Memeware PacketInEvent, Tenacity and Rise 6.x PacketReceiveEvent, Sigma EventPacket, Rise security chain handle(Packet).</div>
 <div class="impl-clients">Memeware cancels via event.cancel() on a custom bus. Rise 6.x components and security features use event.setCancelled() or pipeline drop. Sigma returns early inside a single handler. Tenacity combines cancel with a per-second packet counter shared across crash vectors.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The particle packet is the one clientbound cosmetic packet that anticheats actively generate. Kauri, FlopAC, Artemis, Daedalus and intave all construct and send S2A (or its PacketEvents equivalent) to draw debug overlays: hitbox cuboids, rays and collision boxes during testing and at flag time. Artemis additionally ships a full read/write wrapper so the packet can be parsed and re-emitted by its pipeline. No anticheat flags S2A as a cheat signal; the corpus treats it as an output channel, not an input.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Debug particle visualization (Kauri / FlopAC / Daedalus / intave)</span>
+<span class="impl-module-clients">(funkemunky-KauriV3, JTXOfficial-FlopAC, funkemunky-Daedalus, intave-intave)</span>
+</div>
+<p class="impl-pattern">Render hitboxes, rays and collision boxes to the player's screen by sending particle packets, so staff and developers can see exactly what a check computed.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Kauri's Helper.drawRay and drawCuboid build a WrapperPlayServerParticle (the PacketEvents S2A equivalent) with the ray or box edge positions and send it to the player. FlopAC's MiscUtils does the same through its own WrappedPacketPlayOutWorldParticle wrapper, and its collision box types each implement a draw() that emits particles along their edges. Daedalus submits particle drawing for bounding boxes to a thread pool, and intave spawns villager-happy particles at waypoints via Bukkit spawnParticle, rate-limited per position. The packets are fired on flag, in debug mode, or from dedicated reveal handlers.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing on its own. The visualization is an operator aid layered on top of reach, hitbox and phase checks; it exposes the geometry those checks reason about.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/utils/Helper.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/utils/Helper.java =====
+package dev.brighten.ac.utils;
+
+import com.github.retrooper.packetevents.protocol.particle.Particle;
+import com.github.retrooper.packetevents.protocol.particle.type.ParticleType;
+import com.github.retrooper.packetevents.protocol.world.states.type.StateType;
+import com.github.retrooper.packetevents.protocol.world.states.type.StateTypes;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.util.Vector3f;
+import com.github.retrooper.packetevents.util.Vector3i;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerParticle;
+import dev.brighten.ac.data.APlayer;
+import dev.brighten.ac.handler.entity.TrackedEntity;
+import dev.brighten.ac.utils.world.BlockData;
+import dev.brighten.ac.utils.world.CollisionBox;
+import dev.brighten.ac.utils.world.EntityData;
+import dev.brighten.ac.utils.world.types.RayCollision;
+import dev.brighten.ac.utils.world.types.SimpleCollisionBox;
+import org.bukkit.util.Vector;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
+
+
+/**
+ * @author DeprecatedLuke
+ * Taken from &lt;a href="https://github.com/DeprecatedLuke/fireflyx/blob/master/src/main/java/com/ngxdev/anticheat/utils/Helper.java"&gt;...&lt;/a&gt;
+ */
+public class Helper {
+
+    public static Vector vector(double yaw, double pitch) {
+        Vector vector = new Vector();
+        vector.setY(-Math.sin(Math.toRadians(pitch)));
+        double xz = Math.cos(Math.toRadians(pitch));
+        vector.setX(-xz * Math.sin(Math.toRadians(yaw)));
+        vector.setZ(xz * Math.cos(Math.toRadians(yaw)));
+        return vector;
+    }
+
+    public static void drawRay(RayCollision collision, double distance, ParticleType&lt;?&gt; particle, Collection&lt;? extends APlayer&gt; players) {
+        for (double i = 0; i &lt; distance; i += 0.2) {
+            float fx = (float) (collision.originX + (collision.directionX * i));
+            float fy = (float) (collision.originY + (collision.directionY * i));
+            float fz = (float) (collision.originZ + (collision.directionZ * i));
+
+            WrapperPlayServerParticle packet = new WrapperPlayServerParticle(new Particle&lt;&gt;(particle), false,
+                    new Vector3d(fx, fy, fz), new Vector3f(0, 0, 0),  0f, 1);
+
+            for (APlayer p : players) {
+                p.writePacketSilently(packet);
+            }
+        }
+    }
+
+
+    public static void drawCuboid(SimpleCollisionBox box, ParticleType&lt;?&gt; particle, Collection&lt;? extends APlayer&gt; players) {
+        Step.GenericStepper&lt;Float&gt; x = Step.step((float) box.minX, 0.241F, (float) box.maxX);
+        Step.GenericStepper&lt;Float&gt; y = Step.step((float) box.minY, 0.241F, (float) box.maxY);
+        Step.GenericStepper&lt;Float&gt; z = Step.step((float) box.minZ, 0.241F, (float) box.maxZ);
+
+        for (float fx : x) {
+            Iterator&lt;Float&gt; var8 = y.iterator();
+
+            label61:
+            while (var8.hasNext()) {
+                float fy = var8.next();
+                Iterator&lt;Float&gt; var10 = z.iterator();
+
+                while (true) {
+                    float fz;
+                    int check;
+                    do {
+                        if (!var10.hasNext()) {
+                            continue label61;
+                        }
+
+                        fz = var10.next();
+                        check = 0;
+                        if (x.first() || x.last()) {
+                            ++check;
+                        }
+
+                        if (y.first() || y.last()) {
+                            ++check;
+                        }
+
+                        if (z.first() || z.last()) {
+                            ++check;
+                        }
+                    } while (check &lt; 2);
+
+                    WrapperPlayServerParticle packet = new WrapperPlayServerParticle(new Particle&lt;&gt;(particle), false,
+                            new Vector3d(fx, fy, fz), new Vector3f(0, 0, 0), 0f, 1);
+
+                    for (APlayer p : players) {
+                        p.sendPacket(packet);
+                    }
+                }
+            }
+        }
+
+    }
+
+    public static List&lt;SimpleCollisionBox&gt; getCollisions(APlayer player, SimpleCollisionBox collisionBox) {
+        return getCollisions(player, collisionBox, -100);
+    }
+
+    public static List&lt;SimpleCollisionBox&gt; getCollisions(APlayer player, SimpleCollisionBox collisionBox, int mask) {
+        List&lt;SimpleCollisionBox&gt; collisionBoxes = getCollisionsNoEntities(player, collisionBox, mask);
+
+        if(player != null) {
+            for (TrackedEntity entity : player.getInfo().getNearbyEntities()) {
+                if (!BlockUtils.isEntityCollidable(entity)) continue;
+
+                CollisionBox entityCollisionBox = EntityData.getEntityBox(entity.getLocation()
+                        .toLocation(player.getBukkitPlayer().getWorld()), entity);
+
+                if (entityCollisionBox.isIntersected(collisionBox))
+                    entityCollisionBox.downCast(collisionBoxes);
+            }
+        }
+
+        return collisionBoxes;
+    }
+
+    public static List&lt;SimpleCollisionBox&gt; getCollisionsNoEntities(APlayer player,
+                                                                   SimpleCollisionBox collisionBox, int mask) {
+        int x1 = (int) Math.floor(collisionBox.minX);
+        int y1 = (int) Math.floor(collisionBox.minY);
+        int z1 = (int) Math.floor(collisionBox.minZ);
+        int x2 = (int) Math.floor(collisionBox.maxX + 1);
+        int y2 = (int) Math.floor(collisionBox.maxY + 1);
+        int z2 = (int) Math.floor(collisionBox.maxZ + 1);
+        List&lt;SimpleCollisionBox&gt; collisionBoxes = new ArrayList&lt;&gt;();
+        for (int x = x1; x &lt; x2; ++x)
+            for (int y = y1 - 1; y &lt; y2; ++y)
+                for (int z = z1; z &lt; z2; ++z) {
+                    Vector3i vec = new Vector3i(x, y, z);
+                    StateType type = player.getWorldTracker().getBlock(vec).getType();
+
+                    if (type != StateTypes.AIR &amp;&amp; (mask == -100 || Materials.checkFlag(type, mask))) {
+                        CollisionBox box = BlockData.getData(type)
+                                .getBox(player, vec, player.getPlayerVersion());
+
+                        if (box.isIntersected(collisionBox)) {
+                            box.downCast(collisionBoxes);
+                        }
+                    }
+                }
+
+        return collisionBoxes;
+    }
+
+    private static final int[] decimalPlaces = {0, 10, 100, 1000, 10000, 100000, 1000000,
+            10000000, 100000000, 1000000000};
+
+    public static double format(double d, int dec) {
+        return (long) (d * decimalPlaces[dec] + 0.5) / (double) decimalPlaces[dec];
+    }
+}
+
+// NOTE (AI): drawRay and drawCuboid are the S2A emission paths; they appear in the S2A corpus because anticheats build particle packets themselves rather than reading them.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> FlopAC MiscUtils.drawRay/drawCuboid mirror Kauri's Helper with its own tinyprotocol wrapper. Daedalus CollisionAssessment sends flame particles for bounding boxes. intave Particles.spawnVillagerHappyParticleAt rate-limits waypoint particles. Artemis BoundingUtil.drawBox uses its GPacketPlayServerWorldParticles wrapper for the same purpose.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">World particles wrapper (Artemis)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Give Artemis a full read/write wrapper for the world-particles packet so the pipeline can parse inbound S2A and re-emit particle packets for debug drawing.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">GPacketPlayServerWorldParticles implements ReadableBuffer and WriteableBuffer. read() parses the particle type (with a BARRIER fallback on a bad id), the long-distance flag, position, offsets, speed, count and the per-type argument array; write() serializes them back, negating particle arguments on the wire. BoundingUtil.drawBox builds one of these packets per box edge to render debug bounding boxes, and the ProtocolGeneratorDirect registers the class in the generated protocol.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing. The wrapper is bidirectional plumbing: inbound parsing feeds the packet pipeline, outbound construction powers the debug-box renderer.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.packet.spigot/src/main/java/cc/ghast/packet/wrapper/packet/play/server/GPacketPlayServerWorldParticles.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.packet.spigot/src/main/java/cc/ghast/packet/wrapper/packet/play/server/GPacketPlayServerWorldParticles.java =====
+package cc.ghast.packet.wrapper.packet.play.server;
+
+import ac.artemis.packet.protocol.ProtocolVersion;
+import ac.artemis.packet.spigot.protocol.PacketLink;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import ac.artemis.packet.wrapper.server.PacketPlayServerBed;
+import ac.artemis.packet.wrapper.server.PacketPlayServerWorldParticles;
+import cc.ghast.packet.buffer.ProtocolByteBuf;
+import cc.ghast.packet.wrapper.bukkit.Particle;
+import cc.ghast.packet.wrapper.packet.ReadableBuffer;
+import cc.ghast.packet.wrapper.packet.WriteableBuffer;
+import lombok.Getter;
+import lombok.Setter;
+
+import java.util.UUID;
+
+@Getter
+@Setter
+@PacketLink(PacketPlayServerWorldParticles.class)
+public class GPacketPlayServerWorldParticles extends GPacket implements PacketPlayServerBed, ReadableBuffer, WriteableBuffer {
+    public GPacketPlayServerWorldParticles(UUID player, ProtocolVersion version) {
+        super("PacketPlayOutWorldParticles", player, version);
+    }
+
+    public GPacketPlayServerWorldParticles(String realName, UUID player, ProtocolVersion version, Particle type,
+                                           float x, float y, float z, float offsetX, float offsetY, float offsetZ,
+                                           float particleSpeed, int particleCount, boolean longDistance) {
+        super(realName, player, version);
+        this.type = type;
+        this.x = x;
+        this.y = y;
+        this.z = z;
+        this.offsetX = offsetX;
+        this.offsetY = offsetY;
+        this.offsetZ = offsetZ;
+        this.particleSpeed = particleSpeed;
+        this.particleCount = particleCount;
+        this.longDistance = longDistance;
+    }
+
+    private Particle type;
+    private float x;
+    private float y;
+    private float z;
+    private float offsetX;
+    private float offsetY;
+    private float offsetZ;
+    private float particleSpeed;
+    private int particleCount;
+    private boolean longDistance;
+    /**
+     * These are the block/item ids and possibly metaData ids that are used to color or texture the particle.
+     */
+    private int[] particleArguments;
+
+    @Override
+    public void read(ProtocolByteBuf byteBuf) {
+        try {
+            this.type = Particle.values()[byteBuf.readInt()];
+        } catch (Exception e) { }
+
+
+        if (this.type == null) {
+            this.type = Particle.BARRIER;
+        }
+
+        this.longDistance = byteBuf.readBoolean();
+        this.x = byteBuf.readFloat();
+        this.y = byteBuf.readFloat();
+        this.z = byteBuf.readFloat();
+        this.offsetX = byteBuf.readFloat();
+        this.offsetY = byteBuf.readFloat();
+        this.offsetZ = byteBuf.readFloat();
+        this.particleSpeed = byteBuf.readFloat();
+        this.particleCount = byteBuf.readInt();
+
+        final int size = this.type.getArgumentCount();
+        this.particleArguments = new int[size];
+
+        for (int j = 0; j &lt; size; ++j) {
+            this.particleArguments[j] = byteBuf.readVarInt();
+        }
+    }
+
+    @Override
+    public void write(ProtocolByteBuf byteBuf) {
+        byteBuf.writeInt(this.type.getParticleID());
+        byteBuf.writeBoolean(this.longDistance);
+        byteBuf.writeFloat(this.x);
+        byteBuf.writeFloat(this.y);
+        byteBuf.writeFloat(this.z);
+        byteBuf.writeFloat(this.offsetX);
+        byteBuf.writeFloat(this.offsetY);
+        byteBuf.writeFloat(this.offsetZ);
+        byteBuf.writeFloat(this.particleSpeed);
+        byteBuf.writeInt(this.particleCount);
+        final int size = this.type.getArgumentCount();
+
+        for (int j = 0; j &lt; size; ++j) {
+            byteBuf.writeVarInt(-this.particleArguments[j]);
+        }
+    }
+}
+
+// NOTE (AI): The write() path negates particle arguments when serializing, a quirk of the 1.8 wire format for block and item particle data.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis also maps SERVER_PLAY + 93 to PacketPlayServerWorldParticles in its repository. FlopAC's WrappedPacketPlayOutWorldParticle covers the same packet for its 1.8 base, and Kauri uses PacketEvents' WrapperPlayServerParticle directly.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S29PacketSoundEffect/">S29PacketSoundEffect</a>
 <a class="related-chip" href="../S27PacketExplosion/">S27PacketExplosion</a>

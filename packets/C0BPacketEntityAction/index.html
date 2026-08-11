@@ -482,6 +482,284 @@ public class VulcanSprint extends Mode&lt;Scaffold&gt; {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent (Sprint, KeepSprint), PreMotionEvent (Sneak, Scaffold), attack events (WTap). Sigma uses EventPacket; Rise 6.x uses Listener<PacketSendEvent> and scaffold sub-modes.</div>
 <div class="impl-clients">Rise 5.99 uses PacketUtil.sendPacketWithoutEvent to bypass its own event loop. Spicy pushes to sendQueue directly. Sigma hooks EventPacket with an isIncoming guard. Rise 6.x uses PacketUtil.send and EventLink listeners, and its PingSpoofComponent parks C0B in the blink class list.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The entity action packet carries sprint, crouch, leave-bed, horse jump and inventory-open actions. Sprint and sneak state is the server-side contract anticheats validate: omni-sprint modules forge the sprint action while ignoring hunger and blindness, and toggle spam abuses the state machine. The corpus shows adapters that forward the action (NCP EntityActionAdapter), state checks that validate sprint against food and potions (Grim SprintA, Truthful SprintA), and direction checks on the move stream (Azure OmniSprint).</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">SprintA (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Post-prediction sprint state check: sprinting with a food level at or below 6 is invalid.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PostPredictionListener running after the movement simulation. If the prediction was not checked, the player can fly, or the player rides a camel, the check returns (both are legitimate sprint cases). Otherwise, when food is at or below 6 and the client's sprinting flag (set from the entity action packet) is true, it flags with the food level in the verbose; when the flag is false it rewards the balance.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Omni-sprint and auto-sprint modules that sprint with no hunger, and clients that forge the sprint action state.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/sprint/SprintA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/sprint/SprintA.java =====
+package ac.grim.grimac.checks.impl.sprint;
+
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PostPredictionListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.anticheat.update.PredictionComplete;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityTypes;
+
+@CheckData(name = "SprintA", stableKey = "grim.sprint.hunger", description = "Sprinting with too low hunger", setback = 0)
+public class SprintA extends Check implements PostPredictionListener {
+    private static final Verbose V = Verbose.of("hunger={uint}");
+
+    public SprintA(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPredictionComplete(PredictionComplete predictionComplete) {
+        if (!predictionComplete.isChecked()) return;
+
+        // Players can sprint if they're able to fly
+        // Players can also sprint if they are on a camel, regardless of their hunger level
+        if (player.canFly || EntityTypes.isTypeInstanceOf(player.getVehicleType(), EntityTypes.CAMEL)) return;
+
+        if (player.food &lt;= 6.0F) {
+            if (player.isSprinting) {
+                flagWithSetback(V.write(verbose()).uint(player.food));
+            } else {
+                reward();
+            }
+        }
+    }
+}
+// NOTE (AI): SprintA runs after the prediction engine and validates sprint state against hunger; the entity action packet sets the sprinting state that this check and the SprintB-G family consume. Grim also carries SprintD/E/F for sprint direction and 1.9+ variants.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim's SprintB through SprintG cover sprint direction, 1.9+ sprint and vehicle cases; the entity action packet itself is parsed in PacketEntityAction which feeds player.isSprinting.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">OmniSprint (Azure)</span>
+<span class="impl-module-clients">(AimbotPvP-azure-anticheat)</span>
+</div>
+<p class="impl-pattern">Classic omni-sprint detection: diagonal movement direction must agree with the client yaw.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PlayerMoveEvent with the server-side sprint flag active (set from the entity action packet), it computes deltaX/deltaZ from the movement and the absolute yaw quadrant. Movement diagonally in a direction that contradicts the yaw quadrant is the omni-sprint signature and raises an immediate violation with a 60 second cooldown.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Omni-sprint cheats that move diagonally while facing straight, and sprint direction spoofing.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/motion/OmniSprint.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/motion/OmniSprint.java =====
+package us.skidrevenant.azure.check.checks.motion;
+
+import org.bukkit.Location;
+import org.bukkit.event.player.PlayerMoveEvent;
+import us.skidrevenant.azure.check.Check;
+import us.skidrevenant.azure.stats.PlayerStats;
+
+/**
+ * @author SkidRevenant
+ * at 30/05/2018
+ */
+public class OmniSprint extends Check {
+    public OmniSprint(PlayerStats player) {
+        super(player);
+    }
+
+    @Override
+    public void onMove(Location from, Location to, PlayerMoveEvent event) {
+        double deltaX = to.getX() - from.getX();
+        double deltaZ = to.getZ() - from.getZ();
+
+        float yaw = Math.abs(from.getYaw()) % 360;
+
+        if (!player.getBukkitPlayer().isSprinting()) {
+            return;
+        }
+
+        if (deltaX &lt; 0.0 &amp;&amp; deltaZ &gt; 0.0 &amp;&amp; yaw &gt; 180.0f &amp;&amp; yaw &lt; 270.0f || deltaX &lt; 0.0 &amp;&amp; deltaZ &lt; 0.0 &amp;&amp; yaw &gt; 270.0f &amp;&amp; yaw &lt; 360.0f || deltaX &gt; 0.0 &amp;&amp; deltaZ &lt; 0.0 &amp;&amp; yaw &gt; 0.0f &amp;&amp; yaw &lt; 90.0f || deltaX &gt; 0.0 &amp;&amp; deltaZ &gt; 0.0 &amp;&amp; yaw &gt; 90.0f &amp;&amp; yaw &lt; 180.0f) {
+            onViolation("OmniSprint", 60000L, 0);
+        }
+    }
+}
+// NOTE (AI): Azure OmniSprint flags movement direction that contradicts the client yaw while the server-side sprint flag is set (set from the entity action packet); the classic omni-sprint signature is diagonal motion with a 90 degree yaw offset.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Truthful SprintA flags the same behavior via blindness and hunger state; FlopAC WTapA/B/C and SprintA/B cover sprint-wtap and sprint-state on the packet stream.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">EntityActionAdapter (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">The ProtocolLib bridge for the entity action packet, feeding NCP's net toggle-frequency check.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A BaseAdapter registered at LOW priority for ENTITY_ACTION. It resolves player data safely, records the action timestamp into the player action frequency buffer, refreshes the last-packet time, and runs the ToggleFrequency check that limits how often sprint and sneak can be toggled. A cancel decision requests a setback through the player data.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Sprint and sneak toggle spam, action-frequency abuse, and clients that flood entity actions to desync server state.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/EntityActionAdapter.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/EntityActionAdapter.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.checks.net.protocollib;
+
+import java.util.Arrays;
+import java.util.LinkedList;
+import java.util.List;
+
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.Plugin;
+
+import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.events.ListenerPriority;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.reflect.StructureModifier;
+import com.comphenix.protocol.wrappers.EnumWrappers.PlayerAction;
+
+import fr.neatmonster.nocheatplus.checks.CheckType;
+import fr.neatmonster.nocheatplus.checks.net.NetConfig;
+import fr.neatmonster.nocheatplus.checks.net.NetData;
+import fr.neatmonster.nocheatplus.checks.net.ToggleFrequency;
+import fr.neatmonster.nocheatplus.logging.StaticLog;
+import fr.neatmonster.nocheatplus.players.DataManager;
+import fr.neatmonster.nocheatplus.players.IPlayerData;
+
+/**
+ * Adapter for the EntityAction NMS packet.
+ */
+public class EntityActionAdapter extends BaseAdapter {
+    
+    private final ToggleFrequency toggleFrequency = new ToggleFrequency();
+    
+    private static PacketType[] initPacketTypes() {
+        final List&lt;PacketType&gt; types = new LinkedList&lt;PacketType&gt;(Arrays.asList(PacketType.Play.Client.ENTITY_ACTION));
+        return types.toArray(new PacketType[types.size()]);
+    }
+
+    public EntityActionAdapter(Plugin plugin) {
+        super(plugin, ListenerPriority.LOW, initPacketTypes());
+    }
+    
+    @Override
+    public void onPacketReceiving(final PacketEvent event) {
+        // Do some early return tests first.
+        try {
+            if (event.isPlayerTemporary()) return;
+        } 
+        catch (NoSuchMethodError e) {}
+        
+        // Not interested in any other packet.
+        if (event.getPacketType() != PacketType.Play.Client.ENTITY_ACTION) {
+            return;
+        }
+        final Player player = event.getPlayer();
+        if (player == null) {
+            counters.add(ProtocolLibComponent.idNullPlayer, 1);
+            return;
+        }
+        
+        final IPlayerData pData = DataManager.getPlayerDataSafe(player);
+        if (pData == null) {
+            StaticLog.logWarning("Failed to fetch player data with " + event.getPacketType() + " for: " + player.toString());
+            return;
+        }
+        final StructureModifier&lt;PlayerAction&gt; actions = event.getPacket().getPlayerActions();
+        // if (actions.size() != 1) {
+        //     StaticLog.logWarning("Unexpected packet size for EntityActionAdapter: " + actions.size());
+        //     return;
+        // }
+       
+        final NetData data = pData.getGenericInstance(NetData.class);
+        // (This check might invalidate the current BedLeave implementation...)
+        // Currently, we don't discern action types from one another.
+        data.playerActionFreq.add(System.currentTimeMillis(), 1f);
+        // Always set last received time.
+        data.lastKeepAliveTime = System.currentTimeMillis();
+        boolean cancel = false;
+        if (!cancel &amp;&amp; pData.isCheckActive(CheckType.NET_TOGGLEFREQUENCY, player)
+            &amp;&amp; toggleFrequency.check(player, data, pData.getGenericInstance(NetConfig.class), pData)
+            &amp;&amp; !pData.hasBypass(CheckType.NET_TOGGLEFREQUENCY, player)) {
+            cancel = true;
+        }
+        
+        // Request a setback
+        if (cancel) {
+        	data.requestSetBack(player, this, plugin, checkType);
+        }
+    }
+}
+// NOTE (AI): NCP's EntityActionAdapter is the ProtocolLib bridge for PacketPlayInEntityAction: it records action frequency and last-packet time, then runs the net ToggleFrequency check that limits how often the player may toggle sprint and sneak.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Frequency's WrappedPlayInEntityAction feeds BadPacketsC/G and InvalidD/E; CheaterDeleter's PlayerInteractEntity mixin covers the modern 1.19+ equivalent on the same action domain.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">SprintA (Truthful)</span>
+<span class="impl-module-clients">(TawnyE-TruthfulAC)</span>
+</div>
+<p class="impl-pattern">Sprint state validity check on the movement stream: sprinting is illegal with blindness or with food at or below 6.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Handles relative-move wrappers on position updates. If the player is not sprinting (sprint state set from the entity action packet) the buffer decays. When sprinting and not allowed to fly, blindness adds 2.0 to the buffer (flag at 4.0) and food at or below 6 adds 1.0 (flag at 5.0), with a decaying buffer that resets on quit.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Omni-sprint with blindness, hunger-ignoring sprint modules, and sprint state desync.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> TawnyE-TruthfulAC — src/main/java/ret/tawny/truthful/checks/impl/packet/sprint/SprintA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: TawnyE-TruthfulAC — src/main/java/ret/tawny/truthful/checks/impl/packet/sprint/SprintA.java =====
+package ret.tawny.truthful.checks.impl.packet.sprint;
+
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.potion.PotionEffectType;
+import ret.tawny.truthful.Truthful;
+import ret.tawny.truthful.checks.api.Check;
+import ret.tawny.truthful.checks.api.CheckBuffer;
+import ret.tawny.truthful.checks.api.data.CheckData;
+import ret.tawny.truthful.checks.api.data.CheckType;
+import ret.tawny.truthful.data.PlayerData;
+import ret.tawny.truthful.wrapper.impl.client.position.RelMovePacketWrapper;
+
+@CheckData(order = 'A', type = CheckType.SPRINT)
+public final class SprintA extends Check {
+
+    private final CheckBuffer buffer = new CheckBuffer(10.0);
+
+    @Override
+    public void handleRelMove(final RelMovePacketWrapper wrapper) {
+        if (!wrapper.isPositionUpdate()) return;
+
+        final Player player = wrapper.getPlayer();
+        final PlayerData data = Truthful.getInstance().getDataManager().getPlayerData(player);
+        if (data == null) return;
+
+        if (!data.isSprinting()) {
+            buffer.decrease(player, 0.5);
+            return;
+        }
+
+        if (data.isAllowFlight()) return;
+
+        // 1. Blindness Check
+        if (data.hasPotionEffect(PotionEffectType.BLINDNESS)) {
+            if (buffer.increase(player, 2.0) &gt; 4.0) {
+                flag(data, "OmniSprint (Blindness)");
+            }
+            return;
+        }
+
+        // 2. Hunger Check
+        int foodLevel = data.getFoodLevel();
+        if (foodLevel &lt;= 6) {
+            if (buffer.increase(player, 1.0) &gt; 5.0) {
+                // DETAILED INFO FOR ALERT
+                flag(data, String.format("OmniSprint (Hunger: %d)", foodLevel));
+            }
+        } else {
+            buffer.decrease(player, 0.25);
+        }
+    }
+
+    @EventHandler
+    public void onQuit(final PlayerQuitEvent event) {
+        buffer.remove(event.getPlayer());
+    }
+}
+// NOTE (AI): Truthful SprintA is a state check on the movement stream: sprinting is invalid with blindness or with food at or below 6, using a buffer for both cases; sprint state itself is tracked from the entity action packet.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> SprintB in the same package adds direction validation; Photon's BetterSprint sentinel module and FlopAC SprintA cover the same ground on other bases.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../C03PacketPlayer/">C03PacketPlayer</a>
 <a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>

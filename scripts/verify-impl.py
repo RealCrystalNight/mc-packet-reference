@@ -23,6 +23,7 @@ import sys
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKETS_DIR = os.path.join(BASE, "data", "packets")
 IMPL_DIR = os.path.join(BASE, "data", "impl")
+AC_DIR = os.path.join(BASE, "data", "ac")
 MINED_INDEX = os.path.join(BASE, "data", "mined", "_index.json")
 
 DEFAULT_SOURCES = os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "sources"))
@@ -100,12 +101,51 @@ def norm_trailing(s):
     return "\n".join(line.rstrip() for line in s.split("\n"))
 
 
+def check_ac_file(pkt_id, ac_data, ac_index, ac_root):
+    """Verify one data/ac/<pkt>.json against the anticheat corpus + sources."""
+    for k in ac_data:
+        if k not in ("overview", "checks"):
+            errors.append("[ac:%s] unknown key '%s'" % (pkt_id, k))
+    for c in ac_data.get("checks") or []:
+        if not isinstance(c, dict) or "name" not in c:
+            errors.append("[ac:%s] malformed check entry" % pkt_id)
+            continue
+        name = c.get("name", "?")
+        for ac in c.get("found_in") or []:
+            if ac not in ac_index.get(pkt_id, {}):
+                errors.append("[ac:%s] check '%s': found_in '%s' has no corpus hit" % (pkt_id, name, ac))
+        code = c.get("detailed_code")
+        if code:
+            m = re.match(r"^// ===== FILE: ([^\n]+) =====\n", code)
+            if not m:
+                warnings.append("[ac:%s] check '%s': code lacks FILE: marker" % (pkt_id, name))
+                continue
+            mm = re.match(r"^(.*?) \u2014 (.*)$", m.group(1))
+            if not mm:
+                errors.append("[ac:%s] check '%s': unparseable FILE header" % (pkt_id, name))
+                continue
+            ac_dir, rel = mm.group(1), mm.group(2)
+            verbatim_end = code.find("\n// NOTE")
+            verbatim = code[m.end():] if verbatim_end == -1 else code[m.end():verbatim_end]
+            verbatim = verbatim.rstrip("\n")
+            src_path = os.path.join(ac_root, ac_dir, rel)
+            if not os.path.isfile(src_path):
+                errors.append("[ac:%s] check '%s': source file not found: %s" % (pkt_id, name, src_path))
+                continue
+            actual = open(src_path, encoding="utf-8", errors="replace").read().rstrip("\n")
+            if norm_trailing(verbatim) != norm_trailing(actual):
+                errors.append("[ac:%s] check '%s': code MISMATCH with %s" % (pkt_id, name, src_path))
+
+
 def main():
     check_all = "--all" in sys.argv
+    ac_root = os.environ.get("AC_ROOT") or os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "anticheats"))
     if os.path.exists(MINED_INDEX):
         index = json.load(open(MINED_INDEX))
     else:
         index = {}
+    ac_index_path = os.path.join(BASE, "data", "ac-mined", "_index.json")
+    ac_index = json.load(open(ac_index_path)) if os.path.exists(ac_index_path) else {}
 
     impl_files = sorted(f for f in os.listdir(IMPL_DIR) if f.endswith(".json"))
     for f in impl_files:
@@ -136,7 +176,17 @@ def main():
             for p in missing:
                 print("  " + p)
 
+    # Anti-cheat data (data/ac/*.json)
+    ac_files = sorted(f for f in os.listdir(AC_DIR) if f.endswith(".json")) if os.path.isdir(AC_DIR) else []
+    for f in ac_files:
+        pkt_id = f[:-5]
+        with open(os.path.join(AC_DIR, f)) as fh:
+            ac_data = json.load(fh)
+        check_ac_file(pkt_id, ac_data, ac_index, ac_root)
+
     print("Verified %d impl files" % len(impl_files))
+    if ac_files:
+        print("Verified %d anticheat files" % len(ac_files))
     if warnings:
         print("\nWARNINGS (%d):" % len(warnings))
         for w in warnings:

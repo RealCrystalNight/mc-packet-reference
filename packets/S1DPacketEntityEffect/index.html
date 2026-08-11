@@ -108,6 +108,1062 @@
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">No module in the 8 clients registers a packet receive handler for S1D. The only hook surface that exists in the corpus is Rise 6.x NetworkAPI, which exposes clientbound packets to JavaScript scripts by class-table index.</div>
 <div class="impl-clients">Memeware 7.3, Nekoware v1 private, Sigma 4.11, Spicy and Tenacity 6.0 ship the vanilla handler byte-for-byte. Rise 6.1.30 and 6.2.4 additionally register the class in NetworkAPI (script/api/NetworkAPI.java), the only place any of the 8 clients references the packet outside net/minecraft.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">Server-side anticheats treat the entity-effect packet as state synchronization, not a cheat signal. The corpus splits into packet-driven potion trackers (Grim, Artemis, BetterAnticheat, Kauri, Intave) that decode S1D and mirror the effect onto their simulated player or entity, and Bukkit-polling checks (FlopAC, Hydro, Frequency) that read getActivePotionEffects and only see the effect after the server applies it. The trackers matter because movement checks must know the exact speed, jump and slowness multipliers the client has; a potion state mismatch causes false flags in speed and flight checks, so the apply packet is transaction-confirmed before the effect lands in the simulation.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Effect state replication (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Keep the compensated entity's potion state in sync with the server so movement predictions apply the same speed, jump and slowness multipliers the client sees.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketEntityReplication listens on the packet-send side. For ENTITY_EFFECT it decodes the potion type and amplifier, cancels the packet when ViaVersion would fake an effect the client version does not support, forces a transaction when the effect targets the player, and schedules entity.addPotionEffect on the compensated entity at the transaction's real-time position. The remove branch in the same listener mirrors this with entity.removePotionEffect.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> No cheat directly. It is state replication: speed, jump boost and levitation modifiers on the simulated entity must match the client's, or flight and speed checks misjudge legitimate motion.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketEntityReplication.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketEntityReplication.java =====
+package ac.grim.grimac.events.packets;
+
+import ac.grim.grimac.GrimAPI;
+import ac.grim.grimac.api.config.ConfigManager;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.type.PacketReceiveListener;
+import ac.grim.grimac.checks.type.PacketSendListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.anticheat.LogUtil;
+import ac.grim.grimac.utils.data.SprintingState;
+import ac.grim.grimac.utils.data.TrackerData;
+import ac.grim.grimac.utils.data.packetentity.DashableEntity;
+import ac.grim.grimac.utils.data.packetentity.PacketEntity;
+import ac.grim.grimac.utils.data.packetentity.PacketEntityHook;
+import ac.grim.grimac.utils.data.packetentity.PacketEntityTrackXRot;
+import ac.grim.grimac.utils.enums.Pose;
+import ac.grim.grimac.utils.nmsutil.EntityMetadataPoseUtil;
+import ac.grim.grimac.utils.viaversion.ViaVersionUtil;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.entity.EntityPositionData;
+import com.github.retrooper.packetevents.protocol.entity.data.EntityData;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityType;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityTypes;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.player.InteractionHand;
+import com.github.retrooper.packetevents.protocol.player.UserProfile;
+import com.github.retrooper.packetevents.protocol.potion.PotionType;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerAttachEntity;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerDestroyEntities;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityEffect;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityEquipment;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityMetadata;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityPositionSync;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityRelativeMove;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityRelativeMoveAndRotation;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityRotation;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityStatus;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityTeleport;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerInfo;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerInfoRemove;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPlayerInfoUpdate;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerRemoveEntityEffect;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSetPassengers;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSetSlot;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnEntity;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnLivingEntity;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnPainting;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerSpawnPlayer;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateAttributes;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerWindowItems;
+import org.jetbrains.annotations.NotNull;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public class PacketEntityReplication extends Check implements PacketReceiveListener, PacketSendListener {
+
+    private final AtomicBoolean hasSentPreWavePacket = new AtomicBoolean(true);
+
+    // Let's imagine the player is on a boat.
+    // The player breaks this boat
+    // If we were to despawn the boat without an extra transaction, then the boat would disappear before
+    // it disappeared on the client side, creating a ghost boat to flag checks with
+    //
+    // If we were to despawn the tick after, spawning must occur the transaction before to stop the same exact
+    // problem with ghost boats in reverse.
+    //
+    // Therefore, we despawn the transaction after, and spawn the tick before.
+    //
+    // If we despawn then spawn an entity in the same transaction, then this solution would despawn the new entity
+    // instead of the old entity, so we wouldn't see the boat at all
+    //
+    // Therefore, if the server sends a despawn and then a spawn in the same transaction for the same entity,
+    // We should simply add a transaction (which will clear this list!)
+    //
+    // Another valid solution is to simply spam more transactions, but let's not waste bandwidth.
+    private final List&lt;Integer&gt; despawnedEntitiesThisTransaction = new ArrayList&lt;&gt;();
+
+    // Maximum ping when a firework boost is removed from the player.
+    private int maxFireworkBoostPing = 1000;
+
+    public PacketEntityReplication(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketReceive(PacketReceiveEvent event) {
+        // Teleports don't interpolate, duplicate 1.17 packets don't interpolate
+        if (!isTickPacket(event.getPacketType())) return;
+        player.compensatedEntities.entitiesRemovedThisTick.clear();
+        boolean isTickingReliably = player.isTickingReliablyFor(3);
+
+        PacketEntity playerVehicle = player.compensatedEntities.self.getRiding();
+        for (PacketEntity entity : player.compensatedEntities.entityMap.values()) {
+            if (entity == playerVehicle &amp;&amp; !player.vehicleData.lastDummy) {
+                // The player has this as their vehicle, so they aren't interpolating it.
+                // And it isn't a dummy position
+                entity.setPositionRaw(player, entity.getPossibleLocationBoxes());
+            } else {
+                entity.onMovement(isTickingReliably);
+            }
+        }
+
+        if (player.vehicleData.camelSprintingState == SprintingState.STOPPING) {
+            player.vehicleData.camelSprintingState = SprintingState.STOPPED;
+        } else if (player.vehicleData.camelSprintingState == SprintingState.STOPPED &amp;&amp; player.isSprinting) { // For sprint desyncs
+            player.vehicleData.camelSprintingState = SprintingState.STARTED;
+        }
+    }
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+        // ensure grim is the one that sent the transaction
+        if ((event.getPacketType() == PacketType.Play.Server.PING || event.getPacketType() == PacketType.Play.Server.WINDOW_CONFIRMATION) &amp;&amp; player.packetStateData.lastServerTransWasValid) {
+            despawnedEntitiesThisTransaction.clear();
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_LIVING_ENTITY) {
+            WrapperPlayServerSpawnLivingEntity packetOutEntity = new WrapperPlayServerSpawnLivingEntity(event);
+            addEntity(packetOutEntity.getEntityId(), packetOutEntity.getEntityUUID(), packetOutEntity.getEntityType(), packetOutEntity.getPosition(), packetOutEntity.getYaw(), packetOutEntity.getPitch(), packetOutEntity.getEntityMetadata(), 0);
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_ENTITY) {
+            WrapperPlayServerSpawnEntity packetOutEntity = new WrapperPlayServerSpawnEntity(event);
+            addEntity(packetOutEntity.getEntityId(), packetOutEntity.getUUID().orElse(null), packetOutEntity.getEntityType(), packetOutEntity.getPosition(), packetOutEntity.getYaw(), packetOutEntity.getPitch(), null, packetOutEntity.getData());
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_PLAYER) {
+            WrapperPlayServerSpawnPlayer packetOutEntity = new WrapperPlayServerSpawnPlayer(event);
+            addEntity(packetOutEntity.getEntityId(), packetOutEntity.getUUID(), EntityTypes.PLAYER, packetOutEntity.getPosition(), packetOutEntity.getYaw(), packetOutEntity.getPitch(), packetOutEntity.getEntityMetadata(), 0);
+        } else if (event.getPacketType() == PacketType.Play.Server.SPAWN_PAINTING) {
+            WrapperPlayServerSpawnPainting packetOutEntity = new WrapperPlayServerSpawnPainting(event);
+            addEntity(packetOutEntity.getEntityId(), packetOutEntity.getUUID(), EntityTypes.PAINTING, packetOutEntity.getPosition().toVector3d(), 0, 0f, null, packetOutEntity.getDirection().getHorizontalIndex());
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_RELATIVE_MOVE) {
+            WrapperPlayServerEntityRelativeMove move = new WrapperPlayServerEntityRelativeMove(event);
+            handleMoveEntity(event, move.getEntityId(), move.getDeltaX(), move.getDeltaY(), move.getDeltaZ(), null, null, true, true);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_RELATIVE_MOVE_AND_ROTATION) {
+            WrapperPlayServerEntityRelativeMoveAndRotation move = new WrapperPlayServerEntityRelativeMoveAndRotation(event);
+            handleMoveEntity(event, move.getEntityId(), move.getDeltaX(), move.getDeltaY(), move.getDeltaZ(), move.getYaw() * 0.7111111F, move.getPitch() * 0.7111111F, true, true);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_TELEPORT) {
+            WrapperPlayServerEntityTeleport move = new WrapperPlayServerEntityTeleport(event);
+            Vector3d pos = move.getPosition();
+            handleMoveEntity(event, move.getEntityId(), pos.getX(), pos.getY(), pos.getZ(), move.getYaw(), move.getPitch(), false, true);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_POSITION_SYNC) {
+            // ENTITY_TELEPORT but without relative flags
+            WrapperPlayServerEntityPositionSync move = new WrapperPlayServerEntityPositionSync(event);
+            final EntityPositionData values = move.getValues();
+            final Vector3d pos = values.getPosition();
+            // TODO this isn't technically correct
+            // If the position sync is to a pos &gt; 4096 from the entity pos, client does some special stuff without interpolation
+            handleMoveEntity(event, move.getId(), pos.getX(), pos.getY(), pos.getZ(), values.getYaw(), values.getPitch(), false, true);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_ROTATION) { // Affects interpolation
+            WrapperPlayServerEntityRotation move = new WrapperPlayServerEntityRotation(event);
+            handleMoveEntity(event, move.getEntityId(), 0, 0, 0, move.getYaw() * 0.7111111F, move.getPitch() * 0.7111111F, true, false);
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_METADATA) {
+            WrapperPlayServerEntityMetadata entityMetadata = new WrapperPlayServerEntityMetadata(event);
+            schedulePoseTransition(entityMetadata, event);
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.compensatedEntities.updateEntityMetadata(entityMetadata.getEntityId(), entityMetadata.getEntityMetadata()));
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_EQUIPMENT) {
+            WrapperPlayServerEntityEquipment equipment = new WrapperPlayServerEntityEquipment(event);
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.compensatedEntities.updateEntityEquipment(equipment.getEntityId(), equipment.getEquipment()));
+        }
+
+        // 1.19.3+
+        else if (event.getPacketType() == PacketType.Play.Server.PLAYER_INFO_UPDATE) {
+            WrapperPlayServerPlayerInfoUpdate info = new WrapperPlayServerPlayerInfoUpdate(event);
+            if (info.getActions().contains(WrapperPlayServerPlayerInfoUpdate.Action.ADD_PLAYER)) {
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                    for (WrapperPlayServerPlayerInfoUpdate.PlayerInfo entry : info.getEntries()) {
+                        final UserProfile gameProfile = entry.getGameProfile();
+                        final UUID uuid = gameProfile.getUUID();
+                        player.compensatedEntities.profiles.put(uuid, gameProfile);
+                    }
+                });
+            }
+        } else if (event.getPacketType() == PacketType.Play.Server.PLAYER_INFO_REMOVE) {
+            WrapperPlayServerPlayerInfoRemove remove = new WrapperPlayServerPlayerInfoRemove(event);
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; remove.getProfileIds().forEach(player.compensatedEntities.profiles::remove));
+        } else if (event.getPacketType() == PacketType.Play.Server.PLAYER_INFO) {
+            WrapperPlayServerPlayerInfo info = new WrapperPlayServerPlayerInfo(event);
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                if (info.getAction() == WrapperPlayServerPlayerInfo.Action.ADD_PLAYER) {
+                    for (WrapperPlayServerPlayerInfo.PlayerData entry : info.getPlayerDataList()) {
+                        final UserProfile gameProfile = entry.getUserProfile();
+                        final UUID uuid = gameProfile.getUUID();
+                        player.compensatedEntities.profiles.put(uuid, gameProfile);
+                    }
+                } else if (info.getAction() == WrapperPlayServerPlayerInfo.Action.REMOVE_PLAYER) {
+                    info.getPlayerDataList().forEach(profile -&gt; player.compensatedEntities.profiles.remove(profile.getUserProfile().getUUID()));
+                }
+            });
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_EFFECT) {
+            WrapperPlayServerEntityEffect effect = new WrapperPlayServerEntityEffect(event);
+
+            PotionType type = effect.getPotionType();
+
+            // ViaVersion tries faking levitation effects and fails badly lol, flagging the anticheat
+            // Block other effects just in case ViaVersion gets any ideas
+            //
+            // Set to 24 so ViaVersion blocks it
+            // 24 is the levitation effect
+            if (player.getClientVersion().isOlderThan(ClientVersion.V_1_9) &amp;&amp; ViaVersionUtil.isAvailable &amp;&amp; type.getId(player.getClientVersion()) &gt; 23) {
+                event.setCancelled(true);
+                return;
+            }
+
+            // ViaVersion dolphin's grace also messes us up, set it to a potion effect that doesn't exist on 1.12
+            // Effect 31 is bad omen
+            if (player.getClientVersion().isOlderThan(ClientVersion.V_1_13) &amp;&amp; ViaVersionUtil.isAvailable &amp;&amp; type.getId(player.getClientVersion()) == 30) {
+                event.setCancelled(true);
+                return;
+            }
+
+            if (isDirectlyAffectingPlayer(player, effect.getEntityId())) player.sendTransaction();
+
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                PacketEntity entity = player.compensatedEntities.getEntity(effect.getEntityId());
+                if (entity == null) return;
+
+                entity.addPotionEffect(type, effect.getEffectAmplifier());
+            });
+        } else if (event.getPacketType() == PacketType.Play.Server.REMOVE_ENTITY_EFFECT) {
+            WrapperPlayServerRemoveEntityEffect effect = new WrapperPlayServerRemoveEntityEffect(event);
+
+            if (isDirectlyAffectingPlayer(player, effect.getEntityId())) player.sendTransaction();
+
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                PacketEntity entity = player.compensatedEntities.getEntity(effect.getEntityId());
+                if (entity == null) return;
+
+                entity.removePotionEffect(effect.getPotionType());
+            });
+        } else if (event.getPacketType() == PacketType.Play.Server.UPDATE_ATTRIBUTES) {
+            WrapperPlayServerUpdateAttributes attributes = new WrapperPlayServerUpdateAttributes(event);
+
+            int entityID = attributes.getEntityId();
+
+            // The attributes for this entity is active, currently
+            if (isDirectlyAffectingPlayer(player, entityID)) player.sendTransaction();
+
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(),
+                    () -&gt; player.compensatedEntities.updateAttributes(entityID, attributes.getProperties()));
+        } else if (event.getPacketType() == PacketType.Play.Server.ENTITY_STATUS) {
+            WrapperPlayServerEntityStatus status = new WrapperPlayServerEntityStatus(event);
+            // This hasn't changed from 1.7.2 to 1.17
+            // Needed to exempt players on dead vehicles, as dead entities have strange physics.
+            if (status.getStatus() == 3) {
+                PacketEntity entity = player.compensatedEntities.getEntity(status.getEntityId());
+
+                if (entity == null) return;
+                entity.isDead = true;
+            }
+
+            if (status.getStatus() == 9) {
+                if (status.getEntityId() != player.entityID) return;
+
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+            }
+
+            if (status.getStatus() == 31) {
+                PacketEntity hook = player.compensatedEntities.getEntity(status.getEntityId());
+                if (!(hook instanceof PacketEntityHook hookEntity)) return;
+
+                if (hookEntity.attached == player.entityID) {
+                    player.sendTransaction();
+                    // We don't transaction sandwich this, it's too rare to be a real problem.
+                    player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.uncertaintyHandler.fishingRodPulls.add(hookEntity.owner));
+                }
+            }
+
+            if (status.getStatus() &gt;= 24 &amp;&amp; status.getStatus() &lt;= 28 &amp;&amp; status.getEntityId() == player.entityID) {
+                player.compensatedEntities.self.opLevel = status.getStatus() - 24;
+            }
+        } else if (event.getPacketType() == PacketType.Play.Server.SET_SLOT) {
+            WrapperPlayServerSetSlot slot = new WrapperPlayServerSetSlot(event);
+
+            if (slot.getWindowId() == 0) {
+                Runnable task = () -&gt; {
+                    if (slot.getSlot() - 36 == player.packetStateData.lastSlotSelected &amp;&amp; (
+                            !player.inventory.getHeldItem().is(slot.getItem().getType()) || player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_8)
+                    ) || slot.getSlot() == 45 &amp;&amp; !player.inventory.getOffHand().is(slot.getItem().getType())) {
+                        InteractionHand hand = slot.getSlot() == 45 ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND;
+                        if (hand == player.packetStateData.itemInUseHand) {
+                            player.packetStateData.setSlowedByUsingItem(false);
+                        }
+
+                        if (player.isResetItemUsageOnItemUpdate() &amp;&amp; hand == GrimAPI.INSTANCE.getItemResetHandler().getItemUsageHand(player.platformPlayer)) {
+                            GrimAPI.INSTANCE.getItemResetHandler().resetItemUsage(player.platformPlayer);
+                        }
+                    }
+                };
+
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), task);
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, task);
+            }
+        } else if (event.getPacketType() == PacketType.Play.Server.WINDOW_ITEMS) {
+            WrapperPlayServerWindowItems items = new WrapperPlayServerWindowItems(event);
+
+            if (items.getWindowId() == 0) { // Player inventory
+                Runnable task = () -&gt; {
+                    if (player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_8)) {
+                        player.packetStateData.setSlowedByUsingItem(false);
+                        if (player.isResetItemUsageOnItemUpdate()) {
+                            GrimAPI.INSTANCE.getItemResetHandler().resetItemUsage(player.platformPlayer);
+                        }
+                    } else {
+                        if (items.getItems().size() &gt; 45 &amp;&amp; !player.inventory.getOffHand().is(items.getItems().get(45).getType())) {
+                            if (player.packetStateData.itemInUseHand == InteractionHand.OFF_HAND) {
+                                player.packetStateData.setSlowedByUsingItem(false);
+                            }
+
+                            if (player.isResetItemUsageOnItemUpdate() &amp;&amp; GrimAPI.INSTANCE.getItemResetHandler().getItemUsageHand(player.platformPlayer) == InteractionHand.OFF_HAND) {
+                                GrimAPI.INSTANCE.getItemResetHandler().resetItemUsage(player.platformPlayer);
+                            }
+                        }
+
+                        if (!player.inventory.getHeldItem().is(items.getItems().get(player.packetStateData.lastSlotSelected + 36).getType())) {
+                            if (player.packetStateData.itemInUseHand == InteractionHand.MAIN_HAND) {
+                                player.packetStateData.setSlowedByUsingItem(false);
+                            }
+
+                            if (player.isResetItemUsageOnItemUpdate() &amp;&amp; GrimAPI.INSTANCE.getItemResetHandler().getItemUsageHand(player.platformPlayer) == InteractionHand.MAIN_HAND) {
+                                GrimAPI.INSTANCE.getItemResetHandler().resetItemUsage(player.platformPlayer);
+                            }
+                        }
+                    }
+                };
+
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), task);
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, task);
+            }
+        }
+
+        // 1.8 clients fail to send the RELEASE_USE_ITEM packet when a window is opened client sided while using an item
+        else if (event.getPacketType() == PacketType.Play.Server.OPEN_WINDOW) {
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+        } else if (event.getPacketType() == PacketType.Play.Server.OPEN_HORSE_WINDOW) {
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, () -&gt; player.packetStateData.setSlowedByUsingItem(false));
+        } else if (event.getPacketType() == PacketType.Play.Server.SET_PASSENGERS) {
+            WrapperPlayServerSetPassengers mount = new WrapperPlayServerSetPassengers(event);
+
+            int vehicleID = mount.getEntityId();
+            int[] passengers = mount.getPassengers();
+
+            handleMountVehicle(event, vehicleID, passengers);
+        } else if (event.getPacketType() == PacketType.Play.Server.ATTACH_ENTITY) {
+            WrapperPlayServerAttachEntity attach = new WrapperPlayServerAttachEntity(event);
+
+            // This packet was replaced by the mount packet on 1.9+ servers - to support multiple passengers on one vehicle
+            if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_9))
+                return;
+
+            // If this is mounting rather than leashing
+            if (!attach.isLeash()) {
+                // Alright, let's convert this to the 1.9+ format to make it easier for grim
+                int vehicleID = attach.getHoldingId();
+                int attachID = attach.getAttachedId();
+                TrackerData trackerData = player.compensatedEntities.getTrackedEntity(attachID);
+
+                if (trackerData != null) {
+                    // 1.8 sends a vehicle ID of -1 to dismount the entity from its vehicle
+                    // This is opposite of the 1.9+ format, which sends the vehicle ID and then an empty array.
+                    if (vehicleID == -1) { // Dismounting
+                        vehicleID = trackerData.getLegacyPointEightMountedUpon();
+                        handleMountVehicle(event, vehicleID, new int[]{}); // The vehicle is empty
+                    } else { // Mounting
+                        trackerData.setLegacyPointEightMountedUpon(vehicleID);
+                        handleMountVehicle(event, vehicleID, new int[]{attachID});
+                    }
+                } else {
+                    // I don't think we can recover from this... warn and move on as this shouldn't happen.
+                    LogUtil.warn("Server sent an invalid attach entity packet for entity " + attach.getHoldingId() + " with passenger " + attach.getAttachedId() + "! The client ignores this.");
+                }
+            }
+        } else if (event.getPacketType() == PacketType.Play.Server.DESTROY_ENTITIES) {
+            WrapperPlayServerDestroyEntities destroy = new WrapperPlayServerDestroyEntities(event);
+
+            int[] destroyEntityIds = destroy.getEntityIds();
+
+            for (int entityID : destroyEntityIds) {
+                despawnedEntitiesThisTransaction.add(entityID);
+                player.compensatedEntities.serverPositionsMap.remove(entityID);
+                // Remove the tracked vehicle (handling tracking knockback) if despawned
+                if (player.compensatedEntities.serverPlayerVehicle != null &amp;&amp; player.compensatedEntities.serverPlayerVehicle == entityID) {
+                    player.compensatedEntities.serverPlayerVehicle = null;
+                }
+            }
+
+            final int destroyTransaction = player.lastTransactionSent.get() + 1;
+            player.latencyUtils.addRealTimeTask(destroyTransaction, () -&gt; {
+                for (int entityId : destroyEntityIds) {
+                    player.compensatedEntities.removeEntity(entityId);
+                    player.dashableEntities.removeEntity(entityId);
+                    player.fireworks.removeFirework(entityId);
+                    player.compensatedEntities.entitiesRemovedThisTick.add(entityId);
+                }
+            });
+
+            // Don't let the player freeze transactions to keep the firework boost velocity + uncertainty
+            // Also generally prevents people with high ping gaining too high an advantage in firework use
+            if (maxFireworkBoostPing &gt; 0) {
+                player.runNettyTaskInMs(() -&gt; {
+                    if (player.lastTransactionReceived.get() &gt;= destroyTransaction) return;
+                    for (int entityID : destroyEntityIds) {
+                        // If the player has a firework boosting them, setback
+                        if (player.fireworks.hasFirework(entityID)) {
+                            player.getSetbackTeleportUtil().executeViolationSetback();
+                            break;
+                        }
+                    }
+                }, maxFireworkBoostPing);
+            }
+        }
+    }
+
+    private void handleMountVehicle(PacketSendEvent event, int vehicleID, int[] passengers) {
+        boolean wasInVehicle = player.compensatedEntities.serverPlayerVehicle != null &amp;&amp; player.compensatedEntities.serverPlayerVehicle == vehicleID;
+        boolean inThisVehicle = false;
+
+        for (int passenger : passengers) {
+            inThisVehicle = passenger == player.entityID;
+            if (inThisVehicle) break;
+        }
+
+        if (inThisVehicle &amp;&amp; !wasInVehicle) {
+            player.handleMountVehicle(vehicleID);
+        }
+
+        if (!inThisVehicle &amp;&amp; wasInVehicle) {
+            player.handleDismountVehicle(event);
+        }
+        // Better lag compensation if we were affected by this
+        if (wasInVehicle || inThisVehicle) {
+            player.sendTransaction();
+        }
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+            PacketEntity vehicle = player.compensatedEntities.getEntity(vehicleID);
+
+            // Vanilla likes sending null vehicles, so we must ignore those like the client ignores them
+            if (vehicle == null) return;
+
+            // Eject existing passengers for this vehicle
+            for (PacketEntity passenger : new ArrayList&lt;&gt;(vehicle.passengers)) {
+                passenger.eject();
+            }
+
+            // Add the entities as vehicles
+            for (int entityID : passengers) {
+                PacketEntity passenger = player.compensatedEntities.getEntity(entityID);
+                if (passenger == null) continue;
+                passenger.mount(vehicle);
+            }
+        });
+    }
+
+    private void handleMoveEntity(PacketSendEvent event, int entityId, double deltaX, double deltaY, double deltaZ, Float yaw, Float pitch, boolean isRelative, boolean hasPos) {
+        TrackerData data = player.compensatedEntities.getTrackedEntity(entityId);
+
+        final boolean didNotSendPreWave = hasSentPreWavePacket.compareAndSet(false, true);
+        if (didNotSendPreWave) player.sendTransaction();
+
+        if (data != null) {
+            // Update the tracked server's entity position
+            if (isRelative) {
+                // There is a bug where vehicles may start flying due to mojang setting packet position on the client
+                // (Works at 0 ping but causes funny bugs at any higher ping)
+                // As we don't want vehicles to fly, we need to replace it with a teleport if it is player vehicle
+                //
+                // Don't bother with client controlled vehicles though
+                boolean vanillaVehicleFlight = player.compensatedEntities.serverPlayerVehicle != null
+                        &amp;&amp; player.compensatedEntities.serverPlayerVehicle == entityId
+                        &amp;&amp; player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_9)
+                        // TODO: https://discord.com/channels/721686193061888071/721686193515003966/1310659538831020123
+                        // Why does the server now send an entity rel move packet matching the player's vehicle movement every time?
+                        &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_21_2)
+                        &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_9);
+
+                // ViaVersion sends two relative packets when moving more than 4 blocks
+                // This is broken and causes the client to interpolate like (0, 4) and (1, 3) instead of (1, 7)
+                // This causes impossible hits, so grim must replace this with a teleport entity packet
+                // Not ideal, but neither is 1.8 players on a 1.9+ server.
+                if (vanillaVehicleFlight ||
+                        ((Math.abs(deltaX) &gt;= 3.9375 || Math.abs(deltaY) &gt;= 3.9375 || Math.abs(deltaZ) &gt;= 3.9375) &amp;&amp; player.getClientVersion().isOlderThan(ClientVersion.V_1_9) &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_9))) {
+                    player.user.writePacket(new WrapperPlayServerEntityTeleport(entityId, new Vector3d(data.getX() + deltaX, data.getY() + deltaY, data.getZ() + deltaZ), yaw == null ? data.getXRot() : yaw, pitch == null ? data.getYRot() : pitch, false));
+                    event.setCancelled(true);
+                    return;
+                }
+
+                data.setX(data.getX() + deltaX);
+                data.setY(data.getY() + deltaY);
+                data.setZ(data.getZ() + deltaZ);
+            } else {
+                data.setX(deltaX);
+                data.setY(deltaY);
+                data.setZ(deltaZ);
+            }
+            if (yaw != null) {
+                data.setXRot(yaw);
+                data.setYRot(pitch);
+            }
+
+            // We can't hang two relative moves on one transaction
+            if (data.getLastTransactionHung() == player.lastTransactionSent.get()) {
+                player.sendTransaction();
+            }
+            data.setLastTransactionHung(player.lastTransactionSent.get());
+        }
+
+        int lastTrans = player.lastTransactionSent.get();
+
+        player.latencyUtils.addRealTimeTask(lastTrans, () -&gt; {
+            PacketEntity entity = player.compensatedEntities.getEntity(entityId);
+            if (entity == null) return;
+            if (entity instanceof PacketEntityTrackXRot xRotEntity &amp;&amp; yaw != null) {
+                xRotEntity.packetYaw = yaw;
+                xRotEntity.steps = entity.isBoat ? 10 : 3;
+            }
+
+            entity.onFirstTransaction(isRelative, hasPos, deltaX, deltaY, deltaZ, player);
+        });
+
+        player.latencyUtils.addRealTimeTask(lastTrans + 1, () -&gt; {
+            PacketEntity entity = player.compensatedEntities.getEntity(entityId);
+            if (entity == null) return;
+            entity.onSecondTransaction();
+        });
+    }
+
+    public void addEntity(int entityID, UUID uuid, EntityType type, Vector3d position, float xRot, float yRot, List&lt;EntityData&lt;?&gt;&gt; entityMetadata, int extraData) {
+        if (despawnedEntitiesThisTransaction.contains(entityID)) {
+            player.sendTransaction();
+        }
+
+        player.compensatedEntities.serverPositionsMap.put(entityID, new TrackerData(position.getX(), position.getY(), position.getZ(), xRot, yRot, type, player.lastTransactionSent.get()));
+
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+            PacketEntity entity = player.compensatedEntities.addEntity(entityID, uuid, type, position, xRot, extraData);
+            if (entity instanceof DashableEntity dashable) {
+                player.dashableEntities.addEntity(entityID, dashable);
+            }
+
+            if (entityMetadata != null) {
+                if (EntityMetadataPoseUtil.usesPoseMetadata(entity) &amp;&amp; player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_14)) {
+                    Pose initialPose = EntityMetadataPoseUtil.getPoseFromMetadata(entityMetadata);
+                    if (initialPose != null) {
+                        entity.currentPose = initialPose;
+                    }
+                }
+
+                player.compensatedEntities.updateEntityMetadata(entityID, entityMetadata);
+            }
+        });
+    }
+
+    private void schedulePoseTransition(WrapperPlayServerEntityMetadata entityMetadata, PacketSendEvent event) {
+        if (player.getClientVersion().isOlderThan(ClientVersion.V_1_14)) return;
+
+        int entityId = entityMetadata.getEntityId();
+        if (entityId == player.entityID) return;
+
+        Pose newPose = EntityMetadataPoseUtil.getPoseFromMetadata(entityMetadata.getEntityMetadata());
+        if (newPose == null) return;
+
+        boolean shouldTrackPoseTransition = false;
+        PacketEntity entity = player.compensatedEntities.getEntity(entityId);
+        if (entity != null) {
+            shouldTrackPoseTransition = EntityMetadataPoseUtil.usesPoseMetadata(entity);
+        } else {
+            // If the client didn't respond to the spawn packet yet, we need to check if we should track the pose transition based on the entity type
+            // is there a better way to do this?
+            TrackerData trackedEntity = player.compensatedEntities.getTrackedEntity(entityId);
+            if (trackedEntity != null) {
+                shouldTrackPoseTransition = EntityMetadataPoseUtil.usesPoseMetadata(trackedEntity.getEntityType());
+            }
+        }
+
+        if (!shouldTrackPoseTransition) return;
+
+        player.sendTransaction();
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+            PacketEntity target = player.compensatedEntities.getEntity(entityId);
+            if (target == null) {
+                return;
+            }
+
+            target.beginPoseTransition(newPose);
+        });
+
+        event.getTasksAfterSend().add(() -&gt; {
+            player.sendTransaction();
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                PacketEntity target = player.compensatedEntities.getEntity(entityId);
+                if (target == null) {
+                    return;
+                }
+
+                target.completePoseTransition(newPose);
+            });
+        });
+    }
+
+    private boolean isDirectlyAffectingPlayer(GrimPlayer player, int entityID) {
+        // The attributes for this entity is active, currently
+        return (player.compensatedEntities.serverPlayerVehicle == null &amp;&amp; entityID == player.entityID) ||
+                (player.compensatedEntities.serverPlayerVehicle != null &amp;&amp; entityID == player.compensatedEntities.serverPlayerVehicle);
+    }
+
+    public void onEndOfTickEvent(boolean async, boolean flush) {
+        // Only send a transaction at the end of the tick if we are tracking players
+        player.sendTransaction(async);
+        if (flush) player.user.flushPackets();
+    }
+
+    public void tickStartTick() {
+        hasSentPreWavePacket.set(false);
+    }
+
+    @Override
+    public void onReload(@NotNull ConfigManager config) {
+        maxFireworkBoostPing = config.getIntElse("max-ping-firework-boost", 1000);
+    }
+
+}
+// NOTE (AI): The entity-effect branches sit at lines 193-233; the rest of the file replicates other clientbound state (player info, attributes, status, slots) through the same transaction mechanism.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis (PotionPreProcessor, EmulatorPreProcessor) and BetterAnticheat (PotionTracker) use the same transaction-confirmed pattern; Kauri's PotionHandler adds the effect into a thread-safe list; Intave decodes the fields with EntityEffectReader.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Potion preprocessor (Artemis)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Maintain the user's active effect list from the entity-effect packet so checks and the emulator can read current potion modifiers.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">fastHandle matches GPacketPlayServerEntityEffect, builds a PotionEffect from the effect id, duration and amplifier, then queues the add behind a transaction confirmation: pre() inserts the effect and marks it processed, post() clears the marker. It also clears the using-item flag when the effect ends item use.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly; it feeds checks that must distinguish potion-boosted motion from cheat motion.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/potion/PotionPreProcessor.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/potion/PotionPreProcessor.java =====
+package ac.artemis.core.v4.processor.potion;
+
+import ac.artemis.core.v4.check.FastProcessHandler;
+import ac.artemis.core.v4.data.holders.ConnectionHolder;
+import ac.artemis.core.v4.utils.function.PacketAction;
+import cc.ghast.packet.PacketAPI;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientTransaction;
+
+import ac.artemis.core.v4.data.PlayerData;
+import ac.artemis.core.v4.emulator.potion.PotionEffect;
+import ac.artemis.core.v4.processor.AbstractHandler;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntityEffect;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntityEffectRemove;
+
+import java.util.Map;
+import java.util.Random;
+import java.util.WeakHashMap;
+
+public class PotionPreProcessor extends AbstractHandler implements FastProcessHandler {
+    public PotionPreProcessor(PlayerData data) {
+        super("Potion [0x01]", data);
+    }
+
+    @Override
+    public void handle(final GPacket packet) {
+
+    }
+
+    @Override
+    public void fastHandle(GPacket packet) {
+        if (packet instanceof GPacketPlayServerEntityEffect) {
+            final GPacketPlayServerEntityEffect eff = (GPacketPlayServerEntityEffect) packet;
+            if (eff.getEntityId() == data.getPlayer().getEntityId()) {
+
+                final PotionEffect effect = new PotionEffect(eff.getEffectId(), eff.getDuration(), eff.getAmplifier());
+
+                data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                    @Override
+                    public void pre() {
+                        data.user.getEffects().add(effect);
+                        data.user.setLastAddEffect(effect);
+                        data.user.setEffectAddProcessed(true);
+
+                        if (data.user.isUsingItem() &amp;&amp; data.user.isUsingPotion()) {
+                            data.user.setUsingItem(false);
+                            data.user.setUsingPotion(false);
+                        }
+                    }
+
+                    @Override
+                    public void post() {
+                        data.user.setEffectAddProcessed(false);
+                    }
+                });
+            }
+        }
+
+        else if (packet instanceof GPacketPlayServerEntityEffectRemove) {
+            final GPacketPlayServerEntityEffectRemove eff = (GPacketPlayServerEntityEffectRemove) packet;
+            if (eff.getEntityId() == data.getPlayer().getEntityId()) {
+
+                final PotionEffect effect = data.user.getEffects().parallelStream().filter(e -&gt; e.getPotionID() == eff.getEffectId()).findAny().orElse(null);
+
+                if (effect == null) return;
+
+                data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                    @Override
+                    public void pre() {
+                        data.user.getEffects().remove(effect);
+                        data.user.setLastRemoveEffect(effect);
+                        data.user.setEffectRemoveProcessed(true);
+                    }
+
+                    @Override
+                    public void post() {
+                        data.user.setEffectRemoveProcessed(false);
+                    }
+                });
+            }
+        }
+    }
+}
+// NOTE (AI): The S1D branch is lines 32-57; the sibling remove branch (lines 59-81) is documented under S1EPacketRemoveEntityEffect.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The same anticheat's EmulatorPreProcessor applies the identical pattern to the emulated entity; Grim and BetterAnticheat use equivalent confirmations.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Potion tracker (BetterAnticheat)</span>
+<span class="impl-module-clients">(amnoah-BetterAnticheat)</span>
+</div>
+<p class="impl-pattern">Track each potion type's amplifier and duration as a lag-compensated many-state so checks read the effect that actually reached the client.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PotionTracker subscribes to ENTITY_EFFECT on the send side, takes a confirmation handle, and stages the new Potion in an ObjectManyState: addNew on begin, flushOld plus an active-count after the client confirms. REMOVE_ENTITY_EFFECT stages an EMPTY_POTION the same way so an expired effect cannot linger.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing by itself; getPotion() exposes the confirmed state to checks that need the speed or jump modifier.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/player/tracker/impl/potion/PotionTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/player/tracker/impl/potion/PotionTracker.java =====
+package better.anticheat.core.player.tracker.impl.potion;
+
+import better.anticheat.core.player.Player;
+import better.anticheat.core.player.tracker.Tracker;
+import com.github.retrooper.packetevents.event.simple.PacketPlayReceiveEvent;
+import com.github.retrooper.packetevents.event.simple.PacketPlaySendEvent;
+import com.github.retrooper.packetevents.protocol.attribute.Attributes;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.potion.PotionType;
+import com.github.retrooper.packetevents.protocol.potion.PotionTypes;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityEffect;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerRemoveEntityEffect;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateAttributes;
+import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
+import wtf.spare.sparej.incrementer.IntIncrementer;
+import wtf.spare.sparej.xstate.manystate.ObjectManyState;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+public class PotionTracker extends Tracker {
+
+    private static final Potion EMPTY_POTION = new Potion(0, -1);
+
+    private final Map&lt;PotionType, ObjectManyState&lt;Potion&gt;&gt; potionMap = new Object2ObjectArrayMap&lt;&gt;();
+
+    public PotionTracker(Player player) {
+        super(player);
+
+        for (PotionType potionType : PotionTypes.values()) {
+            ObjectManyState&lt;Potion&gt; newManyState = new ObjectManyState&lt;&gt;();
+            newManyState.addNew(EMPTY_POTION);
+            potionMap.put(potionType, newManyState);
+        }
+    }
+
+    public ObjectManyState&lt;Potion&gt; getPotion(PotionType potionType) {
+        return potionMap.get(potionType);
+    }
+
+    @Override
+    public void handlePacketPlayReceive(PacketPlayReceiveEvent event) {
+        if (event.getPacketType() != PacketType.Play.Client.CLIENT_TICK_END) return;
+
+        // Prevent concurrent modifications.
+        List&lt;PotionType&gt; removals = new ArrayList&lt;&gt;();
+
+        /*
+         * TODO: Figure out if this is necessary.
+         * If I'm totally honest, I don't know whether the server or client has definitive control of when a potion
+         * has ended. I'd assume based on
+        for (PotionType key : potionMap.keySet()) {
+            ObjectManyState&lt;Potion&gt; potions = potionMap.get(key);
+
+            if (potions.getCurrent().getActiveCount() != null) {
+                potions.getCurrent().getActiveCount().increment();
+                if (!potions.getCurrent().isActive()) removals.add(key);
+                continue;
+            }
+
+            if (potions.getOld() != null &amp;&amp; potions.getOld().getActiveCount() != null) {
+                potions.getOld().getActiveCount().increment();
+                if (!potions.getOld().isActive()) potions.flushOld();
+            }
+        }
+
+        for (PotionType potionType : removals) potionMap.remove(potionType);
+         */
+    }
+
+    @Override
+    public void handlePacketPlaySend(PacketPlaySendEvent event) {
+        switch (event.getPacketType()) {
+            case ENTITY_EFFECT -&gt; {
+                WrapperPlayServerEntityEffect wrapper = new WrapperPlayServerEntityEffect(event);
+                if (wrapper.getEntityId() != player.getUser().getEntityId()) return;
+
+                var confirmation = player.getConfirmationTracker().confirm();
+
+                Potion potion = new Potion(wrapper.getEffectAmplifier(), wrapper.getEffectDurationTicks());
+                confirmation.onBegin(() -&gt; {
+                    potionMap.get(wrapper.getPotionType()).addNew(potion);
+                });
+                confirmation.onAfterConfirm(() -&gt; {
+                    potionMap.get(wrapper.getPotionType()).flushOld();
+                    potion.setActiveCount(new IntIncrementer(0));
+                });
+            }
+            case REMOVE_ENTITY_EFFECT -&gt; {
+                WrapperPlayServerRemoveEntityEffect wrapper = new WrapperPlayServerRemoveEntityEffect(event);
+                if (wrapper.getEntityId() != player.getUser().getEntityId()) return;
+
+                event.getUser().sendMessage("Removed potion!");
+
+                var confirmation = player.getConfirmationTracker().confirm();
+
+                /*
+                 * When this packet is beginning to be received, we should begin to transition to an empty potion state
+                 * for this effect. By the time it has been officially received, we should remove the old potion that
+                 * was in there.
+                 */
+                confirmation.onBegin(() -&gt; potionMap.get(wrapper.getPotionType()).addNew(EMPTY_POTION));
+                confirmation.onAfterConfirm(() -&gt; potionMap.get(wrapper.getPotionType()).flushOld());
+            }
+        }
+    }
+}
+// NOTE (AI): The ENTITY_EFFECT branch is lines 75-89; the remove branch is lines 90-105. The commented block in handlePacketPlayReceive is an abandoned tick-based expiry idea.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim and Artemis use transaction confirmations rather than a confirmation tracker; FlopAC polls Bukkit's getActivePotionEffects instead of reading the packet.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Potion handler (Kauri)</span>
+<span class="impl-module-clients">(funkemunky-KauriV3)</span>
+</div>
+<p class="impl-pattern">Keep a thread-safe potion effect list on the player data so movement and velocity checks can query current modifiers.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PotionHandler seeds the list from the Bukkit player's active effects at construction, then onPotionEffect(WrapperPlayServerEntityEffect) replaces the entry for the potion type under a write lock, storing the amplifier, duration and visibility flags. hasPotionEffect and getEffectByType expose the state to checks.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly; the handler is the query surface for checks that must subtract potion-boosted motion from the allowed envelope.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/handler/PotionHandler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/handler/PotionHandler.java =====
+package dev.brighten.ac.handler;
+
+import com.github.retrooper.packetevents.protocol.potion.PotionType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerFlying;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityEffect;
+import dev.brighten.ac.data.APlayer;
+import dev.brighten.ac.utils.KPotionEffect;
+import dev.brighten.ac.utils.KProperties;
+import io.github.retrooper.packetevents.util.SpigotConversionUtil;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class PotionHandler {
+    private final APlayer data;
+
+    private final List&lt;KPotionEffect&gt; potionEffects = new ArrayList&lt;&gt;();
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
+
+    public PotionHandler(APlayer data) {
+        this.data = data;
+
+        lock.writeLock().lock();
+
+        try {
+            data.getBukkitPlayer().getActivePotionEffects().stream()
+                    .map(pe -&gt;
+                            new KPotionEffect(
+                                    SpigotConversionUtil.fromBukkitPotionEffectType(pe.getType()),
+                                    KProperties.fromBukkit(pe)
+                            ))
+                    .forEach(potionEffects::add);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    public void onFlying(WrapperPlayClientPlayerFlying packet) {
+        lock.readLock().lock();
+        try {
+            for (KPotionEffect effect : potionEffects) {
+                lock.readLock().lock();
+
+                try {
+                    if (data.getBukkitPlayer().hasPotionEffect(SpigotConversionUtil.toBukkitPotionEffectType(effect.potionType()))) continue;
+
+                    data.runKeepaliveAction(d -&gt; {
+                        lock.writeLock().lock();
+                        try {
+                            data.getPotionHandler().potionEffects.remove(effect);
+                        } finally {
+                            lock.writeLock().unlock();
+                        }
+                    });
+                } finally {
+                    lock.readLock().unlock();
+                }
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    public void onPotionEffect(WrapperPlayServerEntityEffect packet) {
+        data.runKeepaliveAction(d -&gt; {
+            var type = packet.getPotionType();
+            lock.writeLock().lock();
+            try {
+                data.getPotionHandler().potionEffects.removeIf(pe -&gt; pe.potionType().equals(type));
+                data.getPotionHandler().potionEffects
+                        .add(new KPotionEffect(type, new KProperties(packet.getEffectAmplifier()
+                                , packet.getEffectDurationTicks(),
+                                packet.isAmbient(), packet.isVisible(), packet.isShowIcon(), null)));
+            } finally {
+                lock.readLock().unlock();
+            }
+        });
+    }
+
+    public boolean hasPotionEffect(PotionType type) {
+        lock.readLock().lock();
+        try {
+            for (KPotionEffect potionEffect : potionEffects) {
+                if (potionEffect.potionType().equals(type))
+                    return true;
+            }
+            return false;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    public Optional&lt;KPotionEffect&gt; getEffectByType(PotionType type) {
+        lock.readLock().lock();
+        try {
+            for (KPotionEffect potionEffect : potionEffects) {
+                if (potionEffect.potionType().equals(type))
+                    return Optional.of(potionEffect);
+            }
+            return Optional.empty();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    public List&lt;KPotionEffect&gt; getPotionEffects() {
+        lock.readLock().lock();
+
+        try {
+            return new ArrayList&lt;&gt;(potionEffects);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+}
+// NOTE (AI): onPotionEffect (lines 67-81) is the S1D consumer; the onFlying path polls Bukkit state to catch expiries the server already removed.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis and Grim decode the packet into their own effect model; Tecnio whitelists both effect packets in NetworkFilter and tracks potion levels in AttributeTracker.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Entity effect reader (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Extract effect type, amplifier and duration from the entity-effect packet across every supported protocol version.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">EntityEffectReader is registered for the ENTITY_EFFECT packet in PacketReaders. effectType() reads the potion-type field on 1.19+, the integer slot on 1.18.2, and the legacy byte below; effectAmplifier() and effectDuration() shift their field indexes at 1.21. Each accessor falls back to 0 on a missing field.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing by itself; the reader feeds the effect tracker that movement characteristics consume.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/packet/reader/EntityEffectReader.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/packet/reader/EntityEffectReader.java =====
+package de.jpx3.intave.packet.reader;
+
+import com.comphenix.protocol.events.PacketContainer;
+import de.jpx3.intave.adapter.MinecraftVersions;
+import org.bukkit.potion.PotionEffectType;
+
+import static de.jpx3.intave.adapter.MinecraftVersions.VER1_21;
+
+public final class EntityEffectReader extends EntityReader {
+  private static final boolean SECURE_CHAT = MinecraftVersions.VER1_19.atOrAbove();
+  private static final boolean CAVE_AND_CLIFFS = MinecraftVersions.VER1_18_2.atOrAbove();
+
+  public int effectType() {
+    PacketContainer packet = packet();
+    if (SECURE_CHAT) {
+      PotionEffectType potionEffectType = packet.getEffectTypes().readSafely(0);
+      if (potionEffectType == null) {
+        return 0;
+      }
+      //noinspection deprecation
+      return potionEffectType.getId();
+    } else if (CAVE_AND_CLIFFS) {
+      Integer potionEffectType = packet.getIntegers().readSafely(1);
+      if (potionEffectType == null) {
+        return 0;
+      }
+      return potionEffectType;
+    } else {
+      Byte potionEffectType = packet.getBytes().readSafely(0);
+      if (potionEffectType == null) {
+        potionEffectType = 0;
+      }
+      return potionEffectType;
+    }
+  }
+
+  public int effectAmplifier() {
+    PacketContainer packet = packet();
+    if (VER1_21.atOrAbove()) {
+      Integer potionEffectAmplifier = packet.getIntegers().readSafely(1);
+      if (potionEffectAmplifier == null) {
+        potionEffectAmplifier = 0;
+      }
+      return potionEffectAmplifier;
+    } else {
+      Byte potionEffectAmplifier = packet.getBytes().readSafely(CAVE_AND_CLIFFS ? 0 : 1);
+      if (potionEffectAmplifier == null) {
+        potionEffectAmplifier = 0;
+      }
+      return potionEffectAmplifier;
+    }
+  }
+
+  public int effectDuration() {
+    int fieldIndex = VER1_21.atOrAbove() ? 3 : (CAVE_AND_CLIFFS &amp;&amp; !SECURE_CHAT ? 2 : 1);
+    Integer potionEffectDuration = packet().getIntegers().readSafely(fieldIndex);
+    if (potionEffectDuration == null) {
+      potionEffectDuration = 0;
+    }
+    return potionEffectDuration;
+  }
+}
+// NOTE (AI): ProtocolLib readSafely accessors with version-dependent indexes; the reader is wired in PacketReaders.setup(ENTITY_EFFECT, ...).</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim and Artemis read the same fields through PacketEvents and the cc.ghast wrapper tree instead of ProtocolLib.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S1EPacketRemoveEntityEffect/">S1EPacketRemoveEntityEffect</a>
 <a class="related-chip" href="../S1CPacketEntityMetadata/">S1CPacketEntityMetadata</a>

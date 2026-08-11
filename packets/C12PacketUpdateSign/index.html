@@ -520,6 +520,304 @@ public final class Freecam extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">C12 is reached only through generic PacketSendEvent handling in the corpus.</div>
 <div class="impl-clients">Rise 5.99 is the only client with module-level C12 references. All 8 clients otherwise emit C12 exclusively from the vanilla GuiEditSign close path.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The sign-update packet is a thin but real anticheat surface. NoCheatPlus runs its AutoSign blockplace check on sign edits, timing the edit against the placement and the line content, and Intave kicks players whose sign lines exceed a length limit, which is the crash-exploit angle of this packet.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoSign (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">Catch instant sign-text macros that fill all four lines faster than a human can type.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">After a sign is placed, the blockplace listener stores a block hash and the open time. On the sign edit, the check compares the block hash, then estimates the minimum human edit time from the line count and the distinct characters (150 ms base, 50 ms per extra line, 50 ms per character). An edit faster than the estimate flags, with the violation level scaled by the time deficit.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Auto-sign macros, instant sign spam, and sign edits sent against a different block than the one placed.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/AutoSign.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/AutoSign.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.checks.blockplace;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+import org.bukkit.Material;
+import org.bukkit.block.Block;
+import org.bukkit.entity.Player;
+
+import fr.neatmonster.nocheatplus.actions.ParameterName;
+import fr.neatmonster.nocheatplus.checks.Check;
+import fr.neatmonster.nocheatplus.checks.CheckType;
+import fr.neatmonster.nocheatplus.checks.ViolationData;
+import fr.neatmonster.nocheatplus.compat.bukkit.BridgeMaterial;
+import fr.neatmonster.nocheatplus.players.IPlayerData;
+import fr.neatmonster.nocheatplus.utilities.StringUtil;
+import fr.neatmonster.nocheatplus.utilities.TickTask;
+
+public class AutoSign extends Check {
+
+    /** Reference time that is needed to edit the most complicated sign :). */
+    private static long maxEditTime = 1500;
+    /** Fastest time "possible" estimate for an empty sign. */
+    private static long minEditTime = 150;
+    /** Minimum time needed to add one extra line (not the first). */
+    private static long minLineTime = 50;
+    /** Minimum time needed to type a character. */
+    private static long minCharTime = 50;
+
+    private final List&lt;String&gt; tags = new ArrayList&lt;String&gt;();
+
+    final Set&lt;Character&gt; chars = new HashSet&lt;Character&gt;(15 * 4);
+
+    public AutoSign() {
+        super(CheckType.BLOCKPLACE_AUTOSIGN);
+    }
+    
+    /**
+     * Checks a player
+     * 
+     * @param player
+     * @param block
+     * @param lines
+     * @param pData
+     * @return true if the player failed the check.
+     */
+    public boolean check(final Player player, final Block block, final String[] lines, final IPlayerData pData) {
+        tags.clear();
+        final long time = System.currentTimeMillis();
+        final BlockPlaceData data = pData.getGenericInstance(BlockPlaceData.class);
+        final BlockPlaceConfig cc = pData.getGenericInstance(BlockPlaceConfig.class);
+        Material mat = block.getType();
+        String s = mat.toString();
+        mat = BridgeMaterial.getSignItemFromBlock(mat);
+
+        if (pData.isDebugActive(CheckType.BLOCKPLACE_AUTOSIGN)) {
+            debug(player, "Block-place hash: " + BlockPlaceListener.getBlockPlaceHash(block, mat) + ", Material type: " + mat + " / " + s);
+        }
+
+        // Check hash match
+        if (data.autoSignPlacedHash != 0 &amp;&amp; data.autoSignPlacedHash != BlockPlaceListener.getBlockPlaceHash(block, mat)) {
+            tags.add("block_mismatch");
+            return handleViolation(player, maxEditTime, data, cc);
+        }
+
+        if (time &lt; data.signOpenTime) {
+            data.signOpenTime = 0;
+            return false;
+        }
+        // Check time, mind lag.
+        final long editTime = time - data.signOpenTime;
+        long expected = getExpectedEditTime(lines, cc.autoSignSkipEmpty);
+        if (expected == 0) {
+            return false;
+        }
+        expected = (long) (expected / TickTask.getLag(expected, true));
+        if (expected &gt; editTime){
+            tags.add("edit_time");
+            return handleViolation(player, expected - editTime, data, cc);
+        }
+        return false;
+    }
+
+    private long getExpectedEditTime(final String[] lines, final boolean skipEmpty) {
+        long expected = minEditTime;
+        int n = 0;
+        for (String line : lines){
+            if (line != null){
+                line = line.trim().toLowerCase();
+                if (!line.isEmpty()){
+                    chars.clear();
+                    n += 1;
+                    for (final char c : line.toCharArray()) {
+                        chars.add(c);
+                    }
+                    expected += minCharTime * chars.size();
+                }
+            }
+        }
+        if (skipEmpty &amp;&amp; n == 0) {
+            return 0;
+        }
+        if (n &gt; 1) {
+            expected += minLineTime * n;
+        }
+        return expected;
+    }
+
+    /**
+     * 
+     * @param player
+     * @param violationTime Amount of too fast editing.
+     * @param data
+     * @return
+     */
+    private boolean handleViolation(final Player player, final long violationTime, final BlockPlaceData data, final BlockPlaceConfig cc) {
+        final double addedVL = 10.0 * Math.min(maxEditTime, violationTime) / maxEditTime;
+        data.autoSignVL += addedVL;
+        final ViolationData vd = new ViolationData(this, player, data.autoSignVL, addedVL, cc.autoSignActions);
+        if (vd.needsParameters()){
+            vd.setParameter(ParameterName.TAGS, StringUtil.join(tags, "+"));
+        }
+        return executeActions(vd).willCancel();
+    }
+}
+
+// NOTE (AI): NCP drives this check from SignChangeEvent and PlayerSignOpenEvent rather than from the raw packet, so it also covers servers where the packet is delivered through the Bukkit event bus.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Intave's ItemCrashTracker instead validates sign content length (see next entry); Vrekt-Arc-v2 and Artemis only ship UpdateSign wrappers.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ItemCrashTracker sign limit (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Block the sign-update crash exploit that sends oversized line components.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Subscribes to the UPDATE_SIGN packet, reads the four chat components, and if any JSON serialization exceeds 500 characters it cancels the packet and kicks the player. The same module also carries Intave's window-click crash fix.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Sign update packets with oversized or malformed line components, which crash vanilla sign handling on 1.8 servers.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/module/tracker/player/ItemCrashTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/module/tracker/player/ItemCrashTracker.java =====
+/*
+ * Copyright 2026 Intave
+ *
+ * This software is licensed under the PolyForm Perimeter License 1.0.0.
+ * You may use this software for any purpose, except for providing to
+ * others any product that competes with the software.
+ *
+ * A copy of the license is available at:
+ *   https://polyformproject.org/licenses/perimeter/1.0.0/
+ */
+
+package de.jpx3.intave.module.tracker.player;
+
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.wrappers.WrappedChatComponent;
+import de.jpx3.intave.module.Module;
+import de.jpx3.intave.module.linker.packet.PacketSubscription;
+import de.jpx3.intave.player.FaultKicks;
+import de.jpx3.intave.user.User;
+import de.jpx3.intave.user.UserRepository;
+import de.jpx3.intave.user.meta.InventoryMetadata;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.inventory.meta.SkullMeta;
+
+import java.util.List;
+
+import static de.jpx3.intave.module.linker.packet.PacketId.Client.UPDATE_SIGN;
+import static de.jpx3.intave.module.linker.packet.PacketId.Client.WINDOW_CLICK;
+import static de.jpx3.intave.module.linker.packet.PacketId.Server.SET_SLOT;
+import static de.jpx3.intave.module.linker.packet.PacketId.Server.WINDOW_ITEMS;
+
+public final class ItemCrashTracker extends Module {
+  @PacketSubscription(
+    packetsOut = {
+      WINDOW_ITEMS, SET_SLOT
+    }
+  )
+  public void checkOutgoingItems(PacketEvent event) {
+    Player player = event.getPlayer();
+    User user = UserRepository.userOf(player);
+    PacketContainer packet = event.getPacket();
+    ItemStack itemStack = packet.getItemModifier().readSafely(0);
+    if (itemStack != null) {
+      putOnWhitelist(user, itemStack);
+    }
+    ItemStack[] itemStacks = packet.getItemArrayModifier().readSafely(0);
+    if (itemStacks != null &amp;&amp; itemStacks.length != 0) {
+      for (ItemStack stack : itemStacks) {
+        if (stack != null) {
+          putOnWhitelist(user, stack);
+        }
+      }
+    }
+    List&lt;ItemStack&gt; itemStackList = packet.getItemListModifier().readSafely(0);
+    if (itemStackList != null) {
+      for (ItemStack stack : itemStackList) {
+        if (stack != null) {
+          putOnWhitelist(user, stack);
+        }
+      }
+    }
+  }
+
+  private void putOnWhitelist(User user, ItemStack stack) {
+    InventoryMetadata inventory = user.meta().inventory();
+    String name = ownerFromSkull(stack);
+    if (name != null) {
+      inventory.registerSkullRequest(name);
+    }
+  }
+
+  private String ownerFromSkull(ItemStack skull) {
+    String name = skull.getType().name();
+    if (!(name.contains("SKULL") || name.contains("HEAD"))) {
+      return null;
+    }
+    ItemMeta meta = skull.getItemMeta();
+    if (meta instanceof SkullMeta) {
+      return ownerFromSkullMeta((SkullMeta) meta);
+    }
+    return null;
+  }
+
+  private String ownerFromSkullMeta(SkullMeta meta) {
+    return meta.getOwner();
+  }
+
+  @PacketSubscription(
+    packetsIn = UPDATE_SIGN
+  )
+  public void checkSign(PacketEvent event) {
+    Player player = event.getPlayer();
+    User user = UserRepository.userOf(player);
+    PacketContainer packet = event.getPacket();
+    WrappedChatComponent[] wrappedChatComponents = packet.getChatComponentArrays().readSafely(0);
+
+    if (wrappedChatComponents != null) {
+      for (WrappedChatComponent chatComponent : wrappedChatComponents) {
+        if (chatComponent.getJson().length() &gt; 500) {
+          event.setCancelled(true);
+          user.kick("Too many characters in sign update packet");
+          return;
+        }
+      }
+    }
+  }
+
+  @PacketSubscription(
+    packetsIn = {
+      WINDOW_CLICK
+    }
+  )
+  public void windowClickCrashFix(PacketEvent event) {
+    Player player = event.getPlayer();
+    User user = UserRepository.userOf(player);
+    InventoryMetadata inventoryData = user.meta().inventory();
+    if (System.currentTimeMillis() - inventoryData.lastWCCReset &gt; 10000) {
+      inventoryData.windowClickCounter = 0;
+      inventoryData.lastWCCReset = System.currentTimeMillis();
+    }
+
+    if (inventoryData.windowClickCounter++ &gt; 500 &amp;&amp; FaultKicks.INVENTORY_FAULTS) {
+      user.kick("Too many inventory interactions");
+      event.setCancelled(true);
+    }
+  }
+}
+
+// NOTE (AI): The 500-character cap targets the Jigsaw OPSign-style exploit that re-sends C12 to corrupt the server's sign data structure; the same module handles skull-item whitelisting and window-click rate limits.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other anticheat in the corpus validates sign content; the rest ignore the packet entirely.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S33PacketUpdateSign/">S33PacketUpdateSign</a>
 <a class="related-chip" href="../C0EPacketClickWindow/">C0EPacketClickWindow</a>

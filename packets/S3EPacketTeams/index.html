@@ -378,6 +378,439 @@ public class NetworkAPI extends API {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Rise 6.x: PacketReceiveEvent and PreMotionEvent on StaffDetector; script API table for the class.</div>
 <div class="impl-clients">Only Rise 6.x references S3E outside vanilla. StaffDetector shows the teams scan replaced by the S38 scan; the script API carries the class for scripts.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S3E is the one scoreboard packet anticheats actually consume and produce. Grim reads the outbound team stream into per-entity team state that its collision predicates use; intave rewrites the collision rule on outbound team packets and emits team packets to hide fake-player nametags; Shard's monitor emits team packets to render the target name tag and watches for conflicting team traffic. Photon's Teaming is the only flagging check in the domain and it is driven by Bukkit events, not the packet. The rest of the corpus is noise: Rammelkast and AntiCheatPlus match the 'AntiCheat Team' license header on every file, NCP's CollisionUtil reads the Bukkit scoreboard API, and Negativity plus Artemis only register the packet class.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TeamHandler (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Keep a transaction-ordered mirror of the client's team state so entity checks know the collision and push rules between players and entities.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">TeamHandler is a PacketSendListener on PacketType.Play.Server.TEAMS. On each S3E it wraps the packet, reads the team name, and schedules a real-time task at the last transaction id so the update applies at the same tick the client processes it. CREATE builds a new EntityTeam, REMOVE drops it, and the other modes update the stored team with the collision rule from the packet. EntityTeam maps members to the team by UUID, and MovementTicker plus EntityPredicates consult it to decide whether an entity can push the player.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly. It feeds collision semantics: team-based collision rules are read consistently because the mirror is transaction-ordered, so push-based exploits cannot desync it.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/utils/team/TeamHandler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/utils/team/TeamHandler.java =====
+package ac.grim.grimac.utils.team;
+
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.type.PacketSendListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.data.packetentity.PacketEntity;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerTeams;
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+import lombok.Getter;
+import lombok.Setter;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.Map;
+import java.util.UUID;
+
+// Reminder: Entities use UUIDs, players use name, for setting teams.
+public class TeamHandler extends Check implements PacketSendListener {
+
+    private final Map&lt;String, EntityTeam&gt; entityTeams = new Object2ObjectOpenHashMap&lt;&gt;();
+    private final Map&lt;String, EntityTeam&gt; entityToTeam = new Object2ObjectOpenHashMap&lt;&gt;();
+
+    private @Getter @Setter @Nullable EntityTeam playerTeam = null;
+
+    public TeamHandler(GrimPlayer player) {
+        super(player);
+    }
+
+    public void addEntityToTeam(String entityTeamRepresentation, EntityTeam team) {
+        entityToTeam.put(entityTeamRepresentation, team);
+    }
+
+    public void removeEntityFromTeam(String entityTeamRepresentation) {
+        entityToTeam.remove(entityTeamRepresentation);
+    }
+
+    public EntityTeam getEntityTeam(PacketEntity entity) {
+        // TODO in what cases is UUID null in 1.9+?
+        final UUID uuid = entity.getUuid();
+        return uuid == null ? null : entityToTeam.get(uuid.toString());
+    }
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.TEAMS) {
+            WrapperPlayServerTeams teams = new WrapperPlayServerTeams(event);
+            final String teamName = teams.getTeamName();
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                EntityTeam entityTeam = switch (teams.getTeamMode()) {
+                    case CREATE -&gt; {
+                        var newTeam = new EntityTeam(player, teamName);
+                        entityTeams.put(teamName, newTeam);
+                        yield newTeam;
+                    }
+                    case REMOVE -&gt; entityTeams.remove(teamName);
+                    default -&gt; entityTeams.get(teamName);
+                };
+
+                if (entityTeam != null) {
+                    entityTeam.update(teams);
+                }
+            });
+        }
+    }
+}
+// NOTE (AI): The S3E branch is lines 44-65. EntityTeam.update (EntityTeam.java lines 25-45) stores the collision rule and routes ADD_ENTITIES and REMOVE_ENTITIES into the player-team and entity maps; EntityPredicates.canBePushedBy evaluates the CollisionRule values.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> CheckManager registers the handler per player (CheckManager.java line 119). No other anticheat mirrors team state for physics; the collision-rule consumers are unique to Grim's simulation.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Teaming (Photon)</span>
+<span class="impl-module-clients">(Photon-GitHub-AntiCheatAddition)</span>
+</div>
+<p class="impl-pattern">Flag UHC players who cooperate by clustering, the teaming cheat domain that S3E team membership normally exposes.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Every 5 seconds the check builds a 3D RTree of eligible players (adventure or survival mode, out of combat, outside configured safe zones and WorldGuard no-PVP regions), then clusters players within a configurable proximity range who can see each other. Any cluster larger than the allowed size flags every member with a violation level equal to the surplus. The corpus hit is the team domain: the check never parses S3E and never reads Bukkit team state.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Players teaming in UHC-style gamemodes: two or more players who move together and avoid PVP.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/checks/teaming/Teaming.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/checks/teaming/Teaming.java =====
+package de.photon.anticheataddition.modules.checks.teaming;
+
+import com.github.davidmoten.rtreemulti.Entry;
+import com.github.davidmoten.rtreemulti.RTree;
+import com.github.davidmoten.rtreemulti.geometry.Point;
+import com.google.common.base.Preconditions;
+import de.photon.anticheataddition.AntiCheatAddition;
+import de.photon.anticheataddition.modules.ViolationModule;
+import de.photon.anticheataddition.user.User;
+import de.photon.anticheataddition.user.data.TimeKey;
+import de.photon.anticheataddition.util.log.Log;
+import de.photon.anticheataddition.util.mathematics.TimeUtil;
+import de.photon.anticheataddition.util.minecraft.world.region.Region;
+import de.photon.anticheataddition.util.minecraft.world.region.WorldGuardRegionUtil;
+import de.photon.anticheataddition.util.violationlevels.Flag;
+import de.photon.anticheataddition.util.violationlevels.ViolationLevelManagement;
+import de.photon.anticheataddition.util.violationlevels.ViolationManagement;
+import org.bukkit.Bukkit;
+import org.bukkit.World;
+import org.bukkit.entity.Player;
+import org.bukkit.event.Listener;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+public final class Teaming extends ViolationModule implements Listener
+{
+    public static final Teaming INSTANCE = new Teaming();
+    private static final long CHECK_INTERVAL = TimeUtil.toTicks(5000);
+
+    private Teaming()
+    {
+        super("Teaming");
+    }
+
+    private Set&lt;World&gt; loadEnabledWorlds()
+    {
+        final Set&lt;World&gt; worlds = new HashSet&lt;&gt;();
+        for (final String key : loadStringList(".enabled_worlds")) {
+            final var world = Bukkit.getWorld(key);
+            if (world == null) {
+                Log.fine(() -&gt; "Unable to load world \"" + key + "\" in teaming check.");
+                continue;
+            }
+            worlds.add(world);
+        }
+        return Set.copyOf(worlds);
+    }
+
+    private Set&lt;Region&gt; loadSafeZones(Set&lt;World&gt; enabledWorlds)
+    {
+        final Set&lt;Region&gt; safeZones = new HashSet&lt;&gt;();
+        for (final String s : loadStringList(".safe_zones")) {
+            try {
+                final var region = Region.parseRegion(s);
+                if (enabledWorlds.contains(region.world())) safeZones.add(region);
+            } catch (NullPointerException e) {
+                Log.severe(() -&gt; "Unable to load safe zone \"" + s + "\" in teaming check, is the world correct?");
+            } catch (ArrayIndexOutOfBoundsException e) {
+                Log.severe(() -&gt; "Unable to load safe zone \"" + s + "\" in teaming check, are all coordinates present?");
+            }
+        }
+        return Set.copyOf(safeZones);
+    }
+
+    @Override
+    public void enable()
+    {
+        final var enabledWorlds = loadEnabledWorlds();
+
+        final var safeZonesLoading = new HashSet&lt;&gt;(loadSafeZones(enabledWorlds));
+        if (loadBoolean(".worldguard", false)) safeZonesLoading.addAll(WorldGuardRegionUtil.loadNoPVPRegions(enabledWorlds));
+        final var safeZones = Set.copyOf(safeZonesLoading);
+
+        final double proximityRange = loadDouble(".proximity_range", 4.5);
+
+        final int noPvpTime = loadInt(".no_pvp_time", 6000);
+
+        final int allowedSize = loadInt(".allowed_size", 1);
+        Preconditions.checkArgument(allowedSize &gt; 0, "The Teaming allowed_size must be greater than 0.");
+
+        Bukkit.getScheduler().runTaskTimer(AntiCheatAddition.getInstance(), () -&gt; {
+
+            for (World world : enabledWorlds) {
+                // Pre-calculate the entries for the RTree for faster initialization.
+                final List&lt;Entry&lt;Player, Point&gt;&gt; entries = new ArrayList&lt;&gt;();
+                for (Player player : world.getPlayers()) {
+                    final User user = User.getUser(player);
+                    if (!User.isUserInvalid(user, Teaming.INSTANCE)
+                        // Correct game modes.
+                        &amp;&amp; user.inAdventureOrSurvivalMode()
+                        // Not engaged in pvp.
+                        &amp;&amp; user.getTimeMap().at(TimeKey.COMBAT).notRecentlyUpdated(noPvpTime)) {
+                        final var loc = player.getLocation();
+                        // Not in a bypassed region.
+                        if (safeZones.stream().noneMatch(safeZone -&gt; safeZone.isInsideRegion(loc))) {
+                            entries.add(User.rTreeEntryFromPlayer(player));
+                        }
+                    }
+                }
+
+                // Create an RTree for the players in the world.
+                RTree&lt;Player, Point&gt; rTree = RTree.dimensions(3).create(entries);
+                final var origin = Point.create(0, 0, 0);
+
+                while (!rTree.isEmpty()) {
+                    final var firstNode = rTree.nearest(origin, Double.POSITIVE_INFINITY, 1).iterator().next();
+                    final var teamNodes = rTree.nearest(firstNode.geometry(), proximityRange, 1000);
+
+                    // Get the players.
+                    final List&lt;Player&gt; team = new ArrayList&lt;&gt;();
+                    for (Entry&lt;Player, Point&gt; node : teamNodes) {
+                        // Players need to see each other to be considered to be in a team.
+                        if (firstNode.value().canSee(node.value()) &amp;&amp; node.value().canSee(firstNode.value())) team.add(node.value());
+                    }
+
+                    Log.finer(() -&gt; "Teaming | Team: " + team.stream().map(Player::getName).collect(Collectors.joining(", ")));
+
+                    rTree = rTree.delete(teamNodes);
+
+                    // Team is too big
+                    final int vl = team.size() - allowedSize;
+                    if (vl &lt;= 0) continue;
+
+                    for (final var player : team) this.getManagement().flag(Flag.of(player).setAddedVl(vl));
+                }
+            }
+        }, 1L, CHECK_INTERVAL);
+    }
+
+    @Override
+    protected ViolationManagement createViolationManagement()
+    {
+        return ViolationLevelManagement.builder(this)
+                                       .loadThresholdsToManagement()
+                                       .withDecay(300, 1)
+                                       .build();
+    }
+}
+// NOTE (AI): No scoreboard or packet API is used anywhere in this file; the check is matched to the team domain by name only. The clustering runs on a Bukkit scheduler, never on S3E.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus. Photon's ModuleManager registers the module, and Placeholders exposes its violation level for alert messages.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">EntityCollisionDisabler (intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Patch outbound team packets so the monitored player stops colliding with entities, a server-side no-collision service.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A HIGHEST-priority ProtocolLib subscription on the outbound SCOREBOARD_TEAM packet rewrites the collision-rule string field to 'never' before the packet reaches the client. Version-dependent field indexes handle the 1.13 and 1.17 wire changes, and on 1.17+ the rule is read from the optional internal structure instead of the top-level string list. Active only on 1.9+ servers where the team packet carries a collision rule.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing cheat-related. It is the anticheat applying a collision exemption through the vanilla team mechanism instead of a per-player flag.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/module/tracker/entity/EntityCollisionDisabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/module/tracker/entity/EntityCollisionDisabler.java =====
+package de.jpx3.intave.module.tracker.entity;
+
+import com.comphenix.protocol.events.InternalStructure;
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.reflect.StructureModifier;
+import de.jpx3.intave.adapter.MinecraftVersions;
+import de.jpx3.intave.module.Module;
+import de.jpx3.intave.module.linker.packet.ListenerPriority;
+import de.jpx3.intave.module.linker.packet.PacketSubscription;
+
+import java.util.Optional;
+
+import static de.jpx3.intave.module.linker.packet.PacketId.Server.SCOREBOARD_TEAM;
+
+public final class EntityCollisionDisabler extends Module {
+  private static final boolean DISABLE_ENTITY_COLLISIONS = MinecraftVersions.VER1_9_0.atOrAbove();
+  private static final int COLLISION_RULE_FIELD = (MinecraftVersions.VER1_13_0.atOrAbove() ? (MinecraftVersions.VER1_17_0.atOrAbove() ? 1 : 2) : 5);
+  private static final boolean INDIRECT_SCOREBOARD_ACCESS = MinecraftVersions.VER1_17_0.atOrAbove();
+
+  @PacketSubscription(
+    priority = ListenerPriority.HIGHEST,
+    packetsOut = {
+      SCOREBOARD_TEAM
+    }
+  )
+  public void receiveScoreboardUpdate(PacketEvent event) {
+    if (!DISABLE_ENTITY_COLLISIONS) {
+      return;
+    }
+    PacketContainer packet = event.getPacket();
+    if (INDIRECT_SCOREBOARD_ACCESS) {
+      //noinspection OptionalAssignedToNull
+      if (packet.getSpecificModifier(Optional.class).read(0) != null) {
+        Optional&lt;InternalStructure&gt; optionalStructure = packet.getOptionalStructures().read(0);
+        if (optionalStructure.isPresent()) {
+          InternalStructure structure = optionalStructure.get();
+          StructureModifier&lt;String&gt; strings = structure.getStrings();
+          applyNoCollisionRule(strings);
+        }
+      }
+    } else {
+      applyNoCollisionRule(packet.getStrings());
+    }
+  }
+
+  private void applyNoCollisionRule(StructureModifier&lt;String&gt; strings) {
+    strings.write(COLLISION_RULE_FIELD, "never");
+  }
+}
+// NOTE (AI): A genuine S3E (PacketPlayOutScoreboardTeam) consumer; it appears in the S3C corpus only because the Scoreboard keyword matched the method name receiveScoreboardUpdate.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Same anticheat, opposite direction: ScoreboardAccessor and FakePlayerBody emit S3E team packets to hide the fake-player nametag (see the next check).</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ScoreboardAccessor fake-player nametag (intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Hide the nametag of intave's fake-player bait entities so ESP and nametag features cannot distinguish them from real players.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">sendScoreboard builds a PacketPlayOutScoreboardTeam with action 3 (ADD_PLAYERS) that places the fake player profile in a dedicated team, then, when hiding is requested, sends a second team packet with action 2 (UPDATE) that sets nameTagVisibility to NEVER. FakePlayerBody invokes it at spawn (FakePlayerBody.java line 318).</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing. The team packets are the bait infrastructure behind the aura and reach checks; the nametag must vanish or the fake entity is trivially spotted.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/player/fake/ScoreboardAccessor.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/player/fake/ScoreboardAccessor.java =====
+package de.jpx3.intave.player.fake;
+
+import com.comphenix.protocol.wrappers.WrappedGameProfile;
+import com.google.common.collect.ImmutableList;
+import de.jpx3.intave.klass.rewrite.PatchyAutoTranslation;
+import net.minecraft.server.v1_8_R3.*;
+import org.bukkit.craftbukkit.v1_8_R3.entity.CraftPlayer;
+import org.bukkit.entity.Player;
+
+@PatchyAutoTranslation
+public final class ScoreboardAccessor {
+  @PatchyAutoTranslation
+  public static void sendScoreboard(
+    Player player,
+    String teamName,
+    WrappedGameProfile fakePlayerProfile,
+    boolean hideNameTag
+  ) {
+    PlayerConnection connection = ((CraftPlayer) player).getHandle().playerConnection;
+    ImmutableList&lt;String&gt; teamList = ImmutableList.of(fakePlayerProfile.getName());
+    ScoreboardTeam scoreboardTeam = new ScoreboardTeam(new Scoreboard(), teamName);
+    PacketPlayOutScoreboardTeam packet = new PacketPlayOutScoreboardTeam(scoreboardTeam, teamList, 3);
+    connection.sendPacket(packet);
+    if (hideNameTag) {
+      scoreboardTeam.setNameTagVisibility(ScoreboardTeamBase.EnumNameTagVisibility.NEVER);
+      connection.sendPacket(new PacketPlayOutScoreboardTeam(scoreboardTeam, 2));
+    }
+  }
+}
+// NOTE (AI): Emits the 1.8 S3E ADD_PLAYERS (action 3) and UPDATE (action 2) modes; the constructor is version-locked through @PatchyAutoTranslation.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> FakePlayerBody.java owns the spawn flow and FakePlayerEventService loads the accessor by class name for the 1.8 pipeline.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Monitor nametag team bridge (Shard)</span>
+<span class="impl-module-clients">(KaelusAI-Shard)</span>
+</div>
+<p class="impl-pattern">Render the monitored target's name tag by emitting its own S3E team packets, and keep that rendering valid against other plugins' team traffic.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">ViewTeamPacketBridge builds WrapperPlayServerTeams packets (CREATE, UPDATE, ADD_ENTITIES and REMOVE) whose prefix and suffix carry the rendered tag, with the collision rule and nametag visibility forced to ALWAYS so the monitor's tag never interferes with physics. Its companion ViewTeamConflictObserver listens for outbound S3E at MONITOR priority and, when the session renders above the name, marks the target's tag for rebind whenever another plugin creates a team or adds the target to one.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing. The name-tag rendering is the monitor output channel; the observer exists so a server plugin that manages its own teams does not break the view.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> KaelusAI-Shard — src/main/kotlin/ac/shard/monitor/view/ViewTeamPacketBridge.kt</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: KaelusAI-Shard — src/main/kotlin/ac/shard/monitor/view/ViewTeamPacketBridge.kt =====
+/*
+ * This file is part of Shard - https://github.com/KaelusAI/Shard
+ * Copyright (C) 2026 KaelusAI
+ *
+ * Shard is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Shard is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package ac.shard.monitor.view
+
+import ac.shard.monitor.core.ComponentCache
+import com.github.retrooper.packetevents.PacketEvents
+import com.github.retrooper.packetevents.wrapper.PacketWrapper
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerTeams
+import net.kyori.adventure.text.Component
+import net.kyori.adventure.text.format.NamedTextColor
+import org.bukkit.entity.Player
+
+internal class ViewTeamPacketBridge(private val componentCache: ComponentCache) {
+  fun createTeam(viewer: Player, teamName: String, playerName: String, rendered: RenderedTag) {
+    val wrapper =
+      WrapperPlayServerTeams(
+        teamName,
+        WrapperPlayServerTeams.TeamMode.CREATE,
+        createTeamInfo(rendered),
+        listOf(playerName),
+      )
+    sendPacket(viewer, wrapper)
+  }
+
+  fun updateTeam(viewer: Player, teamName: String, rendered: RenderedTag) {
+    val wrapper =
+      WrapperPlayServerTeams(
+        teamName,
+        WrapperPlayServerTeams.TeamMode.UPDATE,
+        createTeamInfo(rendered),
+        emptyList(),
+      )
+    sendPacket(viewer, wrapper)
+  }
+
+  fun rebindEntity(viewer: Player, teamName: String, playerName: String) {
+    val wrapper =
+      WrapperPlayServerTeams(
+        teamName,
+        WrapperPlayServerTeams.TeamMode.ADD_ENTITIES,
+        null as WrapperPlayServerTeams.ScoreBoardTeamInfo?,
+        listOf(playerName),
+      )
+    sendPacket(viewer, wrapper)
+  }
+
+  fun removeTeam(viewer: Player, teamName: String) {
+    val wrapper =
+      WrapperPlayServerTeams(
+        teamName,
+        WrapperPlayServerTeams.TeamMode.REMOVE,
+        null as WrapperPlayServerTeams.ScoreBoardTeamInfo?,
+        emptyList&lt;String&gt;(),
+      )
+    sendPacket(viewer, wrapper)
+  }
+
+  private fun createTeamInfo(rendered: RenderedTag): WrapperPlayServerTeams.ScoreBoardTeamInfo {
+    return WrapperPlayServerTeams.ScoreBoardTeamInfo(
+      Component.empty(),
+      componentCache.component(rendered.prefix),
+      componentCache.component(rendered.suffix),
+      WrapperPlayServerTeams.NameTagVisibility.ALWAYS,
+      WrapperPlayServerTeams.CollisionRule.ALWAYS,
+      NamedTextColor.WHITE,
+      WrapperPlayServerTeams.OptionData.NONE,
+    )
+  }
+
+  private fun sendPacket(viewer: Player, packet: PacketWrapper&lt;*&gt;) {
+    PacketEvents.getAPI().playerManager.sendPacket(viewer, packet)
+  }
+}
+// NOTE (AI): Emit side only in this file (CREATE, UPDATE, ADD_ENTITIES and REMOVE at lines 29-71). The consume side is ViewTeamConflictObserver.kt, which reads WrapperPlayServerTeams on PacketSendEvent and schedules rebinds for the monitored target.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> ScoreboardSlotObserver and ScoreboardPacketBridge cover the sibling scoreboard packets for the sidebar output; ViewTeamConflictObserverTest and TargetTeamStateTest exercise the rebind logic.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S3BPacketScoreboardObjective/">S3BPacketScoreboardObjective</a>
 <a class="related-chip" href="../S38PacketPlayerListItem/">S38PacketPlayerListItem</a>

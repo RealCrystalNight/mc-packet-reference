@@ -181,6 +181,679 @@ public final class GrimVelocity extends Mode&lt;Velocity&gt; {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent in Rise 6.x; no other hook exists in the corpus.</div>
 <div class="impl-clients">Only Rise 6.x touches the packet outside vanilla. The 6.1.30 and 6.2.4 GrimVelocity files are identical apart from the corpus path prefix.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The status opcode channel has no server-side check surface: the only corpus references are Artemis's packet wrapper and MinecraftAntiCheat's NPC utility, which emits status packets to animate fake players. The opcode byte matters to clients (hurt, death, taming), but anticheats never branch on it. This is one of the thinnest packets in the entity family.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">GPacketPlayServerEntityStatus (packet wrapper)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Wrap the entity status packet in Artemis's packet layer; the wrapper reads the entity id and the opcode byte.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The class binds to PacketPlayServerEntityStatus via @PacketLink, reads entityId as an int and logicOpcode as a byte from the buffer, and stores them as fields for any consumer.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing; the fields are exposed but no Artemis check reads them.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.packet.spigot/src/main/java/cc/ghast/packet/wrapper/packet/play/server/GPacketPlayServerEntityStatus.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.packet.spigot/src/main/java/cc/ghast/packet/wrapper/packet/play/server/GPacketPlayServerEntityStatus.java =====
+package cc.ghast.packet.wrapper.packet.play.server;
+
+import ac.artemis.packet.protocol.ProtocolVersion;
+import ac.artemis.packet.spigot.protocol.PacketLink;
+import ac.artemis.packet.wrapper.server.PacketPlayServerEntityStatus;
+import cc.ghast.packet.buffer.ProtocolByteBuf;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import cc.ghast.packet.wrapper.packet.ReadableBuffer;
+import lombok.Getter;
+
+import java.util.UUID;
+
+@Getter
+@PacketLink(PacketPlayServerEntityStatus.class)
+public class GPacketPlayServerEntityStatus extends GPacket implements PacketPlayServerEntityStatus, ReadableBuffer {
+    public GPacketPlayServerEntityStatus(UUID player, ProtocolVersion version) {
+        super("PacketPlayOutEntityStatus", player, version);
+    }
+
+    private int entityId;
+    private byte logicOpcode;
+
+    @Override
+    public void read(ProtocolByteBuf byteBuf) {
+        this.entityId = byteBuf.readInt();
+        this.logicOpcode = byteBuf.readByte();
+    }
+}
+// NOTE (AI): The read() implementation shows the packet shape (int entity id, byte opcode) even though no check consumes it.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The wrapper mirrors the generic GPacket pattern; the head-rotation wrapper in the same package carries an empty read.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NPC status emission (fake player lifecycle)</span>
+<span class="impl-module-clients">(network-dev-MinecraftAntiCheat)</span>
+</div>
+<p class="impl-pattern">Send entity status packets for fake players so they show hurt and death effects like real players during staff testing.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">setStatus(byte) builds a PacketPlayOutEntityStatus, sets the entity id and status fields by reflection, and sends it; the NPCStatus enum wraps the opcode ids. The packet is only ever emitted for NPCs created by the anticheat's staff tools.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing; the emission exists so NPCs behave like players for testing killaura and reach checks.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> network-dev-MinecraftAntiCheat — src/main/java/me/sendpacket/anticheat/anticheat/Utils/NPC.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: network-dev-MinecraftAntiCheat — src/main/java/me/sendpacket/anticheat/anticheat/Utils/NPC.java =====
+package me.sendpacket.anticheat.anticheat.Utils;
+
+import com.mojang.authlib.GameProfile;
+import com.mojang.authlib.properties.Property;
+import net.minecraft.server.v1_15_R1.*;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.craftbukkit.v1_15_R1.entity.CraftPlayer;
+import org.bukkit.craftbukkit.v1_15_R1.util.CraftChatMessage;
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.scheduler.BukkitRunnable;
+
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.*;
+
+public class NPC {
+
+    private int entityId;
+    private Location location;
+    private Location last_location;
+    private GameProfile gameprofile;
+
+    private List&lt;Player&gt; recipients;
+    private Recipient recipient_type = Recipient.ALL;
+
+    private String display_name;
+    private String tablist_name;
+    private DataWatcher dataWatcher;
+    private DataWatcherObject&lt;Byte&gt; object_entity_state;
+    private DataWatcherObject&lt;String&gt; object_customName;
+    private DataWatcherObject&lt;Boolean&gt; object_isSilent;
+    private DataWatcherObject&lt;Boolean&gt; object_hasGravity;
+    private DataWatcherObject&lt;Boolean&gt; object_isCustomNameVisible;
+
+    private boolean isDestroyed;
+    private Plugin plugin;
+
+
+    /*
+     *  initialize all the npc default settings
+     */
+    public NPC(String name, Location location, Plugin plugin) {
+        this.plugin = plugin;
+        this.display_name = name;
+        this.tablist_name = name;
+        this.recipient_type = Recipient.ALL;
+        this.recipients = new ArrayList&lt;Player&gt;();
+        this.entityId = (int) Math.ceil(Math.random() * 1000);
+        this.gameprofile = new GameProfile(UUID.randomUUID(), display_name);
+        this.location = location;
+        this.dataWatcher = new DataWatcher(null);
+        this.dataWatcher.register(object_entity_state = new DataWatcherObject&lt;&gt;(0, DataWatcherRegistry.a), (byte) 0);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(1, DataWatcherRegistry.b), 300);
+        this.dataWatcher.register(object_customName = new DataWatcherObject&lt;&gt;(2, DataWatcherRegistry.d), "");
+        this.dataWatcher.register(object_isCustomNameVisible = new DataWatcherObject&lt;&gt;(3, DataWatcherRegistry.i),false);
+        this.dataWatcher.register(object_isSilent = new DataWatcherObject&lt;&gt;(4, DataWatcherRegistry.i), false);
+        this.dataWatcher.register(object_hasGravity = new DataWatcherObject&lt;&gt;(5, DataWatcherRegistry.i), false);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(6, DataWatcherRegistry.a), (byte) 0);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(7, DataWatcherRegistry.c), 20.0F);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(8, DataWatcherRegistry.b), 0);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(9, DataWatcherRegistry.i), false);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(10, DataWatcherRegistry.b), 0);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(11, DataWatcherRegistry.c), 0.0F);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(12, DataWatcherRegistry.b), 20);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(13, DataWatcherRegistry.a), (byte) 127);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(14, DataWatcherRegistry.a), (byte) 1);
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(15, DataWatcherRegistry.p), new NBTTagCompound());
+        this.dataWatcher.register(new DataWatcherObject&lt;&gt;(16, DataWatcherRegistry.p), new NBTTagCompound());
+    }
+
+
+    /*
+     *  view all the packet receivers
+     */
+    public List&lt;Player&gt; getRecipients() {
+        return this.recipients;
+    }
+
+
+    /*
+     *  get the signature and skin from the gameprofile
+     */
+    public Property getSkin() {
+        if (this.gameprofile.getProperties().isEmpty())
+            return null;
+        return (Property) this.gameprofile.getProperties().get("textures").toArray()[0];
+    }
+
+    /*
+     * get npc id
+     */
+    public int getEntityId() {
+        return entityId;
+    }
+
+
+    /*
+     * get npc location
+     */
+    public Location getLocation() {
+        return location;
+    }
+
+
+    /*
+     * get npc gameprofile
+     */
+    public GameProfile getGameprofile() {
+        return gameprofile;
+    }
+
+    /*
+     * get all the packet receivers
+     */
+    public Recipient getRecipient_type() {
+        return recipient_type;
+    }
+
+
+    /*
+     * get npc displayname above head
+     */
+    public String getDisplay_name() {
+        return display_name;
+    }
+
+    /*
+     * get npc displayname in tablist
+     */
+    public String getTablist_name() {
+        return tablist_name;
+    }
+
+    /*
+     * check if npc is deleted
+     */
+    public boolean isDestroyed() {
+        return isDestroyed;
+    }
+
+    /*
+     * get plugin
+     */
+    public Plugin getPlugin() {
+        return plugin;
+    }
+
+
+    /*
+     *  add Player so it receives the update packets
+     */
+    public void addRecipient(Player p) {
+        this.recipients.add(p);
+    }
+
+
+    /*
+     *  Remove Player that receives the update packets
+     */
+    public void removeRecipient(Player p) {
+        this.recipients.remove(p);
+    }
+
+
+    /*
+     *  toggle if the packet receivers are all the players online or a specicif group.
+     *  If set to ALL (online) then the set/get recipient will have no effect
+     */
+    public void setRecipientType(Recipient recipient_type) {
+        this.recipient_type = recipient_type;
+    }
+
+
+    /*
+     *  spawn the npc, this should be the last function after init.
+     */
+    public void spawn(boolean tablist, boolean fix_head) {
+        PacketPlayOutNamedEntitySpawn packet = new PacketPlayOutNamedEntitySpawn();
+        this.setField(packet, "a", this.entityId);
+        this.setField(packet, "b", this.gameprofile.getId());
+        this.setField(packet, "c", location.getX());
+        this.setField(packet, "d", location.getY());
+        this.setField(packet, "e", location.getZ());
+        this.setField(packet, "f", fix_head ? (byte) ((int) location.getYaw() * 256.0F / 360.0F) : 0);
+        this.setField(packet, "g", fix_head ? (byte) ((int) location.getPitch() * 256.0F / 360.0F) : 0);
+       // this.setField(packet, "h", this.dataWatcher);
+        this.addToTabList();
+        this.sendPacket(packet);
+        this.isDestroyed = false;
+
+
+        //Delay is required to commit the tablist changes
+        new BukkitRunnable() {
+
+            @Override
+            public void run() {
+                if (!tablist) removeFromTabList();
+            }
+        }.runTaskLater(this.plugin, 5);
+
+    }
+
+    /*
+     *  set the name above the player
+     */
+    public void setDisplayNameAboveHead(String name) throws IOException {
+        if(name.length() &gt; 16) throw new IOException("Name cannot be longer than 16 chatacters.");
+        this.display_name = name;
+        this.reloadNpc();
+    }
+
+
+    /*
+     *  set the name above the player and tablist.
+     */
+    public void setDisplayName(String name) throws IOException {
+        this.setDisplayNameAboveHead(name);
+        this.setTablistName(name);
+    }
+
+
+    /*
+     *  set custom name in tablist
+     */
+    public void setTablistName(String name) {
+        this.tablist_name = name;
+        this.updateToTabList();
+    }
+
+
+    /*
+     *  respawn the npc and refresh all comitted changes
+     */
+    public void reloadNpc() {
+        this.updateProfile();
+        if(!this.isDestroyed) {
+            PacketPlayOutEntityDestroy packet = new PacketPlayOutEntityDestroy(new int[] { this.entityId });
+            this.sendPacket(packet);
+            this.spawn(true, true);
+        }
+    }
+
+
+    /*
+     *  Update/Refresh the gameprofile that contains UUID, Name, Skin.
+     */
+    private void updateProfile() {
+        Property skin = this.getSkin();
+        this.gameprofile = new GameProfile(this.gameprofile.getId(), this.display_name);
+        if (skin != null)
+            this.setSkin(skin.getValue(), skin.getSignature());
+    }
+
+
+    /*
+     *  set the texture and signature in the gameprofile, to submit it you must reload player.
+     */
+    public void setSkin(String texture, String signature) {
+        this.gameprofile.getProperties().put("textures", new Property("textures", texture, signature));
+    }
+
+
+
+    /*
+     *  remove npc from the recipient's tablist
+     */
+    public void removeFromTabList() {
+        PacketPlayOutPlayerInfo packet = new PacketPlayOutPlayerInfo();
+        PacketPlayOutPlayerInfo.PlayerInfoData data = packet.new PlayerInfoData(this.gameprofile, 0,
+                EnumGamemode.NOT_SET, CraftChatMessage.fromString(tablist_name)[0]);
+        List&lt;PacketPlayOutPlayerInfo.PlayerInfoData&gt; players = (List&lt;PacketPlayOutPlayerInfo.PlayerInfoData&gt;) getField(packet, "b");
+        players.add(data);
+        this.setField(packet, "a", PacketPlayOutPlayerInfo.EnumPlayerInfoAction.REMOVE_PLAYER);
+        this.setField(packet, "b", players);
+        this.sendPacket(packet);
+    }
+
+
+
+    /*
+     *  update npc to the recipient's tablist
+     */
+    public void updateToTabList() {
+        PacketPlayOutPlayerInfo packet = new PacketPlayOutPlayerInfo();
+        PacketPlayOutPlayerInfo.PlayerInfoData data = packet.new PlayerInfoData(this.gameprofile, 0,
+                EnumGamemode.NOT_SET, CraftChatMessage.fromString(tablist_name)[0]);
+        List&lt;PacketPlayOutPlayerInfo.PlayerInfoData&gt; players = (List&lt;PacketPlayOutPlayerInfo.PlayerInfoData&gt;) getField(packet, "b");
+        players.add(data);
+        this.setField(packet, "a", PacketPlayOutPlayerInfo.EnumPlayerInfoAction.UPDATE_DISPLAY_NAME);
+        this.setField(packet, "b", players);
+        this.sendPacket(packet);
+    }
+
+
+    /*
+     *  add npc from the recipient's tablist
+     */
+    public void addToTabList() {
+        PacketPlayOutPlayerInfo packet = new PacketPlayOutPlayerInfo();
+        PacketPlayOutPlayerInfo.PlayerInfoData data = packet.new PlayerInfoData(this.gameprofile, 0,
+                EnumGamemode.NOT_SET, CraftChatMessage.fromString(tablist_name)[0]);
+        List&lt;PacketPlayOutPlayerInfo.PlayerInfoData&gt; players = (List&lt;PacketPlayOutPlayerInfo.PlayerInfoData&gt;) getField(packet, "b");
+        players.add(data);
+        this.setField(packet, "a", PacketPlayOutPlayerInfo.EnumPlayerInfoAction.ADD_PLAYER);
+        this.setField(packet, "b", players);
+        this.sendPacket(packet);
+    }
+
+
+    /*
+     *  put items in inventory, see https://www.google.nl/search?q=bukkit+inventory+slots&amp;source=lnms&amp;tbm=isch&amp;sa=X&amp;ved=0ahUKEwjr9v_FxvjaAhUFMuwKHQi7ALUQ_AUICigB&amp;biw=1920&amp;bih=974#imgrc=QUECAbUohgZxbM:
+     *  for more info
+     */
+    public void setEquipment(EnumItemSlot slot, ItemStack item) {
+        PacketPlayOutEntityEquipment packet = new PacketPlayOutEntityEquipment();
+        this.setField(packet, "a", this.entityId);
+        this.setField(packet, "b", slot);
+        this.setField(packet, "c", item);
+        this.sendPacket(packet);
+    }
+
+
+    /*
+     * set player action, such as shift, onfire, ect recommending to use 'public void setAction(Action action)'.
+     */
+    public void setAction(byte action) {
+        this.setMetaData(action);
+    }
+
+
+    /*
+     * set player action, such as shift, onfire, ect.
+     */
+    public void setAction(Action action) {
+        this.setMetaData(action.build());
+    }
+
+
+    /*
+     * delete the npc from the server.
+     */
+    public void destroy() {
+        PacketPlayOutEntityDestroy packet = new PacketPlayOutEntityDestroy(new int[] { this.entityId });
+        this.removeFromTabList();
+        this.sendPacket(packet);
+        this.isDestroyed = true;
+    }
+
+
+    /*
+     * set npc status such as die or hurt. I recommond to use method 'public void setStatus(NPCStatus status)'
+     */
+    public void setStatus(byte status) {
+        PacketPlayOutEntityStatus packet = new PacketPlayOutEntityStatus();
+        this.setField(packet, "a", this.entityId);
+        this.setField(packet, "b", status);
+        this.sendPacket(packet);
+    }
+
+
+    /*
+     * set npc status such as die or hurt.
+     */
+    public void setStatus(NPCStatus status) {
+        this.setStatus((byte) status.getId());
+    }
+
+
+    /*
+     * set npc effect such as Night Vision or something else.
+     */
+    public void setEffect(MobEffect effect) {
+        this.sendPacket(new PacketPlayOutEntityEffect(this.entityId, effect));
+    }
+
+
+    /*
+     * set npc animation such as Swing arm ect. I recommend using method 'public void setAnimation(NPCAnimation animation)'
+     */
+    public void setAnimation(byte animation) {
+        PacketPlayOutAnimation packet = new PacketPlayOutAnimation();
+        this.setField(packet, "a", this.entityId);
+        this.setField(packet, "b", animation);
+        this.sendPacket(packet);
+    }
+
+
+    /*
+     * set npc animation such as Swing arm ect.
+     */
+    public void setAnimation(NPCAnimation animation) {
+        this.setAnimation((byte) animation.getId());
+    }
+
+
+    /*
+     * teleport npc to different location
+     */
+    public void teleport(Location location, Boolean onGround) {
+        PacketPlayOutEntityTeleport packet = new PacketPlayOutEntityTeleport();
+        this.setField(packet, "a", this.entityId);
+        this.setField(packet, "b", location.getX());
+        this.setField(packet, "c", location.getY());
+        this.setField(packet, "d", location.getZ());
+        this.setField(packet, "e", (byte) location.getYaw());
+        this.setField(packet, "f", (byte) location.getPitch());
+        this.setField(packet, "g", onGround);
+        this.sendPacket(packet);
+        this.rotateHead(location.getPitch(), location.getYaw());
+        this.location = location;
+        this.sendPacket(packet);
+    }
+
+
+    /*
+     * rotate npc head to pitch and yaw.
+     */
+    public void rotateHead(float pitch, float yaw) {
+        PacketPlayOutEntity.PacketPlayOutEntityLook packet = new PacketPlayOutEntity.PacketPlayOutEntityLook(this.entityId, getFixRotation(yaw), (byte) pitch, true);
+        PacketPlayOutEntityHeadRotation packet_1 = new PacketPlayOutEntityHeadRotation();
+        this.setField(packet_1, "a", this.entityId);
+        this.setField(packet_1, "b", getFixRotation(yaw));
+        this.sendPacket(packet);
+        this.sendPacket(packet_1);
+    }
+
+
+
+
+    /*
+     * These methods below are not usefull.
+     */
+
+    private &lt;T&gt; void setDataWatcherObject(DataWatcherObject&lt;T&gt; datawatcherobject, Object t0) {
+        try {
+            Method m = this.dataWatcher.getClass().getDeclaredMethod("registerObject", DataWatcherObject.class,
+                    Object.class);
+            m.setAccessible(true);
+            m.invoke(this.dataWatcher, datawatcherobject, t0);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void setMetaData(byte data) {
+        this.setDataWatcherObject(this.object_entity_state, data);
+        PacketPlayOutEntityMetadata packet = new PacketPlayOutEntityMetadata(this.entityId, this.dataWatcher, true);
+        this.sendPacket(packet);
+    }
+
+    private byte getFixRotation(float yawpitch) {
+        return (byte) ((int) (this.location.getYaw() * 256.0F / 360.0F));
+    }
+
+    private Object getField(Object obj, String field_name) {
+        try {
+            Field field = obj.getClass().getDeclaredField(field_name);
+            field.setAccessible(true);
+            return field.get(obj);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    private void setField(Object obj, String field_name, Object value) {
+        try {
+            Field field = obj.getClass().getDeclaredField(field_name);
+            field.setAccessible(true);
+            field.set(obj, value);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void sendPacket(Packet&lt;?&gt; packet, Player player) {
+        ((CraftPlayer) player).getHandle().playerConnection.sendPacket(packet);
+    }
+
+    private void sendPacket(Packet&lt;?&gt; packet) {
+        for (Player p : (this.recipient_type == Recipient.ALL ? Bukkit.getOnlinePlayers() : this.recipients)) {
+            this.sendPacket(packet, p);
+        }
+
+    }
+
+    public enum Recipient {
+        ALL, LISTED_RECIPIENTS;
+    }
+
+    enum NPCAnimation {
+
+        SWING_MAIN_HAND(0),
+        TAKE_DAMAGE(1),
+        LEAVE_BED(2),
+        SWING_OFFHAND(3),
+        CRITICAL_EFFECT(4),
+        MAGIC_CRITICAL_EFFECT(5);
+
+        private int id;
+
+        private NPCAnimation(int id) {
+            this.id = id;
+        }
+
+        public int getId() {
+            return id;
+        }
+
+    }
+
+    enum NPCStatus {
+
+        HURT(2), DIE(3);
+
+        private int id;
+
+        private NPCStatus(int id) {
+            this.id = id;
+        }
+
+        public int getId() {
+            return id;
+        }
+    }
+
+    public static class Action {
+
+        private boolean on_fire, crouched, sprinting, invisible, glowing, flying_elytra;
+        private byte result = 0;
+
+        public Action(boolean on_fire, boolean crouched, boolean sprinting, boolean invisible, boolean glowing,
+                      boolean flying_elytra) {
+            this.on_fire = on_fire;
+            this.crouched = crouched;
+            this.sprinting = sprinting;
+            this.invisible = invisible;
+            this.glowing = glowing;
+            this.flying_elytra = flying_elytra;
+        }
+
+        public Action() {
+        }
+
+        public boolean isOn_fire() {
+            return on_fire;
+        }
+
+        public Action setOn_fire(boolean on_fire) {
+            this.on_fire = on_fire;
+            return this;
+        }
+
+        public boolean isCrouched() {
+            return crouched;
+        }
+
+        public Action setCrouched(boolean crouched) {
+            this.crouched = crouched;
+            return this;
+        }
+
+        public boolean isSprinting() {
+            return sprinting;
+        }
+
+        public Action setSprinting(boolean sprinting) {
+            this.sprinting = sprinting;
+            return this;
+        }
+
+        public boolean isInvisible() {
+            return invisible;
+        }
+
+        public Action setInvisible(boolean invisible) {
+            this.invisible = invisible;
+            return this;
+        }
+
+        public boolean isGlowing() {
+            return glowing;
+        }
+
+        public Action setGlowing(boolean glowing) {
+            this.glowing = glowing;
+            return this;
+        }
+
+        public boolean isFlying_elytra() {
+            return flying_elytra;
+        }
+
+        public Action setFlying_elytra(boolean flying_elytra) {
+            this.flying_elytra = flying_elytra;
+            return this;
+        }
+
+        public byte build() {
+            result = 0;
+            result = add(this.on_fire, (byte) 0x01);
+            result = add(this.crouched, (byte) 0x02);
+            result = add(this.sprinting, (byte) 0x08);
+            result = add(this.invisible, (byte) 0x20);
+            result = add(this.glowing, (byte) 0x40);
+            result = add(this.flying_elytra, (byte) 0x80);
+            return result;
+        }
+
+        private byte add(boolean condition, byte amount) {
+            return (byte) (result += (condition ? amount : 0x00));
+        }
+    }
+}
+// NOTE (AI): This entry exists because the corpus hit is real (the packet constructor at line 360), but the honest reading is a testing utility rather than a detection check.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> PeyangSuperbAntiCheat does not send status packets for its NPCs; it animates them with teleport and head-rotation packets instead.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S12PacketEntityVelocity/">S12PacketEntityVelocity</a>
 <a class="related-chip" href="../S06PacketUpdateHealth/">S06PacketUpdateHealth</a>

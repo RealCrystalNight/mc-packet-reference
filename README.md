@@ -11,6 +11,8 @@ Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0).
 - Server-Side Handling / Protocol Analysis / Anti-Cheat Landscape callouts
 - Real implementation cases: full module source files cat'd verbatim from the
   reference clients, with AI analysis notes appended after the code
+- Anti-Cheat Checks section: real server-side check code from 50 cloned
+  anticheats (NoCheatPlus, Grim, Kauri, Artemis, Intave, Frequency, NESS...)
 - Search by packet name, ID, or description; filter by direction and state
 - Dark theme, mobile-responsive, static GitHub Pages deployment
 
@@ -19,6 +21,9 @@ Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0).
 - wiki.vg protocol specification
 - Forge JavaDocs (1.8.9)
 - 8 reference client source trees (see `data/mined/` for the grep corpus)
+- 50 cloned open-source anticheats (see
+  `../references/mc-client-sources/anticheats/` + its manifest.json; clone with
+  `scripts/clone-anticheats.sh`, AC_ROOT configurable)
 
 ## Pipeline
 
@@ -29,9 +34,15 @@ The site is generated from layered data. Everything is reproducible:
 #    (sources root configurable: --sources=... or env MC_SOURCES_ROOT)
 python3 scripts/mine-sources.py
 
+# 1b. (Optional) Clone anticheat repos → references/mc-client-sources/anticheats/
+#     then mine them for every packet → data/ac-mined/<id>.txt (AC_ROOT configurable)
+bash ../references/mc-client-sources/anticheats/scripts/clone-anticheats.sh
+python3 scripts/mine-ac.py
+
 # 2. (Content authoring) data/impl/<id>.json — advanced writeups + real code.
 #    Schema: data/impl/SCHEMA.md. Full-file code blocks:
 python3 scripts/make-code-block.py "Rise 5.99" "dev/rise/module/impl/other/PingSpoof.java"
+#    Anti-cheat check data: data/ac/<id>.json — Schema: data/ac/SCHEMA.md
 
 # 3. Verify every impl file against ground truth (found_in + verbatim code diff)
 python3 scripts/verify-impl.py --all
@@ -50,7 +61,10 @@ data/
 ├── packets/<id>.json    # base packet metadata (fields, encoding, MCP)
 ├── impl/<id>.json       # advanced writeup + implementation cases (authored)
 ├── impl/SCHEMA.md       # writeup contract / schema
-└── mined/<id>.txt       # grep corpus: every module referencing the packet
+├── ac/<id>.json         # anti-cheat check data (authored, optional)
+├── ac/SCHEMA.md         # anti-cheat schema
+├── mined/<id>.txt       # grep corpus: every module referencing the packet
+└── ac-mined/<id>.txt    # grep corpus: every anticheat check touching the packet
 ```
 
 `js/packet-data.js` (the search bundle) intentionally strips implementation

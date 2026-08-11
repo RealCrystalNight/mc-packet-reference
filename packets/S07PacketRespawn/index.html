@@ -284,6 +284,619 @@ public class UniversoCraftDisabler extends Mode&lt;Disabler&gt; {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Both disabler modes consume S07 to manage a state machine: WatchdogDisabler flushes on PacketReceiveEvent, UniversoCraftDisabler arms a flag on its send-side listener. The packet is never modified, only observed.</div>
 <div class="impl-clients">Rise 6.x event model: @EventLink listener fields on Mode classes under the Disabler module. The 6.1.30 and 6.2.4 trees are structurally identical (com/alan/clients/...) with the 6.2.4 copy under Client-release2/Client/src/main/java.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The respawn packet is a state-reset command: the world reloads, so every anticheat that keeps per-player state must re-arm it on respawn. Simulation anticheats parse WrapperPlayServerRespawn on the send side and rebuild their player model (Grim, Shard, Artemis), while classic anticheats zero grace timers on PlayerRespawnEvent so freshly respawned players are not flagged by movement and combat checks. The packet itself is never flagged; it is the boundary that makes the checks after it trustworthy.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PacketPlayerRespawn (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Reset the entire simulated player model on respawn and dimension change: positions, ground flags, attributes, entity list and the death-screen state.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The RESPAWN branch wraps the packet as WrapperPlayServerRespawn, invalidates the setback teleport (hasAcceptedSpawnTeleport = false), clears server entity positions on world change, and schedules a real-time task that resets onGround, pose, sprinting, food, known input, the self PacketEntity and the BadPacketsE/G/M/F state. KEEP_TRACKED_DATA and KEEP_ATTRIBUTES flags decide what survives on 1.20.2+; isWorldChange compares world name or dimension type to detect cross-dimension teleports that wipe chunks and entities.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly. It prevents stale movement state (old ground flags, old velocity, old entity ids) from leaking across the respawn boundary, which would poison every downstream check.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketPlayerRespawn.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketPlayerRespawn.java =====
+package ac.grim.grimac.events.packets;
+
+import ac.grim.grimac.GrimAPI;
+import ac.grim.grimac.checks.impl.badpackets.*;
+import ac.grim.grimac.checks.impl.elytra.ElytraC;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.data.KnownInput;
+import ac.grim.grimac.utils.data.SprintingState;
+import ac.grim.grimac.utils.data.TrackerData;
+import ac.grim.grimac.utils.data.packetentity.PacketEntitySelf;
+import ac.grim.grimac.utils.enums.Pose;
+import ac.grim.grimac.utils.math.Vector3dm;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketListenerAbstract;
+import com.github.retrooper.packetevents.event.PacketListenerPriority;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityTypes;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerJoinGame;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerRespawn;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateHealth;
+
+import java.util.Objects;
+
+/**
+ * PlayerRespawnS2CPacket info (1.20.2+):
+ * If the world is different (check via registry key), world is recreated (all entities etc destroyed).
+ * &lt;p&gt;
+ * Client player is ALWAYS recreated
+ * &lt;p&gt;
+ * If the packet has the `KEEP_TRACKED_DATA` flag:
+ * Sneaking and Sprinting fields are kept on the new client player.
+ * &lt;p&gt;
+ * If the packet has the `KEEP_ATTRIBUTES` flag:
+ * Attributes are kept.
+ * &lt;p&gt;
+ * New client player is initialised:
+ * Pose is set to standing.
+ * Velocity is set to zero.
+ * Pitch is set to 0.
+ * Yaw is set to -180.
+ */
+// TODO update for 1.20.2-
+public class PacketPlayerRespawn extends PacketListenerAbstract {
+
+    private static final byte KEEP_ATTRIBUTES = 1;
+    private static final byte KEEP_TRACKED_DATA = 2;
+    private static final byte KEEP_ALL = 3;
+
+    public PacketPlayerRespawn() {
+        super(PacketListenerPriority.HIGH);
+    }
+
+    private boolean hasFlag(WrapperPlayServerRespawn respawn, byte flag) {
+        // This packet was added in 1.16
+        if (flag == KEEP_ATTRIBUTES) {
+            // On versions older than 1.15, via does not keep all attributes.
+            // https://github.com/ViaVersion/ViaVersion/blob/master/common/src/main/java/com/viaversion/viaversion/protocols/v1_15_2to1_16/rewriter/EntityPacketRewriter1_16.java#L124
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_15)) {
+                return false;
+            }
+        } else if (flag == KEEP_TRACKED_DATA) {
+            // But for metadata, via DOES keep all data
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_15)) {
+                return true;
+            }
+        }
+
+        return (respawn.getKeptData() &amp; flag) != 0;
+    }
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.UPDATE_HEALTH) {
+            WrapperPlayServerUpdateHealth health = new WrapperPlayServerUpdateHealth(event);
+
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+            //
+            if (player.packetStateData.lastFood == health.getFood()
+                    &amp;&amp; player.packetStateData.lastHealth == health.getHealth()
+                    &amp;&amp; player.packetStateData.lastSaturation == health.getFoodSaturation()
+                    &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_9))
+                return;
+
+            player.packetStateData.lastFood = health.getFood();
+            player.packetStateData.lastHealth = health.getHealth();
+            player.packetStateData.lastSaturation = health.getFoodSaturation();
+
+            player.sendTransaction();
+
+            if (health.getFood() == 20) { // Split so transaction before packet
+                player.latencyUtils.addRealTimeTask(player.lastTransactionReceived.get(), () -&gt; player.food = 20);
+            } else { // Split so transaction after packet
+                player.latencyUtils.addRealTimeTask(player.lastTransactionReceived.get() + 1, () -&gt; player.food = health.getFood());
+            }
+
+            if (health.getHealth() &lt;= 0) {
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                    player.compensatedEntities.self.isDead = true;
+                    player.checkManager.getCheck(BadPacketsM.class).onDeath();
+                });
+            } else {
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, () -&gt; player.compensatedEntities.self.isDead = false);
+            }
+
+            event.getTasksAfterSend().add(player::sendTransaction);
+        }
+
+        if (event.getPacketType() == PacketType.Play.Server.JOIN_GAME) {
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+
+            WrapperPlayServerJoinGame joinGame = new WrapperPlayServerJoinGame(event);
+            player.gamemode = joinGame.getGameMode();
+            player.entityID = joinGame.getEntityId();
+            player.dimensionType = joinGame.getDimensionType();
+            player.worldName = joinGame.getWorldName();
+
+            if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_15)
+                    &amp;&amp; event.getServerVersion().isNewerThanOrEquals(ServerVersion.V_1_15)) {
+                player.packetStateData.showsDeathScreen = joinGame.isRespawnScreenEnabled();
+            }
+
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_17))
+                return;
+            player.compensatedWorld.setDimension(joinGame.getDimensionType(), event.getUser());
+        }
+
+        if (event.getPacketType() == PacketType.Play.Server.RESPAWN) {
+            WrapperPlayServerRespawn respawn = new WrapperPlayServerRespawn(event);
+
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+
+            player.sendTransaction();
+            event.getTasksAfterSend().add(player::sendTransaction);
+
+            // Force the player to accept a teleport before respawning
+            // (We won't process movements until they accept a teleport, we won't let movements though either)
+            // Also invalidate previous positions
+            player.getSetbackTeleportUtil().hasAcceptedSpawnTeleport = false;
+            player.getSetbackTeleportUtil().lastKnownGoodPosition = null;
+
+            // clear server entity positions when the world changes
+            if (isWorldChange(player, respawn)) {
+                player.compensatedEntities.serverPositionsMap.clear();
+            }
+
+            player.addRealTimeTaskNow(player.cameraEntity::reset);
+
+            player.addRealTimeTaskNext(() -&gt; {
+                // From 1.16 to 1.19, this doesn't get set to false for whatever reason
+                if (player.getClientVersion().isOlderThan(ClientVersion.V_1_16) || player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_20)) {
+                    player.isSneaking = false;
+                }
+
+                player.lastOnGround = false;
+                player.clientClaimsLastOnGround = false;
+                player.onGround = false;
+                player.isInBed = false;
+                player.packetStateData.setSlowedByUsingItem(false);
+                player.packetStateData.packetPlayerOnGround = false; // If somewhere else pulls last ground to fix other issues
+                player.packetStateData.lastClaimedPosition = new Vector3d();
+                player.filterMojangStupidityOnMojangStupidity.zero();
+
+                player.checkManager.getCheck(BadPacketsM.class).onRespawn();
+
+                final boolean keepTrackedData = this.hasFlag(respawn, KEEP_TRACKED_DATA);
+
+                if (!keepTrackedData) {
+                    player.food = 20;
+                    player.powderSnowFrozenTicks = 0;
+                    player.compensatedEntities.self.hasGravity = true;
+                    player.playerEntityHasGravity = true;
+                    player.packetStateData.knownInput = KnownInput.DEFAULT;
+                    player.checkManager.getCheck(ElytraC.class).exempt = true;
+
+                    // 1.19.4 uses current sprinting, older versions use last sprinting
+                    if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_19_4)) {
+                        player.isSprinting = false;
+                        player.vehicleData.camelSprintingState = SprintingState.STOPPED;
+                    } else {
+                        player.lastSprintingForSpeed = false;
+                    }
+                }
+
+                player.checkManager.getCheck(BadPacketsE.class).handleRespawn(); // Reminder ticks reset
+                player.checkManager.getCheck(BadPacketsG.class).handleRespawn();
+
+                // compensate for immediate respawn gamerule
+                if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_15)) {
+                    player.checkManager.getCheck(BadPacketsF.class).exemptNext = true;
+                }
+
+                // EVERYTHING gets reset on a cross dimensional teleport, clear chunks and entities!
+                if (isWorldChange(player, respawn)) {
+                    player.compensatedEntities.entityMap.clear();
+                    player.compensatedWorld.activePistons.clear();
+                    player.compensatedWorld.openShulkerBoxes.clear();
+                    player.compensatedWorld.chunks.clear();
+                    player.compensatedGeysers.clear();
+                    player.compensatedWorld.isRaining = false;
+                    player.checkManager.getCheck(BadPacketsH.class).onWorldChange();
+                }
+                player.dimensionType = respawn.getDimensionType();
+                player.worldName = respawn.getWorldName().orElse(null);
+
+                player.compensatedEntities.serverPlayerVehicle = null; // All entities get removed on respawn
+                player.compensatedEntities.self = new PacketEntitySelf(player, player.compensatedEntities.self);
+                player.compensatedEntities.selfTrackedEntity = new TrackerData(0, 0, 0, 0, 0, EntityTypes.PLAYER, player.lastTransactionSent.get());
+
+                player.cameraEntity.reset();
+
+                if (player.getClientVersion().isOlderThan(ClientVersion.V_1_14)) { // 1.14+ players send a packet for this, listen for it instead
+                    player.isSprinting = false;
+                    player.vehicleData.camelSprintingState = SprintingState.STOPPED;
+                    player.checkManager.getCheck(BadPacketsF.class).lastSprinting = false; // Pre 1.14 clients set this to false when creating new entity
+                    // TODO: What the fuck viaversion, why do you throw out keep all metadata?
+                    // The server doesn't even use it... what do we do?
+                    player.compensatedEntities.hasSprintingAttributeEnabled = false;
+                }
+                player.pose = Pose.STANDING;
+                if (!keepTrackedData || player.getClientVersion().isOlderThan(ClientVersion.V_1_21_2)) {
+                    player.clientVelocity = new Vector3dm();
+                }
+                if (!GrimAPI.INSTANCE.getSpectateManager().isSpectating(player.uuid)) {
+                    player.gamemode = respawn.getGameMode();
+                }
+                if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_17)) {
+                    player.compensatedWorld.setDimension(respawn.getDimensionType(), event.getUser());
+                }
+
+                if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_16) &amp;&amp; !this.hasFlag(respawn, KEEP_ATTRIBUTES)) {
+                    // Reset attributes if not kept
+                    player.compensatedEntities.self.resetAttributes();
+                    player.compensatedEntities.hasSprintingAttributeEnabled = false;
+                }
+            });
+        }
+    }
+
+    private boolean isWorldChange(GrimPlayer player, WrapperPlayServerRespawn respawn) {
+        if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_16) &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isNewerThan(ServerVersion.V_1_16)) {
+            return !Objects.equals(respawn.getWorldName().orElse(null), player.worldName);
+        }
+
+        ClientVersion version = PacketEvents.getAPI().getServerManager().getVersion().toClientVersion();
+        return respawn.getDimensionType().getId(version) != player.dimensionType.getId(version)
+                || !Objects.equals(respawn.getDimensionType().getName(), player.dimensionType.getName());
+    }
+}
+
+// NOTE (AI): The RESPAWN branch is lines 133-243. BadPacketsE and BadPacketsG handleRespawn calls are the reminder-tick and repeat-packet resets; BadPacketsM.onRespawn clears death-buffer state, and BadPacketsF.exemptNext covers the immediate-respawn gamerule.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Shard's handleRespawn clears compensatedEntities only; Artemis stamps lastRespawn in MiscellaneousPreProcessor and sets respawnTicks (150) in EmulatorPreProcessor; Kauri resets its lastRespawn TickTimer in PacketHandler; NCP re-inits moving data through dataOnJoin with the joinOrRespawn flag.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Respawn pre-processing (Artemis)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Stamp the respawn moment and clear inventory and vehicle state so every check can exempt the respawn window.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">fastHandle runs on the packet thread: GPacketPlayServerRespawn schedules a transaction-confirmed action that calls setLastRespawn(packet.getTimestamp()), closes the inventory state and drops the predicted vehicle. ExemptType.RESPAWN then exempts checks while lastRespawn is under three seconds or respawnTicks is positive, and MovementPreProcessor decrements respawnTicks each tick. The same timestamp is also set from the client's C16 PERFORM_RESPAWN command.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing on its own; the mechanism is exemption bookkeeping. The dedicated DisablerRespawn check uses the respawn domain to catch clients that abuse the respawn window, while AimIdentical and BadPacketsN read respawnTicks to skip false positives.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/miscellaneous/MiscellaneousPreProcessor.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/miscellaneous/MiscellaneousPreProcessor.java =====
+package ac.artemis.core.v4.processor.miscellaneous;
+
+import ac.artemis.core.v4.check.FastProcessHandler;
+import ac.artemis.core.v4.data.PlayerData;
+import ac.artemis.core.v4.data.holders.ConnectionHolder;
+import ac.artemis.core.v4.nms.NMSManager;
+import ac.artemis.core.v4.processor.AbstractHandler;
+import ac.artemis.core.v4.utils.function.PacketAction;
+import cc.ghast.packet.PacketAPI;
+import cc.ghast.packet.wrapper.mc.PlayerEnums;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientClientCommand;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientWindowClose;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientHeldItemSlot;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientTransaction;
+import cc.ghast.packet.wrapper.packet.play.server.*;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+
+/**
+ * @author Ghast
+ * @since 06-Mar-20
+ */
+public class MiscellaneousPreProcessor extends AbstractHandler implements FastProcessHandler {
+
+    public MiscellaneousPreProcessor(PlayerData data) {
+        super("Misc [0x01]", data);
+    }
+
+    @Override
+    public void handle(final GPacket packet) {
+        long now = System.currentTimeMillis();
+        if (packet instanceof GPacketPlayClientHeldItemSlot) {
+            data.user.usingItem = false;
+        }
+
+        else if (packet instanceof GPacketPlayClientClientCommand) {
+            final GPacketPlayClientClientCommand cmd = (GPacketPlayClientClientCommand) packet;
+            if (cmd.getCommand().equals(PlayerEnums.ClientCommand.PERFORM_RESPAWN)) {
+                data.user.setLastRespawn(packet.getTimestamp());
+                data.prediction.setVehicle(null);
+            }
+        }
+
+        else if (packet instanceof GPacketPlayClientTransaction) {
+            final GPacketPlayClientTransaction trx = (GPacketPlayClientTransaction) packet;
+            if (!trx.isAccepted()) {
+                //data.user.setInventoryOpen(true);
+            }
+        }
+
+        else if (packet instanceof GPacketPlayClientWindowClose) {
+            data.user.setInventoryOpen(false);
+        }
+
+
+
+        /*else if (packet instanceof GPacketPlayServerEntityTeleport) {
+            final GPacketPlayServerEntityTeleport tp = (GPacketPlayServerEntityTeleport) packet;
+
+            if (data.prediction.getVehicle() != null &amp;&amp;
+                    (tp.getEntityId() == data.getPlayer().getEntityId() || tp.getEntityId() == data.prediction.getVehicle().getEntityId())) {
+                data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                    @Override
+                    public void pre() {
+                        data.prediction.setVehicle(null);
+                    }
+                });
+            }
+        }*/
+
+        /*else if (packet instanceof GPacketPlayServerPosition) {
+            if (data.prediction.getVehicle() != null) {
+                data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                    @Override
+                    public void pre() {
+                        data.prediction.setVehicle(null);
+                    }
+                });
+            }
+        }*/
+
+        data.timing.miscTiming.addTime(now, System.currentTimeMillis());
+    }
+
+    @Override
+    public void fastHandle(GPacket packet) {
+        if (packet instanceof GPacketPlayServerRespawn) {
+            data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                @Override
+                public void pre() {
+                    data.user.setLastRespawn(packet.getTimestamp());
+                    data.user.setInventoryOpen(false);
+                    data.prediction.setVehicle(null);
+                }
+            });
+        }
+
+        else if (packet instanceof GPacketPlayServerWindowClose) {
+            data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                @Override
+                public void pre() {
+                    data.user.setInventoryOpen(false);
+                }
+            });
+        }
+
+        else if (packet instanceof GPacketPlayServerEntityAttach) {
+            final GPacketPlayServerEntityAttach attach = (GPacketPlayServerEntityAttach) packet;
+
+            if (attach.getEntityId() == data.getPlayer().getEntityId()) {
+                data.connection.confirmFunctionAndTick(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                    @Override
+                    public void pre() {
+                        data.prediction.setVehicle(NMSManager.getInms().getEntity(data.getPlayer().getWorld(), attach.getVehicleId()));
+                        if (data.prediction.getVehicle() == null) {
+                            data.resetMotion();
+                        }
+                    }
+                });
+            }
+        }
+
+        else if (packet instanceof GPacketPlayServerEntityDestroy) {
+            final GPacketPlayServerEntityDestroy dtr = (GPacketPlayServerEntityDestroy) packet;
+
+            final boolean flag = data.prediction.getVehicle() != null
+                    &amp;&amp; Arrays.stream(dtr.getEntities()).anyMatch(e -&gt; data.prediction.getVehicle().getEntityId() == e);
+            if (flag) {
+                data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                    @Override
+                    public void pre() {
+                        data.prediction.setVehicle(null);
+                        data.resetMotion();
+                    }
+                });
+            }
+        }
+
+        else if (packet instanceof GPacketPlayServerBed) {
+            final GPacketPlayServerBed bed = (GPacketPlayServerBed) packet;
+
+            if (bed.getPlayerID() == data.getPlayer().getEntityId()) {
+                data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                    @Override
+                    public void pre() {
+                        data.prediction.setVehicle(null);
+                        data.resetMotion();
+                    }
+                });
+            }
+        }
+    }
+}
+
+// NOTE (AI): The respawn branch is fastHandle lines 89-98, transaction-confirmed so the timestamp applies only after the client acknowledges. EmulatorPreProcessor (lines 616-633) mirrors it by setting movement.respawnTicks to 150 on the same packet.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim and Shard reset state on the packet directly; SalmonAC and FlopAC keep tick counters instead of wall-clock stamps; Kauri uses a TickTimer reset from WrapperPlayServerRespawn in its PacketHandler.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Respawn-tick exemption (SalmonAC)</span>
+<span class="impl-module-clients">(ch1ck3n-ovo-SalmonAC)</span>
+</div>
+<p class="impl-pattern">Zero the per-player respawnTick on respawn so every movement and combat check skips the respawn window.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PlayerEventListener.onRespawn (PlayerRespawnEvent) sets salmonPlayer.respawnTick = 0, and the counter increments in SalmonPlayer. Checks then bail early while the tick is under their threshold, from 20 ticks (ReachA, CriticalA, SpeedCode) to 60 ticks (TimerC, Invalid0A, JesusC). The same listener registers players on PlayerJoinEvent and zeroes respawnTick on join too.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly: it is an exemption counter, and the corpus hits are the getRespawnTick() guards inside roughly 40 checks.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ch1ck3n-ovo-SalmonAC — src/main/java/com/ch1ck3n/salmonac/events/PlayerEventListener.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ch1ck3n-ovo-SalmonAC — src/main/java/com/ch1ck3n/salmonac/events/PlayerEventListener.java =====
+package com.ch1ck3n.salmonac.events;
+
+import com.ch1ck3n.salmonac.SalmonAC;
+import com.ch1ck3n.salmonac.utils.SalmonPlayer;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.*;
+
+public class PlayerEventListener implements Listener {
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e){
+        SalmonAC.getInstance().getPlayerManager().registerPlayer( e.getPlayer() );
+        SalmonPlayer salmonPlayer = getCustomPlayer(e.getPlayer());
+        salmonPlayer.respawnTick = 0;
+    }
+
+    @EventHandler
+    public void onJoin(PlayerQuitEvent e){
+        SalmonAC.getInstance().getPlayerManager().unregisterPlayer( e.getPlayer() );
+    }
+
+    @EventHandler
+    public void onSwing(PlayerAnimationEvent e) {
+        if( e.getAnimationType() == PlayerAnimationType.ARM_SWING ){
+            SalmonPlayer salmonPlayer = getCustomPlayer(e.getPlayer());
+            if (salmonPlayer == null) return;
+
+            salmonPlayer.swingTick = 0;
+//            salmonPlayer.lastSwingDelay = salmonPlayer.getSwingDelay();
+//            salmonPlayer.swingDelay = System.currentTimeMillis() - salmonPlayer.getLastSwingTime();
+//            salmonPlayer.lastSwingTime = salmonPlayer.getSwingTime();
+//            salmonPlayer.swingTime = System.currentTimeMillis();
+        }
+    }
+
+    @EventHandler
+    public void onItemChange(PlayerItemHeldEvent e) {
+        SalmonPlayer salmonPlayer = getCustomPlayer(e.getPlayer());
+        if (salmonPlayer == null) return;
+
+        salmonPlayer.itemChangeTick = 0;
+    }
+
+    @EventHandler
+    public void onMove(PlayerMoveEvent e) {
+        SalmonPlayer salmonPlayer = getCustomPlayer(e.getPlayer());
+        if (salmonPlayer == null) return;
+
+        if ( salmonPlayer.doSetBack() ) {
+            e.setTo(e.getFrom());
+            salmonPlayer.setBackTick = 0;
+            salmonPlayer.setBack = false;
+        }
+    }
+
+    @EventHandler
+    public void onRespawn(PlayerRespawnEvent e) {
+        SalmonPlayer salmonPlayer = getCustomPlayer(e.getPlayer());
+        if (salmonPlayer == null) return;
+
+        salmonPlayer.respawnTick = 0;
+    }
+
+    @EventHandler
+    public void onTeleport(PlayerTeleportEvent e) {
+        SalmonPlayer salmonPlayer = getCustomPlayer(e.getPlayer());
+        if ( salmonPlayer == null || salmonPlayer.doSetBack() ) return;
+
+        salmonPlayer.teleportTick = 0;
+    }
+
+    @EventHandler
+    public void onVelocity(PlayerVelocityEvent e) {
+        SalmonPlayer salmonPlayer = SalmonAC.getInstance().getPlayerManager().getPlayer( e.getPlayer() );
+        if( salmonPlayer == null ) return;
+
+        salmonPlayer.velocityX = e.getVelocity().getX();
+        salmonPlayer.velocityY = e.getVelocity().getY();
+        salmonPlayer.velocityZ = e.getVelocity().getZ();
+        salmonPlayer.velocityH = Math.hypot(salmonPlayer.velocityX, salmonPlayer.velocityZ);
+        salmonPlayer.velocityTick = 0;
+    }
+
+    public SalmonPlayer getCustomPlayer(Player player){
+        return SalmonAC.getInstance().getPlayerManager().getPlayer( player );
+    }
+}
+
+// NOTE (AI): SalmonAC hooks the Bukkit event, not the packet: PlayerRespawnEvent fires when the respawn position is set, which is the same world-reload moment the S07 packet causes. The respawnTick field is read by every check through SalmonPlayer.getRespawnTick.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> FlopAC guards with a respawnTimer.hasNotPassed(20) inside BadPacketsC, SpeedA/B and SprintA/B; LightAntiCheat keeps cache.lastRespawn in milliseconds and skips checks within 500 ms of respawn; ThotPatrol and Daedalus reset latency data on PlayerRespawnEvent.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Respawn-window exemption (FlopAC)</span>
+<span class="impl-module-clients">(JTXOfficial-FlopAC)</span>
+</div>
+<p class="impl-pattern">Skip the bad-packets teleport check while the player is still inside the respawn grace window.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">BadPacketsC watches the flying packet family and flags an invalid teleport when the client's horizontal delta exceeds the server-position speed. The exemption list includes getRespawnTimer().hasNotPassed(20), so a respawned player's first 20 ticks are never evaluated. The timer is armed from the respawn path in the action processor; the tinyprotocol WrappedOutRespawnPacket wrapper is the packet-side representation.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing on its own; the guard prevents false flags for players that legitimately teleport into the world after respawn.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> JTXOfficial-FlopAC — src/main/java/me/jtx/flopac/checks/misc/badpackets/BadPacketsC.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: JTXOfficial-FlopAC — src/main/java/me/jtx/flopac/checks/misc/badpackets/BadPacketsC.java =====
+package me.jtx.flopac.checks.misc.badpackets;
+
+import me.jtx.flopac.base.check.api.Check;
+import me.jtx.flopac.base.check.api.CheckInformation;
+import me.jtx.flopac.base.event.PacketEvent;
+import me.jtx.flopac.base.user.User;
+import me.jtx.flopac.tinyprotocol.api.Packet;
+
+@CheckInformation(checkName = "BadPackets", checkType = "C", punishmentVL = 2)
+public class BadPacketsC extends Check {
+
+    private double threshold;
+
+    @Override
+    public void onPacket(PacketEvent event) {
+        switch (event.getType()) {
+            case Packet.Client.FLYING:
+            case Packet.Client.LOOK:
+            case Packet.Client.POSITION_LOOK:
+            case Packet.Client.POSITION: {
+
+                User user = event.getUser();
+
+                if (user.shouldCancel()
+                        || user.getTick() &lt; 60
+                        || user.getLastTeleportTimer().hasNotPassed(20)
+                        || user.getActionProcessor().getRespawnTimer().hasNotPassed(20)
+                        || user.getBlockData().pistonTicks &gt; 0
+                        || user.getActionProcessor().getRespawnTimer().hasNotPassed(20)
+                        || user.getPlayer().isDead()
+                        || user.getGhostBlockProcessor().getGhostBlockTeleportTimer().hasNotPassed(20)
+                        || user.getVehicleTimer().hasNotPassed(20)) {
+                    threshold = 0;
+                    return;
+                }
+
+                double deltaXZ = user.getMovementProcessor().getDeltaXZ();
+
+                double maxSpeed = user.getMovementProcessor().getServerPositionSpeed();
+
+                if (user.getActionProcessor().getServerPositionTimer().hasNotPassed(5)) {
+
+                    double delta = Math.abs(deltaXZ - maxSpeed);
+
+                    if (delta &gt; 0.8) {
+                        if (threshold++ &gt; 3) {
+                            flag(user, "Invalid teleport");
+                        }
+                    } else {
+                        threshold -= Math.min(threshold, 0.002);
+                    }
+                } else {
+                    threshold -= Math.min(threshold, 0.002);
+                }
+                break;
+            }
+        }
+    }
+}
+
+// NOTE (AI): The respawn guard appears twice in the same exemption chain (lines 27 and 29), which suggests a merged exemption list; the check is otherwise a plain delta-versus-server-speed teleport check.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> SalmonAC's respawnTick and LightAntiCheat's lastRespawn cache are the same grace-window idea; Grim instead resets the whole simulation and keeps checks active, trusting the reset rather than an exemption window.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../C0FPacketConfirmTransaction/">C0FPacketConfirmTransaction</a>
 <a class="related-chip" href="../S32PacketConfirmTransaction/">S32PacketConfirmTransaction</a>

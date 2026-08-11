@@ -104,6 +104,1525 @@
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">No module in the 8 clients registers a receive handler for S22. The only non-vanilla reference is the NetworkAPI class table entry in Rise 6.1.30 and 6.2.4.</div>
 <div class="impl-clients">All 8 clients keep the vanilla handler. Rise 6.x adds the NetworkAPI registration; Memeware, Nekoware, Sigma, Spicy and Tenacity differ only by vanilla source revision.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S22 batches up to 4096 block changes into one chunk-section update, the form the server uses for explosions, pistons and large world edits. Server-side anticheats treat it as a compensated-world mutation: the changed blocks must be applied to the replicated cache before any movement or visibility check runs, otherwise phase, scaffold and ray-trace checks would judge the player against a stale world. The corpus for S22 is the block-change pipeline (Grim CompensatedWorld, NCP BlockChangeTracker and BlockChangeListener, Hydro WorldTracker, Kauri BlockUpdateHandler, Intave MultiBlockChangeReader), all feeding the same cache that xray and phase detection query.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BlockChangeTracker and BlockChangeListener (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">Compensated block cache: record every server block change, including S22 multi-block updates, with validity intervals so movement checks can tell whether a block existed at the time the player used it.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">BlockChangeListener registers Bukkit events (piston extend and retract, redstone, entity block change, block form, player interact) and forwards each change into BlockChangeTracker.addBlockChange with a change id, tick and direction. The tracker stores per-coordinate linked lists of BlockChangeEntry objects that expire by tick; movement checks (SurvivalFly, Passable, Visible) query getBlockChangeEntry and matchBlockChange with a BlockChangeReference to test whether the block was solid at the player's position at move time.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Feeds ground and passable decisions; prevents false flags when a block was legitimately changed by an explosion or piston between the client's view and the server's world.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/compat/blocks/changetracker/BlockChangeListener.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/compat/blocks/changetracker/BlockChangeListener.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.compat.blocks.changetracker;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
+import org.bukkit.block.data.Bisected.Half;
+import org.bukkit.block.data.BlockData;
+import org.bukkit.event.Event.Result;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.*;
+import org.bukkit.event.entity.EntityChangeBlockEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.material.Directional;
+import org.bukkit.material.Door;
+import org.bukkit.material.MaterialData;
+
+import fr.neatmonster.nocheatplus.NCPAPIProvider;
+import fr.neatmonster.nocheatplus.compat.bukkit.BridgeMaterial;
+import fr.neatmonster.nocheatplus.compat.versions.ServerVersion;
+import fr.neatmonster.nocheatplus.components.NoCheatPlusAPI;
+import fr.neatmonster.nocheatplus.components.registry.order.RegistrationOrder.RegisterMethodWithOrder;
+import fr.neatmonster.nocheatplus.event.mini.MiniListener;
+import fr.neatmonster.nocheatplus.logging.Streams;
+import fr.neatmonster.nocheatplus.utilities.ReflectionUtil;
+import fr.neatmonster.nocheatplus.utilities.map.BlockFlags;
+import fr.neatmonster.nocheatplus.utilities.map.BlockProperties;
+import fr.neatmonster.nocheatplus.utilities.map.BlockProperties.ToolProps;
+import fr.neatmonster.nocheatplus.utilities.map.BlockProperties.ToolType;
+
+
+public class BlockChangeListener implements Listener {
+
+    // TODO: Fine grained configurability (also switch flag in MovingListener to a sub-config).
+    // TODO: Coarse player activity filter?
+    public final boolean is1_13 = ServerVersion.compareMinecraftVersion("1.13") &gt;= 0;
+    public final boolean is1_9 = ServerVersion.compareMinecraftVersion("1.9") &gt;= 0;
+
+    /** These blocks certainly can't be pushed nor pulled. */
+    public static long F_MOVABLE_IGNORE = BlockFlags.F_LIQUID;
+    /** These blocks might be pushed or pulled. */
+    public static long F_MOVABLE = BlockFlags.F_GROUND | BlockFlags.F_SOLID;
+
+    private final BlockChangeTracker tracker;
+    private final boolean retractHasBlocks;
+    private boolean enabled = true;
+
+    /** Default tag for listeners. */
+    private final String defaultTag = "system.nocheatplus.blockchangetracker";
+
+    /** Properties by dirt block type.*/
+    protected final Map&lt;Material, ToolType&gt; dirtblocks = init();
+
+    /**
+     * NOTE: Using MiniListenerWithOrder (and @Override before @EventHandler)
+     * would make the registry attempt to register with Bukkit for 'Object'.
+     */
+    private final MiniListener&lt;?&gt;[] miniListeners = new MiniListener&lt;?&gt;[] {
+        new MiniListener&lt;BlockRedstoneEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(BlockRedstoneEvent event) {
+                if (enabled) {
+                    onBlockRedstone(event);
+                }
+            }
+        },
+        new MiniListener&lt;EntityChangeBlockEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(EntityChangeBlockEvent event) {
+                if (enabled) {
+                    onEntityChangeBlock(event);
+                }
+            }
+        },
+        new MiniListener&lt;BlockPistonExtendEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(BlockPistonExtendEvent event) {
+                if (enabled) {
+                    onPistonExtend(event);
+                }
+            }
+        },
+        new MiniListener&lt;BlockPistonRetractEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(BlockPistonRetractEvent event) {
+                if (enabled) {
+                    onPistonRetract(event);
+                }
+            }
+        },
+        new MiniListener&lt;PlayerInteractEvent&gt;() {
+            // Include cancelled events, due to the use-block part.
+            @EventHandler(ignoreCancelled = false, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(PlayerInteractEvent event) {
+                if (enabled) {
+                    onPlayerInteract(event);
+                }
+            }
+        },
+        new MiniListener&lt;BlockFormEvent&gt;() {
+            @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+            @RegisterMethodWithOrder(tag = defaultTag)
+            @Override
+            public void onEvent(BlockFormEvent event) {
+                if (enabled) {
+                    onBlockForm(event);
+                }
+            }
+        }
+        //        @EventHandler(ignoreCancelled = true, priority = EventPriority.MONITOR)
+        //        public void onBlockPhysics (final BlockPhysicsEvent event) {
+        //            if (!enabled) {
+        //                return;
+        //            }
+        //            // TODO: Fine grained enabling state (pistons, doors, other).
+        //            final Block block = event.getBlock();
+        //            if (block == null || !physicsMaterials.contains(block.getType())) {
+        //                return;
+        //            }
+        //            // TODO: MaterialData -&gt; Door, upper/lower half needed ?
+        //            tracker.addBlocks(block); // TODO: Skip too fast changing states?
+        //            DebugUtil.debug("BlockPhysics: " + block); // TODO: REMOVE
+        //        }
+    };
+
+    public BlockChangeListener(final BlockChangeTracker tracker) {
+        this.tracker = tracker;
+        if (ReflectionUtil.getMethodNoArgs(BlockPistonRetractEvent.class, "getBlocks") == null) {
+            retractHasBlocks = false;
+            NCPAPIProvider.getNoCheatPlusAPI().getLogManager().info(Streams.STATUS, "Assume legacy piston behavior.");
+        }
+        else {
+            retractHasBlocks = true;
+        }
+    }
+
+    private Map&lt;Material, ToolType&gt; init() {
+        Map&lt;Material, ToolType&gt; blocks = new HashMap&lt;Material, ToolType&gt;();
+        blocks.put(BridgeMaterial.GRASS_BLOCK, ToolType.HOE);
+        blocks.put(Material.DIRT, ToolType.HOE);
+        if (is1_13) {
+            blocks.put(Material.COARSE_DIRT, ToolType.SPADE);
+            blocks.put(Material.PODZOL, ToolType.SPADE);
+        }
+        if (ServerVersion.compareMinecraftVersion("1.17") &gt;= 0) {
+            blocks.put(Material.ROOTED_DIRT, ToolType.SPADE);
+        }
+        return blocks;
+    }
+
+    /**
+     * Register actual listener(s).
+     */
+    public void register() {
+        // TODO: Replace 'if (enabled)' by actually unregistering the listeners.
+        final NoCheatPlusAPI api = NCPAPIProvider.getNoCheatPlusAPI();
+        for (final MiniListener&lt;?&gt; listener : miniListeners) {
+            api.addComponent(listener);
+        }
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    private BlockFace getDirection(final Block pistonBlock) {
+        // TODO: Register/store a fetcher thing (DirectionalFromBlock)
+        if (is1_13) {
+            final BlockData data = pistonBlock.getState().getBlockData();
+            if (data instanceof org.bukkit.block.data.Directional) {
+                org.bukkit.block.data.Directional directional = (org.bukkit.block.data.Directional) data;
+                return directional.getFacing();
+            }
+            return null;
+        }
+        final MaterialData data = pistonBlock.getState().getData();
+        if (data instanceof Directional) {
+            Directional directional = (Directional) data;
+            return directional.getFacing();
+        }
+        return null;
+    }
+
+    /**
+     * Get the direction, in which blocks are or would be moved (towards the piston).
+     * 
+     * @param pistonBlock
+     * @param eventDirection
+     * @return
+     */
+    private BlockFace getRetractDirection(final Block pistonBlock, final BlockFace eventDirection) {
+        // Tested for pistons directed upwards.
+        // TODO: Test for pistons directed downwards, N, W, S, E.
+        // TODO: distinguish sticky vs. not sticky.
+        final BlockFace pistonDirection = getDirection(pistonBlock);
+        if (pistonDirection == null) {
+            return eventDirection;
+        }
+        else {
+            return eventDirection.getOppositeFace();
+        }
+    }
+
+    private void onPistonExtend(final BlockPistonExtendEvent event) {
+        final BlockFace direction = event.getDirection();
+        tracker.addPistonBlocks(event.getBlock().getRelative(direction), direction, event.getBlocks());
+    }
+
+    private void onPistonRetract(final BlockPistonRetractEvent event) {
+        final List&lt;Block&gt; blocks;
+        if (retractHasBlocks) {
+            blocks = event.getBlocks();
+        }
+        else {
+            @SuppressWarnings("deprecation")
+            final Location retLoc = event.getRetractLocation();
+            if (retLoc == null) {
+                blocks = null;
+            }
+            else {
+                final Block retBlock = retLoc.getBlock();
+                final long flags = BlockFlags.getBlockFlags(retBlock.getType());
+                if ((flags &amp; F_MOVABLE_IGNORE) == 0L &amp;&amp; (flags &amp; F_MOVABLE) != 0L) {
+                    blocks = new ArrayList&lt;Block&gt;(1);
+                    blocks.add(retBlock);
+                }
+                else {
+                    blocks = null;
+                }
+            }
+        }
+        // TODO: Special cases (don't push upwards on retract, with the resulting location being a solid block).
+        final Block pistonBlock = event.getBlock();
+        final BlockFace direction = getRetractDirection(pistonBlock, event.getDirection());
+        tracker.addPistonBlocks(pistonBlock.getRelative(direction.getOppositeFace()), direction, blocks);
+    }
+
+    private void onBlockRedstone(final BlockRedstoneEvent event) {
+        final int oldCurrent = event.getOldCurrent();
+        final int newCurrent = event.getNewCurrent();
+        if (oldCurrent == newCurrent || oldCurrent &gt; 0 &amp;&amp; newCurrent &gt; 0) {
+            return;
+        }
+        // TODO: Fine grained enabling state (pistons, doors, other).
+        final Block block = event.getBlock();
+        // TODO: Abstract method for a block and a set of materials (redstone, interact, ...).
+        if (block == null 
+            || (BlockFlags.getBlockFlags(block.getType()) &amp; BlockFlags.F_VARIABLE_REDSTONE) == 0) {
+            return;
+        }
+        addRedstoneBlock(block);
+    }
+
+    private void addRedstoneBlock(final Block block) {
+        addBlockWithAttachedPotential(block, BlockFlags.F_VARIABLE_REDSTONE);
+    }
+
+    private void onEntityChangeBlock(final EntityChangeBlockEvent event) {
+        final Block block = event.getBlock();
+        if (block != null) {
+            tracker.addBlocks(block); // E.g. falling blocks like sand.
+        }
+    }
+
+    private void onPlayerInteract(final PlayerInteractEvent event) {
+        // Check preconditions.
+        final org.bukkit.event.block.Action action = event.getAction();
+        if (action == org.bukkit.event.block.Action.RIGHT_CLICK_BLOCK) {
+            onRightClickBlock(event);
+        }
+        else if (!event.isCancelled()) {
+            if (action == org.bukkit.event.block.Action.PHYSICAL) {
+                onInteractPhysical(event);
+            }
+        }
+    }
+
+    private void onInteractPhysical(final PlayerInteractEvent event) {
+        final Block block = event.getClickedBlock();
+        if (block != null) {
+            final Material type = block.getType();
+            // TODO: Consider a flag.
+            if (type == BridgeMaterial.FARMLAND) {
+                tracker.addBlocks(block);
+            }
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private void onRightClickBlock(final PlayerInteractEvent event) {
+        final Result result = event.useInteractedBlock();
+        if ((result == Result.ALLOW 
+            || result == Result.DEFAULT &amp;&amp; !event.isCancelled())) {
+            final Block block = event.getClickedBlock();
+            if (block != null) {
+                final Material type = block.getType();
+                // Dirt
+                final ToolType blocktool = dirtblocks.get(type);
+                if (blocktool != null) {
+                    final ToolProps tool = BlockProperties.getToolProps(event.getItem());
+                    if (is1_13) {
+                        if (tool.toolType == ToolType.SPADE 
+                            || blocktool == tool.toolType) {
+                            tracker.addBlocks(block);
+                        }
+                    } 
+                    else {
+                        final boolean defdata = block.getData() == 0;
+                        if (is1_9 &amp;&amp; type == BridgeMaterial.GRASS_BLOCK &amp;&amp; tool.toolType == ToolType.SPADE 
+                            || defdata &amp;&amp; tool.toolType == ToolType.HOE) {
+                            tracker.addBlocks(block);
+                        }
+                    }
+                }
+
+                if ((BlockFlags.getBlockFlags(type) &amp; BlockFlags.F_VARIABLE_USE) != 0L) {
+                    addBlockWithAttachedPotential(block, BlockFlags.F_VARIABLE_USE);
+                }
+            }
+        }
+    }
+
+    private void onBlockForm(final BlockFormEvent event) {
+        final Block block = event.getBlock();
+        if (block != null) {
+            // TODO: Filter by player activity.
+            tracker.addBlocks(block);
+        }
+    }
+
+    /**
+     * Add a past state for this block, extending for the other block in case of
+     * doors. This is for the case of interaction or redstone level change.
+     * 
+     * @param block
+     * @param relevantFlags
+     */
+    private void addBlockWithAttachedPotential(final Block block, final long relevantFlags) {
+        if (is1_13) {
+            final BlockData data = block.getState().getBlockData();
+            if (data instanceof org.bukkit.block.data.type.Door) {
+                org.bukkit.block.data.type.Door door = (org.bukkit.block.data.type.Door) data;
+                final Block otherBlock = block.getRelative(door.getHalf() == Half.TOP ? BlockFace.DOWN : BlockFace.UP);
+                /*
+                 * TODO: In case of redstone: Double doors... detect those too? Is it still more
+                 * efficient than using BlockPhysics with lazy delayed updating
+                 * (TickListener...). Hinge corner... possibilities?
+                 */
+                if (otherBlock != null // Top of the map / special case.
+                    &amp;&amp; (BlockFlags.getBlockFlags(otherBlock.getType()) &amp; relevantFlags) != 0) {
+                    tracker.addBlocks(block, otherBlock);
+                    return;
+                }
+            }
+        } 
+        // Legacy
+        else {
+            final MaterialData materialData = block.getState().getData();
+            if (materialData instanceof Door) {
+                final Door door = (Door) materialData;
+                final Block otherBlock = block.getRelative(door.isTopHalf() ? BlockFace.DOWN : BlockFace.UP);
+                /*
+                 * TODO: In case of redstone: Double doors... detect those too? Is it still more
+                 * efficient than using BlockPhysics with lazy delayed updating
+                 * (TickListener...). Hinge corner... possibilities?
+                 */
+                if (otherBlock != null // Top of the map / special case.
+                    &amp;&amp; (BlockFlags.getBlockFlags(otherBlock.getType()) &amp; relevantFlags) != 0) {
+                    tracker.addBlocks(block, otherBlock);
+                    return;
+                }
+            }
+        }
+        // Only add the block in question itself.
+        tracker.addBlocks(block);
+    }
+
+}
+// NOTE (AI): The S22 corpus hits include the SurvivalFly and Passable consumption sites (matchBlockChange with Direction.X_NEG and friends); the listener file is the ingestion side of the tracker.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim CompensatedWorld and Hydro WorldTracker are the same compensated cache in modern anticheats; Kauri BlockUpdateHandler applies S22 updates with a keepalive-action queue; Intave MultiBlockChangeReader decodes the packet into positions and block data for its BlockUpdateTracker.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">CompensatedWorld block changes (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Apply S22 multi-block and S23 single-block changes to Grim's compensated world with transaction accuracy.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Block changes from the server, including multi-block-change batches, are queued and applied inside runSafely and applyBlockChanges at the correct transaction point, so the async world matches the client's view when movement simulation reads it; updateBlock writes combined block ids and getBlock and getBlockStateId serve every check that needs a block. Piston and chunk events route into the same cache, and unloaded-chunk regions are tracked for setback logic.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Keeps phase, ground-spoof and scaffold checks honest by presenting the block state the client actually had instead of the server's current state.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/utils/latency/CompensatedWorld.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/utils/latency/CompensatedWorld.java =====
+package ac.grim.grimac.utils.latency;
+
+import ac.grim.grimac.GrimAPI;
+import ac.grim.grimac.api.PacketWorld;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.change.BlockModification;
+import ac.grim.grimac.utils.chunks.Column;
+import ac.grim.grimac.utils.collisions.CollisionData;
+import ac.grim.grimac.utils.collisions.datatypes.SimpleCollisionBox;
+import ac.grim.grimac.utils.data.BlockPrediction;
+import ac.grim.grimac.utils.data.Pair;
+import ac.grim.grimac.utils.data.PistonData;
+import ac.grim.grimac.utils.data.ShulkerData;
+import ac.grim.grimac.utils.data.packetentity.PacketEntity;
+import ac.grim.grimac.utils.data.packetentity.PacketEntityShulker;
+import ac.grim.grimac.utils.math.GrimMath;
+import ac.grim.grimac.utils.math.Vector3dm;
+import ac.grim.grimac.utils.nmsutil.Collisions;
+import ac.grim.grimac.utils.nmsutil.GetBoundingBox;
+import ac.grim.grimac.utils.nmsutil.Materials;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityTypes;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.player.DiggingAction;
+import com.github.retrooper.packetevents.protocol.player.User;
+import com.github.retrooper.packetevents.protocol.world.BlockFace;
+import com.github.retrooper.packetevents.protocol.world.chunk.BaseChunk;
+import com.github.retrooper.packetevents.protocol.world.chunk.TileEntity;
+import com.github.retrooper.packetevents.protocol.world.chunk.impl.v1_16.Chunk_v1_9;
+import com.github.retrooper.packetevents.protocol.world.chunk.impl.v_1_18.Chunk_v1_18;
+import com.github.retrooper.packetevents.protocol.world.chunk.palette.DataPalette;
+import com.github.retrooper.packetevents.protocol.world.chunk.palette.ListPalette;
+import com.github.retrooper.packetevents.protocol.world.chunk.palette.PaletteType;
+import com.github.retrooper.packetevents.protocol.world.chunk.storage.LegacyFlexibleStorage;
+import com.github.retrooper.packetevents.protocol.world.dimension.DimensionType;
+import com.github.retrooper.packetevents.protocol.world.states.WrappedBlockState;
+import com.github.retrooper.packetevents.protocol.world.states.defaulttags.BlockTags;
+import com.github.retrooper.packetevents.protocol.world.states.enums.East;
+import com.github.retrooper.packetevents.protocol.world.states.enums.Half;
+import com.github.retrooper.packetevents.protocol.world.states.enums.North;
+import com.github.retrooper.packetevents.protocol.world.states.enums.South;
+import com.github.retrooper.packetevents.protocol.world.states.enums.West;
+import com.github.retrooper.packetevents.protocol.world.states.type.StateType;
+import com.github.retrooper.packetevents.protocol.world.states.type.StateTypes;
+import com.github.retrooper.packetevents.protocol.world.states.type.StateValue;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.util.Vector3i;
+import com.github.retrooper.packetevents.wrapper.PacketWrapper;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerBlockPlacement;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerDigging;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientUseItem;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Object2ObjectLinkedOpenHashMap;
+import lombok.Getter;
+
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+// Inspired by https://github.com/GeyserMC/Geyser/blob/master/connector/src/main/java/org/geysermc/connector/network/session/cache/ChunkCache.java
+public class CompensatedWorld implements PacketWorld {
+    public static final ClientVersion blockVersion = PacketEvents.getAPI().getServerManager().getVersion().toClientVersion();
+    private static final WrappedBlockState airData = WrappedBlockState.getByGlobalId(blockVersion, 0);
+    public final GrimPlayer player;
+    public final Long2ObjectMap&lt;Column&gt; chunks;
+    // Packet locations for blocks
+    public final Set&lt;PistonData&gt; activePistons = new HashSet&lt;&gt;();
+    public final Set&lt;ShulkerData&gt; openShulkerBoxes = new HashSet&lt;&gt;();
+    // 1.17 with datapacks, and 1.18, have negative world offset values
+    @Getter
+    private int minHeight = 0;
+    @Getter
+    private int maxHeight = 256;
+
+    // When the player changes the blocks, they track what the server thinks the blocks are
+    //
+    // Pair of the block position and the owning list TO the actual block
+    // The owning list is so that this info can be removed when the final list is processed
+    private final Long2ObjectOpenHashMap&lt;BlockPrediction&gt; originalServerBlocks = new Long2ObjectOpenHashMap&lt;&gt;();
+    // Blocks the client changed while placing or breaking blocks
+    private List&lt;Vector3i&gt; currentlyChangedBlocks = new LinkedList&lt;&gt;();
+    private final Int2ObjectMap&lt;List&lt;Vector3i&gt;&gt; serverIsCurrentlyProcessingThesePredictions = new Int2ObjectOpenHashMap&lt;&gt;();
+    private final Object2ObjectLinkedOpenHashMap&lt;Pair&lt;Vector3i, DiggingAction&gt;, Vector3d&gt; unackedActions = new Object2ObjectLinkedOpenHashMap&lt;&gt;();
+    private boolean isCurrentlyPredicting = false;
+    public boolean isRaining = false;
+
+    private final boolean noNegativeBlocks;
+
+    public CompensatedWorld(GrimPlayer player) {
+        this.player = player;
+        chunks = new Long2ObjectOpenHashMap&lt;&gt;(81, 0.5f);
+        noNegativeBlocks = player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_16_4);
+    }
+
+    public void startPredicting() {
+        if (player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_18_2)) return; // No predictions
+        this.isCurrentlyPredicting = true;
+    }
+
+    public void handlePredictionConfirmation(int prediction) {
+        for (Iterator&lt;Int2ObjectMap.Entry&lt;List&lt;Vector3i&gt;&gt;&gt; it = serverIsCurrentlyProcessingThesePredictions.int2ObjectEntrySet().iterator(); it.hasNext(); ) {
+            Map.Entry&lt;Integer, List&lt;Vector3i&gt;&gt; iter = it.next();
+            if (iter.getKey() &lt;= prediction) {
+                applyBlockChanges(iter.getValue());
+                it.remove();
+            } else {
+                break;
+            }
+        }
+    }
+
+    public void handleBlockBreakAck(Vector3i blockPos, int blockState, DiggingAction action, boolean accepted) {
+        if (!accepted || action != DiggingAction.START_DIGGING || !unackedActions.containsKey(new Pair&lt;&gt;(blockPos, action))) {
+            player.sendTransaction(); // This packet actually matters
+            player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                Vector3d playerPos = unackedActions.remove(new Pair&lt;&gt;(blockPos, action));
+                handleAck(blockPos, blockState, playerPos);
+            });
+        } else {
+            unackedActions.remove(new Pair&lt;&gt;(blockPos, action));
+        }
+
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+            while (unackedActions.size() &gt;= 50) {
+                this.unackedActions.removeFirst();
+            }
+        });
+    }
+
+    private void applyBlockChanges(List&lt;Vector3i&gt; toApplyBlocks) {
+        player.sendTransaction();
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; toApplyBlocks.forEach(vector3i -&gt; {
+            BlockPrediction predictionData = originalServerBlocks.get(vector3i.getSerializedPosition());
+
+            // We are the last to care about this prediction, remove it to stop memory leak
+            // Block changes are allowed to execute out of order, because it actually doesn't matter
+            if (predictionData != null &amp;&amp; predictionData.getForBlockUpdate() == toApplyBlocks) {
+                originalServerBlocks.remove(vector3i.getSerializedPosition());
+                handleAck(vector3i, predictionData.getOriginalBlockId(), predictionData.getPlayerPosition());
+            }
+        }));
+    }
+
+    private void handleAck(Vector3i vector3i, int originalBlockId, Vector3d playerPosition) {
+        // If we need to change the world block state
+        if (getBlock(vector3i).getGlobalId() != originalBlockId) {
+            player.blockHistory.add(
+                    new BlockModification(
+                            getBlock(vector3i),
+                            WrappedBlockState.getByGlobalId(originalBlockId),
+                            vector3i,
+                            GrimAPI.INSTANCE.getTickManager().currentTick,
+                            BlockModification.Cause.HANDLE_NETTY_SYNC_TRANSACTION
+                    )
+            );
+            updateBlock(vector3i.getX(), vector3i.getY(), vector3i.getZ(), originalBlockId);
+            WrappedBlockState state = WrappedBlockState.getByGlobalId(blockVersion, originalBlockId);
+
+            // The player will teleport themselves if they get stuck in the reverted block
+            if (playerPosition != null &amp;&amp; CollisionData.getData(state.getType()).getMovementCollisionBox(player, player.getClientVersion(), state, vector3i.getX(), vector3i.getY(), vector3i.getZ()).isIntersected(player.boundingBox)) {
+                player.lastX = player.x;
+                player.lastY = player.y;
+                player.lastZ = player.z;
+                player.x = playerPosition.getX();
+                player.y = playerPosition.getY();
+                player.z = playerPosition.getZ();
+                player.boundingBox = GetBoundingBox.getCollisionBoxForPlayer(player, player.x, player.y, player.z);
+            }
+        }
+    }
+
+    public void handleBlockBreakPrediction(WrapperPlayClientPlayerDigging digging) {
+        // 1.14.4 intentional and correct, do not change it to 1.14
+        if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_14_4) &amp;&amp; player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_18_2)) {
+            unackedActions.put(new Pair&lt;&gt;(digging.getBlockPosition(), digging.getAction()), new Vector3d(player.x, player.y, player.z));
+        }
+    }
+
+    public void stopPredicting(PacketWrapper&lt;?&gt; wrapper) {
+        if (player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_18_2)) return; // No predictions
+        this.isCurrentlyPredicting = false; // We aren't in a block place or use item
+
+        if (this.currentlyChangedBlocks.isEmpty()) return; // Nothing to change
+
+        List&lt;Vector3i&gt; toApplyBlocks = this.currentlyChangedBlocks; // We must now track the client applying the server predicted blocks
+        this.currentlyChangedBlocks = new LinkedList&lt;&gt;(); // Reset variable without changing original
+
+        // We don't need to simulate any packets, it is native to the version we are on
+        if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_19)) {
+            // Pull the confirmation ID out of the packet
+            int confirmationId = 0;
+            if (wrapper instanceof WrapperPlayClientPlayerBlockPlacement playerBlockPlacement) {
+                confirmationId = playerBlockPlacement.getSequence();
+            } else if (wrapper instanceof WrapperPlayClientUseItem useItem) {
+                confirmationId = useItem.getSequence();
+            } else if (wrapper instanceof WrapperPlayClientPlayerDigging playerDigging) {
+                confirmationId = playerDigging.getSequence();
+            }
+
+            serverIsCurrentlyProcessingThesePredictions.put(confirmationId, toApplyBlocks);
+        } else {
+            // ViaVersion is updated and runs tasks with bukkit which is correct
+            // So we must wait for the bukkit thread to start ticking so via can "confirm" it.
+            //
+            // no need to support Folia on this one because Folia is 1.19+ only
+            GrimAPI.INSTANCE.getScheduler().getGlobalRegionScheduler().run(GrimAPI.INSTANCE.getGrimPlugin(), () -&gt; {
+                // And then we jump back to the netty thread to simulate that Via sent the confirmation
+                player.runSafely(() -&gt; applyBlockChanges(toApplyBlocks));
+            });
+        }
+    }
+
+    public static long chunkPositionToLong(int x, int z) {
+        return ((x &amp; 0xFFFFFFFFL) &lt;&lt; 32L) | (z &amp; 0xFFFFFFFFL);
+    }
+
+    public boolean isNearHardEntity(SimpleCollisionBox playerBox) {
+        for (PacketEntity entity : player.compensatedEntities.entityMap.values()) {
+            if ((entity.isBoat || entity.getType() == EntityTypes.SHULKER || entity.isHappyGhast) &amp;&amp; player.compensatedEntities.self.getRiding() != entity) {
+                SimpleCollisionBox box = entity.getPossibleCollisionBoxes();
+                if (box.isIntersected(playerBox)) {
+                    return true;
+                }
+            }
+        }
+
+        // Also block entities
+        for (ShulkerData data : openShulkerBoxes) {
+            SimpleCollisionBox shulkerCollision = data.getCollision();
+            if (playerBox.isCollided(shulkerCollision)) {
+                return true;
+            }
+        }
+
+        // Pistons are a block entity.
+        for (PistonData data : activePistons) {
+            for (SimpleCollisionBox box : data.boxes) {
+                if (playerBox.isCollided(box)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static BaseChunk create() {
+        if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_18)) {
+            return new Chunk_v1_18();
+        } else if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_16)) {
+            return new Chunk_v1_9(0, DataPalette.createForChunk());
+        }
+        return new Chunk_v1_9(0, new DataPalette(new ListPalette(4), new LegacyFlexibleStorage(4, 4096), PaletteType.CHUNK));
+    }
+
+    public void updateBlock(Vector3i pos, WrappedBlockState state) {
+        updateBlock(pos.getX(), pos.getY(), pos.getZ(), state.getGlobalId());
+    }
+
+    public void updateBlock(int x, int y, int z, int combinedID) {
+        Vector3i asVector = new Vector3i(x, y, z);
+        BlockPrediction prediction = originalServerBlocks.get(asVector.getSerializedPosition());
+
+        if (isCurrentlyPredicting) {
+            if (prediction == null) {
+                originalServerBlocks.put(asVector.getSerializedPosition(), new BlockPrediction(currentlyChangedBlocks, asVector, getBlock(asVector).getGlobalId(), new Vector3d(player.x, player.y, player.z))); // Remember server controlled block type
+            } else {
+                prediction.setForBlockUpdate(currentlyChangedBlocks); // Block existing there was placed by client, mark block to have a new prediction
+            }
+            currentlyChangedBlocks.add(asVector);
+        }
+
+        if (!isCurrentlyPredicting &amp;&amp; prediction != null) {
+            // Server has a more up-to-date block, although client is more recent, replace the original serialized position
+            prediction.setOriginalBlockId(combinedID);
+            return;
+        }
+
+        Column column = getChunk(x &gt;&gt; 4, z &gt;&gt; 4);
+
+        // Apply 1.17 expanded world offset
+        int offsetY = y - minHeight;
+
+        if (column != null) {
+            if (column.chunks().length &lt;= (offsetY &gt;&gt; 4) || (offsetY &gt;&gt; 4) &lt; 0) return;
+
+            BaseChunk chunk = column.chunks()[offsetY &gt;&gt; 4];
+
+            if (chunk == null) {
+                chunk = create();
+                column.chunks()[offsetY &gt;&gt; 4] = chunk;
+
+                // Sets entire chunk to air
+                // This glitch/feature occurs due to the palette size being 0 when we first create a chunk section
+                // Meaning that all blocks in the chunk will refer to palette #0, which we are setting to air
+                chunk.set(0, 0, 0, 0);
+            }
+
+            WrappedBlockState previousState = chunk.get(blockVersion, x &amp; 0xF, offsetY &amp; 0xF, z &amp; 0xF);
+            WrappedBlockState newState = WrappedBlockState.getByGlobalId(blockVersion, combinedID);
+
+            // The method also gets called for the previous state before replacement
+            player.pointThreeEstimator.handleChangeBlock(x, y, z, previousState);
+
+            chunk.set(x &amp; 0xF, offsetY &amp; 0xF, z &amp; 0xF, combinedID);
+            player.compensatedGeysers.updateBlock(x, y, z, previousState, newState, minHeight);
+
+            // Handle stupidity such as fluids changing in idle ticks.
+            player.pointThreeEstimator.handleChangeBlock(x, y, z, newState);
+        }
+    }
+
+    public void tickOpenable(int blockX, int blockY, int blockZ) {
+        final WrappedBlockState data = getBlock(blockX, blockY, blockZ);
+        final StateType type = data.getType();
+        if (Materials.isClientSideOpenableDoor(type, player.getClientVersion())) {
+            WrappedBlockState otherDoor = getBlock(blockX,
+                    blockY + (data.getHalf() == Half.LOWER ? 1 : -1), blockZ);
+
+            if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_13)) {
+                if (BlockTags.DOORS.contains(otherDoor.getType())) {
+                    otherDoor.setOpen(!otherDoor.isOpen());
+                    updateBlock(blockX, blockY + (data.getHalf() == Half.LOWER ? 1 : -1), blockZ, otherDoor.getGlobalId());
+                }
+                data.setOpen(!data.isOpen());
+                updateBlock(blockX, blockY, blockZ, data.getGlobalId());
+            } else {
+                // 1.12 attempts to change the bottom half of the door first
+                if (data.getHalf() == Half.LOWER) {
+                    data.setOpen(!data.isOpen());
+                    updateBlock(blockX, blockY, blockZ, data.getGlobalId());
+                } else if (BlockTags.DOORS.contains(otherDoor.getType()) &amp;&amp; otherDoor.getHalf() == Half.LOWER) {
+                    // Then tries setting the first bit of whatever is below it, disregarding its type
+                    otherDoor.setOpen(!otherDoor.isOpen());
+                    updateBlock(blockX, blockY - 1, blockZ, otherDoor.getGlobalId());
+                }
+            }
+        } else if (Materials.isClientSideOpenableTrapdoor(type, player.getClientVersion()) || BlockTags.FENCE_GATES.contains(type)) {
+            // Take 12 most significant bytes -&gt; the material ID.  Combine them with the new block magic data.
+            data.setOpen(!data.isOpen());
+            updateBlock(blockX, blockY, blockZ, data.getGlobalId());
+        } else if (BlockTags.BUTTONS.contains(type)) {
+            data.setPowered(true);
+        }
+    }
+
+    public void tickPlayerInPistonPushingArea() {
+        player.uncertaintyHandler.tick();
+        // Occurs on player login
+        if (player.boundingBox == null) return;
+
+        SimpleCollisionBox expandedBB = GetBoundingBox.getBoundingBoxFromPosAndSize(player, player.lastX, player.lastY, player.lastZ, 0.001f, 0.001f);
+        expandedBB.expandToAbsoluteCoordinates(player.x, player.y, player.z);
+        SimpleCollisionBox playerBox = expandedBB.copy().expand(1);
+
+        double modX = 0;
+        double modY = 0;
+        double modZ = 0;
+
+        for (PistonData data : activePistons) {
+            for (SimpleCollisionBox box : data.boxes) {
+                if (playerBox.isCollided(box)) {
+                    modX = Math.max(modX, Math.abs(data.direction.getModX() * 0.51D));
+                    modY = Math.max(modY, Math.abs(data.direction.getModY() * 0.51D));
+                    modZ = Math.max(modZ, Math.abs(data.direction.getModZ() * 0.51D));
+
+                    playerBox.expandMax(modX, modY, modZ);
+                    playerBox.expandMin(modX * -1, modY * -1, modZ * -1);
+
+                    if (data.hasSlimeBlock || (data.hasHoneyBlock &amp;&amp; player.getClientVersion().isOlderThan(ClientVersion.V_1_15_2))) {
+                        player.uncertaintyHandler.slimePistonBounces.add(data.direction);
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        for (ShulkerData data : openShulkerBoxes) {
+            SimpleCollisionBox shulkerCollision = data.getCollision();
+
+            BlockFace direction;
+            if (data.entity == null) {
+                WrappedBlockState state = getBlock(data.blockPos.getX(), data.blockPos.getY(), data.blockPos.getZ());
+                direction = state.getFacing();
+            } else {
+                direction = ((PacketEntityShulker) data.entity).facing.getOppositeFace();
+            }
+
+            if (direction == null) direction = BlockFace.UP; // default state
+
+            // Change negative corner in expansion as the direction is negative
+            // We don't bother differentiating shulker entities and shulker boxes
+            // I guess players can cheat to get an extra 0.49 of Y height on shulker boxes, I don't care.
+            if (direction.getModX() == -1 || direction.getModY() == -1 || direction.getModZ() == -1) {
+                shulkerCollision.expandMin(direction.getModX(), direction.getModY(), direction.getModZ());
+            } else {
+                shulkerCollision.expandMax(direction.getModX(), direction.getModY(), direction.getModZ());
+            }
+
+            if (playerBox.isCollided(shulkerCollision)) {
+                modX = Math.max(modX, Math.abs(direction.getModX() * 0.51D));
+                modY = Math.max(modY, Math.abs(direction.getModY() * 0.51D));
+                modZ = Math.max(modZ, Math.abs(direction.getModZ() * 0.51D));
+
+                playerBox.expandMax(modX, modY, modZ);
+                playerBox.expandMin(modX, modY, modZ);
+
+                player.uncertaintyHandler.isSteppingNearShulker = true;
+            }
+        }
+
+        player.uncertaintyHandler.pistonX.add(modX);
+        player.uncertaintyHandler.pistonY.add(modY);
+        player.uncertaintyHandler.pistonZ.add(modZ);
+
+        removeInvalidPistonLikeStuff(0);
+    }
+
+    public void removeInvalidPistonLikeStuff(int transactionId) {
+        // Tick the pistons and remove them if they can no longer exist
+        if (transactionId != 0) {
+            activePistons.removeIf(data -&gt; data.lastTransactionSent &lt; transactionId);
+            openShulkerBoxes.removeIf(data -&gt; data.isClosing &amp;&amp; data.lastTransactionSent &lt; transactionId);
+        } else {
+            activePistons.removeIf(PistonData::tickIfGuaranteedFinished);
+            openShulkerBoxes.removeIf(ShulkerData::tickIfGuaranteedFinished);
+        }
+        // Remove if a shulker is not in this block position anymore
+        openShulkerBoxes.removeIf(box -&gt; {
+            if (box.blockPos != null) { // Block is no longer valid
+                return !Materials.isShulker(getBlock(box.blockPos).getType());
+            } else { // Entity is no longer valid
+                return !player.compensatedEntities.entityMap.containsValue(box.entity);
+            }
+        });
+    }
+
+    public WrappedBlockState getBlock(Vector3i position) {
+        return getBlock(position.x, position.y, position.z);
+    }
+
+    public WrappedBlockState getBlock(int x, int y, int z) {
+        if (noNegativeBlocks &amp;&amp; y &lt; 0) return airData;
+
+        try {
+            Column column = getChunk(x &gt;&gt; 4, z &gt;&gt; 4);
+
+            y -= minHeight;
+            if (column == null || y &lt; 0 || (y &gt;&gt; 4) &gt;= column.chunks().length) return airData;
+
+            BaseChunk chunk = column.chunks()[y &gt;&gt; 4];
+            if (chunk != null) {
+                return chunk.get(blockVersion, x &amp; 0xF, y &amp; 0xF, z &amp; 0xF);
+            }
+        } catch (Exception ignored) {
+        }
+
+        return airData;
+    }
+
+    @Override
+    public int getBlockStateId(int x, int y, int z) { // Logic copied from getBlock
+        if (noNegativeBlocks &amp;&amp; y &lt; 0) return -1;
+
+        try {
+            Column column = getChunk(x &gt;&gt; 4, z &gt;&gt; 4);
+
+            y -= minHeight;
+            if (column == null || y &lt; 0 || (y &gt;&gt; 4) &gt;= column.chunks().length) return -2;
+
+            BaseChunk chunk = column.chunks()[y &gt;&gt; 4];
+            if (chunk != null) {
+                return chunk.getBlockId(x &amp; 0xF, y &amp; 0xF, z &amp; 0xF);
+            }
+        } catch (Exception ignored) {
+        }
+        return -3;
+    }
+
+    // Not direct power into a block
+    // Trapped chests give power but there's no packet to the client to actually apply this... ignore trapped chests
+    // just like mojang did!
+    public int getRawPowerAtState(BlockFace face, int x, int y, int z) {
+        WrappedBlockState block = getBlock(x, y, z);
+
+        if (block.getType() == StateTypes.REDSTONE_BLOCK) {
+            return 15;
+        } else if (block.getType() == StateTypes.DETECTOR_RAIL) { // Rails have directional requirement
+            return block.isPowered() ? 15 : 0;
+        } else if (block.getType() == StateTypes.REDSTONE_TORCH) {
+            return face != BlockFace.UP &amp;&amp; block.isLit() ? 15 : 0;
+        } else if (block.getType() == StateTypes.REDSTONE_WIRE) {
+            BlockFace needed = face.getOppositeFace();
+
+            BlockFace badOne = needed.getCW();
+            BlockFace badTwo = needed.getCCW();
+
+            boolean isPowered = false;
+            if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_13)) {
+                switch (needed) {
+                    case DOWN:
+                        isPowered = true;
+                        break;
+                    case NORTH:
+                        isPowered = block.getNorth() == North.TRUE;
+                        if (isPowered &amp;&amp; (badOne == BlockFace.NORTH || badTwo == BlockFace.NORTH)) {
+                            return 0;
+                        }
+                        break;
+                    case SOUTH:
+                        isPowered = block.getSouth() == South.TRUE;
+                        if (isPowered &amp;&amp; (badOne == BlockFace.SOUTH || badTwo == BlockFace.SOUTH)) {
+                            return 0;
+                        }
+                        break;
+                    case WEST:
+                        isPowered = block.getWest() == West.TRUE;
+                        if (isPowered &amp;&amp; (badOne == BlockFace.WEST || badTwo == BlockFace.WEST)) {
+                            return 0;
+                        }
+                        break;
+                    case EAST:
+                        isPowered = block.getEast() == East.TRUE;
+                        if (isPowered &amp;&amp; (badOne == BlockFace.EAST || badTwo == BlockFace.EAST)) {
+                            return 0;
+                        }
+                        break;
+                }
+            } else {
+                isPowered = true; // whatever, just go off the block's power to see if it connects
+            }
+
+            return isPowered ? block.getPower() : 0;
+        } else if (block.getType() == StateTypes.REDSTONE_WALL_TORCH) {
+            return block.getFacing() != face &amp;&amp; block.isLit() ? 15 : 0;
+        } else if (block.getType() == StateTypes.DAYLIGHT_DETECTOR) {
+            return block.getPower();
+        } else if (block.getType() == StateTypes.OBSERVER) {
+            return block.getFacing() == face &amp;&amp; block.isPowered() ? 15 : 0;
+        } else if (block.getType() == StateTypes.REPEATER) {
+            return block.getFacing() == face &amp;&amp; block.isPowered() ? 15 : 0;
+        } else if (block.getType() == StateTypes.LECTERN) {
+            return block.isPowered() ? 15 : 0;
+        } else if (block.getType() == StateTypes.TARGET) {
+            return block.getPower();
+        }
+
+        return 0;
+    }
+
+    // Redstone can power blocks indirectly by directly powering a block next to the block to power
+    public int getDirectSignalAtState(BlockFace face, int x, int y, int z) {
+        WrappedBlockState block = getBlock(x, y, z);
+
+        if (block.getType() == StateTypes.DETECTOR_RAIL) { // Rails hard power block below itself
+            boolean isPowered = block.hasProperty(StateValue.POWERED) &amp;&amp; block.isPowered();
+            return face == BlockFace.UP &amp;&amp; isPowered ? 15 : 0;
+        } else if (block.getType() == StateTypes.REDSTONE_TORCH) {
+            return face != BlockFace.UP &amp;&amp; block.isLit() ? 15 : 0;
+        } else if (block.getType() == StateTypes.LEVER || BlockTags.BUTTONS.contains(block.getType())) {
+            return block.getFacing().getOppositeFace() == face &amp;&amp; block.isPowered() ? 15 : 0;
+        } else if (block.getType() == StateTypes.REDSTONE_WALL_TORCH) {
+            return face == BlockFace.DOWN &amp;&amp; block.isLit() ? 15 : 0;
+        } else if (block.getType() == StateTypes.LECTERN) {
+            return face == BlockFace.UP &amp;&amp; block.isPowered() ? 15 : 0;
+        } else if (block.getType() == StateTypes.OBSERVER) {
+            return block.getFacing() == face &amp;&amp; block.isPowered() ? 15 : 0;
+        } else if (block.getType() == StateTypes.REPEATER) {
+            return block.getFacing() == face &amp;&amp; block.isPowered() ? 15 : 0;
+        } else if (block.getType() == StateTypes.REDSTONE_WIRE) {
+            BlockFace needed = face.getOppositeFace();
+
+            BlockFace badOne = needed.getCW();
+            BlockFace badTwo = needed.getCCW();
+
+            boolean isPowered = false;
+            switch (needed) {
+                case DOWN:
+                case UP:
+                    break;
+                case NORTH:
+                    isPowered = block.getNorth() == North.TRUE;
+                    if (isPowered &amp;&amp; (badOne == BlockFace.NORTH || badTwo == BlockFace.NORTH)) {
+                        return 0;
+                    }
+                    break;
+                case SOUTH:
+                    isPowered = block.getSouth() == South.TRUE;
+                    if (isPowered &amp;&amp; (badOne == BlockFace.SOUTH || badTwo == BlockFace.SOUTH)) {
+                        return 0;
+                    }
+                    break;
+                case WEST:
+                    isPowered = block.getWest() == West.TRUE;
+                    if (isPowered &amp;&amp; (badOne == BlockFace.WEST || badTwo == BlockFace.WEST)) {
+                        return 0;
+                    }
+                    break;
+                case EAST:
+                    isPowered = block.getEast() == East.TRUE;
+                    if (isPowered &amp;&amp; (badOne == BlockFace.EAST || badTwo == BlockFace.EAST)) {
+                        return 0;
+                    }
+                    break;
+            }
+
+            return isPowered ? block.getPower() : 0;
+        }
+
+        return 0;
+    }
+
+    public Column getChunk(int chunkX, int chunkZ) {
+        long chunkPosition = chunkPositionToLong(chunkX, chunkZ);
+        return chunks.get(chunkPosition);
+    }
+
+    @Override
+    public boolean isChunkLoaded(int chunkX, int chunkZ) {
+        long chunkPosition = chunkPositionToLong(chunkX, chunkZ);
+        return chunks.containsKey(chunkPosition);
+    }
+
+    public boolean areChunksUnloadedAt(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
+        if (maxY &lt; minHeight || minY &gt;= maxHeight) {
+            return true;
+        }
+
+        minX &gt;&gt;= 4;
+        minZ &gt;&gt;= 4;
+        maxX &gt;&gt;= 4;
+        maxZ &gt;&gt;= 4;
+
+        for (int i = minX; i &lt;= maxX; i++) {
+            for (int j = minZ; j &lt;= maxZ; j++) {
+                if (!isChunkLoaded(i, j)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    public void addToCache(Column chunk, int chunkX, int chunkZ, TileEntity[] tileEntities) {
+        long chunkPosition = chunkPositionToLong(chunkX, chunkZ);
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+            chunks.put(chunkPosition, chunk);
+            player.compensatedGeysers.addChunkToCache(chunk, tileEntities, minHeight);
+        });
+    }
+
+    public StateType getBlockType(double x, double y, double z) {
+        return getBlock((int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z)).getType();
+    }
+
+    public WrappedBlockState getBlock(double x, double y, double z) {
+        return getBlock((int) Math.floor(x), (int) Math.floor(y), (int) Math.floor(z));
+    }
+
+    public float getFluidLevelAt(int x, int y, int z) {
+        return Math.max(getWaterFluidLevelAt(x, y, z), getLavaFluidLevelAt(x, y, z));
+    }
+
+    public boolean isWaterSourceBlock(int x, int y, int z) {
+        WrappedBlockState bukkitBlock = getBlock(x, y, z);
+        return Materials.isWaterSource(player.getClientVersion(), bukkitBlock);
+    }
+
+    public boolean containsLiquid(SimpleCollisionBox box) {
+        return Collisions.hasMaterial(player, box, (block, x, y, z) -&gt; Materials.isWater(player.getClientVersion(), block) || block.getType() == StateTypes.LAVA);
+    }
+
+    public float getLavaFluidLevelAt(int x, int y, int z) {
+        WrappedBlockState magicBlockState = getBlock(x, y, z);
+        WrappedBlockState magicBlockStateAbove = getBlock(x, y + 1, z);
+
+        if (magicBlockState.getType() != StateTypes.LAVA) return 0f;
+        if (magicBlockStateAbove.getType() == StateTypes.LAVA) return 1f;
+
+        int level = magicBlockState.getLevel();
+
+        // If it is lava or flowing lava
+        if (level &gt;= 8) {
+            // Falling lava has a level of 8
+            return 8 / 9f;
+        }
+
+        return (8 - level) / 9f;
+    }
+
+    public boolean containsLava(SimpleCollisionBox box) {
+        return Collisions.hasMaterial(player, box, (block, x, y, z) -&gt; block.getType() == StateTypes.LAVA);
+    }
+
+    public float getWaterFluidLevelAt(double x, double y, double z) {
+        return getWaterFluidLevelAt(GrimMath.floor(x), GrimMath.floor(y), GrimMath.floor(z));
+    }
+
+    public float getWaterFluidLevelAt(int x, int y, int z) {
+        WrappedBlockState wrappedBlock = getBlock(x, y, z);
+        boolean isWater = Materials.isWater(player.getClientVersion(), wrappedBlock);
+
+        if (!isWater) return 0f;
+
+        // If water has water above it, it's block height is 1, even if it's waterlogged
+        if (Materials.isWater(player.getClientVersion(), getBlock(x, y + 1, z))) {
+            return 1f;
+        }
+
+        // If it is water or flowing water
+        if (wrappedBlock.getType() == StateTypes.WATER) {
+            int level = wrappedBlock.getLevel();
+
+            // Falling water has a level of 8
+            if ((level &amp; 0x8) == 8) return 8 / 9f;
+
+            return (8 - level) / 9f;
+        }
+
+        // The block is water, isn't water material directly, and doesn't have block above, so it is waterlogged
+        // or another source-like block such as kelp.
+        return 8 / 9F;
+    }
+
+    public void removeChunkLater(int chunkX, int chunkZ) {
+        long chunkPosition = chunkPositionToLong(chunkX, chunkZ);
+        player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+            Column column = chunks.remove(chunkPosition);
+            if (column != null) {
+                player.compensatedGeysers.removeChunk(chunkX, chunkZ, column.chunks().length);
+            }
+        });
+    }
+
+    public void setDimension(DimensionType dimension, User user) {
+        // No world height NBT
+        if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_17)) return;
+
+        minHeight = dimension.getMinY();
+        maxHeight = minHeight + dimension.getHeight();
+    }
+
+    public WrappedBlockState getBlock(Vector3dm aboveCCWPos) {
+        return getBlock(aboveCCWPos.getX(), aboveCCWPos.getY(), aboveCCWPos.getZ());
+    }
+}
+// NOTE (AI): The S22 and S23 corpus hits include the applyBlockChanges paths and the acknowledge-block-changes reply for 1.19+ sequenced changes.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> NCP BlockChangeTracker is the classic equivalent; Hydro WorldTracker applies single and multi block changes with the same transaction confirmation; Truthful CompensatedWorld forwards updates to a global world cache.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BlockUpdateHandler (Kauri)</span>
+<span class="impl-module-clients">(funkemunky-KauriV3)</span>
+</div>
+<p class="impl-pattern">Maintain Kauri's per-player replicated world from server block updates, including the S22 multi-block-change packet.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketHandler feeds WrapperPlayServerBlockChange and WrapperPlayServerMultiBlockChange into runUpdate, which applies each encoded block to the current World object inside a keepalive action so the update lands at the right server tick; chunk data and bulk chunk data go through the same path. The replicated world stores WrappedBlock values in 16x384x16 Chunk arrays, and getBlock and getRelative queries serve the reach, phase and interaction checks.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Supplies the block truth for Kauri's checks; clients cannot fake the world because the cache is server-derived.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/handler/block/BlockUpdateHandler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/handler/block/BlockUpdateHandler.java =====
+package dev.brighten.ac.handler.block;
+
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.protocol.item.type.ItemTypes;
+import com.github.retrooper.packetevents.protocol.player.DiggingAction;
+import com.github.retrooper.packetevents.protocol.world.BlockFace;
+import com.github.retrooper.packetevents.protocol.world.chunk.BaseChunk;
+import com.github.retrooper.packetevents.protocol.world.chunk.Column;
+import com.github.retrooper.packetevents.protocol.world.chunk.TileEntity;
+import com.github.retrooper.packetevents.protocol.world.states.WrappedBlockState;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.util.Vector3i;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerBlockPlacement;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerDigging;
+import com.github.retrooper.packetevents.wrapper.play.server.*;
+import dev.brighten.ac.data.APlayer;
+import dev.brighten.ac.utils.KLocation;
+import dev.brighten.ac.utils.Materials;
+import dev.brighten.ac.utils.world.types.RayCollision;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+
+@Slf4j
+@SuppressWarnings("unused")
+@RequiredArgsConstructor
+public class BlockUpdateHandler {
+
+
+    private final APlayer player;
+    private final Map&lt;String, World&gt; worlds = new HashMap&lt;&gt;();
+    @Getter
+    private AtomicReference&lt;World&gt; currentWorld = new AtomicReference&lt;&gt;();
+
+    /**
+     * Clear all chunks when the player changes worlds
+     */
+    public void onRespawn(WrapperPlayServerRespawn respawn) {
+        respawn.getWorldName()
+                .filter(name -&gt; !name.equals(currentWorld.get().getName()))
+                .ifPresent(worldName -&gt; {
+                    currentWorld.set(getWorldByName(worldName));
+                    player.getMob().despawn();
+
+                    player.runKeepaliveAction(ka -&gt; {
+                        KLocation origin = player.getMovement().getTo().getLoc().add(0, 1.7, 0);
+
+                        RayCollision coll = new RayCollision(origin.toVector(), origin.getDirection().multiply(-1));
+
+                        Vector3d loc1 = coll.collisionPoint(1.2);
+                        player.getMob().spawn(true, new KLocation(loc1), new ArrayList&lt;&gt;(), player);
+                    }, 1);
+                });
+    }
+
+    private World getWorldByName(String name) {
+        return worlds.values().stream()
+                .filter(world -&gt; world.getName().equals(name))
+                .findFirst()
+                .orElse(worlds.put(name, new World(name)));
+    }
+
+    /**
+     * Keep track of block placements since the Bukkit API will be a bit behind
+     *
+     * @param place wrapped PacketPlayInBlockPlace
+     */
+    public void onPlace(WrapperPlayClientPlayerBlockPlacement place) {
+        player.getInfo().lastBlockUpdate.reset();
+        // Could not possibly be a block placement as it's not a block a player is holding.
+        Vector3i pos = place.getBlockPosition();
+
+        // Some dumbass shit I have to do because Minecraft with Lilypads
+        if (place.getItemStack().isPresent()
+                &amp;&amp; place.getItemStack().get().getType().equals(ItemTypes.LILY_PAD)) {
+            RayCollision rayCollision = new RayCollision(player.getMovement().getTo().getLoc()
+                    .add(0, player.getEyeHeight(), 0).toVector(),
+                    player.getMovement().getTo().getLoc().getDirection());
+            //TODO Refactor this system to use just packetevents instead of this class
+            WrappedBlock block = rayCollision.getClosestBlockOfType(player, Materials.LIQUID, 5);
+
+            if (block != null) {
+                pos = new Vector3i(
+                        block.getLocation().getX(),
+                        block.getLocation().getY() + 1,
+                        block.getLocation().getZ());
+            } else return;
+        } // Not an actual block place, just an interact
+        else if (pos.getX() == -1 &amp;&amp; (pos.getY() == 255 || pos.getY() == -1) &amp;&amp; pos.getZ() == -1) {
+            return;
+        } else {
+            pos = pos.with(pos.getX() + place.getFace().getModX(),
+                    pos.getY() + place.getFace().getModY(),
+                    pos.getZ() + place.getFace().getModZ());
+        }
+
+        player.getInfo().getLastPlace().reset();
+
+
+        int x = pos.getX();
+        int y = pos.getY();
+        int z = pos.getZ();
+
+        if(place.getItemStack().isEmpty() || place.getItemStack().get().getType().getPlacedType() == null) {
+            return;
+        }
+
+        currentWorld.get().updateBlock(x, y, z,
+                WrappedBlockState.getDefaultState(place.getItemStack().get().getType().getPlacedType()));
+    }
+
+    static final WrappedBlockState airBlockState = WrappedBlockState
+            .getByGlobalId(PacketEvents.getAPI().getServerManager().getVersion().toClientVersion(), 0);
+
+    /**
+     * Keep track of block breaking since the Bukkit API will be a bit behind.
+     *
+     * @param dig Wrapped PacketPlayInBlockDig
+     */
+    public void onDig(WrapperPlayClientPlayerDigging dig) {
+        player.getInfo().lastBlockUpdate.reset();
+        if (dig.getAction() == DiggingAction.FINISHED_DIGGING) {
+
+            Vector3i pos = dig.getBlockPosition();
+
+            if (pos.getX() == -1 &amp;&amp; (pos.getY() == 255 || pos.getY() == -1) &amp;&amp; pos.getZ() == -1) {
+                return;
+            }
+
+            currentWorld.get().updateBlock(pos.getX(), pos.getY(), pos.getZ(), airBlockState);
+        }
+    }
+
+    /**
+     * Keep track of block updates since the Bukkit API will be a bit behind.
+     * @param packet Wrapped PacketPlayOutBlockChange
+     */
+    public void runUpdate(WrapperPlayServerBlockChange packet) {
+        player.getInfo().lastBlockUpdate.reset();
+
+            // Updating block information
+        player.runKeepaliveAction(k -&gt; {
+            Vector3i pos = packet.getBlockPosition();
+
+            currentWorld.get().updateBlock(pos.getX(), pos.getY(), pos.getZ(), packet.getBlockState());
+        });
+    }
+
+    /**
+     * Keep track of block updates since the Bukkit API will be a bit behind.
+     * @param packet Wrapped PacketPlayOutMultiBlockChange
+     */
+    public void runUpdate(WrapperPlayServerMultiBlockChange packet) {
+        player.getInfo().lastBlockUpdate.reset();
+        player.runKeepaliveAction(k -&gt; {
+            for (WrapperPlayServerMultiBlockChange.EncodedBlock info : packet.getBlocks()) {
+
+                WrappedBlockState blockState = info
+                        .getBlockState(PacketEvents.getAPI().getServerManager().getVersion().toClientVersion());
+
+                currentWorld.get().updateBlock(info.getX(), info.getY(), info.getZ(), blockState);
+            }
+        });
+    }
+
+    /**
+     * Keep track of block updates since the Bukkit API will be a bit behind.
+     * @param chunkUpdate Wrapped PacketPlayOutMapChunk
+     */
+    public void runUpdate(WrapperPlayServerChunkData chunkUpdate) {
+        player.runKeepaliveAction(k -&gt; currentWorld.get().updateChunk(chunkUpdate.getColumn()));
+    }
+
+    public void runUpdate(WrapperPlayServerChunkDataBulk chunkBulk) {
+        player.runKeepaliveAction(k -&gt; {
+            for (int index = 0; index &lt; chunkBulk.getChunks().length; index++) {
+                BaseChunk[] chunks = chunkBulk.getChunks()[index];
+
+                int x = chunkBulk.getX()[index];
+                int z = chunkBulk.getZ()[index];
+
+                Column column = new Column(x, z, true, chunks, new TileEntity[0],
+                        chunkBulk.getBiomeData()[index]);
+
+                currentWorld.get().updateChunk(column);
+            }
+        });
+    }
+
+    /**
+     * Get the block relative to the specified location
+     * @param location the location
+     * @param modX the x modifier
+     * @param modY the y modifier
+     * @param modZ the z modifier
+     * @return the block relative to the specified location
+     */
+    public WrappedBlock getRelative(Vector3i location, int modX, int modY, int modZ) {
+        return currentWorld.get().getBlock(location.add(modX, modY, modZ));
+    }
+
+    /**
+     * Get the block relative to the specified location
+     * @param location the location
+     * @param face the face
+     * @param distance the distance
+     * @return the block relative to the specified location
+     */
+    public WrappedBlock getRelative(Vector3i location, BlockFace face, int distance) {
+        return getRelative(location,
+                face.getModX() * distance, face.getModY() * distance, face.getModZ() * distance);
+    }
+
+    /**
+     * Get the block relative to the specified location
+     * @param location the location
+     * @param face the face
+     * @return the block relative to the specified location
+     */
+    public WrappedBlock getRelative(Vector3i location, BlockFace face) {
+        return currentWorld.get().getBlock(location.add(face.getModX(), face.getModY(), face.getModZ()));
+    }
+
+    public WrappedBlock getBlock(int x, int y, int z) {
+        return currentWorld.get().getBlock(x, y, z);
+    }
+
+    public WrappedBlock getBlock(KLocation location) {
+        return getBlock(location.getBlockX(), location.getBlockY(), location.getBlockZ());
+    }
+
+    public WrappedBlock getBlock(Vector3i location) {
+        return getBlock(location.getX(), location.getY(), location.getZ());
+    }
+
+    public record KColumn(int x, int z, BaseChunk[] chunks) {}
+
+}
+// NOTE (AI): runUpdate(WrapperPlayServerMultiBlockChange) is the S22 path; the S23 corpus hit is runUpdate(WrapperPlayServerBlockChange).</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim CompensatedWorld and Hydro WorldTracker apply the same updates with transaction timing; Intave BlockUpdateTracker combines its packet readers with an acknowledgeBlockChange sequence to keep the cache in lockstep with 1.19+ sequenced block changes.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">MultiBlockChangeReader (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Decode the S22 packet into absolute block positions and block data for Intave's block update tracker.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">CompiledPacketReader that reads either the 1.16.2+ section-relative encoding (section position plus 12-bit relative coordinates) or the legacy MultiBlockChangeInfo array, and exposes blockPositions() and blockDataList() to the BlockUpdateTracker, which applies them to the block cache and acknowledges the sequence number.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Feeds the block cache that Intave's interaction ray-trace, phase and physics checks query; no direct flag.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/packet/reader/MultiBlockChangeReader.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/packet/reader/MultiBlockChangeReader.java =====
+package de.jpx3.intave.packet.reader;
+
+import com.comphenix.protocol.wrappers.BlockPosition;
+import com.comphenix.protocol.wrappers.MultiBlockChangeInfo;
+import com.comphenix.protocol.wrappers.WrappedBlockData;
+import de.jpx3.intave.adapter.MinecraftVersions;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public final class MultiBlockChangeReader extends CompiledPacketReader implements BlockChanges {
+  private static final boolean USE_SECTIONS = MinecraftVersions.VER1_16_2.atOrAbove();
+  private List&lt;BlockPosition&gt; blockPositions;
+  private List&lt;WrappedBlockData&gt; blockDataList;
+
+  public void compile() {
+    if (USE_SECTIONS) {
+      BlockPosition blockPosition = packet().getSectionPositions().readSafely(0);
+      int chunkXBase = blockPosition.getX() &lt;&lt; 4;
+      int chunkYBase = blockPosition.getY() &lt;&lt; 4;
+      int chunkZBase = blockPosition.getZ() &lt;&lt; 4;
+      short[] relativePositions = packet().getShortArrays().read(0);
+      WrappedBlockData[] blockInfos = packet().getBlockDataArrays().read(0);
+      int expectedOutputLength = blockInfos.length;
+      blockPositions = new ArrayList&lt;&gt;(expectedOutputLength);
+      blockDataList = new ArrayList&lt;&gt;(expectedOutputLength);
+      for (int i = 0; i &lt; relativePositions.length; i++) {
+        short relativePosition = relativePositions[i];
+        int posX = chunkXBase + (relativePosition &gt;&gt;&gt; 8 &amp; 0xF);
+        int posY = chunkYBase + (relativePosition &amp; 0xF);
+        int posZ = chunkZBase + (relativePosition &gt;&gt;&gt; 4 &amp; 0xF);
+        blockPositions.add(new BlockPosition(posX, posY, posZ));
+        blockDataList.add(blockInfos[i]);
+      }
+    } else {
+      MultiBlockChangeInfo[] multiBlockChangeInfos = packet().getMultiBlockChangeInfoArrays().readSafely(0);
+      int expectedOutputLength = multiBlockChangeInfos.length;
+      blockPositions = new ArrayList&lt;&gt;(expectedOutputLength);
+      blockDataList = new ArrayList&lt;&gt;(expectedOutputLength);
+      for (MultiBlockChangeInfo changeInfo : multiBlockChangeInfos) {
+        blockPositions.add(new BlockPosition(changeInfo.getAbsoluteX(), changeInfo.getY(), changeInfo.getAbsoluteZ()));
+        blockDataList.add(changeInfo.getData());
+      }
+    }
+  }
+
+  @Override
+  public void release() {
+    super.release();
+    blockPositions = null;
+    blockDataList = null;
+  }
+
+  public List&lt;BlockPosition&gt; blockPositions() {
+    return blockPositions;
+  }
+
+  public List&lt;WrappedBlockData&gt; blockDataList() {
+    return blockDataList;
+  }
+}
+// NOTE (AI): Registered in PacketReaders as setup(MULTI_BLOCK_CHANGE, MultiBlockChangeReader::new); SingleBlockChangeReader covers S23.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro WorldTracker handleMultiBlockChange and Kauri runUpdate(WrapperPlayServerMultiBlockChange) are the equivalent decode-and-apply paths; NCP BlockChangeListener converts the same updates into validity-timed entries.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S23PacketBlockChange/">S23PacketBlockChange</a>
 <a class="related-chip" href="../S21PacketChunkData/">S21PacketChunkData</a>

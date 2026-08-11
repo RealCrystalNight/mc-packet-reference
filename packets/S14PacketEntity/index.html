@@ -1005,6 +1005,776 @@ public enum PacketType {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent in Rise 6.x for modules; the Rise 5.99 anticheat receives every packet through PlayerData.handle instead of an event bus.</div>
 <div class="impl-clients">Rise 5.99 anticheat decodes S14 via MCP-style accessors (func_149062_c, func_149060_h); Rise 6.x uses getPosX/getYaw accessors, and WatchdogVelocity switches on the packet class with Java 17 pattern matching while LegitReach and PacketType use instanceof chains. Deltas are consistently divided by 32.0 and angles multiplied by 360/256 across every client.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">Server-side anticheats never see S14 on the wire: it is a clientbound announcement of entity relative movement, rotation and ground state. What they do see is the same stream on the send side, and the richest anticheats use it to keep a lag-compensated copy of every tracked entity's position so reach, phase and velocity checks compare the player against where the server actually believes entities are. The corpus splits into position-replication trackers (Hydro, Kauri, AntiHaxerman), wrappers that classify the S14 subclasses into a packet pipeline (Frequency, Artemis, FlopAC), and reach checks that either consume the replicated positions or, in ThotPatrol's case, admit that rel-move plus AABB would beat their own Bukkit-based math.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TrackedEntity (entity position replication)</span>
+<span class="impl-module-clients">(Incognitolol-Hydro)</span>
+</div>
+<p class="impl-pattern">Rebuild other entities' positions from the S14 relative-move stream so reach and aim checks can query server-truth entity locations instead of trusting the player's rendered view.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">handleMovement(deltaX, deltaY, deltaZ) wraps the S14 byte deltas into an EntityMovement of type RELATIVE, marks the entity as awaiting confirmation, and applies the deltas to every TrackedPosition in the queue. handlePostFlying advances the queue when the player's next flying packet confirms the tick, and handlePostTransaction removes positions that the confirmed state has passed. Confirmed and pending positions are exposed separately (getX/getY/getZ versus getPendingPosition), so checks can evaluate both the server-known location and the one the client has just been told about.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Position desync between the server's entity stream and the client's render state, and provides the entity location used to verify reach against delayed or interpolated entity positions.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Incognitolol-Hydro — src/main/java/integral/studios/hydro/util/player/tracker/entity/TrackedEntity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Incognitolol-Hydro — src/main/java/integral/studios/hydro/util/player/tracker/entity/TrackedEntity.java =====
+package integral.studios.hydro.util.player.tracker.entity;
+
+import lombok.Getter;
+
+import java.util.ArrayDeque;
+import java.util.Deque;
+
+
+@Getter
+public class TrackedEntity {
+    private final Deque&lt;TrackedPosition&gt; positions = new ArrayDeque&lt;&gt;();
+    private TrackedPosition confirmedPosition;
+    private TrackedPosition pendingPosition;
+
+    private EntityMovement pendingMovement = EntityMovement.none();
+    private boolean awaitingConfirmation = false;
+
+    private final int entityId;
+
+    public TrackedEntity(int entityId, double x, double y, double z) {
+        this.entityId = entityId;
+        TrackedPosition initialPos = new TrackedPosition(x, y, z);
+        this.positions.add(initialPos);
+        this.confirmedPosition = initialPos;
+        this.pendingPosition = initialPos.copy();
+    }
+
+    public TrackedEntity(double x, double y, double z) {
+        this(-1, x, y, z);
+    }
+
+
+    public void handleMovement(double deltaX, double deltaY, double deltaZ) {
+        pendingMovement = EntityMovement.relative(deltaX, deltaY, deltaZ);
+        awaitingConfirmation = true;
+
+        // Apply movement to all tracked positions
+        positions.forEach(pos -&gt; pos.handleMovement(deltaX, deltaY, deltaZ));
+    }
+
+    public void handleTeleport(double x, double y, double z) {
+        pendingMovement = EntityMovement.absolute(x, y, z);
+        awaitingConfirmation = true;
+
+        // Apply teleport to all tracked positions
+        positions.forEach(pos -&gt; pos.handleTeleport(x, y, z));
+    }
+
+    public void handlePostTransaction() {
+        if (!awaitingConfirmation) {
+            return;
+        }
+
+        awaitingConfirmation = false;
+
+        // Clean up old positions that match the confirmed position
+        positions.removeIf(pos -&gt; pos.equals(confirmedPosition));
+
+        // Update confirmed position if we have new positions
+        if (!positions.isEmpty()) {
+            confirmedPosition = positions.poll();
+            // Keep at least one position in the queue
+            if (positions.isEmpty()) {
+                positions.add(confirmedPosition.copy());
+            }
+        }
+    }
+
+
+    public void handlePostFlying() {
+        // Apply pending movement if we're waiting for confirmation
+        if (awaitingConfirmation &amp;&amp; pendingMovement.hasMovement()) {
+            // Create new position state for the pending movement
+            TrackedPosition newPosition = confirmedPosition.copy();
+
+            // Apply the movement based on type
+            if (pendingMovement.getType() == EntityMovement.Type.ABSOLUTE) {
+                newPosition.handleTeleport(
+                        pendingMovement.getX(),
+                        pendingMovement.getY(),
+                        pendingMovement.getZ()
+                );
+            } else if (pendingMovement.getType() == EntityMovement.Type.RELATIVE) {
+                newPosition.handleMovement(
+                        pendingMovement.getX(),
+                        pendingMovement.getY(),
+                        pendingMovement.getZ()
+                );
+            }
+
+            // Add to tracking queue if not already present
+            if (!positions.contains(newPosition)) {
+                positions.add(newPosition);
+            }
+
+            pendingPosition = newPosition;
+        }
+
+        // Update all positions (interpolation)
+        positions.forEach(TrackedPosition::onLivingUpdate);
+        confirmedPosition.onLivingUpdate();
+    }
+
+
+    public double getX() {
+        return confirmedPosition.getPosX();
+    }
+
+
+    public double getY() {
+        return confirmedPosition.getPosY();
+    }
+
+    public double getZ() {
+        return confirmedPosition.getPosZ();
+    }
+
+    public TrackedPosition getPendingPosition() {
+        return awaitingConfirmation ? pendingPosition : confirmedPosition;
+    }
+
+    public int getPositionQueueSize() {
+        return positions.size();
+    }
+
+
+    public boolean hasPendingMovement() {
+        return awaitingConfirmation;
+    }
+
+    public double getPendingDistance() {
+        if (!awaitingConfirmation) return 0;
+
+        double dx = pendingPosition.getPosX() - confirmedPosition.getPosX();
+        double dy = pendingPosition.getPosY() - confirmedPosition.getPosY();
+        double dz = pendingPosition.getPosZ() - confirmedPosition.getPosZ();
+
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    public void reset(double x, double y, double z) {
+        positions.clear();
+        TrackedPosition newPos = new TrackedPosition(x, y, z);
+        positions.add(newPos);
+        confirmedPosition = newPos;
+        pendingPosition = newPos.copy();
+        pendingMovement = EntityMovement.none();
+        awaitingConfirmation = false;
+    }
+
+    @Override
+    public String toString() {
+        return String.format("TrackedEntity{id=%d, pos=(%.2f,%.2f,%.2f), pending=%s, queueSize=%d}",
+                entityId, getX(), getY(), getZ(), awaitingConfirmation, positions.size());
+    }
+}
+// NOTE (AI): The S14 deltas arrive as raw fixed-point bytes; TrackedEntity applies them directly as doubles, matching the client's own accumulation behavior.
+// NOTE (AI): The confirmed position only advances after the transaction confirms, which is the lag-compensation model used across the corpus.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro's EntityTracker drives this class from PacketSendEvent, applying the deltas inside the transaction tracker's confirm window. AntiHaxerman's EntityTracker accumulates the same deltas into serverPosX/Y/Z and divides by 32.0 on connection confirm; Kauri's EntityTrackHandler adds the deltas into an interpolating EntityLocation with transaction-anchored application.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">EntityTrackHandler (entity move tracking)</span>
+<span class="impl-module-clients">(funkemunky-KauriV3)</span>
+</div>
+<p class="impl-pattern">Keep a server-side copy of every tracked entity's interpolated location from the S14 stream, and spawn fake mobs around a target to verify that the client's own entity tracking and aim match the server's.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">onRelPosition looks up the entity in the world tracker, skips non-allowed types, then adds the packet's x, y, z, yaw and pitch to the entity's new EntityLocation and sets the interpolation increment to 3. onFlying advances interpolation for every tracked entity whenever the player sends a flying packet. runAction delays the state change until a transaction confirms, or uses an instant action for the current combat target, timestamping entity updates against the player's connection. For a teleporting target it spawns three magma-cube fake mobs around the entity plus a slime on the player's aim ray, then moves them with the entity, so the client's hitbox testing can be verified server-side.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Killaura that attacks where the server holds no entity, hitbox spoofing, and clients whose entity tracking diverges from the sent stream.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/handler/EntityTrackHandler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/handler/EntityTrackHandler.java =====
+package dev.brighten.ac.handler;
+
+import com.github.retrooper.packetevents.protocol.attribute.Attribute;
+import com.github.retrooper.packetevents.protocol.attribute.Attributes;
+import com.github.retrooper.packetevents.protocol.entity.data.EntityData;
+import com.github.retrooper.packetevents.protocol.entity.data.EntityDataTypes;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityType;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityTypes;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerDestroyEntities;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityPositionSync;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityTeleport;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateAttributes;
+import dev.brighten.ac.data.APlayer;
+import dev.brighten.ac.handler.entity.FakeMob;
+import dev.brighten.ac.handler.entity.TrackedEntity;
+import dev.brighten.ac.packet.WPacketPlayOutEntity;
+import dev.brighten.ac.utils.EntityLocation;
+import dev.brighten.ac.utils.KLocation;
+import dev.brighten.ac.utils.timer.Timer;
+import dev.brighten.ac.utils.timer.impl.MillisTimer;
+import dev.brighten.ac.utils.world.types.RayCollision;
+import lombok.RequiredArgsConstructor;
+
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+@RequiredArgsConstructor
+public class EntityTrackHandler {
+
+    private final APlayer data;
+    private final Timer lastFlying = new MillisTimer();
+
+    public Set&lt;Integer&gt; canCreateMob = new HashSet&lt;&gt;();
+    public int streak;
+    public AtomicBoolean clientHasEntity = new AtomicBoolean(false);
+
+    private final Set&lt;EntityType&gt; allowedEntityTypes = Set.of(EntityTypes.ZOMBIE, EntityTypes.SHEEP,
+            EntityTypes.BLAZE, EntityTypes.SKELETON, EntityTypes.PLAYER, EntityTypes.VILLAGER, EntityTypes.IRON_GOLEM,
+            EntityTypes.WITCH, EntityTypes.COW, EntityTypes.CREEPER);
+
+    public Optional&lt;Integer&gt; getTargetOfFakeMob(int fakeMobId) {
+        for (TrackedEntity value : data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntities().values()) {
+            if(value.getFakeMobs().stream().anyMatch(mob -&gt; mob.getEntityId() == fakeMobId)) {
+                return Optional.of(value.getEntityId());
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     *
+     * We are processing PacketPlayInFlying to iterate the tracked entity locations
+     *
+     */
+    void onFlying() {
+        if(lastFlying.isNotPassed(1)) streak++;
+        else {
+            streak = 1;
+        }
+
+        processZombie();
+
+        data.getWorldTracker().getCurrentWorld().get().getTrackedEntities().values().forEach(entity -&gt; {
+            var oldLoc = entity.getOldEntityLocation();
+            var newLoc = entity.getNewEntityLocation();
+
+            if(oldLoc != null) {
+                if(oldLoc.interpolatedLocations.size() &gt; 1 &amp;&amp; oldLoc.increment == 0) {
+                    oldLoc.interpolatedLocations.removeFirst();
+                }
+                oldLoc.interpolateLocation();
+            }
+            if(newLoc != null) {
+                if(newLoc.interpolatedLocations.size() &gt; 1 &amp;&amp; newLoc.increment == 0) {
+                    newLoc.interpolatedLocations.removeFirst();
+                }
+                newLoc.interpolateLocation();
+            }
+        });
+
+        lastFlying.reset();
+    }
+
+    /**
+     *
+     * Processing PacketPlayOutRelativePosition for updating entity locations in a relative manner.
+     *
+     * @param packet WrappedOutRelativePosition
+     */
+    void onRelPosition(WPacketPlayOutEntity packet) {
+        Optional&lt;TrackedEntity&gt; entity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(packet.getId());
+
+        if(entity.isEmpty() || !allowedEntityTypes.contains(entity.get().getEntityType())) return;
+
+        processFakeMobs(packet.getId(), true, packet.getX(), packet.getY(), packet.getZ());
+
+        EntityLocation eloc = entity.get().getNewEntityLocation();
+
+        entity.get().setOldEntityLocation(entity.get().getNewEntityLocation().clone());
+
+        runAction(entity.get(), () -&gt; {
+            //We don't need to do version checking here. Atlas handles this for us.
+            eloc.newX += packet.getX();
+            eloc.newY += packet.getY();
+            eloc.newZ += packet.getZ();
+            eloc.newYaw += packet.getYaw();
+            eloc.newPitch += packet.getPitch();
+
+            eloc.increment = 3;
+        });
+    }
+
+    void onPositionSync(WrapperPlayServerEntityPositionSync packet) {
+        Optional&lt;TrackedEntity&gt; entity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(packet.getId());
+
+        if(entity.isEmpty() || !allowedEntityTypes.contains(entity.get().getEntityType())) return;
+
+        processFakeMobs(packet.getId(), false, packet.getValues().getPosition().getX(),
+                packet.getValues().getPosition().getY(), packet.getValues().getPosition().getZ());
+
+        EntityLocation eloc = entity.get().getNewEntityLocation();
+
+        entity.get().setOldEntityLocation(entity.get().getNewEntityLocation().clone());
+
+        runAction(entity.get(), () -&gt; {
+            //We don't need to do version checking here. Atlas handles this for us.
+            eloc.newX = packet.getValues().getPosition().getX();
+            eloc.newY = packet.getValues().getPosition().getY();
+            eloc.newZ = packet.getValues().getPosition().getZ();
+            eloc.newYaw = packet.getValues().getYaw();
+            eloc.newPitch = packet.getValues().getPitch();
+
+            eloc.increment = 3;
+        });
+    }
+    /**
+     *
+     * Processing PacketPlayOutEntityTeleport to update locations in a non-relative manner.
+     *
+     * @param packet WrappedOutEntityTeleportPacket
+     */
+    void onTeleportSent(WrapperPlayServerEntityTeleport packet) {
+        Optional&lt;TrackedEntity&gt; entity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(packet.getEntityId());
+
+        if(entity.isEmpty() || !allowedEntityTypes.contains(entity.get().getEntityType())) return;
+
+        processFakeMobs(packet.getEntityId(), false, packet.getPosition().getX(), packet.getPosition().getY(), packet.getPosition().getZ());
+
+        EntityLocation eloc = entity.get().getNewEntityLocation();
+
+        entity.get().setOldEntityLocation(entity.get().getNewEntityLocation().clone());
+
+        runAction(entity.get(), () -&gt; {
+            if(data.getPlayerVersion().isNewerThanOrEquals(ClientVersion.V_1_9)) {
+                if (!(Math.abs(eloc.x - packet.getPosition().getX()) &gt;= 0.03125D)
+                        &amp;&amp; !(Math.abs(eloc.y - packet.getPosition().getY()) &gt;= 0.015625D)
+                        &amp;&amp; !(Math.abs(eloc.z - packet.getPosition().getZ()) &gt;= 0.03125D)) {
+                    eloc.increment = 0;
+                    //We don't need to do version checking here. Atlas handles this for us.
+                    eloc.newX = eloc.x = packet.getPosition().getX();
+                    eloc.newY = eloc.y = packet.getPosition().getY();
+                    eloc.newZ = eloc.z = packet.getPosition().getZ();
+                    eloc.newYaw = eloc.yaw = packet.getYaw();
+                    eloc.newPitch = eloc.pitch = packet.getPitch();
+                } else {
+                    eloc.newX = packet.getPosition().getX();
+                    eloc.newY = packet.getPosition().getY();
+                    eloc.newZ = packet.getPosition().getZ();
+                    eloc.newYaw = packet.getYaw();
+                    eloc.newPitch = packet.getPitch();
+
+                    eloc.increment = 3;
+                }
+            } else {
+                //We don't need to do version checking here. Atlas handles this for us.
+                eloc.newX = packet.getPosition().getX();
+                eloc.newY = packet.getPosition().getY();
+                eloc.newZ = packet.getPosition().getZ();
+                eloc.newYaw = packet.getYaw();
+                eloc.newPitch = packet.getPitch();
+
+                eloc.increment = 3;
+            }
+        });
+    }
+
+    void updateAttributes(WrapperPlayServerUpdateAttributes attributes) {
+        data.runKeepaliveAction(ka -&gt; {
+            TrackedEntity tracked = data.getWorldTracker().getCurrentWorld().get()
+                    .getTrackedEntity(attributes.getEntityId()).orElse(null);
+
+            if(tracked == null) return;
+
+            for (WrapperPlayServerUpdateAttributes.Property property : attributes.getProperties()) {
+                Attribute attribute = property.getAttribute();
+
+                if(attributes.getEntityId() == data.getBukkitPlayer().getEntityId() &amp;&amp; attribute == Attributes.MOVEMENT_SPEED) {
+                    ValuedAttribute value = tracked.getAttribute(attribute);
+
+                    value.updateAttribute(property);
+                    data.getInfo().setWalkSpeed(value.getValue());
+                }
+
+                tracked.updateAttribute(property);
+            }
+        });
+    }
+
+    /**
+     *
+     * We are running an action when a transaction is received. If the Entity provided is currently a target,
+     * we want to send a tranasction on this method being run and use that to more accurately get an estimate of when
+     * the client receives the transaction relative to what we want in the action. If not the target, then we use our
+     * transaction system which sends one transaction every tick, and then on return runs a list of Runnables which
+     * may be less accurate in some situations, but uses less processing and network resources.
+     *
+     * @param entity Entity
+     * @param action Runnable
+     */
+    private void runAction(TrackedEntity entity, Runnable action) {
+        if(data.getInfo().getTarget() != null &amp;&amp; data.getInfo().getTarget().getEntityId() == entity.getEntityId()) {
+            data.runInstantAction(ia -&gt; {
+                if(!ia.isEnd()) {
+                    action.run();
+                } else entity.setOldEntityLocation(null);
+            }, true);
+        } else {
+            data.runKeepaliveAction(keepalive -&gt; action.run());
+            data.runKeepaliveAction(keepalive -&gt;
+                    entity.setOldEntityLocation(null), 1);
+        }
+    }
+
+    public void onEntityDestroy(WrapperPlayServerDestroyEntities packet) {
+        data.runKeepaliveAction(ka -&gt; {
+            for(int id : packet.getEntityIds()) {
+                removeFakeMob(id);
+            }
+        });
+    }
+
+    public void removeFakeMob(int id) {
+        if(data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntities().containsKey(id)) {
+            List&lt;FakeMob&gt; mobs = data.getWorldTracker().getCurrentWorld().get()
+                    .getTrackedEntity(id).map(TrackedEntity::getFakeMobs).orElse(new ArrayList&lt;&gt;());
+
+            for (FakeMob mob : mobs) {
+                mob.despawn();
+            }
+
+            mobs.clear();
+        }
+        clientHasEntity.set(false);
+    }
+
+    private static final double[] offsets = new double[]{-1.25, 0, 1.25};
+
+    private void createFakeMob(int entityId, KLocation location) {
+        if (!canCreateMob.contains(entityId)) return;
+
+        Optional&lt;TrackedEntity&gt; trackedEntity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(entityId);
+
+        Optional&lt;TrackedEntity&gt; playerEntity = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(data.getBukkitPlayer().getEntityId());
+
+        if(trackedEntity.isEmpty() || playerEntity.isEmpty()) return;
+
+        for (double offset : offsets) {
+            FakeMob mob = new FakeMob(EntityTypes.MAGMA_CUBE);
+
+            List&lt;EntityData&lt;?&gt;&gt; types = new ArrayList&lt;&gt;();
+            EntityData&lt;?&gt; entityData = new EntityData&lt;&gt;(16, EntityDataTypes.BYTE, (byte)10);
+            types.add(entityData);
+
+            // Setting Magma cube size to size 10
+            mob.spawn(true, location.clone().add(offset, offset, offset),
+                    types, data);
+
+            trackedEntity.get().getFakeMobs().add(mob);
+        }
+
+        KLocation eyeLoc = data.getMovement().getTo().getLoc().clone()
+                .add(0, data.getEyeHeight() / 2.5, 0);
+
+        RayCollision collision = new RayCollision(eyeLoc.toVector(), eyeLoc.getDirection());
+
+        Vector3d point = collision.collisionPoint(0.4);
+
+        FakeMob mob = new FakeMob(EntityTypes.SLIME);
+        List&lt;EntityData&lt;?&gt;&gt; types = new ArrayList&lt;&gt;();
+        EntityData&lt;?&gt; entityData = new EntityData&lt;&gt;(16, EntityDataTypes.BYTE, (byte)5);
+
+        types.add(entityData);
+        mob.spawn(true, new KLocation(point.getX(), point.getY(), point.getZ()), types, data);
+
+        playerEntity.get().getFakeMobs().add(mob);
+
+        canCreateMob.remove(entityId);
+
+        data.runKeepaliveAction(ka -&gt; clientHasEntity.set(true));
+    }
+
+    public void processZombie() {
+        List&lt;FakeMob&gt; fakeMobs = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(data.getBukkitPlayer().getEntityId())
+                .map(TrackedEntity::getFakeMobs)
+                .orElse(new ArrayList&lt;&gt;());
+
+        if(fakeMobs.size() &gt; 1) {
+            fakeMobs.forEach(fakeMob -&gt; removeFakeMob(fakeMob.getEntityId()));
+        }
+
+        for (FakeMob fakeMob : fakeMobs) {
+            if(fakeMob.getType() == EntityTypes.SLIME) {
+                KLocation eyeLoc = data.getMovement().getTo().getLoc().clone().add(0, 0.6, 0);
+
+                RayCollision collision = new RayCollision(eyeLoc.toVector(), eyeLoc.getDirection());
+
+                Vector3d point = collision.collisionPoint(0.4);
+
+                fakeMob.teleport(point.getX(), point.getY(), point.getZ(), 0 ,0);
+                break;
+            }
+        }
+    }
+
+    public void processFakeMobs(int entityId, boolean rel, double x, double y, double z) {
+        List&lt;FakeMob&gt; fakeMobs = data.getWorldTracker().getCurrentWorld().get()
+                .getTrackedEntity(entityId).map(TrackedEntity::getFakeMobs).orElse(new ArrayList&lt;&gt;());
+
+        if(fakeMobs.isEmpty()) {
+            if(!rel) {
+                createFakeMob(entityId, new KLocation(x, y, z));
+            }
+
+            if(data.getInfo().getTarget() != null &amp;&amp; data.getInfo().getTarget().getEntityId() == entityId) {
+                clientHasEntity.set(false);
+            }
+            return;
+        }
+
+        if(fakeMobs.size() != offsets.length + 1) {
+            fakeMobs.forEach(fakeMob -&gt; removeFakeMob(fakeMob.getEntityId()));
+        }
+
+        int current = 0;
+        for (FakeMob fakeMob : fakeMobs) {
+            double offset = offsets[current++];
+
+            if(rel) {
+                fakeMob.move(x, y, z);
+            } else {
+                fakeMob.teleport(x + offset, y + offset, z + offset, 0, 0);
+            }
+        }
+    }
+}
+// NOTE (AI): The fake-mob mechanism only activates for entities that can be targeted (canCreateMob), and the ray collision test uses a 0.4-meter collision point, so the check is a killaura verifier rather than a movement check.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The same handler applies S18 teleports through onTeleportSent and S20 attributes through updateAttributes; WPacketPlayOutEntity is Kauri's internal wrapper for the S14 subclasses. Hydro and AntiHaxerman cover the same tracking duty with simpler, non-interpolating position queues.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ReachD (reach against player positions)</span>
+<span class="impl-module-clients">(freppp-ThotPatrol)</span>
+</div>
+<p class="impl-pattern">Classic 1.8 reach check; the corpus hit is the author's own TODO comment stating that tracking PacketPlayOutRelEntityMove and testing the AABB would be far more accurate than the Bukkit-position math the check actually uses.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketAttackEvent the check measures the distance between attacker and victim eye locations, subtracts the vertical difference and a fixed 0.32 hitbox accommodation, and compares the result against maxReach. The threshold is inflated by ground state, yaw difference, recent horizontal speed (tracked on PlayerMoveEvent), the average ping of both players, TPS and the attacker's speed potion level. Three consecutive exceedances log a cheat.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Blatant reach abuse against players, with tolerance for lag, elevation and speed.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> freppp-ThotPatrol — src/main/java/me/frep/thotpatrol/checks/combat/reach/ReachD.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: freppp-ThotPatrol — src/main/java/me/frep/thotpatrol/checks/combat/reach/ReachD.java =====
+package me.frep.thotpatrol.checks.combat.reach;
+
+import me.frep.thotpatrol.ThotPatrol;
+import me.frep.thotpatrol.checks.Check;
+import me.frep.thotpatrol.packets.PacketPlayerType;
+import me.frep.thotpatrol.packets.events.PacketAttackEvent;
+import me.frep.thotpatrol.utils.UtilMath;
+import me.frep.thotpatrol.utils.UtilPlayer;
+import org.bukkit.GameMode;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+public class ReachD extends Check {
+	
+	public static Map&lt;UUID, Integer&gt; verbose = new HashMap&lt;UUID, Integer&gt;();
+	private Map&lt;UUID, Double&gt; lastDist = new HashMap&lt;&gt;();
+	private Map&lt;UUID, Integer&gt; beforeVL = new HashMap&lt;&gt;();
+	
+    public ReachD(ThotPatrol ThotPatrol) {
+        super("ReachD", "Reach (Type D)", ThotPatrol);
+        setEnabled(true);
+        setBannable(true);
+        setMaxViolations(7);
+		setViolationResetTime(120000);
+    }
+
+    //todo this is a somewhat decent blatant reach check, it shouldnt false too much, but obviously using PacketPlayOutRelEntityMove and AABB is much more accurate than anything that will be found in here
+    
+    @EventHandler
+    public void onLeave(PlayerQuitEvent e) {
+    	verbose.remove(e.getPlayer().getUniqueId());
+    	lastDist.remove(e.getPlayer().getUniqueId());
+    	beforeVL.remove(e.getPlayer().getUniqueId());
+    }
+    
+    @EventHandler
+    public void onAttack(PacketAttackEvent e) {
+    	if (!(e.getEntity() instanceof Player)) {
+    		return;
+		}
+		Player d = e.getPlayer();
+		Player p = (Player)e.getEntity();
+		if(e.getType() != PacketPlayerType.USE
+			|| d.hasPermission("thotpatrol.bypass")
+			|| d.getAllowFlight()
+			|| p.getAllowFlight()
+			|| d.getGameMode().equals(GameMode.CREATIVE)) {
+			return;
+		}
+		int count = verbose.getOrDefault(d.getUniqueId(), 0);
+		int preVL = beforeVL.getOrDefault(d.getUniqueId(), 0);
+		double yDist = Math.abs(UtilPlayer.getEyeLocation(d).getY() - UtilPlayer.getEyeLocation(p).getY()) &gt; 0.5 
+				? Math.abs(UtilPlayer.getEyeLocation(d).getY() - UtilPlayer.getEyeLocation(p).getY()) : 0;
+		double yawDiff = Math.abs(180 - Math.abs(d.getLocation().getYaw() - p.getLocation().getYaw()));
+        double reach = (UtilPlayer.getEyeLocation(d).distance(p.getEyeLocation()) - yDist) - 0.32;
+        if (reach &gt; 6.5) return;
+		double maxReach = 3.1;
+		double speed = lastDist.getOrDefault(d.getUniqueId(), 0D);
+		double tps = getThotPatrol().getLag().getTPS();
+		int ping = getThotPatrol().getLag().getPing(d);
+		int ping2 = getThotPatrol().getLag().getPing(p);
+		if (!UtilPlayer.isOnGround(d)) {
+			maxReach += .23;
+		}
+		maxReach += yawDiff &gt; 100 &amp;&amp; yDist &lt; 0.1 ? yawDiff * 0.01 : yawDiff * 0.001;
+		maxReach += speed * .58;
+		maxReach += yDist * .75;
+		maxReach += ((ping + ping2) / 2) * 0.0034;
+		for (PotionEffect effect : d.getActivePotionEffects()) {
+			if (effect.getType().equals(PotionEffectType.SPEED)) {
+				int level = effect.getAmplifier() + 1;
+				maxReach += level * .125;
+			}
+		}
+		if (reach &gt; maxReach) {
+			count++;
+		} else {
+			if (count &gt; 0) {
+				count--;
+			}
+		}
+		if (count &gt; 3) {
+			getThotPatrol().verbose(this, d, ping, tps, reach + " &gt; " + maxReach);
+			preVL++;
+		}
+		if (preVL &gt;= 2) {
+			count = 0;
+			preVL = 0;
+			getThotPatrol().logCheat(this, d, "Reach: " + reach + " &gt; " + maxReach + " | Ping: " + ping + " | TPS: " + tps);
+        	getThotPatrol().logToFile(d, this, "Reach (Consecutive)", "Reach: " + reach 
+        			+ " &gt; " + maxReach + " | TPS: " + tps + " | Ping: " + ping);
+		}
+		beforeVL.put(d.getUniqueId(), preVL);
+		verbose.put(d.getUniqueId(), count);
+    }
+
+    
+    @EventHandler
+    public void onMove(PlayerMoveEvent e) {
+    	Player p = e.getPlayer();
+    	double dist = UtilMath.getHorizontalDistance(e.getTo(), e.getFrom());
+    	lastDist.put(p.getUniqueId(), dist);
+    }
+}
+// NOTE (AI): The packet class itself never appears in this file; the corpus match is the author's TODO comment. Included to show the historical gap between Bukkit-position reach checks and S14-driven AABB reach.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The commented TODO names the S14-based approach (accumulating rel-move deltas and testing the entity AABB) as the accurate alternative; the modern trackers in this corpus (Hydro TrackedEntity, Kauri EntityTrackHandler, AntiHaxerman EntityTracker) implement exactly that approach and feed it into their own reach checks.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NetworkFilter (entity packet admission control)</span>
+<span class="impl-module-clients">(Tecnio-AntiHaxerman)</span>
+</div>
+<p class="impl-pattern">Whitelist the packet classes AntiHaxerman's trackers may consume, including the three S14 subclasses, so entity replication only runs for state that actually reaches the client.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The constructor registers GPacketPlayServerEntity and its Look, RelEntityMove and RelEntityMoveLook inner classes, plus entity teleport, spawn, destroy, velocity, attributes and the movement/transaction set. isAllowed is the gate every later pipeline stage checks before processing a packet.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly; it is admission control for the tracker pipeline that feeds reach, velocity and position checks.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tecnio-AntiHaxerman — src/main/java/me/tecnio/ahm/listener/network/NetworkFilter.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tecnio-AntiHaxerman — src/main/java/me/tecnio/ahm/listener/network/NetworkFilter.java =====
+package me.tecnio.ahm.listener.network;
+
+import cc.ghast.packet.wrapper.packet.play.client.*;
+import cc.ghast.packet.wrapper.packet.play.server.*;
+
+import java.util.Arrays;
+import java.util.HashSet;
+
+public final class NetworkFilter {
+
+    private final HashSet&lt;Class&lt;?&gt;&gt; filters = new HashSet&lt;&gt;();
+
+    public NetworkFilter() {
+        this.filters.addAll(Arrays.asList(
+                GPacketPlayClientFlying.class,
+                GPacketPlayClientPosition.class,
+                GPacketPlayClientPositionLook.class,
+                GPacketPlayClientLook.class,
+                GPacketPlayClientUseEntity.class,
+                GPacketPlayClientKeepAlive.class,
+                GPacketPlayServerKeepAlive.class,
+                GPacketPlayClientTransaction.class,
+                GPacketPlayServerTransaction.class,
+                GPacketPlayServerEntity.class,
+                GPacketPlayServerEntity.GPacketPlayServerEntityLook.class,
+                GPacketPlayServerEntity.GPacketPlayServerRelEntityMove.class,
+                GPacketPlayServerEntity.GPacketPlayServerRelEntityMoveLook.class,
+                GPacketPlayServerEntityTeleport.class,
+                GPacketPlayServerSpawnNamedEntity.class,
+                GPacketPlayServerEntityDestroy.class,
+                GPacketPlayClientBlockPlace.class,
+                GPacketPlayClientArmAnimation.class,
+                GPacketPlayClientBlockDig.class,
+                GPacketPlayClientHeldItemSlot.class,
+                GPacketPlayServerPosition.class,
+                GPacketPlayServerBlockChange.class,
+                GPacketPlayServerBlockChangeMulti.class,
+                GPacketPlayClientEntityAction.class,
+                GPacketPlayServerEntityEffect.class,
+                GPacketPlayServerEntityEffectRemove.class,
+                GPacketPlayServerUpdateAttributes.class,
+                GPacketPlayServerEntityVelocity.class,
+                GPacketPlayClientBlockDig.class
+        ));
+    }
+
+    public boolean isAllowed(final Class&lt;?&gt; clazz) {
+        return this.filters.contains(clazz);
+    }
+}
+// NOTE (AI): AntiHaxerman classifies the S14 subclasses so the EntityTracker can distinguish relative moves from look-only updates and teleports, mirroring vanilla's subclass structure.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis reaches the same packet family through GPacketPlayServerEntity, Frequency through WrappedPacketPlayOutEntity, and FlopAC through its tinyprotocol NMSObject/Packet layer; all three appear in the corpus for the same reason.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WrappedPacketPlayOutEntity (S14 wrapper)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency, MinecraftUserHAN1110-FrequencyPlus, splatboydev-Degrade)</span>
+</div>
+<p class="impl-pattern">Minimal 1.8 wrapper exposing the S14 base packet to Frequency's outgoing packet pipeline.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The class extends PacketWrapper over PacketPlayOutEntity, giving the processor layer a typed handle for entity move packets. The identical file ships in the FrequencyPlus fork and in Degrade, which is a Frequency derivative.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly; infrastructure for the processor pipeline that classifies entity packets.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/wrapper/impl/server/WrappedPacketPlayOutEntity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/wrapper/impl/server/WrappedPacketPlayOutEntity.java =====
+package xyz.elevated.frequency.wrapper.impl.server;
+
+import net.minecraft.server.v1_8_R3.Packet;
+import net.minecraft.server.v1_8_R3.PacketPlayOutEntity;
+import xyz.elevated.frequency.wrapper.PacketWrapper;
+
+public final class WrappedPacketPlayOutEntity extends PacketWrapper {
+
+    public WrappedPacketPlayOutEntity(final Packet&lt;?&gt; instance) {
+        super(instance, PacketPlayOutEntity.class);
+    }
+
+    public int getEntityId() {
+        return get("a");
+    }
+
+    public double getDeltaX() {
+        return ((byte) get("b")) / 32.d;
+    }
+
+    public double getDeltaY() {
+        return (byte) (get("c")) / 32.d;
+    }
+
+    public double getDeltaZ() {
+        return ((byte) get("d")) / 32.d;
+    }
+}
+// NOTE (AI): The wrapper is registered for the S14 base class, so it covers the S15/S16/S17 subclasses through inheritance, matching how the vanilla client handles the family.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> FrequencyPlus (MinecraftUserHAN1110) and Degrade (splatboydev) carry byte-identical copies of the file. AutoEye's PacketPlayOutEntity wrapper and FlopAC's tinyprotocol layer serve the same role on their own bases.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S18PacketEntityTeleport/">S18PacketEntityTeleport</a>
 <a class="related-chip" href="../S19PacketEntityHeadLook/">S19PacketEntityHeadLook</a>

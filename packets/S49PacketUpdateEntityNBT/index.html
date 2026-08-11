@@ -101,6 +101,544 @@
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Rise 6.1.30 and 6.2.4 expose S49 to scripts through NetworkAPI's packet registry; no event bus in any of the 8 clients has a module handler for it.</div>
 <div class="impl-clients">Only Rise 6.x differs from vanilla: its NetworkAPI packet list includes S49PacketUpdateEntityNBT.class. All other clients carry the unmodified NetHandlerPlayClient handler.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">Server-side anticheats treat this clientbound packet as plumbing: the server pushes a full NBT compound onto a tracked entity, and no movement or combat check keys off it. The corpus shows three anticheats that register or rewrite it (Intave rewrites the entity id inside it, Artemis maps it into its packet library, Negativity lists it in its packet registry) plus Grim's NBT validation logic, which targets client-sent item NBT in the opposite direction. The packet itself carries no client-controlled data, so there is nothing to flag.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NBT book exploit validation (ExploitB)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Validates the NBT attached to client-sent book items and flags compounds the client could not have produced legitimately. The only NBT-content check in the corpus.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Listens for item-slot and book-editing packets, diffs the new book compound against the old one the anticheat tracks, and flags with literal codes: BOOK_NO_NBT when a signed book carries no compound, BOOK_MODIFIED_NBT when unrelated tags change, plus too-many-pages and page-length counters. It faces the client-to-server direction; the S49 server push is never validated because the server authored it.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> NBT-fabrication exploits on written books, including the classic command-block NBT injection via book tags that older clients allowed.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/exploit/ExploitB.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/exploit/ExploitB.java =====
+package ac.grim.grimac.checks.impl.exploit;
+
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.impl.verbose.VerboseCodecs;
+import ac.grim.grimac.checks.type.PacketReceiveListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.payload.PayloadBookEdit;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.component.ComponentTypes;
+import com.github.retrooper.packetevents.protocol.item.ItemStack;
+import com.github.retrooper.packetevents.protocol.item.type.ItemType;
+import com.github.retrooper.packetevents.protocol.item.type.ItemTypes;
+import com.github.retrooper.packetevents.protocol.nbt.NBT;
+import com.github.retrooper.packetevents.protocol.nbt.NBTCompound;
+import com.github.retrooper.packetevents.protocol.nbt.NBTList;
+import com.github.retrooper.packetevents.protocol.nbt.NBTString;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.player.InteractionHand;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientEditBook;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerBlockPlacement;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPluginMessage;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientUseItem;
+import com.google.gson.JsonSyntaxException;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.io.IOException;
+import java.io.StringReader;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+@CheckData(name = "ExploitB", stableKey = "grim.exploit.invalid_book_edit", description = "Invalid book edit")
+public class ExploitB extends Check implements PacketReceiveListener {
+    private static final int BOOK_EXPECTED_SLOT = 0;
+    private static final int BOOK_EXPECTED_TYPE = 1;
+    private static final int BOOK_EXPECTED_AMOUNT = 2;
+    private static final int BOOK_EXPECTED_META = 3;
+    private static final int BOOK_NO_NBT = 4;
+    private static final int BOOK_NO_PAGES = 5;
+    private static final int BOOK_NO_TITLE = 6;
+    private static final int BOOK_EXPECTED_AUTHOR = 7;
+    private static final int BOOK_INVALID_PAGE = 8;
+    private static final int BOOK_MODIFIED_NBT = 9;
+    private static final int BOOK_TITLE_TOO_LONG = 10;
+    private static final int BOOK_INVALID_TITLE = 11;
+    private static final int BOOK_NOT_EDITING = 12;
+    private static final int BOOK_TOO_MANY_PAGES = 13;
+    private static final int BOOK_PAGE_TOO_LONG = 14;
+    private static final int BOOK_EMPTY_LAST_PAGE = 15;
+
+    // One shape per BOOK_* kind; shape index == constant value.
+    private static final Verbose V = Verbose
+            .of("expectedSlot={sint}, slot={sint}")      // BOOK_EXPECTED_SLOT
+            .or("expectedType={item}, type={item}")      // BOOK_EXPECTED_TYPE
+            .or("expectedAmount={sint}, amount={sint}")  // BOOK_EXPECTED_AMOUNT
+            .or("expectedMeta={sint}, meta={sint}")      // BOOK_EXPECTED_META
+            .or("no nbt")                                // BOOK_NO_NBT
+            .or("no pages")                              // BOOK_NO_PAGES
+            .or("no title")                              // BOOK_NO_TITLE
+            .or("expectedAuthor={str}, author={str}")    // BOOK_EXPECTED_AUTHOR
+            .or("invalid page")                          // BOOK_INVALID_PAGE
+            .or("modified nbt")                          // BOOK_MODIFIED_NBT
+            .or("title too long")                        // BOOK_TITLE_TOO_LONG
+            .or("invalid title '{str}'")                 // BOOK_INVALID_TITLE
+            .or("not editing book")                      // BOOK_NOT_EDITING
+            .or("too many pages")                        // BOOK_TOO_MANY_PAGES
+            .or("page too long")                         // BOOK_PAGE_TOO_LONG
+            .or("empty last page");                      // BOOK_EMPTY_LAST_PAGE
+
+    private static final int UNUSED_TYPE = -1;
+    private static final boolean IS_1_8 = PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_8_8);
+    private ItemStack oldBook;
+    private InteractionHand hand;
+
+    public ExploitB(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketReceive(PacketReceiveEvent event) {
+        if (IS_1_8 ? event.getPacketType() == PacketType.Play.Client.PLAYER_BLOCK_PLACEMENT
+                &amp;&amp; new WrapperPlayClientPlayerBlockPlacement(event).getFaceId() == 255
+                : event.getPacketType() == PacketType.Play.Client.USE_ITEM) {
+            hand = IS_1_8 ? InteractionHand.MAIN_HAND : new WrapperPlayClientUseItem(event).getHand();
+            oldBook = player.inventory.getItemInHand(hand).copy();
+        }
+
+        if (event.getPacketType() == PacketType.Play.Client.EDIT_BOOK) {
+            checkEditBook(new WrapperPlayClientEditBook(event), event);
+            oldBook = null;
+        }
+
+        // 1.13-
+        if (event.getPacketType() == PacketType.Play.Client.PLUGIN_MESSAGE &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_13)) {
+            WrapperPlayClientPluginMessage wrapper = new WrapperPlayClientPluginMessage(event);
+
+            boolean signing;
+            switch (wrapper.getChannelName()) {
+                case "MC|BSign" -&gt; signing = true;
+                case "MC|BEdit" -&gt; signing = false;
+                default -&gt; {
+                    return;
+                }
+            }
+
+            ItemStack newBook = new PayloadBookEdit(wrapper.getData()).itemStack();
+            checkItemStack(newBook, signing, event);
+            oldBook = null;
+        }
+    }
+
+    private void checkEditBook(WrapperPlayClientEditBook wrapper, PacketReceiveEvent event) {
+        if (checkEditingBook(event)) return;
+
+        int expectedSlot = hand == InteractionHand.OFF_HAND ? 40 : player.packetStateData.lastSlotSelected;
+        int slot = wrapper.getSlot();
+        if (slot != expectedSlot) {
+            flagExpectedSlot(event, expectedSlot, slot);
+            return;
+        }
+
+        if (wrapper.getSigning() == null) { // 1.17+
+            if (wrapper.getTitle() != null &amp;&amp; checkTitle(wrapper.getTitle(), event)) return;
+
+            List&lt;String&gt; pages = wrapper.getPages();
+            if (pages.size() &gt; 1 &amp;&amp; checkEmptyLastPage(pages.get(pages.size() - 1), event)) return;
+            if (checkTooManyPages(pages.size(), event)) return;
+            for (String page : pages) {
+                if (checkPage(page, event)) return;
+            }
+        } else { // 1.13 - 1.16.5
+            checkItemStack(wrapper.getItemStack(), wrapper.getSigning(), event);
+        }
+    }
+
+    private void checkItemStack(ItemStack newBook, boolean signing, PacketReceiveEvent event) {
+        if (checkEditingBook(event)) return;
+
+        ItemType expectedType = signing &amp;&amp; IS_1_8 ? ItemTypes.WRITTEN_BOOK : ItemTypes.WRITABLE_BOOK;
+        if (!newBook.is(expectedType)) {
+            flagExpectedType(event, expectedType, newBook.getType());
+            return;
+        }
+
+        if (newBook.getAmount() != oldBook.getAmount()) {
+            flagExpectedAmount(event, oldBook.getAmount(), newBook.getAmount());
+            return;
+        }
+
+        if (newBook.getLegacyData() != oldBook.getLegacyData()) {
+            flagExpectedMeta(event, oldBook.getLegacyData(), newBook.getLegacyData());
+            return;
+        }
+
+        NBTCompound newBookNBT = newBook.getNBT();
+        if (newBookNBT == null) {
+            flagLiteral(event, BOOK_NO_NBT);
+            return;
+        }
+
+        NBTList&lt;@NotNull NBTString&gt; newPagesNBT = newBookNBT.getStringListTagOrNull("pages");
+        if (newPagesNBT == null) {
+            flagLiteral(event, BOOK_NO_PAGES);
+            return;
+        }
+
+        if (checkTooManyPages(newPagesNBT.size(), event)) return;
+
+        if (signing) {
+            String title = newBookNBT.getStringTagValueOrNull("title");
+            if (title == null) {
+                flagLiteral(event, BOOK_NO_TITLE);
+                return;
+            }
+
+            if (checkTitle(title, event)) return;
+
+            String author = newBookNBT.getStringTagValueOrNull("author");
+            if (!player.getName().equals(author)) {
+                flagExpectedAuthor(event, player.getName(), author == null ? "null" : author);
+                return;
+            }
+        }
+
+        String last = null;
+        for (NBTString string : newPagesNBT.getTags()) {
+            if (IS_1_8 &amp;&amp; signing) {
+                try {
+                    JsonReader reader = new JsonReader(new StringReader(string.getValue()));
+                    if (reader.peek() != JsonToken.BEGIN_OBJECT) throw new JsonSyntaxException("");
+                    reader.beginObject();
+                    if (reader.peek() != JsonToken.NAME || !reader.nextName().equals("text")
+                            || reader.peek() != JsonToken.STRING) throw new JsonSyntaxException("");
+                    last = reader.nextString();
+                    if (reader.peek() != JsonToken.END_OBJECT) throw new JsonSyntaxException("");
+                } catch (JsonSyntaxException e) {
+                    flagLiteral(event, BOOK_INVALID_PAGE);
+                    return;
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            } else {
+                last = string.getValue();
+            }
+
+            if (checkPage(last, event)) return;
+        }
+
+        if (last != null &amp;&amp; checkEmptyLastPage(last, event)) {
+            return;
+        }
+
+        Set&lt;Map.Entry&lt;String, NBT&gt;&gt; newNBT = newBookNBT.getTags().entrySet();
+        HashMap&lt;String, NBT&gt; oldNBT = oldBook.getNBT() == null ? new HashMap&lt;&gt;() : new HashMap&lt;&gt;(oldBook.getNBT().getTags());
+        oldNBT.remove("pages");
+        oldNBT.remove("title");
+        oldNBT.remove("author");
+        for (var entry : newNBT) {
+            if (!entry.getKey().equals("pages") &amp;&amp; !entry.getKey().equals("title") &amp;&amp; !entry.getKey().equals("author")) {
+                NBT nbt = oldNBT.remove(entry.getKey());
+                if (nbt == null || !nbt.equals(entry.getValue())) {
+                    flagLiteral(event, BOOK_MODIFIED_NBT);
+                    return;
+                }
+            }
+        }
+
+        if (!oldNBT.isEmpty()) {
+            flagLiteral(event, BOOK_MODIFIED_NBT);
+        }
+    }
+
+    private boolean checkTitle(@NotNull String title, PacketReceiveEvent event) {
+        if (title.length() &gt; (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_16) ? 15 : 16)) {
+            flagLiteral(event, BOOK_TITLE_TOO_LONG);
+            return true;
+        } else if (title.isEmpty() || !title.trim().equals(title) || containsInvalidCharacters(title, false)) {
+            flagInvalidTitle(event, title);
+            return true;
+        }
+
+        return false;
+    }
+
+    private boolean checkEditingBook(PacketReceiveEvent event) {
+        if (oldBook == null || !oldBook.is(ItemTypes.WRITABLE_BOOK)) {
+            flagLiteral(event, BOOK_NOT_EDITING);
+            return true;
+        }
+        return false;
+    }
+
+    private boolean checkTooManyPages(int pages, PacketReceiveEvent event) {
+        NBTList&lt;@NotNull NBTString&gt; oldPagesNBT;
+        int oldPages = oldBook.getVersion().isNewerThanOrEquals(ClientVersion.V_1_20_5)
+                ? oldBook.getComponent(ComponentTypes.WRITABLE_BOOK_CONTENT).map(content -&gt; content.getPages().size()).orElse(0)
+                : oldBook.getNBT() != null &amp;&amp; (oldPagesNBT = oldBook.getNBT().getStringListTagOrNull("pages")) != null
+                ? oldPagesNBT.size() : 0;
+
+        if (pages &gt; oldPages &amp;&amp; pages &gt; (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_14) ? 100 : 50)) {
+            flagLiteral(event, BOOK_TOO_MANY_PAGES);
+            return true;
+        }
+
+        return false;
+    }
+
+    private boolean checkPage(String page, PacketReceiveEvent event) {
+        if (page.length() &gt; (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_14) ? 1023 : 256)) {
+            flagLiteral(event, BOOK_PAGE_TOO_LONG);
+            return true;
+        }
+
+        // commented out because existing characters are not considered
+//        if (containsInvalidCharacters(page, true)) {
+//            if (flag("invalid page characters") &amp;&amp; shouldModifyPackets()) {
+//                event.setCancelled(true);
+//                player.onPacketCancel();
+//            }
+//            return true;
+//        }
+
+        return false;
+    }
+
+    private boolean checkEmptyLastPage(String page, PacketReceiveEvent event) {
+        if (page.isEmpty()) {
+            flagLiteral(event, BOOK_EMPTY_LAST_PAGE);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void flagExpectedSlot(PacketReceiveEvent event, int expectedSlot, int slot) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_SLOT).sint(expectedSlot).sint(slot));
+    }
+
+    private void flagExpectedType(PacketReceiveEvent event, @NotNull ItemType expectedType, @Nullable ItemType type) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_TYPE).sint(typeId(expectedType)).sint(typeId(type)));
+    }
+
+    private void flagExpectedAmount(PacketReceiveEvent event, int expectedAmount, int amount) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_AMOUNT).sint(expectedAmount).sint(amount));
+    }
+
+    private void flagExpectedMeta(PacketReceiveEvent event, int expectedMeta, int meta) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_META).sint(expectedMeta).sint(meta));
+    }
+
+    private void flagExpectedAuthor(PacketReceiveEvent event, @NotNull String expectedAuthor, @NotNull String author) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_AUTHOR).str(expectedAuthor).str(author));
+    }
+
+    private void flagInvalidTitle(PacketReceiveEvent event, @NotNull String title) {
+        flagBookEdit(event, V.write(verbose(), BOOK_INVALID_TITLE).str(title));
+    }
+
+    private void flagLiteral(PacketReceiveEvent event, int kind) {
+        flagBookEdit(event, V.write(verbose(), kind));
+    }
+
+    private void flagBookEdit(PacketReceiveEvent event, Verbose.Writer writer) {
+        if (flag(writer) &amp;&amp; shouldModifyPackets()) {
+            event.setCancelled(true);
+            player.onPacketCancel();
+        }
+    }
+
+    private int typeId(@Nullable ItemType type) {
+        return type == null ? UNUSED_TYPE : VerboseCodecs.item(type, player.getClientVersion());
+    }
+
+    private static boolean containsInvalidCharacters(@NotNull String string, boolean allowLineBreak) {
+        for (int i = 0; i &lt; string.length(); ++i) {
+            char character = string.charAt(i);
+            if (character == 167 || character &lt; 32 &amp;&amp; (!allowLineBreak || character != 10) || character == 127) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+// NOTE (AI): ExploitB inspects client-sent book NBT, not the server-to-client S49 payload. It anchors the NBT check domain in the corpus because it is the only anticheat logic here that parses compound tags and flags malformed ones.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Intave registers UPDATE_ENTITY_NBT in PacketId and feeds it to EntityReader, and Artemis maps PacketPlayOutUpdateEntityNBT to PacketPlayServerUpdateMetadata in HardcodeMap; neither validates NBT content. Only Grim parses compounds, and it does so on the inbound item path.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Entity id translation filter (EntityIdFilter)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Rewrites entity ids in serverbound and clientbound entity packets so Intave tracks entities under its own local id scheme. UPDATE_ENTITY_NBT sits in the outbound rewrite list.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A ProtocolLib filter with two subscriptions: inbound USE_ENTITY, ATTACK_ENTITY and ENTITY_NBT_QUERY packets get their local id translated to the global id, and the outbound list (which includes UPDATE_ENTITY_NBT) maps every entity id back to the local id through ConnectionMetadata, minting new local ids on first sight. It reads the first integer field of each packet, never the NBT payload.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Not a cheat check. It is an id-translation layer that keeps killaura, reach and position checks consistent with the anticheat's own entity table.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/module/filter/EntityIdFilter.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/module/filter/EntityIdFilter.java =====
+package de.jpx3.intave.module.filter;
+
+import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.reflect.StructureModifier;
+import de.jpx3.intave.IntavePlugin;
+import de.jpx3.intave.cleanup.ShutdownTasks;
+import de.jpx3.intave.module.linker.packet.ListenerPriority;
+import de.jpx3.intave.module.linker.packet.PacketSubscription;
+import de.jpx3.intave.packet.reader.EntityIterable;
+import de.jpx3.intave.packet.reader.PacketReaders;
+import de.jpx3.intave.packet.reader.SubstitutionIterator;
+import de.jpx3.intave.user.User;
+import de.jpx3.intave.user.UserRepository;
+import de.jpx3.intave.user.meta.ConnectionMetadata;
+import org.bukkit.Bukkit;
+import org.bukkit.entity.Player;
+import org.bukkit.metadata.FixedMetadataValue;
+import org.bukkit.metadata.MetadataValue;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+import static de.jpx3.intave.module.linker.packet.PacketId.Client.*;
+import static de.jpx3.intave.module.linker.packet.PacketId.Server.*;
+
+public final class EntityIdFilter extends Filter {
+  private static final String RELOAD_METADATA_KEY = "intave::DT6NyhqI5bPJTeQRO6KWl1hNcEy2YZAp";
+
+  public EntityIdFilter() {
+    super("entityid");
+    setup();
+  }
+
+  public void setup() {
+    ShutdownTasks.addBeforeAll(this::shutdown);
+    for (Player player : Bukkit.getOnlinePlayers()) {
+      Plugin owningPlugin = null;
+      for (MetadataValue metadata : player.getMetadata(RELOAD_METADATA_KEY)) {
+        Map&lt;Integer, Integer&gt; translations = (Map&lt;Integer, Integer&gt;) metadata.value();
+        if (translations != null &amp;&amp; metadata.getOwningPlugin().getName().equalsIgnoreCase("Intave")) {
+          UserRepository.userOf(player).meta().connection().insertIdTranslations(translations);
+          owningPlugin = metadata.getOwningPlugin();
+          break;
+        }
+      }
+      if (owningPlugin != null) {
+        player.removeMetadata(RELOAD_METADATA_KEY, owningPlugin);
+      }
+    }
+  }
+
+  public void shutdown() {
+    for (Player player : Bukkit.getOnlinePlayers()) {
+      JavaPlugin intave = IntavePlugin.singletonInstance();
+      Map&lt;Integer, Integer&gt; translation = new HashMap&lt;&gt;(UserRepository.userOf(player).meta().connection().globalEntityIdsToLocalIds());
+      player.removeMetadata(RELOAD_METADATA_KEY, intave);
+      player.setMetadata(RELOAD_METADATA_KEY, new FixedMetadataValue(intave, translation));
+    }
+  }
+
+  @PacketSubscription(
+    packetsIn = {
+      ATTACK_ENTITY,
+      USE_ENTITY,
+      ENTITY_NBT_QUERY
+    },
+    priority = ListenerPriority.LOWEST
+  )
+  public void onPacket(
+    PacketEvent event
+  ) {
+    User user = UserRepository.userOf(event.getPlayer());
+    PacketContainer packet = event.getPacket();
+    StructureModifier&lt;Integer&gt; ints = packet.getIntegers();
+    int localId = ints.read(0);
+    int globalId = user.meta().connection().globalEntityIdFromLocal(localId);
+    ints.write(0, globalId);
+  }
+
+  @PacketSubscription(
+    packetsOut = {
+      ATTACH_ENTITY,
+      BED,
+      BLOCK_BREAK_ANIMATION,
+      CAMERA,
+      COLLECT,
+      COMBAT_EVENT,
+      ENTITY,
+      ENTITY_DESTROY,
+      ENTITY_EFFECT,
+      ENTITY_EQUIPMENT,
+      ENTITY_HEAD_ROTATION,
+      ENTITY_LOOK,
+      ENTITY_METADATA,
+      ENTITY_MOVE_LOOK,
+      ENTITY_SOUND,
+      ENTITY_STATUS,
+      ENTITY_TELEPORT,
+      ENTITY_VELOCITY,
+      LOOK_AT,
+      LOGIN,
+      MOUNT,
+      NAMED_ENTITY_SPAWN,
+      OPEN_WINDOW,
+      OPEN_WINDOW_HORSE,
+      REL_ENTITY_MOVE,
+      REL_ENTITY_MOVE_LOOK,
+      REMOVE_ENTITY_EFFECT,
+      SPAWN_ENTITY,
+      SPAWN_ENTITY_EXPERIENCE_ORB,
+      SPAWN_ENTITY_LIVING,
+      SPAWN_ENTITY_PAINTING,
+      SPAWN_ENTITY_WEATHER,
+      UPDATE_ATTRIBUTES,
+      UPDATE_ENTITY_NBT,
+      USE_BED
+    },
+    priority = ListenerPriority.HIGHEST
+  )
+  public void onPacketOut(
+    PacketEvent event
+  ) {
+    PacketContainer packet = event.getPacket();
+    User user = UserRepository.userOf(event.getPlayer());
+    ConnectionMetadata connection = user.meta().connection();
+    EntityIterable entities = PacketReaders.readerOf(packet);
+    boolean isDestroy = packet.getType() == PacketType.Play.Server.ENTITY_DESTROY;
+    for (SubstitutionIterator&lt;Integer&gt; iterator = entities.iterator(); iterator.hasNext(); ) {
+      Integer globalId = iterator.next();
+      Integer localId = connection.localEntityIdFromGlobal(globalId);
+      if (localId == -1) {
+        localId = connection.newLocalIdFor(globalId);
+      }
+      iterator.set(localId);
+    }
+    if (isDestroy) {
+      Set&lt;Integer&gt; toRemove = new HashSet&lt;&gt;();
+      entities.forEach(toRemove::add);
+      toRemove.forEach(connection::markIdAsDeprecated);
+      user.tickFeedback(() -&gt;
+        user.tickFeedback(() -&gt;
+          toRemove.forEach(connection::removeId)
+        ));
+    }
+    entities.release();
+  }
+
+  @Override
+  protected boolean enabled() {
+    return false;
+  }
+}
+
+// NOTE (AI): EntityIdFilter rewrites the entity id inside the outbound UPDATE_ENTITY_NBT packet but never inspects the compound tag. The filter is disabled by default in this build.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis and Negativity only register the packet name in their packet libraries; neither filters or reads it. Grim's PacketWorldReaderEighteen reads NBT on chunk and tile-entity data, which is a different wire path from the entity NBT push.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S0CPacketSpawnPlayer/">S0CPacketSpawnPlayer</a>
 <a class="related-chip" href="../S0EPacketSpawnObject/">S0EPacketSpawnObject</a>

@@ -102,6 +102,773 @@
 <p class="impl-pattern">Equipment sync for tracked entities that the vanilla handler commits straight into EntityLivingBase, which is why every armor-aware feature in the 8 clients reads the fields instead of the packet. The only non-vanilla references are two dead imports (Rise 5.99 Aura, Sigma 4.11 InventoryManager) and the Rise 6.x script whitelist; no module processes it, so the module list is empty by corpus fact, not by omission.</p>
 <div class="impl-clients">The only client-side deltas are the dead imports (Rise 5.99 Aura, Sigma 4.11 InventoryManager) and the Rise 6.x script API entry; everything else in all 8 clients is the untouched vanilla handler.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">Server-side anticheats see S04 only on send, and the real consumers split into two groups. State mirrors keep the simulated entity copy honest: Grim reads the packet in PacketEntityReplication and applies it through CompensatedEntities on the transaction clock. Countermeasure modules rewrite the outgoing payload so other clients cannot scout gear: Photon's information hiders and Intave's EquipmentFilter. The rest of the corpus is keyword noise: Rammelkast, NCP UseItemAdapter and LightAntiCheat hit on org.bukkit.inventory.EquipmentSlot armor reads inside movement checks, Artemis and Negativity contribute wrappers and registrations, and the Peyang and MinecraftAntiCheat NPC bait code sends the packet to fake entities, which is a send-side use, not a check.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Entity equipment replication (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Keeps the compensated entity copy's equipment mirror in sync with the server so checks that depend on other players' gear (elytra gliding, attack range, horse saddle state) evaluate the right items at the right tick.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketEntityReplication reads WrapperPlayServerEntityEquipment on the ENTITY_EQUIPMENT send and schedules updateEntityEquipment as a real-time task on the transaction clock (lastTransactionSent), so the equipment change lands exactly when the client would have processed it. CompensatedEntities guards on the trackEntityEquipment flag, then folds each Equipment entry into the packet entity through setItemBySlot. PacketEntityHorse and PacketEntityNautilus enable tracking because saddle state is movement-relevant, and PacketEntityHappyGhast tracks its body slot.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly: this is state replication. It removes equipment desync as a variable from checks that reason about what a tracked entity holds or rides.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/utils/latency/CompensatedEntities.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/utils/latency/CompensatedEntities.java =====
+package ac.grim.grimac.utils.latency;
+
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.collisions.datatypes.SimpleCollisionBox;
+import ac.grim.grimac.utils.data.ShulkerData;
+import ac.grim.grimac.utils.data.TrackerData;
+import ac.grim.grimac.utils.data.attribute.ValuedAttribute;
+import ac.grim.grimac.utils.data.packetentity.*;
+import ac.grim.grimac.utils.data.packetentity.dragon.PacketEntityEnderDragon;
+import ac.grim.grimac.utils.nmsutil.BoundingBoxSize;
+import ac.grim.grimac.utils.nmsutil.WatchableIndexUtil;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.attribute.Attribute;
+import com.github.retrooper.packetevents.protocol.attribute.Attributes;
+import com.github.retrooper.packetevents.protocol.entity.data.EntityData;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityType;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityTypes;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.player.Equipment;
+import com.github.retrooper.packetevents.protocol.player.UserProfile;
+import com.github.retrooper.packetevents.protocol.potion.PotionType;
+import com.github.retrooper.packetevents.protocol.potion.PotionTypes;
+import com.github.retrooper.packetevents.protocol.world.BlockFace;
+import com.github.retrooper.packetevents.protocol.world.Direction;
+import com.github.retrooper.packetevents.resources.ResourceLocation;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateAttributes;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.ints.IntArraySet;
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.UUID;
+
+public class CompensatedEntities {
+
+    public static final UUID SPRINTING_MODIFIER_UUID = UUID.fromString("662A6B8D-DA3E-4C1C-8813-96EA6097278D");
+    public static final UUID SNOW_MODIFIER_UUID = UUID.fromString("1eaf83ff-7207-4596-b37a-d7a07b3ec4ce");
+
+    public final Int2ObjectOpenHashMap&lt;PacketEntity&gt; entityMap = new Int2ObjectOpenHashMap&lt;&gt;(40, 0.7f);
+    public final IntArraySet entitiesRemovedThisTick = new IntArraySet();
+    public final Int2ObjectOpenHashMap&lt;TrackerData&gt; serverPositionsMap = new Int2ObjectOpenHashMap&lt;&gt;(40, 0.7f);
+    public final Object2ObjectOpenHashMap&lt;UUID, UserProfile&gt; profiles = new Object2ObjectOpenHashMap&lt;&gt;();
+    public Integer serverPlayerVehicle = null;
+    public boolean hasSprintingAttributeEnabled = false;
+    public TrackerData selfTrackedEntity;
+    public PacketEntitySelf self;
+    private final GrimPlayer player;
+
+    public CompensatedEntities(GrimPlayer player) {
+        this.player = player;
+        this.self = new PacketEntitySelf(player);
+        this.selfTrackedEntity = new TrackerData(0, 0, 0, 0, 0, EntityTypes.PLAYER, player.lastTransactionSent.get());
+    }
+
+    public int getPacketEntityID(PacketEntity entity) {
+        for (Map.Entry&lt;Integer, PacketEntity&gt; entry : entityMap.int2ObjectEntrySet()) {
+            if (entry.getValue() == entity) {
+                return entry.getKey();
+            }
+        }
+        return Integer.MIN_VALUE;
+    }
+
+    public void tick() {
+        this.self.setPositionRaw(player, new SimpleCollisionBox(player.x, player.y, player.z, player.x, player.y, player.z));
+        for (PacketEntity vehicle : entityMap.values()) {
+            for (PacketEntity passenger : vehicle.passengers) {
+                tickPassenger(vehicle, passenger);
+            }
+        }
+    }
+
+    public void removeEntity(int entityID) {
+        PacketEntity entity = entityMap.remove(entityID);
+        if (entity == null) return;
+
+        if (entity instanceof PacketEntityEnderDragon dragon) {
+            for (int i = 1; i &lt; dragon.getParts().size() + 1; i++) {
+                entityMap.remove(entityID + i);
+            }
+        }
+
+        for (PacketEntity passenger : new ArrayList&lt;&gt;(entity.passengers)) {
+            passenger.eject();
+        }
+    }
+
+    public OptionalInt getSlowFallingAmplifier() {
+        return player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_12_2) ? OptionalInt.empty() : getPotionLevelForPlayer(PotionTypes.SLOW_FALLING);
+    }
+
+    public OptionalInt getPotionLevelForPlayer(PotionType type) {
+        return getEntityInControl().getPotionEffectLevel(type);
+    }
+
+    public OptionalInt getPotionLevelForSelfPlayer(PotionType type) {
+        return self.getPotionEffectLevel(type);
+    }
+
+    public boolean hasPotionEffect(PotionType type) {
+        return getEntityInControl().hasPotionEffect(type);
+    }
+
+    public PacketEntity getEntityInControl() {
+        return self.getRiding() != null ? self.getRiding() : self;
+    }
+
+    public void updateAttributes(int entityID, List&lt;WrapperPlayServerUpdateAttributes.Property&gt; objects) {
+        if (entityID == player.entityID) {
+            // Check for sprinting attribute. Note that this value can desync: https://bugs.mojang.com/browse/MC-69459
+            for (WrapperPlayServerUpdateAttributes.Property snapshotWrapper : objects) {
+                final Attribute attribute = snapshotWrapper.getAttribute();
+                if (attribute != Attributes.MOVEMENT_SPEED) continue;
+
+                boolean found = false;
+                List&lt;WrapperPlayServerUpdateAttributes.PropertyModifier&gt; modifiers = snapshotWrapper.getModifiers();
+                for (WrapperPlayServerUpdateAttributes.PropertyModifier modifier : modifiers) {
+                    final ResourceLocation name = modifier.getName();
+                    if (name.getKey().equals(SPRINTING_MODIFIER_UUID.toString()) || name.getKey().equals("sprinting")) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                // The server can set the player's sprinting attribute
+                hasSprintingAttributeEnabled = found;
+                break;
+            }
+        }
+
+        PacketEntity entity = player.compensatedEntities.getEntity(entityID);
+        if (entity == null) return;
+
+        for (WrapperPlayServerUpdateAttributes.Property snapshotWrapper : objects) {
+            Attribute attribute = snapshotWrapper.getAttribute();
+            if (attribute == null)
+                continue; // TODO: Warn if this happens? Either modded server or bug in packetevents.
+
+            // Rewrite horse.jumpStrength -&gt; modern equivalent
+            if (attribute == Attributes.HORSE_JUMP_STRENGTH) {
+                attribute = Attributes.JUMP_STRENGTH;
+            }
+
+            final Optional&lt;ValuedAttribute&gt; valuedAttribute = entity.getAttribute(attribute);
+            if (valuedAttribute.isEmpty()) {
+                // Not an attribute we want to track
+                continue;
+            }
+
+            valuedAttribute.get().with(snapshotWrapper);
+        }
+    }
+
+    private void tickPassenger(PacketEntity riding, PacketEntity passenger) {
+        if (riding == null || passenger == null) {
+            return;
+        }
+
+        passenger.setPositionRaw(player, riding.getPossibleLocationBoxes().offset(0, BoundingBoxSize.getMyRidingOffset(riding) + BoundingBoxSize.getPassengerRidingOffset(player, passenger), 0));
+
+        for (PacketEntity passengerPassenger : riding.passengers) {
+            tickPassenger(passenger, passengerPassenger);
+        }
+    }
+
+    public PacketEntity addEntity(int entityID, UUID uuid, EntityType entityType, Vector3d position, float xRot, int data) {
+        // Dropped items are all server sided and players can't interact with them (except create them!), save the performance
+        if (entityType == EntityTypes.ITEM) return null;
+
+        PacketEntity packetEntity;
+        if (EntityTypes.isTypeInstanceOf(entityType, EntityTypes.ABSTRACT_NAUTILUS)) {
+            packetEntity = new PacketEntityNautilus(player, uuid, entityType, position.getX(), position.getY(), position.getZ());
+        } else if (EntityTypes.HAPPY_GHAST.equals(entityType)) {
+            packetEntity = new PacketEntityHappyGhast(player, uuid, entityType, position.getX(), position.getY(), position.getZ(), xRot);
+        } else if (EntityTypes.isTypeInstanceOf(entityType, EntityTypes.CAMEL)) {
+            packetEntity = new PacketEntityCamel(player, uuid, entityType, position.getX(), position.getY(), position.getZ(), xRot);
+        } else if (EntityTypes.isTypeInstanceOf(entityType, EntityTypes.ABSTRACT_HORSE)) {
+            packetEntity = new PacketEntityHorse(player, uuid, entityType, position.getX(), position.getY(), position.getZ(), xRot);
+        } else if (entityType == EntityTypes.SULFUR_CUBE) {
+            packetEntity = new PacketEntitySizeable(player, uuid, entityType, position.getX(), position.getY(), position.getZ());
+        } else if (entityType == EntityTypes.SLIME || entityType == EntityTypes.MAGMA_CUBE || entityType == EntityTypes.PHANTOM) {
+            packetEntity = new PacketEntitySizeable(player, uuid, entityType, position.getX(), position.getY(), position.getZ());
+        } else if (EntityTypes.PIG.equals(entityType)) {
+            packetEntity = new PacketEntityRideable(player, uuid, entityType, position.getX(), position.getY(), position.getZ());
+        } else if (EntityTypes.SHULKER.equals(entityType)) {
+            packetEntity = new PacketEntityShulker(player, uuid, entityType, position.getX(), position.getY(), position.getZ());
+        } else if (EntityTypes.STRIDER.equals(entityType)) {
+            packetEntity = new PacketEntityStrider(player, uuid, entityType, position.getX(), position.getY(), position.getZ());
+        } else if (EntityTypes.isTypeInstanceOf(entityType, EntityTypes.BOAT) || EntityTypes.CHICKEN.equals(entityType)) {
+            packetEntity = new PacketEntityTrackXRot(player, uuid, entityType, position.getX(), position.getY(), position.getZ(), xRot);
+        } else if (EntityTypes.FISHING_BOBBER.equals(entityType)) {
+            packetEntity = new PacketEntityHook(player, uuid, entityType, position.getX(), position.getY(), position.getZ(), data);
+        } else if (EntityTypes.ENDER_DRAGON.equals(entityType)) {
+            packetEntity = new PacketEntityEnderDragon(player, uuid, entityID, position.getX(), position.getY(), position.getZ());
+        } else if (
+                EntityTypes.isTypeInstanceOf(entityType, EntityTypes.ABSTRACT_ARROW)
+                || EntityTypes.FIREWORK_ROCKET.equals(entityType)
+                || EntityTypes.BLOCK_DISPLAY.equals(entityType)
+                || EntityTypes.TEXT_DISPLAY.equals(entityType)
+                || EntityTypes.LIGHTNING_BOLT.equals(entityType)
+                || EntityTypes.EXPERIENCE_BOTTLE.equals(entityType)
+                || EntityTypes.EXPERIENCE_ORB.equals(entityType)
+                || EntityTypes.EVOKER_FANGS.equals(entityType)
+        ) {
+            packetEntity = new PacketEntityUnHittable(player, uuid, entityType, position.getX(), position.getY(), position.getZ());
+        } else if (EntityTypes.ARMOR_STAND.equals(entityType)) {
+            packetEntity = new PacketEntityArmorStand(player, uuid, entityType, position.getX(), position.getY(), position.getZ(), data);
+        } else if (EntityTypes.PAINTING.equals(entityType)) {
+            packetEntity = new PacketEntityPainting(player, uuid, position.x, position.y, position.z, Direction.values()[data]);
+        } else if (EntityTypes.GUARDIAN.equals(entityType)) {
+            packetEntity = new PacketEntityGuardian(player, uuid, entityType, position.x, position.y, position.z, false); // can still be an Elder Guardian in 1.8-1.10.2 from entity metadata updates
+        } else if (EntityTypes.ELDER_GUARDIAN.equals(entityType)) {
+            packetEntity = new PacketEntityGuardian(player, uuid, entityType, position.x, position.y, position.z, true);
+        } else if (EntityTypes.SKELETON == entityType) {
+            packetEntity = new PacketEntitySkeleton(player, uuid, entityType, position.x, position.y, position.z);
+        } else {
+            packetEntity = new PacketEntity(player, uuid, entityType, position.getX(), position.getY(), position.getZ());
+        }
+
+        entityMap.put(entityID, packetEntity);
+        return packetEntity;
+    }
+
+    public PacketEntity getEntity(int entityID) {
+        if (entityID == player.entityID) {
+            return self;
+        }
+        return entityMap.get(entityID);
+    }
+
+    public TrackerData getTrackedEntity(int id) {
+        if (id == player.entityID) {
+            return selfTrackedEntity;
+        }
+        return serverPositionsMap.get(id);
+    }
+
+    // TODO optimize into if-else chain instead of individual ifs
+    public void updateEntityMetadata(int entityID, List&lt;EntityData&lt;?&gt;&gt; watchableObjects) {
+        PacketEntity entity = player.compensatedEntities.getEntity(entityID);
+        if (entity == null) return;
+
+        // 26.1 added AGE_LOCKED to AgeableMob after BABY, shifting all descendant field indices +1.
+        // Only affects entities extending AgeableMob (horses, pigs, striders, tamables, etc.)
+        final int ageableOffset = PacketEvents.getAPI().getServerManager().getVersion()
+                .isNewerThanOrEquals(ServerVersion.V_26_1) ? 1 : 0;
+
+        if (entity.isAgeable) {
+            int id;
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_8_8)) {
+                id = 12;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_9_4)) {
+                id = 11;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_13_2)) {
+                id = 12;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_14_4)) {
+                id = 14;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_16_5)) {
+                id = 15;
+            } else {
+                id = 16 + (EntityTypes.isTypeInstanceOf(entity.getType(), EntityTypes.ABSTRACT_PIGLIN) ? 1 : 0); // BABY is still at 16 in 26.1 (AGE_LOCKED is 17, after BABY), for some reason, piglins have their own age metadata??
+            }
+
+            // 1.14 good
+            EntityData&lt;?&gt; ageableObject = WatchableIndexUtil.getIndex(watchableObjects, id);
+            if (ageableObject != null) {
+                Object value = ageableObject.getValue();
+                // Required because bukkit Ageable doesn't align with minecraft's ageable
+                if (value instanceof Boolean) {
+                    entity.isBaby = (boolean) value;
+                } else if (value instanceof Byte) {
+                    entity.isBaby = ((Byte) value) &lt; 0;
+                }
+            }
+        }
+
+        if (entity instanceof PacketEntitySizeable sizeable) {
+            int id;
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_8_8)) {
+                id = 16;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_9_4)) {
+                id = 11;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_13_2)) {
+                id = 12;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_14_4)) {
+                id = 14;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_16_5)) {
+                id = 15;
+            } else {
+                id = 16;
+            }
+
+            EntityData&lt;?&gt; sizeObject = WatchableIndexUtil.getIndex(watchableObjects, id);
+            if (sizeObject != null) {
+                Object value = sizeObject.getValue();
+                if (value instanceof Integer) {
+                    sizeable.size = (int) value;
+                } else if (value instanceof Byte) {
+                    sizeable.size = (byte) value;
+                }
+            }
+        }
+
+        if (entity instanceof PacketEntityShulker shulker) {
+            int id;
+
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_9_4)) {
+                id = 11;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_13_2)) {
+                id = 12;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_14_4)) {
+                id = 14;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_16_5)) {
+                id = 15;
+            } else {
+                id = 16;
+            }
+
+            EntityData&lt;?&gt; shulkerAttached = WatchableIndexUtil.getIndex(watchableObjects, id);
+
+            if (shulkerAttached != null) {
+                // This NMS -&gt; Bukkit conversion is great and works in all 11 versions.
+                shulker.facing = BlockFace.valueOf(shulkerAttached.getValue().toString().toUpperCase());
+            }
+
+            // ATTACH_POS was removed in 1.17, shifting PEEK from id+2 to id+1
+            int peekOffset = PacketEvents.getAPI().getServerManager().getVersion()
+                    .isNewerThanOrEquals(ServerVersion.V_1_17) ? 1 : 2;
+            EntityData&lt;?&gt; height = WatchableIndexUtil.getIndex(watchableObjects, id + peekOffset);
+            if (height != null) {
+                ShulkerData data = new ShulkerData(shulker, player.lastTransactionSent.get(), (byte) height.getValue() == 0);
+                player.compensatedWorld.openShulkerBoxes.remove(data);
+                player.compensatedWorld.openShulkerBoxes.add(data);
+            }
+        }
+
+        if (entity instanceof PacketEntityRideable rideable) {
+            int offset = 0;
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_8_8)) {
+                if (entity.getType() == EntityTypes.PIG) {
+                    EntityData&lt;?&gt; pigSaddle = WatchableIndexUtil.getIndex(watchableObjects, 16);
+                    if (pigSaddle != null) {
+                        rideable.hasSaddle = ((byte) pigSaddle.getValue()) != 0;
+                    }
+                }
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_9_4)) {
+                offset = 5;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_13_2)) {
+                offset = 4;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_14_4)) {
+                offset = 2;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_16_5)) {
+                offset = 1;
+            }
+
+            if (entity.getType() == EntityTypes.PIG) {
+                // SADDLE removed in 1.21.5, shifting BOOST_TIME from 18→17.
+                // ageableOffset naturally cancels this out in 26.1 (BOOST_TIME back at 18).
+                if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_21_5))
+                    offset = 1;
+
+                // SADDLE removed in 1.21.5; now handled via equipment
+                if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_21_5)) {
+                    EntityData&lt;?&gt; pigSaddle = WatchableIndexUtil.getIndex(watchableObjects, 17 - offset + ageableOffset);
+                    if (pigSaddle != null) {
+                        rideable.hasSaddle = (boolean) pigSaddle.getValue();
+                    }
+                }
+
+                EntityData&lt;?&gt; pigBoost = WatchableIndexUtil.getIndex(watchableObjects, 18 - offset + ageableOffset);
+                if (pigBoost != null) { // What does 1.9-1.10 do here? Is this feature even here?
+                    rideable.boostTimeMax = (int) pigBoost.getValue();
+                    rideable.currentBoostTime = 0;
+                }
+            } else if (entity instanceof PacketEntityStrider) {
+                EntityData&lt;?&gt; striderBoost = WatchableIndexUtil.getIndex(watchableObjects, 17 - offset + ageableOffset);
+                if (striderBoost != null) {
+                    rideable.boostTimeMax = (int) striderBoost.getValue();
+                    rideable.currentBoostTime = 0;
+                }
+
+                EntityData&lt;?&gt; striderShaking = WatchableIndexUtil.getIndex(watchableObjects, 18 - offset + ageableOffset);
+                if (striderShaking != null) {
+                    ((PacketEntityStrider) rideable).isShaking = (boolean) striderShaking.getValue();
+                }
+
+                // SADDLE removed in 1.21.5; now handled via equipment
+                if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_21_5)) {
+                    EntityData&lt;?&gt; striderSaddle = WatchableIndexUtil.getIndex(watchableObjects, 19 - offset + ageableOffset);
+                    if (striderSaddle != null) {
+                        rideable.hasSaddle = (boolean) striderSaddle.getValue();
+                    }
+                }
+            }
+        }
+
+        if (entity instanceof PacketEntityHorse horse) {
+            if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_9_4)) {
+                int offset = 0;
+
+                if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_9_4)) {
+                    offset = 5;
+                } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_13_2)) {
+                    offset = 4;
+                } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_14_4)) {
+                    offset = 2;
+                } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_16_5)) {
+                    offset = 1;
+                }
+
+                EntityData&lt;?&gt; horseByte = WatchableIndexUtil.getIndex(watchableObjects, 17 - offset + ageableOffset);
+                if (horseByte != null) {
+                    byte info = (byte) horseByte.getValue();
+
+                    horse.isTame = (info &amp; 0x02) != 0;
+                    horse.hasSaddle = (info &amp; 0x04) != 0;
+                    horse.isRearing = (info &amp; 0x20) != 0;
+                }
+
+                // track camel dashing
+                if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_20)) {
+                    if (entity instanceof PacketEntityCamel camel) {
+                        EntityData&lt;?&gt; entityData = WatchableIndexUtil.getIndex(watchableObjects, 18 + ageableOffset);
+                        if (entityData != null) {
+                            camel.setDashing((boolean) entityData.getValue());
+
+                            // TODO there is: if (!this.firstTick &amp;&amp; DASH.equals(accessor)) {
+                            // !firstTick condition
+                            camel.setDashCooldown(camel.getDashCooldown() == 0 ? 55 : camel.getDashCooldown());
+                        }
+                    }
+                }
+            } else {
+                EntityData&lt;?&gt; horseByte = WatchableIndexUtil.getIndex(watchableObjects, 16);
+                if (horseByte != null) {
+                    int info = (int) horseByte.getValue();
+
+                    horse.isTame = (info &amp; 0x02) != 0;
+                    // TODO: Check this
+                    horse.hasSaddle = (info &amp; 0x04) != 0;
+                    // horse.hasSaddle = (info &amp; 0x08) != 0; // 0x08 should be hasChest
+                    horse.isRearing = (info &amp; 0x40) != 0;
+                }
+            }
+        }
+
+        if (entity instanceof PacketEntityNautilus nautilus) {
+            EntityData&lt;?&gt; entityData = WatchableIndexUtil.getIndex(watchableObjects, 19 + ageableOffset);
+            if (entityData != null) {
+                nautilus.setDashing((boolean) entityData.getValue());
+
+                // TODO there is: if (!this.firstTick &amp;&amp; DASH.equals(accessor)) {
+                // !firstTick condition
+                nautilus.setDashCooldown(nautilus.getDashCooldown() == 0 ? 40 : nautilus.getDashCooldown());
+            }
+        }
+
+        if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_9_4)) {
+            EntityData&lt;?&gt; gravity = WatchableIndexUtil.getIndex(watchableObjects, 5);
+
+            if (gravity != null) {
+                Object gravityObject = gravity.getValue();
+
+                if (gravityObject instanceof Boolean) {
+                    // Vanilla uses hasNoGravity, which is a bad name IMO
+                    // hasGravity &gt; hasNoGravity
+                    entity.hasGravity = !((Boolean) gravityObject);
+                }
+            }
+        }
+
+        if (entity.getType() == EntityTypes.FIREWORK_ROCKET) {
+            int offset = 0;
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_12_2)) {
+                offset = 2;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_16_5)) {
+                offset = 1;
+            }
+
+            EntityData&lt;?&gt; fireworkWatchableObject = WatchableIndexUtil.getIndex(watchableObjects, 9 - offset);
+            if (fireworkWatchableObject == null) return;
+
+            if (fireworkWatchableObject.getValue() instanceof Integer) { // Pre 1.14
+                int attachedEntityID = (Integer) fireworkWatchableObject.getValue();
+                if (attachedEntityID == player.entityID) {
+                    player.fireworks.addNewFirework(entityID);
+                }
+            } else if (fireworkWatchableObject.getValue() instanceof Optional&lt;?&gt; optional
+                    &amp;&amp; optional.isPresent() &amp;&amp; optional.get() instanceof Integer attachedEntityID
+                    &amp;&amp; attachedEntityID.equals(player.entityID)) { // 1.14+
+                player.fireworks.addNewFirework(entityID);
+            }
+        }
+
+        if (entity instanceof PacketEntityHook hook) {
+            int index;
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_9_4)) {
+                index = 5;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_14_4)) {
+                index = 6;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_16_5)) {
+                index = 7;
+            } else {
+                index = 8;
+            }
+
+            EntityData&lt;?&gt; hookWatchableObject = WatchableIndexUtil.getIndex(watchableObjects, index);
+            if (hookWatchableObject == null) return;
+
+            Integer attachedEntityID = (Integer) hookWatchableObject.getValue();
+            hook.attached = attachedEntityID - 1; // the server adds 1 to the ID
+        }
+
+        if (entity instanceof PacketEntityArmorStand) {
+            int index;
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_9_4)) {
+                index = 10;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_13_2)) {
+                index = 11;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_14_4)) {
+                index = 13;
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_16_5)) {
+                index = 14;
+            } else {
+                index = 15;
+            }
+
+            EntityData&lt;?&gt; armorStandByte = WatchableIndexUtil.getIndex(watchableObjects, index);
+            if (armorStandByte != null) {
+                byte info = (Byte) armorStandByte.getValue();
+
+                entity.isBaby = (info &amp; 0x01) != 0; // technically this is IsSmall which is a different tag, but it has the same effect for us
+                ((PacketEntityArmorStand) entity).isMarker = (info &amp; 0x10) != 0;
+            }
+        }
+
+        if (entity instanceof PacketEntityGuardian &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_11)) {
+            int index;
+            int isElderlyBitMask;
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_9)) {
+                index = 16;
+                isElderlyBitMask = 0x04; // the wiki is wrong 0x02 is not "Is Elderly"
+            } else if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_10)) {
+                index = 11;
+                isElderlyBitMask = 0x04;
+            } else {
+                index = 12;
+                isElderlyBitMask = 0x04;
+            }
+
+            EntityData&lt;?&gt; guardianByte = WatchableIndexUtil.getIndex(watchableObjects, index);
+            if (guardianByte != null) {
+                int info = (Integer) guardianByte.getValue(); // wiki says this is a byte but testing on 1.8 shows it's an integer
+                ((PacketEntityGuardian) entity).isElder = (info &amp; isElderlyBitMask) != 0;
+            }
+        }
+
+        if (entity instanceof PacketEntitySkeleton skeleton &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_8_8)) {
+            EntityData&lt;?&gt; skeletonTypeObject = WatchableIndexUtil.getIndex(watchableObjects, 13);
+            if (skeletonTypeObject != null &amp;&amp; skeletonTypeObject.getValue() instanceof Byte skeletonType) {
+                skeleton.isWitherSkeleton = skeletonType == 1;
+            }
+        }
+    }
+
+    public void updateEntityEquipment(int entityId, List&lt;Equipment&gt; equipment) {
+        PacketEntity entity = player.compensatedEntities.getEntity(entityId);
+        if (entity == null || !entity.trackEntityEquipment) return;
+
+        for (Equipment equipmentItem : equipment) {
+            entity.setItemBySlot(equipmentItem.getSlot(), equipmentItem.getItem());
+        }
+    }
+
+}
+// NOTE (AI): S04 handling lives in two corpus files: PacketEntityReplication lines 161-162 reads the wrapper and schedules the apply on the transaction clock; updateEntityEquipment at lines 572-580 of this file performs the state write. trackEntityEquipment is enabled per entity type in PacketEntityHorse, PacketEntityNautilus and PacketEntityHappyGhast.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The packet read lives in Grim PacketEntityReplication lines 161-162, the same transaction sandwich used for the metadata and player-info branches. No other anticheat mirrors other entities' equipment into a simulation.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Information hider (Photon)</span>
+<span class="impl-module-clients">(Photon-GitHub-AntiCheatAddition)</span>
+</div>
+<p class="impl-pattern">Anti-ESP countermeasure: rewrite outgoing S04 payloads so other clients cannot infer a player's gear from durability, enchantments, lore or item counts.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">InformationHiderModule registers a HIGH-priority send listener on ENTITY_EQUIPMENT, parses the wrapper, skips the player's own entity, and hands every equipped item to the abstract hideInformation hook. DurabilityHider, EnchantmentHider and ItemCountHider subclass it, and PacketInformationHider routes the ENTITY_EQUIPMENT case by entity id for the visibility system. The server still sees the real items; only the forwarded copies are stripped.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing: this is a protection module, not a violation check. It defeats client-side gear scouting such as enchantment and durability ESP that a server-side anticheat cannot observe directly.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/additions/informationhider/InformationHiderModule.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/additions/informationhider/InformationHiderModule.java =====
+package de.photon.anticheataddition.modules.additions.informationhider;
+
+import com.github.retrooper.packetevents.event.PacketListenerPriority;
+import com.github.retrooper.packetevents.protocol.item.ItemStack;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityEquipment;
+import de.photon.anticheataddition.ServerVersion;
+import de.photon.anticheataddition.modules.Module;
+import de.photon.anticheataddition.modules.ModuleLoader;
+import de.photon.anticheataddition.user.User;
+import de.photon.anticheataddition.util.protocol.PacketAdapterBuilder;
+
+public abstract class InformationHiderModule extends Module
+{
+    protected InformationHiderModule(String configString)
+    {
+        super(configString);
+    }
+
+    @Override
+    protected ModuleLoader createModuleLoader()
+    {
+        final var adapter = PacketAdapterBuilder
+                .of(this, PacketType.Play.Server.ENTITY_EQUIPMENT)
+                .priority(PacketListenerPriority.HIGH)
+                .onSending((event, user) -&gt; {
+                    final var wrapper = new WrapperPlayServerEntityEquipment(event);
+                    final int entityId = wrapper.getEntityId();
+
+                    // Do not modify the player's own equipment.
+                    if (user.getPlayer().getEntityId() == entityId) return;
+
+                    for (var equip : wrapper.getEquipment()) {
+                        this.hideInformation(user, wrapper, entityId, equip.getItem());
+                    }
+                }).build();
+
+        return ModuleLoader.builder(this)
+                           .addPacketListeners(adapter)
+                           .setAllowedServerVersions(ServerVersion.NON_188_VERSIONS)
+                           .build();
+    }
+
+    protected abstract void hideInformation(User user, WrapperPlayServerEntityEquipment wrapper, int entityId, ItemStack item);
+}
+// NOTE (AI): The ENTITY_EQUIPMENT send adapter is lines 23-36; DurabilityHider, EnchantmentHider and ItemCountHider each implement hideInformation. The NON_188_VERSIONS gate excludes 1.8, where this packet has no off-hand slot.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Photon's LegacyPlayerEquipmentHider and ModernPlayerEquipmentHider replace the equipment list with empty stacks for hidden players. No other anticheat rewrites S04 payloads.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Equipment filter (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">The same countermeasure family as Photon: strip enchantments, display names, lore and book contents from outgoing equipment packets so clients cannot scout items.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">EquipmentFilter subscribes to the ENTITY_EQUIPMENT outbound packet and rewrites the payload in place: amounts are set to 1, enchantments are removed and replaced with a single THORNS marker, book title and pages are cleared, firework effects are emptied, and display name and lore are blanked. It handles both the legacy single-item layout (1.8-1.15) and the slot-pair list layout (1.16+). The clone ships with enabled() returning false, so the filter is compiled but inactive by default.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing: a defensive filter. It prevents other players' clients from reading real equipment data off the wire.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/module/filter/EquipmentFilter.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/module/filter/EquipmentFilter.java =====
+package de.jpx3.intave.module.filter;
+
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.wrappers.EnumWrappers;
+import com.comphenix.protocol.wrappers.Pair;
+import de.jpx3.intave.IntavePlugin;
+import de.jpx3.intave.module.linker.packet.PacketSubscription;
+import org.bukkit.enchantments.Enchantment;
+import org.bukkit.inventory.ItemFlag;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.*;
+
+import java.util.Collections;
+import java.util.List;
+
+import static de.jpx3.intave.module.linker.packet.PacketId.Server.ENTITY_EQUIPMENT;
+
+public final class EquipmentFilter extends Filter {
+  private final IntavePlugin plugin;
+
+  public EquipmentFilter(IntavePlugin plugin) {
+    super("equipmentdata");
+    this.plugin = plugin;
+  }
+
+  @PacketSubscription(
+    packetsOut = {
+      ENTITY_EQUIPMENT
+    }
+  )
+  public void filterEquipment(PacketEvent event) {
+    PacketContainer packet = event.getPacket();
+
+    if (packet.getItemModifier().readSafely(0) != null) {
+      // 1.8 - 1.15
+      ItemStack itemStack = packet.getItemModifier().readSafely(0);
+      ItemStack newItemStack = stripFromData(itemStack);
+      packet.getItemModifier().write(0, newItemStack);
+//      int a = packet.getIntegers().read(0);
+//      int b = packet.getIntegers().read(1);
+//      System.out.println("New equipment: " + itemStack + " " + a + " " + b);
+    } else {
+      List&lt;Pair&lt;EnumWrappers.ItemSlot, ItemStack&gt;&gt; read = packet.getSlotStackPairLists().read(0);
+      for (Pair&lt;EnumWrappers.ItemSlot, ItemStack&gt; itemSlotItemStackPair : read) {
+        ItemStack itemStack = itemSlotItemStackPair.getSecond().clone();
+        ItemStack newItemStack = stripFromData(itemStack);
+        itemSlotItemStackPair.setSecond(newItemStack);
+      }
+    }
+  }
+
+  private ItemStack stripFromData(ItemStack itemStack) {
+    itemStack.setAmount(1);
+
+    if (itemStack.hasItemMeta()) {
+      ItemMeta meta = itemStack.getItemMeta();
+      if (meta.hasEnchants()) {
+        for (Enchantment enchantment : itemStack.getEnchantments().keySet()) {
+          itemStack.removeEnchantment(enchantment);
+        }
+        itemStack.addUnsafeEnchantment(Enchantment.THORNS, 1);
+      }
+
+      // taken from https://gist.github.com/dmulloy2/5d52ddbb89a1609dbea2
+      if (meta instanceof BookMeta) {
+        BookMeta bookMeta = (BookMeta) meta;
+        bookMeta.setTitle(null);
+        bookMeta.setPages(Collections.emptyList());
+        bookMeta.setAuthor(null);
+      } else if (meta instanceof EnchantmentStorageMeta) {
+        EnchantmentStorageMeta enchantmentStorageMeta = (EnchantmentStorageMeta) meta;
+        if (enchantmentStorageMeta.hasStoredEnchants()) {
+          for (Enchantment ench : enchantmentStorageMeta.getStoredEnchants().keySet()) {
+            enchantmentStorageMeta.removeStoredEnchant(ench);
+          }
+          enchantmentStorageMeta.addStoredEnchant(Enchantment.THORNS, 1, true);
+        }
+      } else if (meta instanceof FireworkEffectMeta) {
+        ((FireworkEffectMeta) meta).setEffect(null);
+      } else if (meta instanceof FireworkMeta) {
+        FireworkMeta fireworkMeta = (FireworkMeta) meta;
+        fireworkMeta.clearEffects();
+        fireworkMeta.setPower(0);
+      }
+      //
+
+      meta.setDisplayName("");
+      if (meta.getLore() != null) {
+        meta.setLore(Collections.emptyList());
+      }
+      meta.removeItemFlags(meta.getItemFlags().toArray(new ItemFlag[0]));
+    }
+    return itemStack;
+  }
+
+  @Override
+  protected boolean enabled() {
+//    if (MinecraftVersions.VER1_19.atOrAbove()) {
+//      return false;
+//    }
+//    return !IntaveControl.GOMME_MODE &amp;&amp; super.enabled();
+    return false;
+  }
+}
+// NOTE (AI): filterEquipment (lines 32-51) is the ENTITY_EQUIPMENT outbound subscriber; stripFromData (lines 53-95) does the rewriting. enabled() at lines 97-104 returns false in the clone, so the filter is inactive by default.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Intave's FakePlayer equipment actions (EquipmentArmorAction, EquipmentHeldItemAction) send S04 to bait NPCs instead of filtering it. Peyang and network-dev MinecraftAntiCheat NPC code also send S04 with armor stacks to fake entities; those are bait sends, not checks.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S09PacketHeldItemChange/">S09PacketHeldItemChange</a>
 <a class="related-chip" href="../S1CPacketEntityMetadata/">S1CPacketEntityMetadata</a>

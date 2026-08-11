@@ -828,6 +828,306 @@ public class Disabler extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent is the universal S32 surface in Rise. WatchdogDisabler adds PreMotionEvent and PacketSendEvent; Timer adds TickEvent, StrafeEvent, JumpEvent and KeyboardInputEvent; Spicy touches only the serverbound side via EventSendPacket.</div>
 <div class="impl-clients">Rise 5.99 has only Debugger. Rise 6.1.30 ships WatchdogDisabler, InventorySync and Debugger; 6.2.4 adds the velocity modes (VulcanVelocity, WatchdogVelocity, WatchdogPredictionVelocity) and the Timer watchdog mode. Spicy's Disabler imports S32 but processes only C0F. Memeware, Nekoware, Sigma and Tenacity 6.0 carry only the vanilla handler.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S32 is the server's transaction confirmation, the oldest reliable latency probe in the protocol: the server sends a transaction id, the client echoes it back, and the round trip is the ping. Modern anticheats have turned the echo into a transaction clock (Grim sends a transaction before and after sensitive packets, Hydro schedules work on frames), while classic anticheats use it as a ping spoof detector by comparing transaction latency against keep-alive latency. Because the client must echo the exact id, S32 is also where ping-spoof disablers attack the anticheat.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PacketPingListener (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Runs the transaction clock: sends transaction ids the client must echo, tracks send and receive order, and fires the transaction events the whole anticheat schedules on.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On the OUT side, records each sent window-confirmation (negative ids Grim generates, and the ping packet on modern versions) into a sent-map and increments lastTransactionSent. On the IN side, only accepts replies whose id was actually sent, marks the transaction valid, cancels the echo to keep packet limiters happy, and fires the send/receive events that checks, setback teleports and velocity handlers all schedule against.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping-spoof disablers that echo fake transaction ids, and any client that reorders or drops transaction confirmations.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketPingListener.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketPingListener.java =====
+package ac.grim.grimac.events.packets;
+
+import ac.grim.grimac.GrimAPI;
+import ac.grim.grimac.api.event.events.GrimTransactionReceivedEvent;
+import ac.grim.grimac.api.event.events.GrimTransactionSendEvent;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.data.ShortToLongPair;
+import com.github.retrooper.packetevents.event.PacketListenerAbstract;
+import com.github.retrooper.packetevents.event.PacketListenerPriority;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPong;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientWindowConfirmation;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPing;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerWindowConfirmation;
+
+public class PacketPingListener extends PacketListenerAbstract {
+
+    private static final GrimTransactionSendEvent.Channel SEND_CHANNEL = GrimAPI.INSTANCE.getEventBus().get(GrimTransactionSendEvent.class);
+    private static final GrimTransactionReceivedEvent.Channel RECEIVED_CHANNEL = GrimAPI.INSTANCE.getEventBus().get(GrimTransactionReceivedEvent.class);
+
+    // Must listen on LOWEST (or maybe low) to stop Tuinity packet limiter from kicking players for transaction/pong spam
+    public PacketPingListener() {
+        super(PacketListenerPriority.LOWEST);
+    }
+
+    @Override
+    public void onPacketReceive(PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.WINDOW_CONFIRMATION) {
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+            player.packetStateData.lastTransactionPacketWasValid = false;
+
+            WrapperPlayClientWindowConfirmation transaction = new WrapperPlayClientWindowConfirmation(event);
+            short id = transaction.getActionId();
+
+            // Vanilla always uses an ID starting from 1
+            // Check if we sent this packet before cancelling it
+            if (id &lt;= 0 &amp;&amp; player.addTransactionResponse(id)) {
+                player.packetStateData.lastTransactionPacketWasValid = true;
+                boolean shouldCancel = !GrimAPI.INSTANCE.getConfigManager().isDisablePongCancelling();
+                // Not needed for vanilla as vanilla ignores this packet, needed for packet limiters
+                event.setCancelled(shouldCancel);
+                RECEIVED_CHANNEL.fire(player, id, shouldCancel, event.getTimestamp());
+            }
+        }
+
+        if (event.getPacketType() == PacketType.Play.Client.PONG) {
+            WrapperPlayClientPong pong = new WrapperPlayClientPong(event);
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+            player.packetStateData.lastTransactionPacketWasValid = false;
+
+            int id = pong.getId();
+            // If it wasn't below 0, it wasn't us
+            // If it wasn't in short range, it wasn't us either
+            if (id == (short) id) {
+                short shortID = (short) id;
+                if (player.addTransactionResponse(shortID)) {
+                    player.packetStateData.lastTransactionPacketWasValid = true;
+                    boolean shouldCancel = !GrimAPI.INSTANCE.getConfigManager().isDisablePongCancelling();
+                    // Not needed for vanilla as vanilla ignores this packet, needed for packet limiters
+                    event.setCancelled(shouldCancel);
+                    RECEIVED_CHANNEL.fire(player, id, shouldCancel, event.getTimestamp());
+                }
+            }
+        }
+    }
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.WINDOW_CONFIRMATION) {
+            WrapperPlayServerWindowConfirmation confirmation = new WrapperPlayServerWindowConfirmation(event);
+            short id = confirmation.getActionId();
+            //
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+            player.packetStateData.lastServerTransWasValid = false;
+            // Vanilla always uses an ID starting from 1
+            if (id &lt;= 0) {
+                if (player.didWeSendThatTrans.remove(id)) {
+                    player.packetStateData.lastServerTransWasValid = true;
+                    player.transactionsSent.add(new ShortToLongPair(id, System.nanoTime()));
+                    player.lastTransactionSent.getAndIncrement();
+                    SEND_CHANNEL.fire(player, id, event.getTimestamp());
+                }
+            }
+        }
+
+        if (event.getPacketType() == PacketType.Play.Server.PING) {
+            WrapperPlayServerPing pong = new WrapperPlayServerPing(event);
+            int id = pong.getId();
+            //
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+            player.packetStateData.lastServerTransWasValid = false;
+            // Check if in the short range, we only use short range
+            if (id == (short) id) {
+                // Cast ID twice so we can use the list
+                short shortID = (short) id;
+                if (player.didWeSendThatTrans.remove(shortID)) {
+                    player.packetStateData.lastServerTransWasValid = true;
+                    player.transactionsSent.add(new ShortToLongPair(shortID, System.nanoTime()));
+                    player.lastTransactionSent.getAndIncrement();
+                    SEND_CHANNEL.fire(player, id, event.getTimestamp());
+                }
+            }
+        }
+    }
+}
+// NOTE (AI): Grim listens at LOWEST priority specifically so Tuinity's packet limiter does not kick players for the transaction spam the anticheat itself generates.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro's TransactionTracker uses Pledge frames for the same two-phase confirmation; Frequency keeps a simple id-to-timestamp map.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoofA (Frequency)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency)</span>
+</div>
+<p class="impl-pattern">Flags ping spoofing as a divergence between the transaction-measured ping and the keep-alive-measured ping.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On each flying packet, reads the transaction ping (from the ConnectionManager echo map) and the keep-alive ping. If the transaction ping exceeds the keep-alive ping by more than 50ms outside lag, teleport, tps and chunk exemptions, and after the first 10 ticks, the check fails.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping-spoof modules that inflate only the transaction clock while the keep-alive clock stays honest.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofA.java =====
+package xyz.elevated.frequency.check.impl.pingspoof;
+
+import xyz.elevated.frequency.check.CheckData;
+import xyz.elevated.frequency.check.type.PacketCheck;
+import xyz.elevated.frequency.data.PlayerData;
+import xyz.elevated.frequency.exempt.type.ExemptType;
+import xyz.elevated.frequency.wrapper.impl.client.WrappedPlayInFlying;
+
+@CheckData(name = "PingSpoof (A)")
+public final class PingSpoofA extends PacketCheck {
+
+    public PingSpoofA(final PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void process(final Object object) {
+        if (object instanceof WrappedPlayInFlying) {
+            final long transactionPing = playerData.getTransactionPing().get();
+            final long keepAlivePing = playerData.getKeepAlivePing().get();
+
+            final boolean joined = playerData.getTicks().get() - playerData.getJoined().get() &lt; 10;
+            final boolean exempt = this.isExempt(ExemptType.LAGGING, ExemptType.TELEPORTING, ExemptType.TPS, ExemptType.CHUNK);
+
+            if (!exempt &amp;&amp; !joined &amp;&amp; transactionPing &gt; keepAlivePing &amp;&amp; Math.abs(transactionPing - keepAlivePing) &gt; 50) fail();
+        }
+    }
+}
+// NOTE (AI): The two clocks diverge because spoofers usually target the transaction stream, the one anticheats historically trusted.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Azure's PingSpoof sends its own random transaction ids and compares the echo delay to the reported NMS ping; both detect the same divergence.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoof (Azure)</span>
+<span class="impl-module-clients">(AimbotPvP-azure-anticheat)</span>
+</div>
+<p class="impl-pattern">Sends its own random transaction probes and compares the echo delay against the reported ping to expose spoofed latency.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On the first flying packet after a transaction, sends a server-bound transaction with a random id and sets the sent flag. When the client echoes it, the check compares the round-trip delay against the player's reported NMS ping: if the reported ping is more than 2.75 times the measured delay plus 50ms, it flags with the spoofed millisecond difference.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping-spoof modules that inflate the reported ping while the real transaction echo stays fast.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/misc/PingSpoof.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/misc/PingSpoof.java =====
+package us.skidrevenant.azure.check.checks.misc;
+
+import net.minecraft.server.v1_8_R3.*;
+import us.skidrevenant.azure.check.Check;
+import us.skidrevenant.azure.stats.PlayerStats;
+import us.skidrevenant.azure.util.entity.NMSUtil;
+import us.skidrevenant.azure.util.math.MathUtil;
+
+/**
+ * @author SkidRevenant
+ * at 28/05/2018
+ */
+public class PingSpoof extends Check {
+
+    private boolean sent;
+
+    public PingSpoof(PlayerStats player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketReceiving(Class&lt;? extends Packet&gt; type, Packet packet) {
+        if (packet instanceof PacketPlayInTransaction) {
+            sent = false;
+
+            long delay = System.currentTimeMillis() - player.getLastMovePacket();
+
+            int playerPing = NMSUtil.getNmsPlayer(player.getBukkitPlayer()).ping;
+
+            if (delay &lt; 20L) {
+                return;
+            }
+
+            if (playerPing &gt; (delay + 50L) * 2.75) {
+                this.onViolation(String.format("PingSpoof (+%dms)", playerPing - delay), 60000L, 0);
+            }
+
+        } else if (packet instanceof PacketPlayInFlying) {
+            if (sent) {
+                return;
+            }
+
+            NMSUtil.getNmsPlayer(player.getBukkitPlayer()).playerConnection.sendPacket(new PacketPlayOutTransaction(0, (short) MathUtil.RANDOM.nextInt(1000), false));
+            sent = true;
+        }
+    }
+}
+// NOTE (AI): The check self-generates the probe ids instead of relying on the vanilla transaction stream, which makes spoofing the expected ids harder.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Frequency compares two independent clocks; Azure compares the transaction clock against the server's own reported ping field.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TransactionTracker (Hydro)</span>
+<span class="impl-module-clients">(Incognitolol-Hydro)</span>
+</div>
+<p class="impl-pattern">Schedules anticheat work on the transaction confirmations using Pledge frames, and kicks on frame errors.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Registers pre and post actions against Pledge frame ids: confirmPre schedules work on the first id of a frame, confirmPost on the second. When a transaction frame arrives, the tracker runs every action scheduled for that id; missing or incomplete frames are handled as error events that kick the player.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Transaction desync and confirmation manipulation: a client that drops or reorders confirmations produces missing or incomplete frames.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/TransactionTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/TransactionTracker.java =====
+package integral.studios.hydro.model.tracker.impl;
+
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.Multimap;
+import integral.studios.hydro.Hydro;
+import integral.studios.hydro.model.tracker.Tracker;
+import dev.thomazz.pledge.api.PacketFrame;
+import dev.thomazz.pledge.api.event.ErrorType;
+import dev.thomazz.pledge.api.event.PacketFrameErrorEvent;
+import dev.thomazz.pledge.api.event.PacketFrameReceiveEvent;
+import dev.thomazz.pledge.api.event.ReceiveType;
+import integral.studios.hydro.model.PlayerData;
+import lombok.Getter;
+
+@Getter
+public class TransactionTracker extends Tracker {
+    private final Multimap&lt;Short, Runnable&gt; scheduledTransactions = ArrayListMultimap.create();
+
+    private final int splitCounter = 0;
+
+    public TransactionTracker(PlayerData playerData) {
+        super(playerData);
+    }
+
+    public void handleTransaction(PacketFrameReceiveEvent event) {
+        short id = (short) (event.getType() == ReceiveType.RECEIVE_START
+                ? event.getFrame().getId1()
+                : event.getFrame().getId2()
+        );
+
+        if (scheduledTransactions.containsKey(id)) {
+            for (Runnable runnable : scheduledTransactions.removeAll(id)) {
+                runnable.run();
+            }
+        }
+    }
+
+    public void handleTransactionError(PacketFrameErrorEvent event) {
+        if (event.getType() == ErrorType.MISSING_FRAME) {
+            // KICK THE PLAYER
+        }
+
+        if (event.getType() == ErrorType.INCOMPLETE_FRAME) {
+            // KICK THE PLAYER
+        }
+    }
+
+    public void confirmPre(Runnable runnable) {
+        try {
+            PacketFrame frame = Hydro.get().getPledge().getOrCreateFrame(playerData.getBukkitPlayer());
+
+            scheduledTransactions.put((short) frame.getId1(), runnable);
+        } catch (Exception ignored) {
+
+        }
+    }
+
+    public void confirmPost(Runnable runnable) {
+        PacketFrame frame = Hydro.get().getPledge().getOrCreateFrame(playerData.getBukkitPlayer());
+
+        if (frame == null) {
+            return;
+        }
+
+        scheduledTransactions.put((short) frame.getId2(), runnable);
+    }
+}
+// NOTE (AI): Hydro is the only corpus anticheat that delegates the transaction clock to Pledge instead of implementing the echo map itself.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim implements the same two-phase ordering natively; Hydro outsources it to Pledge and turns frame errors into kicks.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../C0FPacketConfirmTransaction/">C0FPacketConfirmTransaction</a>
 <a class="related-chip" href="../C0EPacketClickWindow/">C0EPacketClickWindow</a>

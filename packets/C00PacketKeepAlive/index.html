@@ -567,6 +567,323 @@ if(this.isMode("Damage")) {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent (serverbound C00) and PacketReceiveEvent (clientbound S00) on every client; Rise 6.x uses its component system (PingSpoofComponent, KeepAliveDisabler).</div>
 <div class="impl-clients">Classic clients (Memeware, Nekoware, Sigma, Spicy) mutate or cancel the packet object inside the event. Rise 5.99 and 6.x replace the packet on the event (event.setPacket) or flush via PacketUtil.sendPacket, which bypasses the event bus entirely.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The keepalive echo is the anticheat's latency reference. Serious anticheats issue their own keepalives (Frequency TickManager, FlopAC KeepAliveHandler) or track the vanilla ones, and fold the C00 round-trip into a ping value that movement checks read. Ping spoofers delay or duplicate the echo, so ping-spoof checks compare keepalive RTT against transaction RTT (Frequency PingSpoofA) or validate the echoed ID against the list of server-issued IDs (Grim BadPacketsO, Hydro BadPacketsE/F). Because a frozen or inflated ping breaks timer discrimination, timer checks gate their acceptance on keepalive confirmation (Frequency TimerA) and NCP rate-limits keepalive replies outright.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoofA (Frequency)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency, MinecraftUserHAN1110-FrequencyPlus, splatboydev-Degrade, AimbotPvP-azure-anticheat, Incognitolol-Hydro, JTXOfficial-FlopAC, artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Cross-checks the keepalive round-trip against the transaction round-trip to catch ping spoofers that delay keepalive echoes.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On every flying packet, compares the ping computed from keepalive echoes (playerData.getKeepAlivePing()) with the ping computed from transaction echoes. If the transaction ping exceeds the keepalive ping by more than 50 ms, outside the first 10 ticks and the lag/teleport/TPS exemptions, the check fails. The premise: a ping spoof buffers C00PacketKeepAlive and flushes it late, so the keepalive ping stays artificially low while transaction traffic reveals the real latency.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping spoofers that delay the keepalive echo, and clients that fake a low tab-list ping.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofA.java =====
+package xyz.elevated.frequency.check.impl.pingspoof;
+
+import xyz.elevated.frequency.check.CheckData;
+import xyz.elevated.frequency.check.type.PacketCheck;
+import xyz.elevated.frequency.data.PlayerData;
+import xyz.elevated.frequency.exempt.type.ExemptType;
+import xyz.elevated.frequency.wrapper.impl.client.WrappedPlayInFlying;
+
+@CheckData(name = "PingSpoof (A)")
+public final class PingSpoofA extends PacketCheck {
+
+    public PingSpoofA(final PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void process(final Object object) {
+        if (object instanceof WrappedPlayInFlying) {
+            final long transactionPing = playerData.getTransactionPing().get();
+            final long keepAlivePing = playerData.getKeepAlivePing().get();
+
+            final boolean joined = playerData.getTicks().get() - playerData.getJoined().get() &lt; 10;
+            final boolean exempt = this.isExempt(ExemptType.LAGGING, ExemptType.TELEPORTING, ExemptType.TPS, ExemptType.CHUNK);
+
+            if (!exempt &amp;&amp; !joined &amp;&amp; transactionPing &gt; keepAlivePing &amp;&amp; Math.abs(transactionPing - keepAlivePing) &gt; 50) fail();
+        }
+    }
+}
+// NOTE (AI): The check runs on the flying stream, not on the keepalive packet itself; the keepalive echo only feeds the ping value being compared. The 50 ms gap threshold works because transaction echoes are processed on the same tick as the movement packet while keepalive echoes are batched, so a delay applied to C00 shows up as a transaction-minus-keepalive gap.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Azure PingSpoof measures the delay between the client's last move packet and its keepalive reply and flags anything above roughly 150 ms. Hydro PingSpoofA, FlopAC PingSpoofA-D and Artemis PingSpoofProtocol, PingSpoofDuplicate and PingSpoofIdDupe implement the same cross-signal idea on their own trackers. FrequencyPlus and Degrade carry near-identical copies of the Frequency check.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BadPacketsO keepalive ID validation (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim, Incognitolol-Hydro, AimbotPvP-azure-anticheat, ElevatedDev-Frequency, artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Rejects keepalive replies whose ID was never issued by the server, catching fabricated echoes, key-mutating disablers and duplicate replays.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Records every server-issued keepalive ID in a linked list on the send side, then on each C00 reply scans the list for the echoed ID and drains entries up to the match. A reply that matches no pending ID is flagged and cancelled. Listening to both directions lets the check tell a legitimately delayed echo from a fabricated one: a real echo always corresponds to an outstanding server ID.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping spoofers that fabricate keepalive IDs, disabler modes that corrupt the key so the server silently drops it, and duplicate-echo replay.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsO.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsO.java =====
+package ac.grim.grimac.checks.impl.badpackets;
+
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PacketReceiveListener;
+import ac.grim.grimac.checks.type.PacketSendListener;
+import ac.grim.grimac.player.GrimPlayer;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientKeepAlive;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerKeepAlive;
+
+import java.util.LinkedList;
+
+@CheckData(name = "BadPacketsO", stableKey = "grim.badpackets.invalid_keepalive", description = "Responded with a keepalive ID that was not sent by the server")
+public class BadPacketsO extends Check implements PacketReceiveListener, PacketSendListener {
+    private static final Verbose V = Verbose.of("id={slong}");
+
+    private final LinkedList&lt;Long&gt; keepalives = new LinkedList&lt;&gt;();
+
+    public BadPacketsO(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.KEEP_ALIVE) {
+            keepalives.add(new WrapperPlayServerKeepAlive(event).getId());
+        }
+    }
+
+    @Override
+    public void onPacketReceive(PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.KEEP_ALIVE) {
+            final long id = new WrapperPlayClientKeepAlive(event).getId();
+
+            for (long keepalive : keepalives) {
+                if (keepalive == id) {
+                    // Found the ID, remove stuff until we get to it (to stop very slow memory leaks)
+                    Long data;
+                    do {
+                        data = keepalives.poll();
+                    } while (data != null &amp;&amp; data != id);
+
+                    return;
+                }
+            }
+
+            if (flag(V.write(verbose()).slong(id)) &amp;&amp; shouldModifyPackets()) {
+                event.setCancelled(true);
+                player.onPacketCancel();
+            }
+        }
+    }
+}
+// NOTE (AI): The list is drained on match precisely to bound memory, and the flag is combined with event cancellation so a bad reply never reaches the vanilla keepalive handler. This is the strictest keepalive check in the corpus because it requires the echo to be a real reply to a real server-issued ID.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro BadPacketsE flags keepalive IDs that were never sent and BadPacketsF flags a duplicate of the current ID; Azure BadPacketsG flags a keepalive arriving more than 550 ms after the last move packet; Frequency BadPacketsP and Artemis PingSpoofIdDupe and PingSpoofDuplicate do the same ID bookkeeping on their own packet wrappers.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KeepAliveFrequency (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">Limits the rate of keepalive replies and maintains the lastKeepAliveTime reference that the net and godmode checks use to separate real latency from timer abuse.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The ProtocolLib KeepAliveAdapter records every incoming C00 reply with its ID shape and updates data.lastKeepAliveTime; the check itself buckets reply timestamps into a frequency bucket model and cancels when the first bucket exceeds 1, with modeled-boundary exceptions so two replies timestamped in the same millisecond do not flag. A startup delay after join and duplicate-ID handling suppress the false positives that join-time bursts would cause.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Keepalive floods, duplicate or spoofed keepalive spam, and disabler modes that fire extra echoes to reset server-side timing heuristics.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.checks.net;
+
+import org.bukkit.entity.Player;
+
+import fr.neatmonster.nocheatplus.checks.Check;
+import fr.neatmonster.nocheatplus.checks.CheckType;
+import fr.neatmonster.nocheatplus.players.IPlayerData;
+import fr.neatmonster.nocheatplus.utilities.CheckUtils;
+
+public class KeepAliveFrequency extends Check {
+
+    public KeepAliveFrequency() {
+        super(CheckType.NET_KEEPALIVEFREQUENCY);
+    }
+    
+    /**
+     * Checks hasBypass on violation only.
+     * @param player
+     * @param time
+     * @param data
+     * @param cc
+     * @return If to cancel.
+     */
+    public boolean check(final Player player, final long time, final NetData data, final NetConfig cc, final IPlayerData pData) {
+        final long now = System.currentTimeMillis();
+        final long joinTime = pData.getLastJoinTime();
+        if (joinTime &gt; 0L &amp;&amp; now &lt; joinTime + cc.keepAliveFrequencyStartupDelay) {
+            return false;
+        }
+        if (data.keepAliveExpectedResponse &amp;&amp; !data.keepAliveDuplicateId) {
+            return false;
+        }
+        data.keepAliveFreq.add(time, 1f);
+        final float first = data.keepAliveFreq.bucketScore(0);
+        
+        if (first &gt; 1f) {
+            // Trigger a violation.
+            final float fullScore = data.keepAliveFreq.score(1f);
+            if (isModeledBoundaryBurst(data, fullScore, first)) {
+                return false;
+            }
+            final double vl = Math.max(first - getFirstBucketViolationLimit(data), fullScore - data.keepAliveFreq.numberOfBuckets());
+            final boolean cancel = executeActions(player, vl, 1.0, cc.keepAliveFrequencyActions).willCancel();
+            return cancel;
+        }
+        return false;
+    }
+
+    private boolean isModeledBoundaryBurst(final NetData data, final float fullScore, final float first) {
+        // KeepAlive model: if outgoing tracking is unavailable, only treat small monotonic id bursts as timing leftovers.
+        if (data.keepAliveDuplicateId || fullScore &gt; data.keepAliveFreq.numberOfBuckets() + 2f) {
+            return false;
+        }
+        // Folia/netty can timestamp two adjacent valid replies in the same millisecond; do not cancel a single pair.
+        return first &lt;= 2f || isUntrackedMonotonicBurst(data, fullScore, first);
+    }
+
+    private boolean isUntrackedMonotonicBurst(final NetData data, final float fullScore, final float first) {
+        if (data.keepAliveOutgoingSeen || fullScore &gt; data.keepAliveFreq.numberOfBuckets()) {
+            return false;
+        }
+        if (!data.keepAlivePacketIdAvailable || !data.keepAlivePreviousPacketIdAvailable) {
+            return false;
+        }
+        if (data.keepAlivePacketId &lt;= data.keepAlivePreviousPacketId) {
+            return false;
+        }
+        return first &lt;= getFallbackFirstBucketLimit(data);
+    }
+
+    private float getFirstBucketViolationLimit(final NetData data) {
+        if (data.keepAliveDuplicateId) {
+            return 1f;
+        }
+        if (!data.keepAliveOutgoingSeen
+                &amp;&amp; data.keepAlivePacketIdAvailable
+                &amp;&amp; data.keepAlivePreviousPacketIdAvailable
+                &amp;&amp; data.keepAlivePacketId &gt; data.keepAlivePreviousPacketId) {
+            return getFallbackFirstBucketLimit(data);
+        }
+        return 2f;
+    }
+
+    private float getFallbackFirstBucketLimit(final NetData data) {
+        return Math.max(3f, Math.min(6f, data.keepAliveFreq.numberOfBuckets() / 4f));
+    }
+}
+// NOTE (AI): The check is deliberately lenient about bursts when the outgoing tracking model is unavailable, falling back to monotonic-ID heuristics instead of canceling on raw count. lastKeepAliveTime is the shared output: MovingFlying and the other adapters update it so fight.godmode can guess keepalive timing even when this check is disabled.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Fight GodMode reads lastKeepAliveTime with CheckUtils.guessKeepAliveTime as fallback; Artemis ConnectionPreProcessor and AntiHaxerman ConnectionTracker maintain equivalent per-player keepalive ping state that their timer and lag checks consume.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TimerA (Frequency)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency, MinecraftUserHAN1110-FrequencyPlus, splatboydev-Degrade, GrimAnticheat-Grim, JTXOfficial-FlopAC, artemisac-artemis-minecraft-anticheat, AimbotPvP-azure-anticheat, TawnyE-TruthfulAC, Tecnio-AntiHaxerman)</span>
+</div>
+<p class="impl-pattern">Detects timer speed by measuring movement packet cadence against the 50 ms tick, gated on keepalive confirmation that the server tick actually ran.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On each flying packet, computes the delay since the previous one, feeds it into a 20-sample MovingStats deviation model, and accumulates an allowance of +50 ms per expected tick minus the observed delay. The check only runs when the current server tick has a matching keepalive echo in ConnectionManager, so lagged or desynced connections are excluded. A persistent deviation under the 7.07 threshold with a positive allowance balance flags.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Timer cheats that raise the client game speed, and indirectly ping spoofing, because a spoofed low ping keeps the keepalive acceptance gate open.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/timer/TimerA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/timer/TimerA.java =====
+package xyz.elevated.frequency.check.impl.timer;
+
+import xyz.elevated.frequency.Frequency;
+import xyz.elevated.frequency.check.CheckData;
+import xyz.elevated.frequency.check.type.PacketCheck;
+import xyz.elevated.frequency.data.PlayerData;
+import xyz.elevated.frequency.exempt.type.ExemptType;
+import xyz.elevated.frequency.util.MovingStats;
+import xyz.elevated.frequency.wrapper.impl.client.WrappedPlayInFlying;
+
+@CheckData(name = "Timer (A)")
+public final class TimerA extends PacketCheck {
+    private final MovingStats movingStats = new MovingStats(20);
+
+    private long lastFlying = 0L;
+    private long allowance = 0;
+
+    public TimerA(final PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void process(final Object object) {
+        final boolean flying = object instanceof WrappedPlayInFlying;
+
+        if (flying) {
+            // Get the server ticks and the current time for the check processing
+            final int serverTicks = Frequency.INSTANCE.getTickManager().getTicks();
+            final long now = System.currentTimeMillis();
+
+            /*
+            * We want to make sure the player is not exempt from any of the actions below.
+            * Additionally, we want to ensure that the player is not lagged out and accepted a keepalive.
+            * Thankfully, we shouldn't have any bypasses because of this because of PingSpoof.
+             */
+            final boolean exempt = this.isExempt(ExemptType.TPS, ExemptType.TELEPORTING, ExemptType.LAGGING);
+            final boolean accepted = playerData.getConnectionManager().getKeepAliveTime(serverTicks).isPresent();
+
+            /*
+            * Basic theory is that the player is going to deviate through 50ms without many changes to that
+            * basic range of [48, 50]. So we're running a deviation check to check how much the player has deviated
+            * from the basic limit of 50ms (square-root of 50 is 7.07). We're also making sure the player is actually
+            * increasing speed through an allowance that accounts for the tick expected versus the tick received.
+             */
+            handle: {
+                if (exempt || !accepted) break handle;
+
+                // Get the delay from the current and the last flying packet
+                final long delay = now - lastFlying;
+
+                // Add the delay to the MovingStats to analyze our input
+                movingStats.add(delay);
+
+                /*
+                * As mentioned above, the basic threshold of the player is the square-root of 50. Because
+                * the expected tick should always be 50ms. To check how much the player has deviated from that
+                * single point, we're using it as a threshold value in the deviation check below.
+                 */
+                final double threshold = 7.07;
+                final double deviation = movingStats.getStdDev(threshold);
+
+                // We're making sure the deviation check processed and the deviation is smaller than the threshold.
+                if (deviation &lt; threshold &amp;&amp; !Double.isNaN(deviation)) {
+                    /*
+                    * I am sure many of you have seen this before, and it's essentially the most basic version of
+                    * a balance / allowance check. We're increasing the allowance with the expected amount of 50,
+                    * and we're subtracting from it the actual delay received. This will act as our "buffer" system.
+                     */
+                    allowance += 50;
+                    allowance -= delay;
+
+                    // Our previous threshold can act as one here too.
+                    if (allowance &gt; Math.floor(threshold)) fail();
+                }
+
+                else {
+                    allowance = 0;
+                }
+            }
+
+            this.lastFlying = now;
+        }
+    }
+}
+// NOTE (AI): The keepalive tie-in is the acceptance gate: getKeepAliveTime(serverTicks) only returns a value when the player's C00 echo for that tick's keepalive arrived, proving the client actually processed the tick before the flying packet. Without that gate, high latency would look exactly like timer abuse.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim Timer and TimerLimit use the same balance concept with a packet-type whitelist that deliberately excludes keepalive from the count; FlopAC TimerA/B and Artemis TimerBalance, TimerGladUrBad and TimerReverse add statistical scoring; Azure Timer and TimerB average timer speed over a deque; TruthfulAC TimerA keeps a nanosecond timer balance; AntiHaxerman TimerA runs a balance system on the Artemis packet wrapper.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S00PacketKeepAlive/">S00PacketKeepAlive</a>
 <a class="related-chip" href="../C0FPacketConfirmTransaction/">C0FPacketConfirmTransaction</a>

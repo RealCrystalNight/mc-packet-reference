@@ -1281,6 +1281,553 @@ public class ChestStealer extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent (cancel C16 open), tick handlers (send C16 open), packet receive tracking (C16/C0D state machines). Spicy hooks EventPacket; Rise 6.x uses EventLink listeners and sendUnregisteredPacket.</div>
 <div class="impl-clients">Rise 5.99 sends C16 via sendQueue.addToSendQueue or PacketUtil.sendPacketWithoutEvent. Rise 6.2.4 uses sendUnregisteredPacket to bypass its own event system (and the PingSpoofComponent parks C16 in its blink tuple). Sigma/Spicy push raw packets to the send queue. Tenacity references C16 only in PacketUtil in this corpus.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The client status packet is a lifecycle signal: PERFORM_RESPAWN after death and OPEN_INVENTORY_ACHIEVEMENT to open the statistics screen. Server-side anticheats use it in two ways. Respawn handling resets movement, inventory and combat state so the player starts clean after death, and a respawn command sent at the wrong time is a disabler signature. The open-inventory command also toggles the state that inventory-move and inv-tweak checks rely on, because moving while a screen is open is what inventory move cheats do.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InventoryB (Frequency)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency, MinecraftUserHAN1110-FrequencyPlus, splatboydev-Degrade)</span>
+</div>
+<p class="impl-pattern">Detects the open-inventory-achievement spam that inventory move and inventory tweak modules use to move while a screen is open.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketCheck on WrappedPlayInClientCommand. When the command is OPEN_INVENTORY_ACHIEVEMENT it sets the inventory flag; while the flag is set, if the player is attacking or swinging with less than 60 ms since the last flying packet, a buffer increments and fails at 3. Any flying packet clears the flag and refreshes lastFlying. The threshold of 3 keeps it tolerant of legitimate statistics-screen opens.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Inventory move, inventory tweak, and modules that keep the inventory state open while attacking.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/inventory/InventoryB.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/inventory/InventoryB.java =====
+package xyz.elevated.frequency.check.impl.inventory;
+
+import net.minecraft.server.v1_8_R3.PacketPlayInClientCommand;
+import xyz.elevated.frequency.check.CheckData;
+import xyz.elevated.frequency.check.type.PacketCheck;
+import xyz.elevated.frequency.data.PlayerData;
+import xyz.elevated.frequency.wrapper.impl.client.WrappedPlayInClientCommand;
+import xyz.elevated.frequency.wrapper.impl.client.WrappedPlayInFlying;
+
+@CheckData(name = "Inventory (B)", threshold = 3)
+public final class InventoryB extends PacketCheck {
+
+    private long lastFlying = System.currentTimeMillis();
+    private boolean inventory = false;
+    private int buffer = 0;
+
+    public InventoryB(final PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void process(final Object object) {
+        if (object instanceof WrappedPlayInClientCommand) {
+            final WrappedPlayInClientCommand wrapper = (WrappedPlayInClientCommand) object;
+
+            achievement: {
+                if (wrapper.getCommand() != PacketPlayInClientCommand.EnumClientCommand.OPEN_INVENTORY_ACHIEVEMENT) break achievement;
+
+                inventory = true;
+            }
+
+            if (inventory) {
+                final long now = System.currentTimeMillis();
+
+                final boolean lagging = now - lastFlying &gt; 60L;
+                final boolean attacking = playerData.getActionManager().getAttacking().get();
+                final boolean swinging = playerData.getActionManager().getSwinging().get();
+
+                if (!lagging &amp;&amp; (attacking || swinging)) {
+                    if (++buffer &gt; 2) {
+                        fail();
+                    }
+                } else {
+                    buffer = 0;
+                }
+            }
+        } else if (object instanceof WrappedPlayInFlying) {
+            lastFlying = System.currentTimeMillis();
+            inventory = false;
+        }
+    }
+}
+
+// NOTE (AI): Frequency is a 1.8 anticheat; the same file is forked into FrequencyPlus and Degrade, which is why they share the corpus hit.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> CheaterDeleter InventoryMoveCheck keys the same state off the vanilla client-command listener; AutoEye InventoryWalk flags position changes while the inventory event is open.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">DisablerRespawn (Artemis)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Flags PERFORM_RESPAWN commands sent while the player is not dead, the classic disabler that resets server-side state without dying.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketHandler that reads GPacketPlayClientClientCommand. If the command is PERFORM_RESPAWN and the Bukkit player is not actually dead, a buffer increments and logs a violation at 3. Flying packets decay the buffer by 0.0125 per packet so lag does not accumulate it. The check annotation sets threshold 3.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Respawn disablers, respawn spam, and clients that send the respawn command to reset check state without a death.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.checks.regular/src/main/java/ac/artemis/checks/regular/v2/checks/impl/disabler/DisablerRespawn.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.checks.regular/src/main/java/ac/artemis/checks/regular/v2/checks/impl/disabler/DisablerRespawn.java =====
+package ac.artemis.checks.regular.v2.checks.impl.disabler;
+
+import ac.artemis.core.v4.check.ArtemisCheck;
+import ac.artemis.core.v4.check.PacketHandler;
+import ac.artemis.core.v4.check.annotations.Check;
+import ac.artemis.anticheat.api.check.type.Type;
+import ac.artemis.core.v4.check.settings.CheckInformation;
+import ac.artemis.core.v4.data.PlayerData;
+import cc.ghast.packet.wrapper.mc.PlayerEnums;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientClientCommand;
+import cc.ghast.packet.wrapper.packet.play.client.*;
+import ac.artemis.packet.wrapper.client.*;
+
+/**
+ * @author Ghast
+ * @since 05/07/2020
+ */
+@Check(type = Type.DISABLER, var = "RSP", threshold = 3)
+public class DisablerRespawn extends ArtemisCheck implements PacketHandler {
+
+    public DisablerRespawn(PlayerData data, CheckInformation info) {
+        super(data, info);
+    }
+
+    private float buffer;
+
+    @Override
+    public void handle(final GPacket packet) {
+        if (packet instanceof GPacketPlayClientClientCommand) {
+            final GPacketPlayClientClientCommand cmd = (GPacketPlayClientClientCommand) packet;
+
+            if (cmd.getCommand() != PlayerEnums.ClientCommand.PERFORM_RESPAWN) return;
+
+            flag: {
+                final boolean dead = data.getPlayer().isDead();
+
+                if (dead) {
+                    break flag;
+                }
+
+                if (buffer++ &gt; 2) {
+                    this.log("");
+                }
+            }
+        } else if (packet instanceof PacketPlayClientFlying) {
+            buffer -= 0.0125;
+        }
+    }
+}
+
+// NOTE (AI): Artemis is licensed under AGPL-3.0; the header comment credits Ghast. The buffer decay tied to flying packets is the interesting part of this check.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> NoCheatPlus validates respawn timing inside its moving checks; Frequency treats the packet only as inventory state; Grim resets its check state on the respawn flow instead of flagging.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InventoryMoveCheck (CheaterDeleter)</span>
+<span class="impl-module-clients">(CoolMineman-CheaterDeleter)</span>
+</div>
+<p class="impl-pattern">Flags movement while a container screen is open, using the vanilla client-command listener to track open state.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Registers a ClientCommandC2SPacketListener plus movement, packet and damage listeners. While the player has a current screen handler open and changes position, it records the open time and inspects each move: upward movement with falling velocity, or horizontal acceleration in an axis where the server velocity is zero, flags Inventory Move. The first 500 ms after opening are ignored, damage resets the deltas, and closing the screen clears the open flag.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Inventory move, inventory walk and inv-tweak movement while a screen is open.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> CoolMineman-CheaterDeleter — src/main/java/io/github/coolmineman/cheaterdeleter/modules/movement/InventoryMoveCheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: CoolMineman-CheaterDeleter — src/main/java/io/github/coolmineman/cheaterdeleter/modules/movement/InventoryMoveCheck.java =====
+package io.github.coolmineman.cheaterdeleter.modules.movement;
+
+import io.github.coolmineman.cheaterdeleter.events.PlayerMovementListener;
+import io.github.coolmineman.cheaterdeleter.events.PacketCallback;
+import io.github.coolmineman.cheaterdeleter.events.PlayerDamageListener;
+import io.github.coolmineman.cheaterdeleter.modules.CDModule;
+import io.github.coolmineman.cheaterdeleter.objects.PlayerMoveC2SPacketView;
+import io.github.coolmineman.cheaterdeleter.objects.entity.CDPlayer;
+import io.github.coolmineman.cheaterdeleter.util.BlockCollisionUtil;
+import net.minecraft.entity.damage.DamageSource;
+import net.minecraft.network.Packet;
+import net.minecraft.network.listener.ServerPlayPacketListener;
+import net.minecraft.network.packet.c2s.play.CloseHandledScreenC2SPacket;
+import net.minecraft.util.ActionResult;
+
+public class InventoryMoveCheck extends CDModule
+        implements PlayerMovementListener, PacketCallback, PlayerDamageListener {
+    public InventoryMoveCheck() {
+        super("inventorymove_check");
+        PlayerMovementListener.EVENT.register(this);
+        PacketCallback.EVENT.register(this);
+        PlayerDamageListener.EVENT.register(this);
+    }
+
+    @Override
+    public long getFlagCoolDownMs() {
+        return 100;
+    }
+
+    @Override
+    public void onMovement(CDPlayer player, PlayerMoveC2SPacketView packet, MoveCause cause) {
+        if (
+            !enabledFor(player) ||
+            player.isFallFlying() ||
+            player.isSpectator() ||
+            BlockCollisionUtil.isNearby(player, 2, 4, BlockCollisionUtil.NON_SOLID_COLLISION)
+        ) {
+            return;
+        }
+        InventoryMoveCheckData data = player.getOrCreateData(InventoryMoveCheckData.class, InventoryMoveCheckData::new);
+        if (packet.isChangePosition() &amp;&amp; player.getCurrentScreenHandler() != null) {
+            if (!data.wasOpen) {
+                data.wasOpen = true;
+                data.openTime = System.currentTimeMillis();
+            }
+            if (invalidateMove(player, packet)) {
+                flag(player, FlagSeverity.MINOR, "Inventory Move");
+            }
+        } else if (player.getCurrentScreenHandler() == null) {
+            data.lastDeltaX = Double.MAX_VALUE;
+            data.lastDeltaZ = Double.MAX_VALUE;
+            data.wasOpen = false;
+        }
+    }
+
+    private boolean invalidateMove(CDPlayer player, PlayerMoveC2SPacketView packet) {
+        InventoryMoveCheckData data = player.getOrCreateData(InventoryMoveCheckData.class, InventoryMoveCheckData::new);
+        if (System.currentTimeMillis() - data.openTime &lt; 500)
+            return false;
+        if (player.getVelocity().getY() &lt; 0.0 &amp;&amp; packet.getY() &gt; player.getPacketY())
+            return true;
+        double delaX = Math.abs(packet.getX() - player.getPacketX());
+        double delaZ = Math.abs(packet.getZ() - player.getPacketZ());
+        if (player.getVelocity().getX() == 0.0 &amp;&amp; delaX &gt; 0.0 &amp;&amp; delaX &gt; data.lastDeltaX)
+            return true;
+        if (player.getVelocity().getX() != 0.0) {
+            data.lastDeltaX = Double.MAX_VALUE;
+        } else {
+            data.lastDeltaX = delaX;
+        }
+        if (player.getVelocity().getZ() == 0.0 &amp;&amp; delaZ &gt; 0.0 &amp;&amp; delaZ &gt; data.lastDeltaZ)
+            return true;
+        if (player.getVelocity().getZ() != 0.0) {
+            data.lastDeltaZ = Double.MAX_VALUE;
+        } else {
+            data.lastDeltaZ = delaZ;
+        }
+        return false;
+    }
+
+    public static class InventoryMoveCheckData {
+        volatile double lastDeltaX = Double.MAX_VALUE;
+        volatile double lastDeltaZ = Double.MAX_VALUE;
+        volatile boolean wasOpen = false;
+        volatile long openTime = 0;
+    }
+
+    @Override
+    public ActionResult onPacket(CDPlayer player, Packet&lt;ServerPlayPacketListener&gt; packet) {
+        if (packet instanceof CloseHandledScreenC2SPacket) {
+            InventoryMoveCheckData data = player.getOrCreateData(InventoryMoveCheckData.class,
+                    InventoryMoveCheckData::new);
+            data.wasOpen = false;
+        }
+        return ActionResult.PASS;
+    }
+
+    @Override
+    public void onPlayerDamage(CDPlayer player, DamageSource source, float amount) {
+        InventoryMoveCheckData data = player.getOrCreateData(InventoryMoveCheckData.class, InventoryMoveCheckData::new);
+        data.lastDeltaX = Double.MAX_VALUE;
+        data.lastDeltaZ = Double.MAX_VALUE;
+        data.openTime = System.currentTimeMillis() + 1000;
+    }
+    
+}
+
+// NOTE (AI): CheaterDeleter runs on modern Minecraft via Fabric; the client-command listener is the modern equivalent of the C16 packet. The flag cooldown is 100 ms.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> AutoEye InventoryWalk flags the same behavior with a one-line condition and reverts by closing the inventory; Frequency InventoryB catches the open-command spam itself; Photon InventoryMove runs on the open state from its own tracker.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Respawn state reset (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Rebuilds the simulation state when the respawn flow runs, so checks do not carry stale data across a death.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketPlayerRespawn listens to the server-side respawn, join-game and health packets that follow the client's PERFORM_RESPAWN command. On UPDATE_HEALTH with health below zero it marks the self entity dead, and on RESPAWN it forces the player to accept a teleport before movements are processed, clears positions, resets ground, sneak, sprint and known-input state, resets several badpackets checks, and clears chunk and entity caches on a dimension change. The client half of the flow is the C16 PERFORM_RESPAWN command.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Not a flagging check; it prevents respawn-related desync and disablers that rely on stale check state.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketPlayerRespawn.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/events/packets/PacketPlayerRespawn.java =====
+package ac.grim.grimac.events.packets;
+
+import ac.grim.grimac.GrimAPI;
+import ac.grim.grimac.checks.impl.badpackets.*;
+import ac.grim.grimac.checks.impl.elytra.ElytraC;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.data.KnownInput;
+import ac.grim.grimac.utils.data.SprintingState;
+import ac.grim.grimac.utils.data.TrackerData;
+import ac.grim.grimac.utils.data.packetentity.PacketEntitySelf;
+import ac.grim.grimac.utils.enums.Pose;
+import ac.grim.grimac.utils.math.Vector3dm;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketListenerAbstract;
+import com.github.retrooper.packetevents.event.PacketListenerPriority;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.entity.type.EntityTypes;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerJoinGame;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerRespawn;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUpdateHealth;
+
+import java.util.Objects;
+
+/**
+ * PlayerRespawnS2CPacket info (1.20.2+):
+ * If the world is different (check via registry key), world is recreated (all entities etc destroyed).
+ * &lt;p&gt;
+ * Client player is ALWAYS recreated
+ * &lt;p&gt;
+ * If the packet has the `KEEP_TRACKED_DATA` flag:
+ * Sneaking and Sprinting fields are kept on the new client player.
+ * &lt;p&gt;
+ * If the packet has the `KEEP_ATTRIBUTES` flag:
+ * Attributes are kept.
+ * &lt;p&gt;
+ * New client player is initialised:
+ * Pose is set to standing.
+ * Velocity is set to zero.
+ * Pitch is set to 0.
+ * Yaw is set to -180.
+ */
+// TODO update for 1.20.2-
+public class PacketPlayerRespawn extends PacketListenerAbstract {
+
+    private static final byte KEEP_ATTRIBUTES = 1;
+    private static final byte KEEP_TRACKED_DATA = 2;
+    private static final byte KEEP_ALL = 3;
+
+    public PacketPlayerRespawn() {
+        super(PacketListenerPriority.HIGH);
+    }
+
+    private boolean hasFlag(WrapperPlayServerRespawn respawn, byte flag) {
+        // This packet was added in 1.16
+        if (flag == KEEP_ATTRIBUTES) {
+            // On versions older than 1.15, via does not keep all attributes.
+            // https://github.com/ViaVersion/ViaVersion/blob/master/common/src/main/java/com/viaversion/viaversion/protocols/v1_15_2to1_16/rewriter/EntityPacketRewriter1_16.java#L124
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_15)) {
+                return false;
+            }
+        } else if (flag == KEEP_TRACKED_DATA) {
+            // But for metadata, via DOES keep all data
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_15)) {
+                return true;
+            }
+        }
+
+        return (respawn.getKeptData() &amp; flag) != 0;
+    }
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.UPDATE_HEALTH) {
+            WrapperPlayServerUpdateHealth health = new WrapperPlayServerUpdateHealth(event);
+
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+            //
+            if (player.packetStateData.lastFood == health.getFood()
+                    &amp;&amp; player.packetStateData.lastHealth == health.getHealth()
+                    &amp;&amp; player.packetStateData.lastSaturation == health.getFoodSaturation()
+                    &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_9))
+                return;
+
+            player.packetStateData.lastFood = health.getFood();
+            player.packetStateData.lastHealth = health.getHealth();
+            player.packetStateData.lastSaturation = health.getFoodSaturation();
+
+            player.sendTransaction();
+
+            if (health.getFood() == 20) { // Split so transaction before packet
+                player.latencyUtils.addRealTimeTask(player.lastTransactionReceived.get(), () -&gt; player.food = 20);
+            } else { // Split so transaction after packet
+                player.latencyUtils.addRealTimeTask(player.lastTransactionReceived.get() + 1, () -&gt; player.food = health.getFood());
+            }
+
+            if (health.getHealth() &lt;= 0) {
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get(), () -&gt; {
+                    player.compensatedEntities.self.isDead = true;
+                    player.checkManager.getCheck(BadPacketsM.class).onDeath();
+                });
+            } else {
+                player.latencyUtils.addRealTimeTask(player.lastTransactionSent.get() + 1, () -&gt; player.compensatedEntities.self.isDead = false);
+            }
+
+            event.getTasksAfterSend().add(player::sendTransaction);
+        }
+
+        if (event.getPacketType() == PacketType.Play.Server.JOIN_GAME) {
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+
+            WrapperPlayServerJoinGame joinGame = new WrapperPlayServerJoinGame(event);
+            player.gamemode = joinGame.getGameMode();
+            player.entityID = joinGame.getEntityId();
+            player.dimensionType = joinGame.getDimensionType();
+            player.worldName = joinGame.getWorldName();
+
+            if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_15)
+                    &amp;&amp; event.getServerVersion().isNewerThanOrEquals(ServerVersion.V_1_15)) {
+                player.packetStateData.showsDeathScreen = joinGame.isRespawnScreenEnabled();
+            }
+
+            if (PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_17))
+                return;
+            player.compensatedWorld.setDimension(joinGame.getDimensionType(), event.getUser());
+        }
+
+        if (event.getPacketType() == PacketType.Play.Server.RESPAWN) {
+            WrapperPlayServerRespawn respawn = new WrapperPlayServerRespawn(event);
+
+            GrimPlayer player = GrimAPI.INSTANCE.getPlayerDataManager().getPlayer(event.getUser());
+            if (player == null) return;
+
+            player.sendTransaction();
+            event.getTasksAfterSend().add(player::sendTransaction);
+
+            // Force the player to accept a teleport before respawning
+            // (We won't process movements until they accept a teleport, we won't let movements though either)
+            // Also invalidate previous positions
+            player.getSetbackTeleportUtil().hasAcceptedSpawnTeleport = false;
+            player.getSetbackTeleportUtil().lastKnownGoodPosition = null;
+
+            // clear server entity positions when the world changes
+            if (isWorldChange(player, respawn)) {
+                player.compensatedEntities.serverPositionsMap.clear();
+            }
+
+            player.addRealTimeTaskNow(player.cameraEntity::reset);
+
+            player.addRealTimeTaskNext(() -&gt; {
+                // From 1.16 to 1.19, this doesn't get set to false for whatever reason
+                if (player.getClientVersion().isOlderThan(ClientVersion.V_1_16) || player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_20)) {
+                    player.isSneaking = false;
+                }
+
+                player.lastOnGround = false;
+                player.clientClaimsLastOnGround = false;
+                player.onGround = false;
+                player.isInBed = false;
+                player.packetStateData.setSlowedByUsingItem(false);
+                player.packetStateData.packetPlayerOnGround = false; // If somewhere else pulls last ground to fix other issues
+                player.packetStateData.lastClaimedPosition = new Vector3d();
+                player.filterMojangStupidityOnMojangStupidity.zero();
+
+                player.checkManager.getCheck(BadPacketsM.class).onRespawn();
+
+                final boolean keepTrackedData = this.hasFlag(respawn, KEEP_TRACKED_DATA);
+
+                if (!keepTrackedData) {
+                    player.food = 20;
+                    player.powderSnowFrozenTicks = 0;
+                    player.compensatedEntities.self.hasGravity = true;
+                    player.playerEntityHasGravity = true;
+                    player.packetStateData.knownInput = KnownInput.DEFAULT;
+                    player.checkManager.getCheck(ElytraC.class).exempt = true;
+
+                    // 1.19.4 uses current sprinting, older versions use last sprinting
+                    if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_19_4)) {
+                        player.isSprinting = false;
+                        player.vehicleData.camelSprintingState = SprintingState.STOPPED;
+                    } else {
+                        player.lastSprintingForSpeed = false;
+                    }
+                }
+
+                player.checkManager.getCheck(BadPacketsE.class).handleRespawn(); // Reminder ticks reset
+                player.checkManager.getCheck(BadPacketsG.class).handleRespawn();
+
+                // compensate for immediate respawn gamerule
+                if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_15)) {
+                    player.checkManager.getCheck(BadPacketsF.class).exemptNext = true;
+                }
+
+                // EVERYTHING gets reset on a cross dimensional teleport, clear chunks and entities!
+                if (isWorldChange(player, respawn)) {
+                    player.compensatedEntities.entityMap.clear();
+                    player.compensatedWorld.activePistons.clear();
+                    player.compensatedWorld.openShulkerBoxes.clear();
+                    player.compensatedWorld.chunks.clear();
+                    player.compensatedGeysers.clear();
+                    player.compensatedWorld.isRaining = false;
+                    player.checkManager.getCheck(BadPacketsH.class).onWorldChange();
+                }
+                player.dimensionType = respawn.getDimensionType();
+                player.worldName = respawn.getWorldName().orElse(null);
+
+                player.compensatedEntities.serverPlayerVehicle = null; // All entities get removed on respawn
+                player.compensatedEntities.self = new PacketEntitySelf(player, player.compensatedEntities.self);
+                player.compensatedEntities.selfTrackedEntity = new TrackerData(0, 0, 0, 0, 0, EntityTypes.PLAYER, player.lastTransactionSent.get());
+
+                player.cameraEntity.reset();
+
+                if (player.getClientVersion().isOlderThan(ClientVersion.V_1_14)) { // 1.14+ players send a packet for this, listen for it instead
+                    player.isSprinting = false;
+                    player.vehicleData.camelSprintingState = SprintingState.STOPPED;
+                    player.checkManager.getCheck(BadPacketsF.class).lastSprinting = false; // Pre 1.14 clients set this to false when creating new entity
+                    // TODO: What the fuck viaversion, why do you throw out keep all metadata?
+                    // The server doesn't even use it... what do we do?
+                    player.compensatedEntities.hasSprintingAttributeEnabled = false;
+                }
+                player.pose = Pose.STANDING;
+                if (!keepTrackedData || player.getClientVersion().isOlderThan(ClientVersion.V_1_21_2)) {
+                    player.clientVelocity = new Vector3dm();
+                }
+                if (!GrimAPI.INSTANCE.getSpectateManager().isSpectating(player.uuid)) {
+                    player.gamemode = respawn.getGameMode();
+                }
+                if (PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_17)) {
+                    player.compensatedWorld.setDimension(respawn.getDimensionType(), event.getUser());
+                }
+
+                if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_16) &amp;&amp; !this.hasFlag(respawn, KEEP_ATTRIBUTES)) {
+                    // Reset attributes if not kept
+                    player.compensatedEntities.self.resetAttributes();
+                    player.compensatedEntities.hasSprintingAttributeEnabled = false;
+                }
+            });
+        }
+    }
+
+    private boolean isWorldChange(GrimPlayer player, WrapperPlayServerRespawn respawn) {
+        if (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_16) &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isNewerThan(ServerVersion.V_1_16)) {
+            return !Objects.equals(respawn.getWorldName().orElse(null), player.worldName);
+        }
+
+        ClientVersion version = PacketEvents.getAPI().getServerManager().getVersion().toClientVersion();
+        return respawn.getDimensionType().getId(version) != player.dimensionType.getId(version)
+                || !Objects.equals(respawn.getDimensionType().getName(), player.dimensionType.getName());
+    }
+}
+
+// NOTE (AI): The file handles the outbound respawn packets rather than the C16 packet itself; it was included because the corpus matched it on the respawn keywords and it is the state manager paired with the client command.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis DisablerRespawn flags premature respawn commands; NCP resets its move queue on respawn events inside the moving checks.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InventoryWalk (AutoEye)</span>
+<span class="impl-module-clients">(heirteir-AutoEye)</span>
+</div>
+<p class="impl-pattern">Flags position changes while the inventory event is active and the client should be frozen.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Check of type INVENTORY_EVENT: it fires when the client reports the open-inventory event. The check passes only if the player moved, lastFlying is zero, physics say the player is moving, the server velocity is zero on both horizontal axes, and less than 60 ms passed since the last move. On a pass it reverts by closing the player's inventory.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Inventory walk where the player moves while the inventory screen is open.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> heirteir-AutoEye — src/main/java/com/heirteir/autoeye/check/checks/movement/InventoryWalk.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: heirteir-AutoEye — src/main/java/com/heirteir/autoeye/check/checks/movement/InventoryWalk.java =====
+package com.heirteir.autoeye.check.checks.movement;
+
+import com.heirteir.autoeye.Autoeye;
+import com.heirteir.autoeye.check.Check;
+import com.heirteir.autoeye.check.CheckType;
+import com.heirteir.autoeye.player.AutoEyePlayer;
+
+public class InventoryWalk extends Check {
+    public InventoryWalk(Autoeye autoeye) {
+        super(autoeye, CheckType.INVENTORY_EVENT, "Inventory Walk");
+    }
+
+    @Override public boolean check(AutoEyePlayer player) {
+        return player.getLocationData().isChangedPos() &amp;&amp; player.getTimeData().getLastFlying().getAmount() == 0 &amp;&amp; player.getPhysics().isMoving() &amp;&amp; player.getPhysics().getServerVelocity().getX() == 0 &amp;&amp; player.getPhysics().getServerVelocity().getZ() == 0 &amp;&amp; player.getTimeData().getLastMove().getDifference() &lt; 60L;
+    }
+
+    @Override public boolean revert(AutoEyePlayer player) {
+        player.getPlayer().closeInventory();
+        return false;
+    }
+}
+
+// NOTE (AI): AutoEye uses a revert model: the check undoes the cheat action by closing the inventory instead of cancelling the packet.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> CheaterDeleter InventoryMoveCheck and Photon InventoryMove detect the same cheat with more tolerant timing; Frequency InventoryB catches the open-command spam that precedes it.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S07PacketRespawn/">S07PacketRespawn</a>
 <a class="related-chip" href="../C0DPacketCloseWindow/">C0DPacketCloseWindow</a>

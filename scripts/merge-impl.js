@@ -14,6 +14,7 @@ const path = require('path');
 const BASE = path.join(__dirname, '..');
 const PACKETS_DIR = path.join(BASE, 'data', 'packets');
 const IMPL_DIR = path.join(BASE, 'data', 'impl');
+const AC_DIR = path.join(BASE, 'data', 'ac');
 
 function main() {
   const targets = process.argv.slice(2);
@@ -43,6 +44,20 @@ function main() {
     }
     if (impl.modules && !Array.isArray(impl.modules)) {
       console.error('DROPPED non-array modules in ' + pktId); delete impl.modules;
+    }
+
+    // Anti-cheat data (data/ac/<id>.json) -> implementation.anticheat
+    const acPath = path.join(AC_DIR, pktId + '.json');
+    if (fs.existsSync(acPath)) {
+      const ac = JSON.parse(fs.readFileSync(acPath, 'utf8'));
+      const AC_ALLOWED = new Set(['overview', 'checks']);
+      for (const k of Object.keys(ac)) {
+        if (!AC_ALLOWED.has(k)) { console.error('DROPPED unknown ac key "' + k + '" in ' + pktId); delete ac[k]; }
+      }
+      if (ac.checks && !Array.isArray(ac.checks)) {
+        console.error('DROPPED non-array ac checks in ' + pktId); delete ac.checks;
+      }
+      impl.anticheat = ac;
     }
 
     pkt.implementation = impl;

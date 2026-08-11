@@ -436,6 +436,737 @@ public class TestDisabler extends Mode&lt;Disabler&gt; {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent for rewrite/cancel (Rise 5.99, Rise 6.x), TickEvent for REGISTER floods, direct send-queue pushes for crash commands (Tenacity).</div>
 <div class="impl-clients">Rise 5.99 mutates the packet in place; Rise 6.x cancels and replays via sendNoEvent; Tenacity pushes raw packets into the vanilla send queue. PingSpoofComponent additionally holds C17 in its blink tuple in both Rise 6.x builds.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The custom payload packet is the plugin channel carrier: brand, mod handshake, book edit, sign, anvil rename and trade data all arrive inside it. Anticheats use it for three things: client brand identification on the minecraft:brand channel, validation of the payloads that can carry exploit data such as book edit NBT and oversized payloads, and mod fingerprinting for cheat-mod detection. Because the packet is the only one that can smuggle arbitrary bytes, payload parsing is also where crash and JNDI mitigations attach.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ClientBrand (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Reads the brand channel, records the client's brand for staff and database, and disconnects blacklisted Forge clients that shipped with extended reach.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketReceiveListener on PLUGIN_MESSAGE in the play and configuration states. It handles only the brand channel, minecraft:brand on 1.13+ and MC|Brand before. Data longer than 64 bytes or empty marks the brand as invalid; otherwise it strips the length byte, removes the (Velocity) proxy suffix, strips color codes, alerts staff unless the brand is ignored, and writes the brand into the session row. Forge brands on 1.18.2 to 1.19.3 clients are disconnected when the config blocks blacklisted Forge clients, referencing the known Forge reach hack.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Spoofed or oversized brand payloads and Forge clients with built-in reach hacks.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/misc/ClientBrand.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/misc/ClientBrand.java =====
+package ac.grim.grimac.checks.impl.misc;
+
+import ac.grim.grimac.GrimAPI;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.type.PacketReceiveListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.anticheat.MessageUtil;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.wrapper.configuration.client.WrapperConfigClientPluginMessage;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPluginMessage;
+import lombok.Getter;
+import net.kyori.adventure.text.Component;
+
+public class ClientBrand extends Check implements PacketReceiveListener {
+
+    private static final String CHANNEL = PacketEvents.getAPI().getServerManager().getVersion().isNewerThanOrEquals(ServerVersion.V_1_13) ? "minecraft:brand" : "MC|Brand";
+
+    @Getter
+    private String brand = "vanilla";
+    @Getter
+    private boolean hasBrand = false;
+
+    public ClientBrand(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.PLUGIN_MESSAGE) {
+            WrapperPlayClientPluginMessage packet = new WrapperPlayClientPluginMessage(event);
+            handle(packet.getChannelName(), packet.getData());
+        } else if (event.getPacketType() == PacketType.Configuration.Client.PLUGIN_MESSAGE) {
+            WrapperConfigClientPluginMessage packet = new WrapperConfigClientPluginMessage(event);
+            handle(packet.getChannelName(), packet.getData());
+        }
+    }
+
+    private void handle(String channel, byte[] data) {
+        if (!channel.equals(ClientBrand.CHANNEL)) return;
+
+        if (data.length &gt; 64 || data.length == 0) {
+            brand = "sent " + data.length + " bytes as brand";
+        } else if (!hasBrand) {
+            byte[] minusLength = new byte[data.length - 1];
+            System.arraycopy(data, 1, minusLength, 0, minusLength.length);
+
+            brand = new String(minusLength).replace(" (Velocity)", ""); // removes velocity's brand suffix
+            brand = MessageUtil.stripColor(brand); // strip color codes from client brand
+            if (!GrimAPI.INSTANCE.getConfigManager().isIgnoredClient(brand)) {
+                String message = GrimAPI.INSTANCE.getConfigManager().getConfig().getStringElse("client-brand-format", "%prefix% &amp;f%player% joined using %brand%");
+                Component component = MessageUtil.replacePlaceholders(player, MessageUtil.miniMessage(message));
+
+                GrimAPI.INSTANCE.getAlertManager().sendBrand(component, null);
+            }
+            // Push the now-known brand into the session row. The initial onJoin
+            // upsert ran from PlayerJoinEvent, before the brand packet arrived,
+            // so client_brand was null on disk. observeBrandFromCheck re-issues
+            // the upsert with the same session_id (idempotent) but the brand
+            // column now filled in. NOOP impl skips the work entirely.
+            GrimAPI.INSTANCE.getDataStoreLifecycle().liveWriteHooks().observeBrandFromCheck(player);
+        }
+
+        // https://github.com/MinecraftForge/MinecraftForge/issues/9309
+        // "Forge 40.1.22 1.18.2+ has extended player reach"
+        // quality development from forge devs
+        // inbuilt reach hacks for over a year across 2 (3 if you include 1.19.3/1.20) major versions
+        // Fixed in 1.19.4 possibly? Definitely fixed in 1.20+.
+        final boolean hasReachHacks = brand.contains("forge")
+                &amp;&amp; player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_18_2)
+                &amp;&amp; player.getClientVersion().isOlderThan(ClientVersion.V_1_19_4);
+        if (hasReachHacks &amp;&amp; GrimAPI.INSTANCE.getConfigManager().isBlockBlacklistedForgeClients()) {
+            player.disconnect(MessageUtil.miniMessage(MessageUtil.replacePlaceholders(player, GrimAPI.INSTANCE.getConfigManager().getDisconnectBlacklistedForge())));
+        }
+
+        hasBrand = true;
+    }
+}
+
+// NOTE (AI): The 64-byte cap and the Forge reach disconnect are the notable details; the file references the MinecraftForge issue tracking the reach bug.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Shard ClientBrand.kt is a near-identical port with the same Forge reach disconnect; Photon BrandChannelData stores the last 10 brand messages for sentinel checks; Intave PayloadInReader extracts the channel tag across protocol versions.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ExploitB (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Validates book edit and book sign payloads against the player's tracked inventory, killing item-book exploits.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On 1.13 and older the book data arrives in the C17 payload on the MC|BEdit and MC|BSign channels, parsed by PayloadBookEdit into an ItemStack. The check then compares slot, item type, amount, meta, author, pages, title and NBT against the copy of the book taken when the player last used the item, with 16 distinct violation codes: expected slot, no pages, title too long, invalid page, modified NBT, and others. On 1.14+ it runs the same validation on the dedicated EDIT_BOOK packet.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Book duplication, item NBT manipulation and inventory desync exploits delivered through the book payload.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/exploit/ExploitB.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/exploit/ExploitB.java =====
+package ac.grim.grimac.checks.impl.exploit;
+
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.impl.verbose.VerboseCodecs;
+import ac.grim.grimac.checks.type.PacketReceiveListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.payload.PayloadBookEdit;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.manager.server.ServerVersion;
+import com.github.retrooper.packetevents.protocol.component.ComponentTypes;
+import com.github.retrooper.packetevents.protocol.item.ItemStack;
+import com.github.retrooper.packetevents.protocol.item.type.ItemType;
+import com.github.retrooper.packetevents.protocol.item.type.ItemTypes;
+import com.github.retrooper.packetevents.protocol.nbt.NBT;
+import com.github.retrooper.packetevents.protocol.nbt.NBTCompound;
+import com.github.retrooper.packetevents.protocol.nbt.NBTList;
+import com.github.retrooper.packetevents.protocol.nbt.NBTString;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.player.InteractionHand;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientEditBook;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerBlockPlacement;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPluginMessage;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientUseItem;
+import com.google.gson.JsonSyntaxException;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.io.IOException;
+import java.io.StringReader;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+@CheckData(name = "ExploitB", stableKey = "grim.exploit.invalid_book_edit", description = "Invalid book edit")
+public class ExploitB extends Check implements PacketReceiveListener {
+    private static final int BOOK_EXPECTED_SLOT = 0;
+    private static final int BOOK_EXPECTED_TYPE = 1;
+    private static final int BOOK_EXPECTED_AMOUNT = 2;
+    private static final int BOOK_EXPECTED_META = 3;
+    private static final int BOOK_NO_NBT = 4;
+    private static final int BOOK_NO_PAGES = 5;
+    private static final int BOOK_NO_TITLE = 6;
+    private static final int BOOK_EXPECTED_AUTHOR = 7;
+    private static final int BOOK_INVALID_PAGE = 8;
+    private static final int BOOK_MODIFIED_NBT = 9;
+    private static final int BOOK_TITLE_TOO_LONG = 10;
+    private static final int BOOK_INVALID_TITLE = 11;
+    private static final int BOOK_NOT_EDITING = 12;
+    private static final int BOOK_TOO_MANY_PAGES = 13;
+    private static final int BOOK_PAGE_TOO_LONG = 14;
+    private static final int BOOK_EMPTY_LAST_PAGE = 15;
+
+    // One shape per BOOK_* kind; shape index == constant value.
+    private static final Verbose V = Verbose
+            .of("expectedSlot={sint}, slot={sint}")      // BOOK_EXPECTED_SLOT
+            .or("expectedType={item}, type={item}")      // BOOK_EXPECTED_TYPE
+            .or("expectedAmount={sint}, amount={sint}")  // BOOK_EXPECTED_AMOUNT
+            .or("expectedMeta={sint}, meta={sint}")      // BOOK_EXPECTED_META
+            .or("no nbt")                                // BOOK_NO_NBT
+            .or("no pages")                              // BOOK_NO_PAGES
+            .or("no title")                              // BOOK_NO_TITLE
+            .or("expectedAuthor={str}, author={str}")    // BOOK_EXPECTED_AUTHOR
+            .or("invalid page")                          // BOOK_INVALID_PAGE
+            .or("modified nbt")                          // BOOK_MODIFIED_NBT
+            .or("title too long")                        // BOOK_TITLE_TOO_LONG
+            .or("invalid title '{str}'")                 // BOOK_INVALID_TITLE
+            .or("not editing book")                      // BOOK_NOT_EDITING
+            .or("too many pages")                        // BOOK_TOO_MANY_PAGES
+            .or("page too long")                         // BOOK_PAGE_TOO_LONG
+            .or("empty last page");                      // BOOK_EMPTY_LAST_PAGE
+
+    private static final int UNUSED_TYPE = -1;
+    private static final boolean IS_1_8 = PacketEvents.getAPI().getServerManager().getVersion().isOlderThanOrEquals(ServerVersion.V_1_8_8);
+    private ItemStack oldBook;
+    private InteractionHand hand;
+
+    public ExploitB(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketReceive(PacketReceiveEvent event) {
+        if (IS_1_8 ? event.getPacketType() == PacketType.Play.Client.PLAYER_BLOCK_PLACEMENT
+                &amp;&amp; new WrapperPlayClientPlayerBlockPlacement(event).getFaceId() == 255
+                : event.getPacketType() == PacketType.Play.Client.USE_ITEM) {
+            hand = IS_1_8 ? InteractionHand.MAIN_HAND : new WrapperPlayClientUseItem(event).getHand();
+            oldBook = player.inventory.getItemInHand(hand).copy();
+        }
+
+        if (event.getPacketType() == PacketType.Play.Client.EDIT_BOOK) {
+            checkEditBook(new WrapperPlayClientEditBook(event), event);
+            oldBook = null;
+        }
+
+        // 1.13-
+        if (event.getPacketType() == PacketType.Play.Client.PLUGIN_MESSAGE &amp;&amp; PacketEvents.getAPI().getServerManager().getVersion().isOlderThan(ServerVersion.V_1_13)) {
+            WrapperPlayClientPluginMessage wrapper = new WrapperPlayClientPluginMessage(event);
+
+            boolean signing;
+            switch (wrapper.getChannelName()) {
+                case "MC|BSign" -&gt; signing = true;
+                case "MC|BEdit" -&gt; signing = false;
+                default -&gt; {
+                    return;
+                }
+            }
+
+            ItemStack newBook = new PayloadBookEdit(wrapper.getData()).itemStack();
+            checkItemStack(newBook, signing, event);
+            oldBook = null;
+        }
+    }
+
+    private void checkEditBook(WrapperPlayClientEditBook wrapper, PacketReceiveEvent event) {
+        if (checkEditingBook(event)) return;
+
+        int expectedSlot = hand == InteractionHand.OFF_HAND ? 40 : player.packetStateData.lastSlotSelected;
+        int slot = wrapper.getSlot();
+        if (slot != expectedSlot) {
+            flagExpectedSlot(event, expectedSlot, slot);
+            return;
+        }
+
+        if (wrapper.getSigning() == null) { // 1.17+
+            if (wrapper.getTitle() != null &amp;&amp; checkTitle(wrapper.getTitle(), event)) return;
+
+            List&lt;String&gt; pages = wrapper.getPages();
+            if (pages.size() &gt; 1 &amp;&amp; checkEmptyLastPage(pages.get(pages.size() - 1), event)) return;
+            if (checkTooManyPages(pages.size(), event)) return;
+            for (String page : pages) {
+                if (checkPage(page, event)) return;
+            }
+        } else { // 1.13 - 1.16.5
+            checkItemStack(wrapper.getItemStack(), wrapper.getSigning(), event);
+        }
+    }
+
+    private void checkItemStack(ItemStack newBook, boolean signing, PacketReceiveEvent event) {
+        if (checkEditingBook(event)) return;
+
+        ItemType expectedType = signing &amp;&amp; IS_1_8 ? ItemTypes.WRITTEN_BOOK : ItemTypes.WRITABLE_BOOK;
+        if (!newBook.is(expectedType)) {
+            flagExpectedType(event, expectedType, newBook.getType());
+            return;
+        }
+
+        if (newBook.getAmount() != oldBook.getAmount()) {
+            flagExpectedAmount(event, oldBook.getAmount(), newBook.getAmount());
+            return;
+        }
+
+        if (newBook.getLegacyData() != oldBook.getLegacyData()) {
+            flagExpectedMeta(event, oldBook.getLegacyData(), newBook.getLegacyData());
+            return;
+        }
+
+        NBTCompound newBookNBT = newBook.getNBT();
+        if (newBookNBT == null) {
+            flagLiteral(event, BOOK_NO_NBT);
+            return;
+        }
+
+        NBTList&lt;@NotNull NBTString&gt; newPagesNBT = newBookNBT.getStringListTagOrNull("pages");
+        if (newPagesNBT == null) {
+            flagLiteral(event, BOOK_NO_PAGES);
+            return;
+        }
+
+        if (checkTooManyPages(newPagesNBT.size(), event)) return;
+
+        if (signing) {
+            String title = newBookNBT.getStringTagValueOrNull("title");
+            if (title == null) {
+                flagLiteral(event, BOOK_NO_TITLE);
+                return;
+            }
+
+            if (checkTitle(title, event)) return;
+
+            String author = newBookNBT.getStringTagValueOrNull("author");
+            if (!player.getName().equals(author)) {
+                flagExpectedAuthor(event, player.getName(), author == null ? "null" : author);
+                return;
+            }
+        }
+
+        String last = null;
+        for (NBTString string : newPagesNBT.getTags()) {
+            if (IS_1_8 &amp;&amp; signing) {
+                try {
+                    JsonReader reader = new JsonReader(new StringReader(string.getValue()));
+                    if (reader.peek() != JsonToken.BEGIN_OBJECT) throw new JsonSyntaxException("");
+                    reader.beginObject();
+                    if (reader.peek() != JsonToken.NAME || !reader.nextName().equals("text")
+                            || reader.peek() != JsonToken.STRING) throw new JsonSyntaxException("");
+                    last = reader.nextString();
+                    if (reader.peek() != JsonToken.END_OBJECT) throw new JsonSyntaxException("");
+                } catch (JsonSyntaxException e) {
+                    flagLiteral(event, BOOK_INVALID_PAGE);
+                    return;
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            } else {
+                last = string.getValue();
+            }
+
+            if (checkPage(last, event)) return;
+        }
+
+        if (last != null &amp;&amp; checkEmptyLastPage(last, event)) {
+            return;
+        }
+
+        Set&lt;Map.Entry&lt;String, NBT&gt;&gt; newNBT = newBookNBT.getTags().entrySet();
+        HashMap&lt;String, NBT&gt; oldNBT = oldBook.getNBT() == null ? new HashMap&lt;&gt;() : new HashMap&lt;&gt;(oldBook.getNBT().getTags());
+        oldNBT.remove("pages");
+        oldNBT.remove("title");
+        oldNBT.remove("author");
+        for (var entry : newNBT) {
+            if (!entry.getKey().equals("pages") &amp;&amp; !entry.getKey().equals("title") &amp;&amp; !entry.getKey().equals("author")) {
+                NBT nbt = oldNBT.remove(entry.getKey());
+                if (nbt == null || !nbt.equals(entry.getValue())) {
+                    flagLiteral(event, BOOK_MODIFIED_NBT);
+                    return;
+                }
+            }
+        }
+
+        if (!oldNBT.isEmpty()) {
+            flagLiteral(event, BOOK_MODIFIED_NBT);
+        }
+    }
+
+    private boolean checkTitle(@NotNull String title, PacketReceiveEvent event) {
+        if (title.length() &gt; (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_16) ? 15 : 16)) {
+            flagLiteral(event, BOOK_TITLE_TOO_LONG);
+            return true;
+        } else if (title.isEmpty() || !title.trim().equals(title) || containsInvalidCharacters(title, false)) {
+            flagInvalidTitle(event, title);
+            return true;
+        }
+
+        return false;
+    }
+
+    private boolean checkEditingBook(PacketReceiveEvent event) {
+        if (oldBook == null || !oldBook.is(ItemTypes.WRITABLE_BOOK)) {
+            flagLiteral(event, BOOK_NOT_EDITING);
+            return true;
+        }
+        return false;
+    }
+
+    private boolean checkTooManyPages(int pages, PacketReceiveEvent event) {
+        NBTList&lt;@NotNull NBTString&gt; oldPagesNBT;
+        int oldPages = oldBook.getVersion().isNewerThanOrEquals(ClientVersion.V_1_20_5)
+                ? oldBook.getComponent(ComponentTypes.WRITABLE_BOOK_CONTENT).map(content -&gt; content.getPages().size()).orElse(0)
+                : oldBook.getNBT() != null &amp;&amp; (oldPagesNBT = oldBook.getNBT().getStringListTagOrNull("pages")) != null
+                ? oldPagesNBT.size() : 0;
+
+        if (pages &gt; oldPages &amp;&amp; pages &gt; (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_14) ? 100 : 50)) {
+            flagLiteral(event, BOOK_TOO_MANY_PAGES);
+            return true;
+        }
+
+        return false;
+    }
+
+    private boolean checkPage(String page, PacketReceiveEvent event) {
+        if (page.length() &gt; (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_14) ? 1023 : 256)) {
+            flagLiteral(event, BOOK_PAGE_TOO_LONG);
+            return true;
+        }
+
+        // commented out because existing characters are not considered
+//        if (containsInvalidCharacters(page, true)) {
+//            if (flag("invalid page characters") &amp;&amp; shouldModifyPackets()) {
+//                event.setCancelled(true);
+//                player.onPacketCancel();
+//            }
+//            return true;
+//        }
+
+        return false;
+    }
+
+    private boolean checkEmptyLastPage(String page, PacketReceiveEvent event) {
+        if (page.isEmpty()) {
+            flagLiteral(event, BOOK_EMPTY_LAST_PAGE);
+            return true;
+        }
+
+        return false;
+    }
+
+    private void flagExpectedSlot(PacketReceiveEvent event, int expectedSlot, int slot) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_SLOT).sint(expectedSlot).sint(slot));
+    }
+
+    private void flagExpectedType(PacketReceiveEvent event, @NotNull ItemType expectedType, @Nullable ItemType type) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_TYPE).sint(typeId(expectedType)).sint(typeId(type)));
+    }
+
+    private void flagExpectedAmount(PacketReceiveEvent event, int expectedAmount, int amount) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_AMOUNT).sint(expectedAmount).sint(amount));
+    }
+
+    private void flagExpectedMeta(PacketReceiveEvent event, int expectedMeta, int meta) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_META).sint(expectedMeta).sint(meta));
+    }
+
+    private void flagExpectedAuthor(PacketReceiveEvent event, @NotNull String expectedAuthor, @NotNull String author) {
+        flagBookEdit(event, V.write(verbose(), BOOK_EXPECTED_AUTHOR).str(expectedAuthor).str(author));
+    }
+
+    private void flagInvalidTitle(PacketReceiveEvent event, @NotNull String title) {
+        flagBookEdit(event, V.write(verbose(), BOOK_INVALID_TITLE).str(title));
+    }
+
+    private void flagLiteral(PacketReceiveEvent event, int kind) {
+        flagBookEdit(event, V.write(verbose(), kind));
+    }
+
+    private void flagBookEdit(PacketReceiveEvent event, Verbose.Writer writer) {
+        if (flag(writer) &amp;&amp; shouldModifyPackets()) {
+            event.setCancelled(true);
+            player.onPacketCancel();
+        }
+    }
+
+    private int typeId(@Nullable ItemType type) {
+        return type == null ? UNUSED_TYPE : VerboseCodecs.item(type, player.getClientVersion());
+    }
+
+    private static boolean containsInvalidCharacters(@NotNull String string, boolean allowLineBreak) {
+        for (int i = 0; i &lt; string.length(); ++i) {
+            char character = string.charAt(i);
+            if (character == 167 || character &lt; 32 &amp;&amp; (!allowLineBreak || character != 10) || character == 127) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+// NOTE (AI): Only the 1.13- branch reads the C17 payload; the same check body also covers the modern EDIT_BOOK packet, which is why the corpus matched it under the custom payload search.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Intave scans payloads in PayloadInReader for custom-client channels; Kauri and Photon do not validate book payloads and rely on inventory checks instead.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ClientBrand (Shard)</span>
+<span class="impl-module-clients">(KaelusAI-Shard)</span>
+</div>
+<p class="impl-pattern">Kotlin brand check that records the client brand, alerts staff, and disconnects Forge clients on the reach-exploit version range.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketCheck subscribing to PLUGIN_MESSAGE in the play and configuration states. It matches the versioned brand channel, accepts the first brand only, marks data over 64 bytes or empty as invalid, strips the length byte and the (Velocity) suffix, strips color, stores it on the player, alerts unless ignored, and disconnects Forge brands between 1.18.2 and 1.19.4 when configured.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Spoofed brand payloads and Forge clients with the extended reach bug.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> KaelusAI-Shard — src/main/kotlin/ac/shard/checks/impl/misc/ClientBrand.kt</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: KaelusAI-Shard — src/main/kotlin/ac/shard/checks/impl/misc/ClientBrand.kt =====
+/*
+ * This file is part of GrimAC - https://github.com/GrimAnticheat/Grim
+ * Copyright (C) 2021-2026 GrimAC, DefineOutside and contributors
+ *
+ * GrimAC is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * GrimAC is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package ac.shard.checks.impl.misc
+
+import ac.shard.alert.AlertManager
+import ac.shard.alert.AlertType
+import ac.shard.checks.AbstractCheck
+import ac.shard.checks.CheckData
+import ac.shard.checks.CheckFactory
+import ac.shard.checks.type.PacketCheck
+import ac.shard.config.ConfigManager
+import ac.shard.player.ShardPlayer
+import ac.shard.utils.ChatUtil
+import ac.shard.utils.Message
+import ac.shard.utils.MessageUtil
+import com.github.retrooper.packetevents.PacketEvents
+import com.github.retrooper.packetevents.event.PacketReceiveEvent
+import com.github.retrooper.packetevents.manager.server.ServerVersion
+import com.github.retrooper.packetevents.protocol.packettype.PacketType
+import com.github.retrooper.packetevents.protocol.player.ClientVersion
+import com.github.retrooper.packetevents.wrapper.configuration.client.WrapperConfigClientPluginMessage
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPluginMessage
+import java.nio.charset.StandardCharsets
+import net.kyori.adventure.text.Component
+
+@CheckData(name = "ClientBrand_Internal")
+class ClientBrand(
+  shardPlayer: ShardPlayer,
+  private val configManager: ConfigManager,
+  private val alertManager: AlertManager,
+) : AbstractCheck(shardPlayer), PacketCheck {
+  companion object {
+    private val CHANNEL =
+      if (PacketEvents.getAPI().serverManager.version.isNewerThanOrEquals(ServerVersion.V_1_13)) {
+        "minecraft:brand"
+      } else {
+        "MC|Brand"
+      }
+  }
+
+  var brand: String = "vanilla"
+    private set
+
+  private var hasBrand = false
+
+  interface Factory : CheckFactory {
+    override fun create(player: ShardPlayer): ClientBrand
+  }
+
+  override fun onPacketReceive(event: PacketReceiveEvent) {
+    if (event.packetType == PacketType.Play.Client.PLUGIN_MESSAGE) {
+      val packet = WrapperPlayClientPluginMessage(event)
+      handle(packet.channelName, packet.data)
+    } else if (event.packetType == PacketType.Configuration.Client.PLUGIN_MESSAGE) {
+      val packet = WrapperConfigClientPluginMessage(event)
+      handle(packet.channelName, packet.data)
+    }
+  }
+
+  private fun handle(channel: String, data: ByteArray) {
+    if (channel != CHANNEL || hasBrand) {
+      return
+    }
+
+    val shardPlayer = shardPlayer
+    hasBrand = true
+
+    if (data.size &gt; 64 || data.isEmpty()) {
+      brand = "invalid (${data.size} bytes)"
+    } else {
+      val brandBytes = ByteArray(data.size - 1)
+      System.arraycopy(data, 1, brandBytes, 0, brandBytes.size)
+
+      brand = String(brandBytes, StandardCharsets.UTF_8).replace(" (Velocity)", "")
+      brand = ChatUtil.stripColor(brand) ?: brand
+    }
+
+    shardPlayer.brand = brand
+
+    if (!configManager.isClientIgnored(brand)) {
+      val component: Component =
+        MessageUtil.getMessage(
+          Message.BRAND_NOTIFICATION,
+          "player",
+          shardPlayer.player.name,
+          "brand",
+          brand,
+        )
+      alertManager.send(component, AlertType.BRAND)
+    }
+
+    val hasReachExploit =
+      brand.contains("forge") &amp;&amp;
+        shardPlayer.user.clientVersion.isNewerThanOrEquals(ClientVersion.V_1_18_2) &amp;&amp;
+        shardPlayer.user.clientVersion.isOlderThan(ClientVersion.V_1_19_4)
+
+    if (hasReachExploit &amp;&amp; configManager.isDisconnectBlacklistedForge()) {
+      shardPlayer.disconnect(MessageUtil.getMessage(Message.BRAND_DISCONNECT_FORGE))
+    }
+  }
+}
+
+// NOTE (AI): Shard is a fork lineage of Grim, and the file header carries the GrimAC GPL notice; the logic mirrors Grim's ClientBrand with Kotlin idioms.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim's ClientBrand is the original this file is derived from; LightAntiCheat ClientBrandRecognizer matches known client brand strings; Photon BrandChannelData feeds brand messages into sentinel checks.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PayloadInReader (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">ProtocolLib reader that extracts the plugin channel tag and payload bytes from the custom payload packet across all protocol versions.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">AbstractPacketReader on the payload packet. tag() reads the channel name from string, MinecraftKey or CustomPacketPayloadWrapper fields depending on the protocol version, strips the minecraft: prefix, and returns unsupported on 1.21+ when the layout changed. readBytes and readStringNormal pull the PacketDataSerializer buffer via reflection for downstream parsers, and readStringWithExtraByte reads the length-prefixed brand-style string.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Feeds channel and payload data to Intave's custom-client detection, brand tracking and payload-based checks.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/packet/reader/PayloadInReader.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/packet/reader/PayloadInReader.java =====
+package de.jpx3.intave.packet.reader;
+
+import com.comphenix.protocol.wrappers.CustomPacketPayloadWrapper;
+import com.google.common.base.Charsets;
+import de.jpx3.intave.adapter.MinecraftVersions;
+import de.jpx3.intave.klass.Lookup;
+import io.netty.buffer.ByteBuf;
+
+import java.nio.charset.Charset;
+
+public final class PayloadInReader extends AbstractPacketReader {
+  public String tag() {
+    String tag;
+    if (packet().getStrings().getValues().isEmpty()) {
+      if (MinecraftVersions.VER1_21.atOrAbove()) {
+        return "unsupported";
+      }
+      Object minecraftKey = null;
+      if (packet().getMinecraftKeys().getValues().isEmpty()) {
+        for (CustomPacketPayloadWrapper value : packet().getCustomPacketPayloads().getValues()) {
+          minecraftKey = value.getId();
+          if (minecraftKey != null) {
+            break;
+          }
+        }
+        if (minecraftKey == null) {
+          return "error";
+        }
+      } else {
+        minecraftKey = packet().getMinecraftKeys().getValues().get(0);
+      }
+      try {
+        tag = (String) minecraftKey.getClass().getMethod("toString").invoke(minecraftKey);
+      } catch (Exception exception) {
+        exception.printStackTrace();
+        tag = "error";
+      }
+    } else {
+      tag = packet().getStrings().getValues().get(0);
+    }
+    if (tag.startsWith("minecraft:")) {
+      tag = tag.substring(10);
+    }
+    return tag;
+  }
+
+  public ByteBuf readBytes() {
+    return (ByteBuf) packet().getSpecificModifier(Lookup.serverClass("PacketDataSerializer")).getValues().get(0);
+  }
+
+  public String readStringNormal() {
+    Object packetDataSerializer = packet().getSpecificModifier(Lookup.serverClass("PacketDataSerializer")).getValues().get(0);
+    try {
+      return (String) packetDataSerializer.getClass().getMethod("toString", Charset.class).invoke(packetDataSerializer, Charset.defaultCharset());
+    } catch (Exception exception) {
+      return "error";
+    }
+  }
+
+  public String readStringWithExtraByte() {
+    ByteBuf bytes = (ByteBuf) packet().getSpecificModifier(Lookup.serverClass("PacketDataSerializer")).getValues().get(0);
+    try {
+      bytes.markReaderIndex();
+      int length = bytes.readByte();
+      return bytes.toString(Charsets.UTF_8);
+    } catch (Exception exception) {
+      exception.printStackTrace();
+    }
+    return "";
+  }
+}
+
+// NOTE (AI): The version branching exists because the channel field moved from a string to a MinecraftKey to a custom payload wrapper across protocol versions.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim and Shard use PacketEvents wrappers instead of ProtocolLib reflection; Photon BrandChannelData listens via ParsedPluginMessageListener.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BrandChannelData (Photon)</span>
+<span class="impl-module-clients">(Photon-GitHub-AntiCheatAddition)</span>
+</div>
+<p class="impl-pattern">Stores the last brand channel messages per user so sentinel checks can fingerprint modded clients.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A RingBuffer capped at 10 holds brand channel messages. A ParsedPluginMessageListener implementation updates the user's data on every brand-channel message; hasBrandChannelMessage checks membership and listBrandChannelMessages joins them for display. The ring buffer exists so a malicious client spamming the brand channel cannot exhaust memory.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Provides the brand message history used by Photon sentinel modules to detect known cheat clients.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/user/data/subdata/BrandChannelData.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/user/data/subdata/BrandChannelData.java =====
+package de.photon.anticheataddition.user.data.subdata;
+
+import de.photon.anticheataddition.modules.sentinel.ParsedPluginMessageListener;
+import de.photon.anticheataddition.user.User;
+import de.photon.anticheataddition.util.datastructure.buffer.RingBuffer;
+import org.bukkit.entity.Player;
+import org.jetbrains.annotations.NotNull;
+
+/**
+ * Represents a data class to manage and save brand channel messages.
+ */
+public class BrandChannelData
+{
+    // Use a RingBuffer here as a malicious client could spam the brand channel with messages.
+    private final RingBuffer&lt;String&gt; brandChannelMessages = new RingBuffer&lt;&gt;(10);
+
+    // This method is private as only the listener below is supposed to add messages.
+    private void addBrandChannelMessage(String message)
+    {
+        brandChannelMessages.add(message);
+    }
+
+    public boolean hasBrandChannelMessage(String message)
+    {
+        return brandChannelMessages.contains(message);
+    }
+
+    public String listBrandChannelMessages()
+    {
+        return String.join(", ", brandChannelMessages);
+    }
+
+    /**
+     * Listens for brand channel plugin messages and updates the {@link User}'s {@link BrandChannelData} accordingly.
+     */
+    public static class BrandChannelMessageListener implements ParsedPluginMessageListener
+    {
+        @Override
+        public void onPluginMessageReceived(@NotNull String channel, @NotNull Player player, @NotNull String message)
+        {
+            final var user = User.getUser(player);
+            if (user == null) return;
+
+            user.getBrandChannelData().addBrandChannelMessage(message);
+        }
+    }
+}
+
+// NOTE (AI): The listener is registered as a ParsedPluginMessageListener so it receives already-decoded channel messages, not raw payload bytes.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim, Shard and LightAntiCheat store a single normalized brand string instead of a message history.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S3FPacketCustomPayload/">S3FPacketCustomPayload</a>
 <a class="related-chip" href="../C19PacketResourcePackStatus/">C19PacketResourcePackStatus</a>

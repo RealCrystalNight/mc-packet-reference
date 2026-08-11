@@ -694,6 +694,991 @@ public class FastBow extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Dig and drop automation hooks UpdateEvent or MotionEvent and sends C07 directly. Item-use and NoSlow modules hook the same events but split pre and post phases: release on pre, re-place on post. Packet-listener modules (Tenacity SpeedMine, Rise 6.x LegitNoSlow, Sigma Scaffold, Rise Infinite) instead hook the outgoing packet event and inspect getStatus() to react to the vanilla dig state machine.</div>
 <div class="impl-clients">Send paths: PacketUtil.sendPacket and sendPacketSilent in Memeware, addToSendQueue in Nekoware and Tenacity, PacketUtil.sendPacket and sendPacketWithoutEvent in Rise 5.99, PacketUtil.send and sendNoEvent in Rise 6.x, addToSendQueue and NetworkManager.sendPacketNoEvent in Sigma and Spicy. Rise 5.99 and 6.x also expose C07 to their scripting APIs (PacketAPI.send with Action.valueOf). The facing byte varies by module: EnumFacing.UP for nuker and breaker floods, EnumFacing.DOWN for release and drop packets, EnumFacing.NORTH in Memeware's Breaker.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The digging packet is the block-break trigger: it carries start, stop, abort and item-release actions with a block position and face. Server-side anticheats treat it as the point to validate break duration against block hardness and tool speed, break reach, swing correlation, and the number of blocks broken per second. The corpus splits into modern simulation checks (Grim FastBreak, Intave CompletionDurationCheck) that recompute the expected mining time, and classic rate checks (NCP blockbreak suite, Arc Nuker) that score break frequency and packet rhythm.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">FastBreak (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">The reference modern fast-break check: verifies that the time between start-digging and finish-digging is long enough for the held tool to break the block.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Implements BlockBreakListener and PreViaPacketReceiveListener. On START_DIGGING it records the target block and the maximum block damage per 50 ms tick computed from the held item and block properties (BlockBreakSpeed), then on STOP_DIGGING it measures the elapsed time against the accumulated damage. A balance tracks how far the player finished early, and a separate delay balance enforces the 300 ms minimum between non-instant breaks. It cancels the finish-digging packet and flags when the client breaks faster than the simulated damage allows.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> FastBreak and speedmine modules, nuker variants that break blocks in a single instant, and clients that skip the mining animation timing entirely.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/breaking/FastBreak.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/breaking/FastBreak.java =====
+package ac.grim.grimac.checks.impl.breaking;
+
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.impl.verbose.VerboseCodecs;
+import ac.grim.grimac.checks.type.BlockBreakListener;
+import ac.grim.grimac.checks.type.PreViaPacketReceiveListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.anticheat.update.BlockBreak;
+import ac.grim.grimac.utils.math.GrimMath;
+import ac.grim.grimac.utils.nmsutil.BlockBreakSpeed;
+import ac.grim.grimac.utils.viaversion.ViaVersionUtil;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.player.DiggingAction;
+import com.github.retrooper.packetevents.protocol.world.states.WrappedBlockState;
+import com.github.retrooper.packetevents.protocol.world.states.type.StateType;
+import com.github.retrooper.packetevents.protocol.world.states.type.StateTypes;
+import com.github.retrooper.packetevents.util.Vector3i;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientPlayerFlying;
+
+import java.util.Set;
+
+// Based loosely off of Hawk BlockBreakSpeedSurvival
+// Also based loosely off of NoCheatPlus FastBreak
+// Also based off minecraft wiki: https://minecraft.wiki/w/Breaking#Instant_breaking
+@CheckData(name = "FastBreak", stableKey = "grim.breaking.fast_break", description = "Breaking blocks too quickly")
+public class FastBreak extends Check implements BlockBreakListener, PreViaPacketReceiveListener {
+    private static final Verbose V =
+            Verbose.of("[delay={ulong}ms|diff={f64:%.1f}ms, balance={f64:%.1f}ms], type={block}");
+
+    // For some reason these states flag and I don't know why.
+    // Better to just exempt to not annoy legit players.
+    private static final Set&lt;StateType&gt; EXEMPT_STATES = Set.of();
+    private final boolean clientOlderThanServer = PacketEvents.getAPI().getServerManager().getVersion().getProtocolVersion() &gt; player.getClientVersion().getProtocolVersion();
+
+    public FastBreak(GrimPlayer playerData) {
+        super(playerData);
+    }
+
+    // The block the player is currently breaking
+    Vector3i targetBlockPosition = null;
+    // The maximum amount of damage the player deals to the block
+    //
+    double maximumBlockDamage = 0;
+    // The last time a finish digging packet was sent, to enforce 0.3-second delay after non-instabreak
+    long lastFinishBreak = 0;
+    // The time the player started to break the block, to know how long the player waited until they finished breaking the block
+    long startBreak = 0;
+
+    // The buffer to this check
+    double blockBreakBalance = 0;
+    double blockDelayBalance = 0;
+
+    @Override
+    public void onBlockBreak(BlockBreak blockBreak) {
+        if (blockBreak.action == DiggingAction.START_DIGGING) {
+            if (!ViaVersionUtil.isAvailable) {
+                // Exempt all blocks that do not exist in the player version
+                final WrappedBlockState defaultState = WrappedBlockState.getDefaultState(player.getClientVersion(), blockBreak.block.getType());
+                if (defaultState.getType() == StateTypes.AIR || EXEMPT_STATES.contains(defaultState.getType())) {
+                    return;
+                }
+            }
+            // If client is older than the server, fetch block client actually sees from via
+            // otherwise just return the server-side block (since if client is &gt;= server version the block is guaranteed to exist in client version)
+            // TODO this lazy loads PacketEvents mappings for older versions for clients on versions older than the servers, increasing memory usage
+            //  * its the only thing we use non-native mappings for behind ViaVersion
+            //  * can we translate back "up" to server version and run check against server version to avoid loading older registries?
+            WrappedBlockState block = clientOlderThanServer ? WrappedBlockState.getByGlobalId(player.getClientVersion(), player.getViaTranslatedClientBlockID(blockBreak.block.getGlobalId())) : blockBreak.block;
+
+            startBreak = System.currentTimeMillis() - (targetBlockPosition == null ? 50 : 0); // ???
+            targetBlockPosition = blockBreak.position;
+
+            // FIXME: getBlockDamage might not return the correct value if the player switched slots before this
+            maximumBlockDamage = BlockBreakSpeed.getBlockDamage(player, block);
+
+            double breakDelay = System.currentTimeMillis() - lastFinishBreak;
+
+            if (breakDelay &gt;= 275) { // Reduce buffer if "close enough"
+                blockDelayBalance *= 0.9;
+            } else { // Otherwise, increase buffer
+                blockDelayBalance += 300 - breakDelay;
+            }
+
+            if (blockDelayBalance &gt; 1000) { // If more than a second of advantage
+                int type = VerboseCodecs.block(blockBreak.block.getType(), player.getClientVersion());
+                if (flag(V.write(verbose()).bool(true).ulong((long) breakDelay).f64(0).f64(0).sint(type)) &amp;&amp; shouldModifyPackets()) {
+                    blockBreak.cancel();
+                }
+            }
+
+            clampBalance();
+        }
+
+        if (blockBreak.action == DiggingAction.FINISHED_DIGGING &amp;&amp; targetBlockPosition != null) {
+            double predictedTime = Math.ceil(1 / maximumBlockDamage) * 50;
+            double realTime = System.currentTimeMillis() - startBreak;
+            double diff = predictedTime - realTime;
+
+            clampBalance();
+
+            if (diff &lt; 25) {  // Reduce buffer if "close enough"
+                blockBreakBalance *= 0.9;
+            } else { // Otherwise, increase buffer
+                blockBreakBalance += diff;
+            }
+
+            if (blockBreakBalance &gt; 1000) { // If more than a second of advantage
+                int type = VerboseCodecs.block(blockBreak.block.getType(), player.getClientVersion());
+                if (flag(V.write(verbose()).bool(false).ulong(0).f64(diff).f64(blockBreakBalance).sint(type)) &amp;&amp; shouldModifyPackets()) {
+                    blockBreak.cancel();
+                }
+            }
+
+            // also set start time because the breaking netcode is fucked on 1.14.4+
+            lastFinishBreak = startBreak = System.currentTimeMillis();
+        }
+    }
+
+    @Override
+    public void onPreViaPacketReceive(PacketReceiveEvent event) {
+        // Find the most optimal block damage using the animation packet, which is sent at least once a tick when breaking blocks
+        // On 1.8 clients, via screws with this packet meaning we must fall back to the 1.8 idle flying packet
+        //
+        // listen for flying packets because some block breaks can happen before the next animation (somehow???), causing onGround desync
+        boolean flying = WrapperPlayClientPlayerFlying.isFlying(event.getPacketType());
+        if ((flying || (player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_9) &amp;&amp; event.getPacketType() == PacketType.Play.Client.ANIMATION)) &amp;&amp; targetBlockPosition != null) {
+            maximumBlockDamage = Math.max(maximumBlockDamage, BlockBreakSpeed.getBlockDamage(player, player.compensatedWorld.getBlock(targetBlockPosition)));
+        }
+    }
+
+    private void clampBalance() {
+        double balance = Math.max(1000, (player.getTransactionPing()));
+        blockBreakBalance = GrimMath.clamp(blockBreakBalance, -balance, balance); // Clamp not Math.max in case other logic changes
+        blockDelayBalance = GrimMath.clamp(blockDelayBalance, -balance, balance);
+    }
+}
+// NOTE (AI): Grim's FastBreak compares the client-reported break start to the server simulation of block damage over time; the breaking package (FarBreak, MultiBreak, WrongBreak, PositionBreakA/B, RotationBreak) forms a full block-break pipeline driven by the digging packet.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Truthful FastBreakA and LightAntiCheat FastBreakA run the same damage-time accounting on smaller event bases. NCP's FastBreak class is an explicit ancestor of this check (credited in the header comment).</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BlockBreakListener suite (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">The classic 1.8 dispatcher for the whole block-break check family: direction, fast break, frequency, no swing, reach and wrong block.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Registers six checks (Direction, FastBreak, Frequency, NoSwing, Reach, WrongBlock) plus BlockBreakConfig/BlockBreakData, and listens to BlockBreakEvent, BlockDamageEvent, PlayerAnimationEvent and PlayerInteractEvent at LOWEST priority. The ProtocolLib compat adapters wrap PacketPlayInBlockDig actions (START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, ABORT_DESTROY_BLOCK, RELEASE_USE_ITEM) and route them into the same check set, so both packet-level and event-level break attempts are covered.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Fast break, nuker and frequency abuse, breaking while looking away from the block, no-swing breaking, break reach beyond the interaction range, and wrong-block exploits.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/BlockBreakListener.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/BlockBreakListener.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.checks.blockbreak;
+
+import org.bukkit.GameMode;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.block.Block;
+import org.bukkit.entity.Player;
+import org.bukkit.event.Cancellable;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.block.Action;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockDamageEvent;
+import org.bukkit.event.player.PlayerAnimationEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerItemHeldEvent;
+import org.bukkit.inventory.ItemStack;
+
+import fr.neatmonster.nocheatplus.NCPAPIProvider;
+import fr.neatmonster.nocheatplus.checks.CheckListener;
+import fr.neatmonster.nocheatplus.checks.CheckType;
+import fr.neatmonster.nocheatplus.checks.blockinteract.BlockInteractData;
+import fr.neatmonster.nocheatplus.checks.blockinteract.BlockInteractListener;
+import fr.neatmonster.nocheatplus.checks.net.FlyingQueueHandle;
+import fr.neatmonster.nocheatplus.checks.net.model.DataPacketFlying;
+import fr.neatmonster.nocheatplus.compat.AlmostBoolean;
+import fr.neatmonster.nocheatplus.compat.Bridge1_9;
+import fr.neatmonster.nocheatplus.components.NoCheatPlusAPI;
+import fr.neatmonster.nocheatplus.components.data.ICheckData;
+import fr.neatmonster.nocheatplus.components.data.IData;
+import fr.neatmonster.nocheatplus.components.registry.factory.IFactoryOne;
+import fr.neatmonster.nocheatplus.hooks.NCPExemptionManager;
+import fr.neatmonster.nocheatplus.permissions.Permissions;
+import fr.neatmonster.nocheatplus.players.DataManager;
+import fr.neatmonster.nocheatplus.players.IPlayerData;
+import fr.neatmonster.nocheatplus.players.PlayerFactoryArgument;
+import fr.neatmonster.nocheatplus.stats.Counters;
+import fr.neatmonster.nocheatplus.utilities.TickTask;
+import fr.neatmonster.nocheatplus.utilities.map.BlockProperties;
+import fr.neatmonster.nocheatplus.utilities.moving.MovingUtil;
+import fr.neatmonster.nocheatplus.worlds.WorldFactoryArgument;
+
+/**
+ * Central location to listen to events that are relevant for the block break checks.
+ * 
+ * @see BlockBreakEvent
+ */
+public class BlockBreakListener extends CheckListener {
+
+    /** The direction check. */
+    private final Direction direction = addCheck(new Direction());
+
+    /** The fast break check (per block breaking speed). */
+    private final FastBreak fastBreak = addCheck(new FastBreak());
+
+    /** The frequency check (number of blocks broken) */
+    private final Frequency frequency = addCheck(new Frequency());
+
+    /** The no swing check. */
+    private final NoSwing noSwing = addCheck(new NoSwing());
+
+    /** The reach check. */
+    private final Reach reach = addCheck(new Reach());
+
+    /** The wrong block check. */
+    private final WrongBlock wrongBlock = addCheck(new WrongBlock());
+
+    private AlmostBoolean isInstaBreak = AlmostBoolean.NO;
+
+    private final Counters counters = NCPAPIProvider.getNoCheatPlusAPI().getGenericInstance(Counters.class);
+
+    /** For temporary use: LocUtil.clone before passing deeply, call setWorld(null) after use. */
+    private final Location useLoc = new Location(null, 0, 0, 0);
+
+    @SuppressWarnings("unchecked")
+    public BlockBreakListener(){
+        super(CheckType.BLOCKBREAK);
+        final NoCheatPlusAPI api = NCPAPIProvider.getNoCheatPlusAPI();
+        // Register config and data.
+        api.register(api.newRegistrationContext()
+                // BlockBreakConfig
+                .registerConfigWorld(BlockBreakConfig.class)
+                .factory(new IFactoryOne&lt;WorldFactoryArgument, BlockBreakConfig&gt;() {
+                    @Override
+                    public BlockBreakConfig getNewInstance(WorldFactoryArgument arg) {
+                        return new BlockBreakConfig(arg.worldData);
+                    }
+                })
+                .registerConfigTypesPlayer(CheckType.BLOCKBREAK, true)
+                .context() //
+                // BlockBreakData
+                .registerDataPlayer(BlockBreakData.class)
+                .factory(new IFactoryOne&lt;PlayerFactoryArgument, BlockBreakData&gt;() {
+                    @Override
+                    public BlockBreakData getNewInstance(
+                            PlayerFactoryArgument arg) {
+                        return new BlockBreakData(
+                                arg.playerData.getGenericInstance(BlockBreakConfig.class));
+                    }
+                })
+                // (Complete data removal for now.)
+                .addToGroups(CheckType.BLOCKBREAK, true, IData.class, ICheckData.class)
+                .context() //
+                );
+    }
+
+    @EventHandler(ignoreCancelled = false, priority = EventPriority.LOWEST)
+    public void onBlockBreak(final BlockBreakEvent event) {
+        final long now = System.currentTimeMillis();
+        final Player player = event.getPlayer();
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final BlockBreakConfig cc = pData.getGenericInstance(BlockBreakConfig.class);
+        final BlockBreakData data = pData.getGenericInstance(BlockBreakData.class);
+        final BlockInteractData bdata = pData.getGenericInstance(BlockInteractData.class);
+        boolean cancelled = false;
+    
+        if (MovingUtil.hasScheduledPlayerSetBack(player)) {
+            event.setCancelled(true);
+        }
+        // Cancelled events only leads to resetting insta break.
+        if (event.isCancelled()) {
+            isInstaBreak = AlmostBoolean.NO;
+            return;
+        }
+        // TODO: maybe invalidate instaBreak on some occasions.
+        final Block block = event.getBlock();
+        if (BlockProperties.isScaffolding(block.getType())) {
+            return;
+        }
+
+        // Re-check if this is a block interacted with before. With instantly broken blocks, this may be off by one orthogonally.
+        final int tick = TickTask.getTick();
+        final boolean isInteractBlock = !bdata.getLastIsCancelled() &amp;&amp; bdata.matchesLastBlock(tick, block);
+        final GameMode gameMode = player.getGameMode();
+        int skippedRedundantChecks = 0;
+        // Did the player try to destroy a liquid block? (Not possible)
+        if (BlockProperties.isLiquid(block.getType()) &amp;&amp; !BlockProperties.isWaterPlant(block.getType())
+            &amp;&amp; !pData.hasPermission(Permissions.BLOCKBREAK_BREAK_LIQUID, player) 
+            &amp;&amp; !NCPExemptionManager.isExempted(player, CheckType.BLOCKBREAK_BREAK)){
+            cancelled = true;
+        }
+
+        // Has the player broken a block that was not damaged before?
+        if (!cancelled &amp;&amp; wrongBlock.isEnabled(player, pData) 
+            &amp;&amp; wrongBlock.check(player, block, cc, data, pData, isInstaBreak)) {
+            cancelled = true;
+        }
+
+        // Has the player broken more blocks per second than allowed?
+        if (!cancelled &amp;&amp; frequency.isEnabled(player, pData) 
+            &amp;&amp; frequency.check(player, tick, cc, data, pData)) {
+            cancelled = true;
+        }
+
+        // Has the player broken single blocks faster than possible?
+        if (!cancelled &amp;&amp; gameMode != GameMode.CREATIVE
+            &amp;&amp; fastBreak.isEnabled(player, pData) 
+            &amp;&amp; fastBreak.check(player, block, isInstaBreak, cc, data, pData)) {
+            cancelled = true;
+        }
+
+        // Did the arm of the player move before breaking this block?
+        if (!cancelled &amp;&amp; noSwing.isEnabled(player, pData) 
+            &amp;&amp; noSwing.check(player, data, pData)) {
+            cancelled = true;
+        }
+
+        final FlyingQueueHandle flyingHandle;
+        if (reach.isEnabled(player, pData) || direction.isEnabled(player, pData)) {
+            flyingHandle = new FlyingQueueHandle(pData);
+            final Location loc = player.getLocation(useLoc);
+            final double eyeHeight = MovingUtil.getEyeHeight(player);
+            // Is the block really in reach distance?
+            if (!cancelled) {
+                if (isInteractBlock &amp;&amp; bdata.isPassedCheck(CheckType.BLOCKINTERACT_REACH)) {
+                    skippedRedundantChecks ++;
+                }
+                else if (reach.isEnabled(player, pData) &amp;&amp; reach.check(player, eyeHeight, block, data, cc)) {
+                    cancelled = true;
+                }
+            }
+
+            // Did the player look at the block at all?
+            // TODO: Skip if checks were run on this block (all sorts of hashes/conditions).
+            if (!cancelled) {
+                if (isInteractBlock &amp;&amp; (bdata.isPassedCheck(CheckType.BLOCKINTERACT_DIRECTION)
+                    || bdata.isPassedCheck(CheckType.BLOCKINTERACT_VISIBLE))) {
+                    skippedRedundantChecks ++;
+                }
+                else if (direction.isEnabled(player, pData) 
+                        &amp;&amp; direction.check(player, loc, eyeHeight, block, null, flyingHandle, data, cc, pData)) {
+                    cancelled = true;
+                }
+            }
+            useLoc.setWorld(null);
+        }
+        else flyingHandle = null;
+
+        // On cancel...
+        if (cancelled) {
+            event.setCancelled(cancelled);
+            // Reset damage position:
+            // TODO: Review this (!), check if set at all !?
+            data.clickedX = block.getX();
+            data.clickedY = block.getY();
+            data.clickedZ = block.getZ();
+        }
+        else {
+            // Invalidate last damage position:
+            //        	data.clickedX = Integer.MAX_VALUE;
+            // Debug log (only if not cancelled, to avoid spam).
+            if (pData.isDebugActive(CheckType.BLOCKBREAK)) {
+                debugBlockBreakResult(player, block, skippedRedundantChecks, flyingHandle, pData);
+            }
+        }
+        
+        // Adjust data.
+        data.wasInstaBreak = isInstaBreak.decideOptimistically() ? now : 0;
+        data.fastBreakBreakTime = now;
+        isInstaBreak = AlmostBoolean.NO;
+    }
+
+    private void debugBlockBreakResult(final Player player, final Block block, final int skippedRedundantChecks, 
+                                       final FlyingQueueHandle flyingHandle, final IPlayerData pData) {
+        debug(player, "Block break(" + block.getType() + "): " + block.getX() + ", " + block.getY() + ", " + block.getZ());
+        BlockInteractListener.debugBlockVSBlockInteract(player, checkType, block, "onBlockBreak", Action.LEFT_CLICK_BLOCK, pData);
+        if (skippedRedundantChecks &gt; 0) {
+            debug(player, "Skipped redundant checks: " + skippedRedundantChecks);
+        }
+        if (flyingHandle != null &amp;&amp; flyingHandle.isFlyingQueueFetched()) {
+            final int flyingIndex = flyingHandle.getFirstIndexWithContentIfFetched();
+            final DataPacketFlying packet = flyingHandle.getIfFetched(flyingIndex);
+            if (packet != null) {
+                debug(player, "Flying packet queue used at index " + flyingIndex + ": pitch=" + packet.getPitch() + ",yaw=" + packet.getYaw());
+                return;
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPlayerAnimation(final PlayerAnimationEvent event) {
+        final BlockBreakData data = DataManager.getPlayerData(event.getPlayer()).getGenericInstance(BlockBreakData.class);
+        data.noSwingCount = Math.max(data.noSwingCount - 1, 0);
+    }
+
+    @EventHandler(ignoreCancelled = false, priority = EventPriority.LOWEST)
+    public void onPlayerInteract(final PlayerInteractEvent event) {
+        // We listen to BlockInteract events to be (at least in many cases) able to distinguish between block break events
+        //  that were triggered by players actually digging and events that were artificially created by plugins.
+        // debug(player, "Interact("+event.isCancelled()+"): " + event.getClickedBlock());
+        // The following is to set the "first damage time" for a block.
+        // Return if it is not left clicking a block. 
+        // (Allows right click to be ignored.)
+        isInstaBreak = AlmostBoolean.NO;
+        if (event.getAction() != Action.LEFT_CLICK_BLOCK) {
+            return;
+        }
+        checkBlockDamage(event.getPlayer(), event.getClickedBlock(), event);
+    }
+
+    @EventHandler(ignoreCancelled = false, priority = EventPriority.LOWEST)
+    public void onBlockDamageLowest(final BlockDamageEvent event) {
+        /*
+         * TODO: Add a check type BLOCKDAMAGE_CONFIRM (no permission):
+         * Cancel if the block doesn't match (MC 1.11.2, other ...)?
+         */
+        if (MovingUtil.hasScheduledPlayerSetBack(event.getPlayer())) {
+            event.setCancelled(true);
+        }
+        else if (event.getInstaBreak()) {
+            // Indicate that this might have been set by CB/MC.
+            // TODO: Set in BlockInteractListener !!
+            isInstaBreak = AlmostBoolean.MAYBE;
+        }
+    }
+
+    @EventHandler(ignoreCancelled = false, priority = EventPriority.MONITOR)
+    public void onBlockDamage(final BlockDamageEvent event) {
+        if (!event.isCancelled() &amp;&amp; event.getInstaBreak()) {
+            // Keep MAYBE.
+            if (isInstaBreak != AlmostBoolean.MAYBE) {
+                isInstaBreak = AlmostBoolean.YES;
+            }
+        }
+        else isInstaBreak = AlmostBoolean.NO;
+        checkBlockDamage(event.getPlayer(), event.getBlock(), event);
+    }
+
+    private void checkBlockDamage(final Player player, final Block block, final Cancellable event){
+        final long now = System.currentTimeMillis();
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final BlockBreakData data = pData.getGenericInstance(BlockBreakData.class);
+
+        //        if (event.isCancelled()){
+        //        	// Reset the time, to avoid certain kinds of cheating. =&gt; WHICH ?
+        //        	data.fastBreakfirstDamage = now;
+        //        	data.clickedX = Integer.MAX_VALUE; // Should be enough to reset that one.
+        //        	return;
+        //        }
+
+        // Do not care about null blocks.
+        if (block == null) {
+            return;
+        }
+
+        final int tick = TickTask.getTick();
+        // Skip if already set to the same block without breaking within one tick difference.
+        final ItemStack stack = Bridge1_9.getItemInMainHand(player);
+        final Material tool = stack == null ? null : stack.getType();
+
+        if (data.toolChanged(tool)) {
+            // Update.
+        } 
+        else if (tick &lt; data.clickedTick || now &lt; data.fastBreakfirstDamage || now &lt; data.fastBreakBreakTime) {
+            // Time/tick ran backwards: Update.
+            // Tick running backwards should not happen in the main thread unless for reload. A plugin could reset it (not intended).
+        } 
+        else if (data.fastBreakBreakTime &lt; data.fastBreakfirstDamage &amp;&amp; data.clickedX == block.getX() &amp;&amp;  data.clickedZ == block.getZ() &amp;&amp;  data.clickedY == block.getY()){
+            // Preserve first damage time.
+            if (tick - data.clickedTick &lt;= 1 ) {
+                return;
+            }
+        }
+        // (Always set, the interact event only fires once: the first time.)
+        // Only record first damage:
+        data.setClickedBlock(block, tick, now, tool);
+        // Compare with BlockInteract data (debug first).
+        if (pData.isDebugActive(CheckType.BLOCKBREAK)) {
+            BlockInteractListener.debugBlockVSBlockInteract(player, this.checkType, block, "checkBlockDamage", Action.LEFT_CLICK_BLOCK, pData);
+        }
+    }
+
+    @EventHandler(ignoreCancelled = false, priority = EventPriority.MONITOR)
+    public void onItemHeld(final PlayerItemHeldEvent event) {
+        // Reset clicked block.
+        final Player player = event.getPlayer();
+        final BlockBreakData data = DataManager.getPlayerData(player).getGenericInstance(BlockBreakData.class);
+        if (data.toolChanged(player.getInventory().getItem(event.getNewSlot()))) {
+            data.resetClickedBlock();
+        }
+    }
+}
+// NOTE (AI): NCP's blockbreak listener is event-driven (BlockBreakEvent, BlockDamageEvent, PlayerAnimationEvent); the ProtocolLib adapters wrap PacketPlayInBlockDig (START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, ABORT_DESTROY_BLOCK, RELEASE_USE_ITEM) and feed the same FastBreak, Frequency, NoSwing, Reach and WrongBlock checks.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim FastBreak is directly modeled on NCP's FastBreak class. AntiCheatPlus and MIU (securitygab) expose the same blockbreak check family through their own event listeners.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BreakSpeedLimiter / CompletionDurationCheck (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Intave's modern break-speed check: recomputes the expected break duration server-side from the held item and block hardness, and cancels the stop-dig packet when the block was finished too early.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">CompletionDurationCheck subscribes to BLOCK_DIG on ProtocolLib at LOW priority. On START_DESTROY_BLOCK it stores the target position and the initial block damage from BlockInteractionAccess. On STOP_DESTROY_BLOCK it re-resolves the damage with onGround forced true, converts it to the required milliseconds, and if the actual duration fell more than 100 ms short and the balance allows, it builds a Violation, cancels the event and resends the block state to the client. A separate tick subscription decays the balance on every flying packet, and RestartCheck covers dig-restart spam.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Speedmine and nuker cheats that finish blocks faster than hardness and tool speed permit, including breaks that skip the required damage accumulation.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/check/world/breakspeedlimiter/CompletionDurationCheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/check/world/breakspeedlimiter/CompletionDurationCheck.java =====
+package de.jpx3.intave.check.world.breakspeedlimiter;
+
+import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.ProtocolLibrary;
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.wrappers.BlockPosition;
+import com.comphenix.protocol.wrappers.EnumWrappers;
+import com.comphenix.protocol.wrappers.WrappedBlockData;
+import de.jpx3.intave.block.access.BlockInteractionAccess;
+import de.jpx3.intave.block.access.VolatileBlockAccess;
+import de.jpx3.intave.block.variant.BlockVariantNativeAccess;
+import de.jpx3.intave.check.MetaCheckPart;
+import de.jpx3.intave.check.world.BreakSpeedLimiter;
+import de.jpx3.intave.executor.Synchronizer;
+import de.jpx3.intave.klass.Lookup;
+import de.jpx3.intave.math.MathHelper;
+import de.jpx3.intave.module.Modules;
+import de.jpx3.intave.module.linker.packet.ListenerPriority;
+import de.jpx3.intave.module.linker.packet.PacketSubscription;
+import de.jpx3.intave.module.violation.Violation;
+import de.jpx3.intave.module.violation.ViolationContext;
+import de.jpx3.intave.module.violation.ViolationProcessor;
+import de.jpx3.intave.packet.PacketSender;
+import de.jpx3.intave.packet.converter.BlockPositionConverter;
+import de.jpx3.intave.reflect.access.ReflectiveEntityAccess;
+import de.jpx3.intave.user.User;
+import de.jpx3.intave.user.meta.CheckCustomMetadata;
+import de.jpx3.intave.user.meta.InventoryMetadata;
+import org.bukkit.Location;
+import org.bukkit.block.Block;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.ItemStack;
+
+import static de.jpx3.intave.module.linker.packet.PacketId.Client.*;
+
+public final class CompletionDurationCheck extends MetaCheckPart&lt;BreakSpeedLimiter, CompletionDurationCheck.BreakSpeedFinishMeta&gt; {
+  public CompletionDurationCheck(BreakSpeedLimiter parentCheck) {
+    super(parentCheck, BreakSpeedFinishMeta.class);
+  }
+
+  @PacketSubscription(
+    priority = ListenerPriority.LOW,
+    packetsIn = {
+      POSITION, POSITION_LOOK, LOOK, FLYING, VEHICLE_MOVE
+    }
+  )
+  public void tickUpdate(PacketEvent event) {
+    Player player = event.getPlayer();
+    User user = userOf(player);
+    BreakSpeedFinishMeta meta = metaOf(user);
+
+    if (meta.balance &gt; 0 &amp;&amp; !event.isCancelled()) {
+      meta.balance -= 0.005;
+    }
+  }
+
+//  @PacketSubscription(
+//    priority = ListenerPriority.LOW,
+//    packetsIn = {
+//      ARM_ANIMATION
+//    }
+//  )
+//  public void actualTickUpdate(PacketEvent event) {
+//    Player player = event.getPlayer();
+//    User user = userOf(player);
+//    BreakSpeedFinishMeta meta = metaOf(user);
+//
+//    ProtocolMetadata clientData = user.meta().protocol();
+//    InventoryMetadata inventoryData = user.meta().inventory();
+//
+//    if (meta.breakProcess) {
+//      ItemStack itemInHand = inventoryData.heldItem();
+//      BlockPosition blockPosition = meta.targetBlockPosition;
+//
+//      float blockDamage = clientData.flyingPacketStream()
+//        ? BlockInnerAccess.blockDamage(player, itemInHand, blockPosition)
+//        : resolveBlockDamageOnGround(player, itemInHand, blockPosition);
+//      player.sendMessage("block damage in tick: " + blockDamage);
+//      meta.curBlockDamageMP += blockDamage;
+//      meta.maximumBlockDamage = Math.max(meta.maximumBlockDamage, blockDamage);
+//    }
+//  }
+
+  @PacketSubscription(
+    priority = ListenerPriority.LOW,
+    packetsIn = {
+      BLOCK_DIG
+    }
+  )
+  public void receiveBlockAction(PacketEvent event) {
+    Player player = event.getPlayer();
+    User user = userOf(player);
+    BreakSpeedFinishMeta meta = metaOf(user);
+//    ProtocolMetadata clientData = user.meta().protocol();
+    InventoryMetadata inventoryData = user.meta().inventory();
+
+    ItemStack heldItem = inventoryData.heldItem();
+    PacketContainer packet = event.getPacket();
+//    BlockPosition blockPosition = packet.getBlockPositionModifier().read(0);
+    BlockPosition blockPosition = event.getPacket().getModifier()
+      .withType(Lookup.serverClass("BlockPosition"), BlockPositionConverter.threadConverter())
+      .read(0);
+    EnumWrappers.PlayerDigType digType = packet.getPlayerDigTypes().read(0);
+
+    switch (digType) {
+      case START_DESTROY_BLOCK: {
+        float blockDamage = BlockInteractionAccess.blockDamage(player, heldItem, blockPosition);
+        meta.breakProcess = true;
+        meta.breakProcessStartTime = System.currentTimeMillis();
+        meta.curBlockDamageMP = blockDamage;
+        meta.targetBlockPosition = blockPosition;
+        meta.maximumBlockDamage = blockDamage;
+        break;
+      }
+      case STOP_DESTROY_BLOCK: {
+//        if (clientData.flyingPacketStream()) {
+//          float blockDamageDealt = BlockInnerAccess.blockDamage(player, heldItem, blockPosition);
+//          if (blockDamageDealt &lt; 0.79 &amp;&amp; meta.balance++ &gt;= 2) { // ~79%
+//            String message = "broke block too quickly";
+//            String percentage = (int)(blockDamageDealt * 100d) + "%";
+//            String details = "at " + percentage;
+//
+//            ViolationProcessor violationProcessor = IntavePlugin.singletonInstance().violationProcessor();
+//            Violation violation = Violation.builderFor(BreakSpeedLimiter.class)
+//              .forPlayer(player).withMessage(message).withDetails(details)
+//              .withVL(10).build();
+//            ViolationContext violationContext = violationProcessor.processViolation(violation);
+//            if (violationContext.shouldCounterThreat()) {
+//              event.setCancelled(true);
+//              refreshBlocksAround(player, blockPosition.toLocation(player.getWorld()));
+//            }
+//          }
+//        } else {
+
+        if (meta.targetBlockPosition != blockPosition) {
+          blockPosition = meta.targetBlockPosition;
+        }
+
+        if (blockPosition == null) {
+          return;
+        }
+
+        long requiredDuration = resolveMillisecondsOf(resolveBlockDamageOnGround(player, heldItem, blockPosition));
+        long actualDuration = System.currentTimeMillis() - meta.breakProcessStartTime;
+        long exceeded = Math.max(0, requiredDuration - actualDuration);
+
+        if (exceeded &gt; 100 &amp;&amp; meta.balance++ &gt;= 2) {
+          String message = "broke block too quickly";
+          String details = MathHelper.formatDouble(exceeded / 50d, 2) + " ticks faster than expected";
+          ViolationProcessor violationProcessor = Modules.violationProcessor();
+          Violation violation = Violation.builderFor(BreakSpeedLimiter.class)
+            .forPlayer(player).withMessage(message).withDetails(details)
+            .withVL(10).build();
+          ViolationContext violationContext = violationProcessor.processViolation(violation);
+          if (violationContext.shouldCounterThreat()) {
+            event.setCancelled(true);
+            refreshBlocksAround(player, blockPosition.toLocation(player.getWorld()));
+          }
+        }
+//        }
+//        break;
+      }
+      case ABORT_DESTROY_BLOCK:
+        meta.breakProcessStartTime = System.currentTimeMillis();
+        meta.curBlockDamageMP = 0f;
+        meta.targetBlockPosition = null;
+        meta.breakProcess = false;
+        meta.maximumBlockDamage = Float.MIN_VALUE;
+    }
+  }
+
+  private void refreshBlocksAround(Player player, Location targetLocation) {
+    Synchronizer.synchronize(() -&gt; {
+      player.updateInventory();
+      refreshBlock(player, targetLocation);
+//      for (EnumDirection direction : EnumDirection.values()) {
+//        Location placedBlock = targetLocation.clone().add(direction.getDirectionVec().convertToBukkitVec());
+//        refreshBlock(player, placedBlock);
+//      }
+    });
+  }
+
+  private void refreshBlock(Player player, Location location) {
+    PacketContainer packet = ProtocolLibrary.getProtocolManager().createPacket(PacketType.Play.Server.BLOCK_CHANGE);
+    if (!VolatileBlockAccess.isInLoadedChunk(location.getWorld(), location.getBlockX(), location.getBlockZ())) {
+      return;
+    }
+    Block block = VolatileBlockAccess.blockAccess(location);
+    Object handle = BlockVariantNativeAccess.nativeVariantAccess(block);
+    WrappedBlockData blockData = WrappedBlockData.fromHandle(handle);
+    packet.getBlockData().write(0, blockData);
+    BlockPosition position = new BlockPosition(location.getBlockX(), location.getBlockY(), location.getBlockZ());
+    packet.getBlockPositionModifier().write(0, position);
+    PacketSender.sendServerPacket(player, packet);
+  }
+
+  private long resolveMillisecondsOf(float blockDamage) {
+    if (blockDamage == 0) {
+      return 0;
+    }
+    long time = 0;
+    float curBlockDamageMP = 0f;
+    int iterationCountdown = 100;
+    while (curBlockDamageMP &lt; 1f) {
+      curBlockDamageMP += blockDamage;
+      time += 50;
+      if (--iterationCountdown &lt; 0) {
+        break;
+      }
+    }
+    return time;
+  }
+
+  private float resolveBlockDamageOnGround(
+    Player player,
+    ItemStack itemInHand,
+    BlockPosition blockPosition
+  ) {
+    boolean onGroundBefore = ReflectiveEntityAccess.onGround(player);
+    ReflectiveEntityAccess.setOnGround(player, true);
+    float blockDamage = BlockInteractionAccess.blockDamage(player, itemInHand, blockPosition);
+    ReflectiveEntityAccess.setOnGround(player, onGroundBefore);
+    return blockDamage;
+  }
+
+  public static final class BreakSpeedFinishMeta extends CheckCustomMetadata {
+    public BlockPosition targetBlockPosition;
+    public float curBlockDamageMP = 0f;
+    public float maximumBlockDamage;
+    /*
+    breakProcess won't be set to false if a player is stop breaking a block (only when destroying a block),
+    So isBreakingBlock is a boolean which determines if the player is breaking a block and is false when he stops breaking.
+     */
+    public boolean breakProcess;
+    public long breakProcessStartTime;
+    public double balance;
+  }
+}
+// NOTE (AI): CompletionDurationCheck is the active part of Intave's BreakSpeedLimiter. It subscribes to BLOCK_DIG on ProtocolLib, recomputes the expected break duration from the held item and block hardness, and cancels the stop-dig packet plus resends the block when the client finished more than 100 ms early. The sibling RestartCheck covers dig restart spam on the same stream.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The parent BreakSpeedLimiter container also wires RestartCheck; Grim's breaking package and BetterAnticheat's DigOrderCheck/DigBlockFacePositionCheck cover the same ground on different packet stacks.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Nuker (Arc)</span>
+<span class="impl-module-clients">(Vrekt-Arc)</span>
+</div>
+<p class="impl-pattern">Classic statistical nuker check: caps the number of block breaks per second and the spacing between them.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PacketCheck configured with max-breaks-per-second 15, min-delta-between-breaks 50 ms and a threshold of 5 violations before flagging, plus a packet-level cap of 50 break packets per second with an optional kick threshold. Creative-only by default, it cancels the offending events and notifies after every 4th violation.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nuker and instamine modules that destroy an improbable number of blocks around the player in one second.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Vrekt-Arc — src/main/java/arc/check/block/Nuker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Vrekt-Arc — src/main/java/arc/check/block/Nuker.java =====
+package arc.check.block;
+
+import arc.Arc;
+import arc.check.PacketCheck;
+import arc.check.result.CheckResult;
+import arc.check.types.CheckType;
+import arc.data.block.BlockData;
+import arc.data.packet.PacketData;
+import com.comphenix.protocol.PacketType;
+import org.bukkit.GameMode;
+import org.bukkit.entity.Player;
+
+/**
+ * Checks if the player is using nuker - destroying an improbable amount of blocks around them.
+ * This check will also utilize {@code maxPacketsPerSecond} to ensure not too many events are sent.
+ * &lt;p&gt;
+ * packet-check: the check will use packets
+ * creative-only: Player must be in creative to check.
+ * max-breaks-per-second: The max amount of block breaks per second.
+ * min-delta-between-breaks: The minimum time allowed between the last break.
+ * min-delta-between-breaks-threshold: the amount of times the above ^^ has to be triggered to flag.
+ */
+public final class Nuker extends PacketCheck {
+
+    /**
+     * packet-check: the check will use packets
+     * creative-only: Player must be in creative to check.
+     * If packets should be checked.
+     */
+    private boolean packetCheck, creativeOnly, checkPackets;
+
+    /**
+     * max-breaks-per-second: The max amount of block breaks per second.
+     * min-delta-between-breaks: The minimum time allowed between the last break.
+     * min-delta-between-breaks-threshold: the amount of times the above ^^ has to be triggered to flag.
+     */
+    private int maxBreaksPerSecond, minDeltaBetweenBreaks, minDeltaBetweenBreaksThreshold;
+
+    /**
+     * Max packets and packet kick threshold
+     */
+    private int maxPacketsPerSecond, packetKickThreshold;
+
+    /**
+     * Kick if the threshold is reached
+     */
+    private boolean kickIfThresholdReached;
+
+    public Nuker() {
+        super(CheckType.NUKER);
+
+        isEnabled(true)
+                .cancel(true)
+                .cancelLevel(0)
+                .notify(true)
+                .notifyEvery(4)
+                .ban(true)
+                .banLevel(1000)
+                .kick(true)
+                .kickLevel(500)
+                .build();
+
+        addConfigurationValue("packet-check", true);
+        addConfigurationValue("creative-only", true);
+        addConfigurationValue("max-breaks-per-second", 15);
+        addConfigurationValue("min-delta-between-breaks", 50);
+        addConfigurationValue("min-delta-between-breaks-threshold", 5);
+
+        addConfigurationValue("check-packets", true);
+        addConfigurationValue("max-break-packets-per-second", 50);
+        addConfigurationValue("kick-if-threshold-reached", false);
+        addConfigurationValue("packet-kick-threshold", 100);
+
+        if (isEnabled()) load();
+    }
+
+    /**
+     * Check this player for Nuker.
+     *
+     * @param player the player
+     * @return the result
+     */
+    public boolean check(Player player) {
+        if (!isEnabled() || exempt(player) || creativeOnly &amp;&amp; player.getGameMode() != GameMode.CREATIVE) return false;
+
+        final CheckResult result = new CheckResult();
+        final long now = System.currentTimeMillis();
+
+        // first, just check packet-stuff.
+        // Don't use a scheduled check here, because meh.
+        if (checkPackets) {
+            final PacketData packetData = PacketData.get(player);
+
+            final int count = packetData.getBreakPacketCount() + 1;
+            packetData.setBreakPacketCount(count);
+            final long packetDelta = now - packetData.getLastBreakPacketReset();
+
+            // check packet counts and deltas.
+            if (packetDelta &gt;= 1000) {
+                packetData.setLastBreakPacketReset(now);
+                if (count &gt;= maxPacketsPerSecond) {
+                    result.setFailed("Too many break packets (or events) per second.")
+                            .withParameter("amount", count)
+                            .withParameter("max", maxPacketsPerSecond);
+
+                    if (count &gt;= packetKickThreshold &amp;&amp; kickIfThresholdReached
+                            &amp;&amp; !Arc.getInstance().getPunishmentManager().hasPendingKick(player)) {
+                        Arc.getInstance().getPunishmentManager().kickPlayer(player, this);
+                    }
+                } else {
+                    packetData.setCancelBreakPackets(false);
+                }
+
+                packetData.setBreakPacketCount(0);
+            }
+
+            // cancel if we should.
+            if (packetData.cancelBreakPackets()) {
+                result.setFailed("Cancelling break packets because there were too many.");
+                checkViolation(player, result);
+                return true;
+            }
+
+            final boolean violation = checkViolation(player, result);
+            packetData.setCancelBreakPackets(violation);
+            if (violation) return true;
+        }
+
+        // now, block checking.
+        final BlockData data = BlockData.get(player);
+        final long delta = now - data.getLastBreak();
+        data.setTotalBroke(data.getTotalBroke() + 1);
+        data.setLastBreak(now);
+
+        if (now - data.getTotalBrokeReset() &gt;= 1000) {
+            data.setTotalBrokeReset(now);
+
+            if (data.getTotalBroke() &gt; maxBreaksPerSecond) {
+                result.setFailed("Breaking too many blocks per second.")
+                        .withParameter("total", data.getTotalBroke())
+                        .withParameter("max", maxBreaksPerSecond);
+            }
+
+            data.setTotalBroke(0);
+        }
+
+        // check delta times
+        if (delta &lt; minDeltaBetweenBreaks) {
+            // "failed", increment one count.
+            data.setLastBreakDeltaCount(data.getLastBreakDeltaCount() + 1);
+
+            // make sure we haven't already failed, and then check against min.
+            if (data.getLastBreakDeltaCount() &gt;= minDeltaBetweenBreaksThreshold
+                    &amp;&amp; !result.failed()) {
+                result.setFailed("Breaking blocks too fast")
+                        .withParameter("count", data.getLastBreakDeltaCount())
+                        .withParameter("min", minDeltaBetweenBreaksThreshold)
+                        .withParameter("delta", delta)
+                        .withParameter("min-delta", minDeltaBetweenBreaks);
+            }
+        } else {
+            // lower since we're okay.
+            data.setLastBreakDeltaCount(data.getLastBreakDeltaCount() - 1);
+        }
+
+        return checkViolation(player, result);
+    }
+
+    /**
+     * @return if this check uses packets.
+     */
+    public boolean isPacketCheck() {
+        return packetCheck;
+    }
+
+    @Override
+    public void reloadConfig() {
+        load();
+    }
+
+    @Override
+    public void load() {
+        packetCheck = configuration.getBoolean("packet-check");
+        creativeOnly = configuration.getBoolean("creative-only");
+        checkPackets = configuration.getBoolean("check-packets");
+        maxBreaksPerSecond = configuration.getInt("max-breaks-per-second");
+        minDeltaBetweenBreaks = configuration.getInt("min-delta-between-breaks");
+        minDeltaBetweenBreaksThreshold = configuration.getInt("min-delta-between-breaks-threshold");
+
+        maxPacketsPerSecond = configuration.getInt("max-break-packets-per-second");
+        kickIfThresholdReached = configuration.getBoolean("kick-if-threshold-reached");
+        packetKickThreshold = configuration.getInt("packet-kick-threshold");
+
+        if (packetCheck) {
+            registerPacketListener(PacketType.Play.Client.BLOCK_DIG, event -&gt; event.setCancelled(check(event.getPlayer())));
+        }
+    }
+}
+// NOTE (AI): Arc's Nuker is a classic 1.8 statistical check: it counts distinct blocks dug within one second using Bukkit events and flags when the count exceeds the natural mining speed for the held tool.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Negativity's NukerProtocol and MC-Jinky's XRayCheck apply the same break-rate idea on Bukkit events; Azure BadPacketsC/I validate the dig action itself instead of the rate.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../C08PacketPlayerBlockPlacement/">C08PacketPlayerBlockPlacement</a>
 <a class="related-chip" href="../C02PacketUseEntity/">C02PacketUseEntity</a>

@@ -385,6 +385,303 @@ public class PacketAPI extends API {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">No module-level C15 hook in the corpus; the packet is handled by component infrastructure (Rise 6.x) or script calls.</div>
 <div class="impl-clients">Vanilla GameSettings emits C15 on settings change in every client; Rise 6.x adds the blink tuple and script bridge. Spicy Bhop carries dead imports of C15 (and C14, C17, C18, C19) with no call sites.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The client-settings packet carries locale, view distance, chat visibility and the skin-parts bitmask, so anticheats read it for two purposes: enforcing protocol limits (Grim CrashE, BetterAnticheat SmallRender) and tying chat visibility to chat activity (Grim ChatD, BetterAnticheat HiddenChat). Photon reads the skin bitmask to catch skinblinker mods that toggle parts while sprinting or that set the unused 0x80 bit.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ChatD hidden chat (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Stop chat messages from clients that set chat visibility to hidden.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Tracks the chatVisibility flag from CLIENT_SETTINGS in both the play and configuration protocol states, then cancels any CHAT_MESSAGE or CHAT_COMMAND sent while the flag is HIDDEN, flagging each attempt.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Hidden-chat clients that keep sending chat, a common bypass primitive for chat moderation and reporting systems.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/chat/ChatD.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/chat/ChatD.java =====
+package ac.grim.grimac.checks.impl.chat;
+
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PreViaPacketReceiveListener;
+import ac.grim.grimac.player.GrimPlayer;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.common.client.WrapperCommonClientSettings;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientSettings;
+
+@CheckData(name = "ChatD", stableKey = "grim.exploit.chat_while_hidden", description = "Chatting while chat is hidden")
+public class ChatD extends Check implements PreViaPacketReceiveListener {
+    private boolean hidden;
+
+    public ChatD(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPreViaPacketReceive(PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.CHAT_MESSAGE
+                || event.getPacketType() == PacketType.Play.Client.CHAT_COMMAND_UNSIGNED
+                || event.getPacketType() == PacketType.Play.Client.CHAT_COMMAND) {
+            if (hidden &amp;&amp; flag() &amp;&amp; shouldModifyPackets()) {
+                event.setCancelled(true);
+                player.onPacketCancel();
+            }
+        }
+
+        if (event.getPacketType() == PacketType.Play.Client.CLIENT_SETTINGS || event.getPacketType() == PacketType.Configuration.Client.CLIENT_SETTINGS) {
+            hidden = new WrapperPlayClientSettings(event).getChatVisibility() == WrapperCommonClientSettings.ChatVisibility.HIDDEN;
+        }
+    }
+}
+
+// NOTE (AI): Grim also handles the configuration-state variant of CLIENT_SETTINGS, which matters on 1.20.2+ where settings move into the configuration phase.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> BetterAnticheat HiddenChatCheck implements the same rule with a one-message grace period instead of cancellation.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">CrashE view distance (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Enforce the minimum view distance the client may advertise.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On CLIENT_SETTINGS, wraps the packet and if the view distance is below 2, flags the value and rewrites it to 2 before the server processes the packet.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Clients advertising a zero or negative view distance, which destabilizes chunk sending and can be used as a crash or lag primitive.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/crash/CrashE.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/crash/CrashE.java =====
+package ac.grim.grimac.checks.impl.crash;
+
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PacketReceiveListener;
+import ac.grim.grimac.player.GrimPlayer;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientSettings;
+
+@CheckData(name = "CrashE", stableKey = "grim.crash.low_view_distance", description = "Sent a client view distance below the minimum allowed value")
+public class CrashE extends Check implements PacketReceiveListener {
+    private static final Verbose V = Verbose.of("distance={sint}");
+
+    public CrashE(GrimPlayer playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.CLIENT_SETTINGS) {
+            WrapperPlayClientSettings wrapper = new WrapperPlayClientSettings(event);
+            int viewDistance = wrapper.getViewDistance();
+            if (viewDistance &lt; 2) {
+                flag(V.write(verbose()).sint(viewDistance));
+                wrapper.setViewDistance(2);
+            }
+        }
+    }
+
+}
+
+// NOTE (AI): The check rewrites the packet in place rather than cancelling it, so the client connection stays healthy while the impossible value is neutralized.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> BetterAnticheat SmallRenderCheck fails on the same condition but does not rewrite the value.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">SkinBlinkerSprinting (Photon)</span>
+<span class="impl-module-clients">(Photon-GitHub-AntiCheatAddition)</span>
+</div>
+<p class="impl-pattern">Catch skin-part toggles that happen while the player is sprinting or sneaking.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On CLIENT_SETTINGS, reads the skin-parts bitmask and compares it to the last saved mask. If the player is sprinting or sneaking and the mask changed, the module flags with a violation level of 50. An unmodified client can only change settings from the menu, where sprint and sneak are impossible.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Skinblinker mods that flash skin parts during movement, which is how many 1.8-era skinblinker bypasses worked.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/checks/skinblinker/SkinBlinkerSprinting.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/checks/skinblinker/SkinBlinkerSprinting.java =====
+package de.photon.anticheataddition.modules.checks.skinblinker;
+
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientSettings;
+import de.photon.anticheataddition.modules.ModuleLoader;
+import de.photon.anticheataddition.modules.ViolationModule;
+import de.photon.anticheataddition.user.User;
+import de.photon.anticheataddition.util.protocol.PacketAdapterBuilder;
+import de.photon.anticheataddition.util.violationlevels.Flag;
+import de.photon.anticheataddition.util.violationlevels.ViolationLevelManagement;
+import de.photon.anticheataddition.util.violationlevels.ViolationManagement;
+
+import java.util.OptionalInt;
+
+public final class SkinBlinkerSprinting extends ViolationModule
+{
+    public static final SkinBlinkerSprinting INSTANCE = new SkinBlinkerSprinting();
+
+    private SkinBlinkerSprinting() {super("Skinblinker.parts.Sprinting");}
+
+    @Override
+    protected ModuleLoader createModuleLoader()
+    {
+        return ModuleLoader.builder(this)
+                           .addPacketListeners(PacketAdapterBuilder.of(this, PacketType.Play.Client.CLIENT_SETTINGS).onReceiving((event, user) -&gt; {
+                               /*
+                                * An unmodified client can only send such packets if the player is in the menu
+                                * -&gt; They obviously cannot sprint or sneak while doing this.
+                                * -&gt; They can move, especially in MC 1.9+ because of entity-collision, etc.
+                                * -&gt; As of the render-debug-cycle which can be done in the game (F3 + F) I need to check for the change of the skin.
+                                */
+                               final WrapperPlayClientSettings settings = new WrapperPlayClientSettings(event);
+                               final byte skinMask = settings.getSkinMask();
+
+                               // Sprinting or sneaking (detection)
+                               if ((user.getPlayer().isSprinting() || user.getPlayer().isSneaking())
+                                   // The skin mask has been changed
+                                   &amp;&amp; handleSentSkinMask(user, skinMask)) {
+                                   getManagement().flag(Flag.of(user)
+                                                            .setAddedVl(50)
+                                                            .setDebug(() -&gt; "SkinBlinkerSprinting: Skin changed while sprinting or sneaking. New skinmask is %x".formatted(skinMask)));
+                               }
+                           }).build())
+                           .build();
+    }
+
+    /**
+     * Updates the saved skin components.
+     *
+     * @return true if there was already a skin mask saved before, and it differs from the new skin mask.
+     */
+    public boolean handleSentSkinMask(User user, int skinMask)
+    {
+        final OptionalInt oldSkin = user.getData().object.skinComponents;
+        final boolean skinChange = oldSkin.isPresent() &amp;&amp; oldSkin.getAsInt() != skinMask;
+
+        // Update the skin components.
+        user.getData().object.skinComponents = OptionalInt.of(skinMask);
+        return skinChange;
+    }
+
+    @Override
+    protected ViolationManagement createViolationManagement()
+    {
+        return ViolationLevelManagement.builder(this)
+                                       .emptyThresholdManagement()
+                                       .withDecay(200, 25).build();
+    }
+}
+
+// NOTE (AI): Photon stores the last mask per user and only flags on a real change, so a player who re-opens settings without toggling anything is not flagged.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The sibling module SkinBlinkerUnusedBit flags the 0x80 bit in the same mask, which vanilla clients never set; LabyMod and similar clients use that bit for cosmetics.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">HiddenChatCheck (BetterAnticheat)</span>
+<span class="impl-module-clients">(amnoah-BetterAnticheat)</span>
+</div>
+<p class="impl-pattern">Catch players who hide the chat but keep chatting.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Tracks chatVisibility from CLIENT_SETTINGS (FULL and SYSTEM set canChat true, HIDDEN sets it false). When a CHAT_MESSAGE arrives while hidden, the check fails, with a one-message grace period because the settings packet can lag behind the chat packet.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Clients that hide the chat box while still sending messages, an evasion pattern for chat-based detection.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/check/impl/chat/HiddenChatCheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/check/impl/chat/HiddenChatCheck.java =====
+package better.anticheat.core.check.impl.chat;
+
+import better.anticheat.core.BetterAnticheat;
+import better.anticheat.core.check.Check;
+import better.anticheat.core.check.CheckInfo;
+import better.anticheat.core.player.Player;
+import com.github.retrooper.packetevents.event.simple.PacketPlayReceiveEvent;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientSettings;
+
+/**
+ * This check looks for chatting with no chat box.
+ */
+@CheckInfo(name = "HiddenChat", category = "chat")
+public class HiddenChatCheck extends Check {
+
+    private boolean canChat = true, initalFlag = false;
+
+    public HiddenChatCheck(BetterAnticheat plugin, Player player) {
+        super(plugin, player);
+    }
+
+    @Override
+    public void handleReceivePlayPacket(PacketPlayReceiveEvent event) {
+
+        /*
+         * In Minecraft, there are three chat modes:
+         * FULL - Full access to the chat with other players.
+         * SYSTEM - You should only be able to interact with the Minecraft server, not other players.
+         * HIDDEN - You cannot interact with anything.
+         * So, if a player interacts with the chat on Hidden, they're cheating!
+         */
+
+        switch (event.getPacketType()) {
+            case CLIENT_SETTINGS:
+                try {
+                    WrapperPlayClientSettings wrapper = new WrapperPlayClientSettings(event);
+                    switch (wrapper.getChatVisibility()) {
+                        case FULL:
+                        case SYSTEM:
+                            canChat = true;
+                            break;
+                        case HIDDEN:
+                            canChat = false;
+                            break;
+                    }
+                } catch (final Exception e) {
+                    player.getChecks().remove(this);
+                    return;
+                }
+                break;
+            case CHAT_MESSAGE:
+                if (!canChat) {
+                    // Settings aren't always sent to update this until after chats are sent.
+                    if (initalFlag) fail();
+                    else initalFlag = true;
+                }
+                break;
+        }
+    }
+}
+
+// NOTE (AI): The check disables itself if the settings wrapper throws, since the wrapper is known to be unstable on some protocol versions.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim ChatD is the same rule with hard cancellation instead of a grace period.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">SmallRenderCheck (BetterAnticheat)</span>
+<span class="impl-module-clients">(amnoah-BetterAnticheat)</span>
+</div>
+<p class="impl-pattern">Flag impossibly small render distances.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On CLIENT_SETTINGS, fails when the view distance is below 2, the lowest value an unmodified modern client can select.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Clients advertising render distances below 2, which some modules set to reduce chunk load or destabilize server chunk sending.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/check/impl/misc/SmallRenderCheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/check/impl/misc/SmallRenderCheck.java =====
+package better.anticheat.core.check.impl.misc;
+
+import better.anticheat.core.BetterAnticheat;
+import better.anticheat.core.check.Check;
+import better.anticheat.core.check.CheckInfo;
+import better.anticheat.core.player.Player;
+import com.github.retrooper.packetevents.event.simple.PacketPlayReceiveEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientSettings;
+
+/**
+ * This check looks for excessively small render distance values.
+ */
+@CheckInfo(name = "SmallRender", category = "misc")
+public class SmallRenderCheck extends Check {
+
+    public SmallRenderCheck(BetterAnticheat plugin, Player player) {
+        super(plugin, player);
+    }
+
+    @Override
+    public void handleReceivePlayPacket(PacketPlayReceiveEvent event) {
+
+        /*
+         * In modern clients, the lowest value that the render distance can be set to without modification is 2.
+         * There's some issue right now with the Settings wrapper throwing exceptions. This try catch is a quick patch
+         * until that can be investigated fully.
+         */
+
+        if (event.getPacketType() != PacketType.Play.Client.CLIENT_SETTINGS) return;
+        try {
+            WrapperPlayClientSettings wrapper = new WrapperPlayClientSettings(event);
+            if (wrapper.getViewDistance() &lt; 2) fail();
+        } catch (final Exception e) {
+            return;
+        }
+    }
+}
+
+// NOTE (AI): The try-catch around the wrapper is a known workaround for a PacketEvents settings-wrapper exception on some versions.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim CrashE flags and rewrites the same value; the BetterAnticheat version only records a fail.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../C16PacketClientStatus/">C16PacketClientStatus</a>
 <a class="related-chip" href="../S39PacketPlayerAbilities/">S39PacketPlayerAbilities</a>

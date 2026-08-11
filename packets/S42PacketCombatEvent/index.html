@@ -105,6 +105,178 @@
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
 <p class="impl-pattern">Combat tag transitions from the server's CombatTracker. ENTER_COMBAT and END_COMBAT are the only variants the vanilla server constructs; ENTITY_DIED exists on the wire but is dead code in vanilla 1.8.9, which is why none of the 8 clients hooks it. Client-side the handler only feeds Twitch streaming metadata.</p>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The combat event packet carries combat tag transitions: enter combat, end combat, and entity died. Server-side anticheats do not use it for reach or killaura validation, because combat state is tracked from attack packets, but two anticheats consume it for state: Grim reads the death combat event to track whether the client's death screen is showing, which anchors its respawn-alive check, and Intave registers a packet reader that exposes the two entity id fields for substitution. Artemis and Negativity only name the packet in registries.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Respawn alive / death screen state (Grim BadPacketsM)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Flag a PERFORM_RESPAWN status request sent while the player is alive and no death screen is showing.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">BadPacketsM listens on both directions. On the server side it wraps DEATH_COMBAT_EVENT and COMBAT_EVENT (ENTITY_DEAD) for the player's own entity id and, transaction-sandwiched, marks the menu state from showsDeathScreen. On the client side, a PERFORM_RESPAWN action while the compensated self is not dead and no menu is recorded flags the player. Change-game-state win events and respawns grant short exemptions for the client's own menu toggling.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Respawn-while-alive exploits, death-screen spoofing, and clients that send respawn without the server having announced their death.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsM.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsM.java =====
+package ac.grim.grimac.checks.impl.badpackets;
+
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PreViaPacketReceiveListener;
+import ac.grim.grimac.checks.type.PreViaPacketSendListener;
+import ac.grim.grimac.player.GrimPlayer;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.protocol.player.Combat;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientClientStatus;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerChangeGameState;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerCombatEvent;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerDeathCombatEvent;
+
+@CheckData(name = "BadPacketsM", stableKey = "grim.badpackets.respawn_alive", description = "Tried to respawn while alive", experimental = true)
+public class BadPacketsM extends Check implements PreViaPacketReceiveListener, PreViaPacketSendListener {
+    public BadPacketsM(final GrimPlayer player) {
+        super(player);
+    }
+
+    // not a boolean because the server could send packets that cause
+    // the client to send a respawn packet before it receives the first
+    private int exempt;
+    private boolean menu;
+
+    @Override
+    public void onPreViaPacketReceive(PacketReceiveEvent event) {
+        if (event.getPacketType() != PacketType.Play.Client.CLIENT_STATUS
+                || new WrapperPlayClientClientStatus(event).getAction() != WrapperPlayClientClientStatus.Action.PERFORM_RESPAWN) {
+            return;
+        }
+
+        if (exempt &gt; 0) {
+            exempt--;
+            return;
+        }
+
+        if (!player.compensatedEntities.self.isDead &amp;&amp; !menu) {
+            flag(); // don't cancel in case of a false positive
+        }
+
+        // the client closes the menu and reopens it if dead
+        menu = player.compensatedEntities.self.isDead &amp;&amp; player.packetStateData.showsDeathScreen;
+    }
+
+    @Override
+    public void onPreViaPacketSend(PacketSendEvent event) {
+        if (player.getClientVersion().isOlderThanOrEquals(ClientVersion.V_1_8)) {
+            return;
+        }
+
+        if (event.getPacketType() == PacketType.Play.Server.CHANGE_GAME_STATE) {
+            WrapperPlayServerChangeGameState packet = new WrapperPlayServerChangeGameState(event);
+            if (packet.getReason() != WrapperPlayServerChangeGameState.Reason.WIN_GAME) return;
+
+            if (packet.getValue() != 0 &amp;&amp; packet.getValue() != 1) {
+                return; // client ignores this
+            }
+
+            player.sendTransaction();
+            player.addRealTimeTaskNow(() -&gt; {
+                // we COULD get a DEATH_COMBAT_EVENT/COMBAT_EVENT while the credits are rolling, (IF packet.getValue == 1)
+                // but this can only cause at most one false negative (for each of this packet sent)
+                exempt++;
+                menu = false;
+            });
+        }
+
+        if (event.getPacketType() == PacketType.Play.Server.DEATH_COMBAT_EVENT
+                &amp;&amp; new WrapperPlayServerDeathCombatEvent(event).getPlayerId() == player.entityID) {
+            player.sendTransaction();
+            player.addRealTimeTaskNow(this::onDeathCombatEvent);
+        }
+
+        if (event.getPacketType() == PacketType.Play.Server.COMBAT_EVENT) {
+            WrapperPlayServerCombatEvent packet = new WrapperPlayServerCombatEvent(event);
+            if (packet.getCombat() == Combat.ENTITY_DEAD &amp;&amp; packet.getPlayerId() == player.entityID) {
+                player.sendTransaction();
+                player.addRealTimeTaskNow(this::onDeathCombatEvent);
+            }
+        }
+    }
+
+    private void onDeathCombatEvent() {
+        if (player.packetStateData.showsDeathScreen) {
+            menu = true;
+        } else {
+            exempt++;
+        }
+    }
+
+    public void onRespawn() {
+        menu = false; // the client closes any open screens on respawn
+    }
+
+    // the menu is actually kept when the player's health is set to &gt;0
+    public void onDeath() {
+        if (player.packetStateData.showsDeathScreen) {
+            menu = true;
+        }
+    }
+}
+// NOTE (AI): The check is marked experimental and flags without cancelling to avoid false positives. On 1.8 the death screen is implied by the death combat event itself; the change-game-state and respawn hooks cover the 1.19+ death screen toggle.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other anticheat in the corpus runs a death-state check keyed to this packet; Negativity and Artemis only register the packet name.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Combat event reader (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Expose the combat event packet's two integer entity fields to Intave's packet pipeline so they can be read or substituted.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">CombatEventReader is registered in PacketReaders for COMBAT_EVENT. It reads the first two integers of the packet through a substitution iterator: the iterator writes back to the same integer fields, which lets the pipeline rewrite entity references carried by combat events.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> None directly; it is packet plumbing that lets entity-tracking code see and optionally rewrite the entity id fields carried by combat events.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/packet/reader/CombatEventReader.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/packet/reader/CombatEventReader.java =====
+package de.jpx3.intave.packet.reader;
+
+import org.jetbrains.annotations.NotNull;
+
+public final class CombatEventReader extends AbstractPacketReader implements EntityIterable{
+  public int firstEntityId() {
+    return packet().getIntegers().read(0);
+  }
+
+  public int secondEntityId() {
+    return packet().getIntegers().read(1);
+  }
+
+  private int slot = 0;
+
+  @Override
+  public @NotNull SubstitutionIterator&lt;Integer&gt; iterator() {
+    slot = 0;
+    return STATIC_ITERATOR;
+  }
+
+  private final SubstitutionIterator&lt;Integer&gt; STATIC_ITERATOR = new SubstitutionIterator&lt;Integer&gt;() {
+    @Override
+    public void set(Integer integer) {
+      if (slot == 1) {
+        packet().getIntegers().write(0, integer);
+      } else if (slot == 2) {
+        packet().getIntegers().write(1, integer);
+      }
+    }
+
+    @Override
+    public boolean hasNext() {
+      return slot &lt; 2;
+    }
+
+    @Override
+    public Integer next() {
+      return packet().getIntegers().read(slot++);
+    }
+  };
+}
+// NOTE (AI): The reader implements EntityIterable, so the two ids are treated as substitution targets: any rewrite writes back into the raw packet integers, keeping the packet valid on the wire.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis's PacketRepository maps SERVER_PLAY + 18 to PacketPlayServerCombatEvent and ships a marker interface, and Negativity's PacketType enum lists COMBAT_EVENT('CombatEvent'); neither runs a check on it.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S02PacketChat/">S02PacketChat</a>
 <a class="related-chip" href="../S13PacketDestroyEntities/">S13PacketDestroyEntities</a>

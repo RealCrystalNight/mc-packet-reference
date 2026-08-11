@@ -339,6 +339,909 @@ public class NetworkAPI extends API {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Rise 5.99: PacketSendEvent. Rise 6.x: script API table.</div>
 <div class="impl-clients">Rise 5.99 logs the packet through its event bus; Rise 6.x exposes the class to scripts. No client in the corpus cancels or forges S3F.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S3F is the outbound plugin channel, and the corpus splits by direction. The inbound machinery dominates the keyword matches: brand recognition (Grim ClientBrand, Shard ClientBrand, Truthful BrandListener, Photon BrandChannelData, intave PayloadInReader and SettingsTracker, LightAntiCheat ClientBrandRecognizer), payload frequency (Arc PayloadFrequency), payload exploits (Grim ExploitA and ExploitB), and badpackets (Frequency BadPacketsD, Hydro BadPacketsC, FlopAC BadPacketsF and BadPacketsG) all consume the client-to-server payload and appear here because the search terms overlap. The genuine S3F consumers are the anticheats' own outbound payloads: Photon rewrites the outgoing brand so clients cannot fingerprint the server, intave emits a brand-channel mark to authenticate its companion client, and Negativity sends FML handshake probes to enumerate Forge mods. Artemis and Negativity register the packet classes (SERVER_PLAY+21, CUSTOM_PAYLOAD_IN and CUSTOM_PAYLOAD_OUT).</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BrandHider (Photon)</span>
+<span class="impl-module-clients">(Photon-GitHub-AntiCheatAddition)</span>
+</div>
+<p class="impl-pattern">Stop clients from fingerprinting the server: rewrite every outbound brand payload to a configured fake brand.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Two PacketAdapterBuilder listeners hook the outbound PLUGIN_MESSAGE packets (Configuration.Server and Play.Server, the S3F path) with onSendingRaw. When the channel is the brand channel (MC|Brand or minecraft:brand), the payload data is replaced with createBrandPayload of the configured brand ('Some Spigot' by default) and the packet is marked for re-encode. On join, and at an optional refresh rate, the module also pushes an empty brand payload so the adapter has something to rewrite.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Clients and disablers that read the server brand to pick a bypass mode; the rewrite keeps the advertised stack generic.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/additions/BrandHider.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/additions/BrandHider.java =====
+package de.photon.anticheataddition.modules.additions;
+
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketListener;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.configuration.server.WrapperConfigServerPluginMessage;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPluginMessage;
+import de.photon.anticheataddition.AntiCheatAddition;
+import de.photon.anticheataddition.modules.Module;
+import de.photon.anticheataddition.modules.ModuleLoader;
+import de.photon.anticheataddition.util.execute.Placeholders;
+import de.photon.anticheataddition.util.log.Log;
+import de.photon.anticheataddition.util.pluginmessage.ByteBufUtil;
+import de.photon.anticheataddition.util.pluginmessage.MessageChannel;
+import de.photon.anticheataddition.util.protocol.PacketAdapterBuilder;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.scheduler.BukkitTask;
+
+public final class BrandHider extends Module implements PacketListener, Listener {
+    public static final BrandHider INSTANCE = new BrandHider();
+
+    private String brand;
+    private final String channel = MessageChannel.MC_BRAND_CHANNEL.getChannel().orElseThrow();
+    private BukkitTask updateTask;
+
+    private BrandHider()
+    {
+        super("BrandHider");
+    }
+
+    public void setBrand(String brand)
+    {
+        this.brand = ChatColor.translateAlternateColorCodes('&amp;', brand) + ChatColor.RESET;
+        this.updateAllBrands();
+    }
+
+    private void updateAllBrands()
+    {
+        for (Player onlinePlayer : Bukkit.getOnlinePlayers()) updateBrand(onlinePlayer);
+    }
+
+    private void updateBrand(final Player player)
+    {
+        // Just send an empty brand message, as this will be replaced by the Packet Adapter below anyways.
+        final byte[] payload = createBrandPayload("");
+        PacketEvents.getAPI().getPlayerManager().sendPacket(player, new WrapperPlayServerPluginMessage(this.channel, payload));
+    }
+
+    private static byte[] createBrandPayload(final String brand)
+    {
+        final ByteBuf buf = Unpooled.buffer();
+        try {
+            ByteBufUtil.writeString(buf, brand);
+            return ByteBufUtil.toArray(buf);
+        } finally {
+            buf.release();
+        }
+    }
+
+    @EventHandler
+    public void onJoin(final PlayerJoinEvent event)
+    {
+        updateBrand(event.getPlayer());
+    }
+
+    @Override
+    public void enable()
+    {
+        Log.finer(() -&gt; "BrandHider brand " + this.brand + " | channel " + this.channel);
+        this.setBrand(loadString(".brand", "Some Spigot"));
+
+        final long refreshRate = loadLong(".refresh_rate", 0);
+        if (refreshRate &gt; 0) {
+            this.updateTask = Bukkit.getScheduler().runTaskTimer(AntiCheatAddition.getInstance(), this::updateAllBrands, 20L, refreshRate);
+        }
+    }
+
+    @Override
+    public void disable()
+    {
+        if (this.updateTask != null) this.updateTask.cancel();
+    }
+
+    @Override
+    protected ModuleLoader createModuleLoader()
+    {
+        return ModuleLoader.builder(this)
+                           //
+                           .addPacketListeners(
+                                   // For Configuration.Server, the player might still be null, as they are currently being constructed.
+                                   PacketAdapterBuilder.of(this, PacketType.Configuration.Server.PLUGIN_MESSAGE).onSendingRaw((event) -&gt; {
+                                       final WrapperConfigServerPluginMessage packet = new WrapperConfigServerPluginMessage(event);
+                                       final String channel = packet.getChannelName();
+                                       Log.finer(() -&gt; "BrandHider got PLUGIN_MESSAGE in channel " + channel + " | equals: " + this.channel.equals(channel));
+
+                                       if (this.channel.equals(channel)) {
+                                           // Only replace non-player placeholders
+                                           final String brand = Placeholders.replacePlaceholdersSafely(this.brand);
+                                           packet.setData(createBrandPayload(brand));
+                                           event.markForReEncode(true);
+                                       }
+                                   }).build(),
+                                   // For Play.Server, the player is already fully initialized on the server, so non-null.
+                                   PacketAdapterBuilder.of(this, PacketType.Play.Server.PLUGIN_MESSAGE).onSendingRaw((event) -&gt; {
+                                       final WrapperPlayServerPluginMessage packet = new WrapperPlayServerPluginMessage(event);
+                                       final String channel = packet.getChannelName();
+                                       Log.finer(() -&gt; "BrandHider got PLUGIN_MESSAGE in channel " + channel + " | equals: " + this.channel.equals(channel));
+
+                                       if (this.channel.equals(channel)) {
+                                           // Replace all placeholders.
+                                           final String brand = Placeholders.replacePlaceholders(this.brand, event.getPlayer());
+                                           packet.setData(createBrandPayload(brand));
+                                           event.markForReEncode(true);
+                                       }
+                                   }).build()).build();
+    }
+}
+// NOTE (AI): The Play.Server branch (lines 111-122) is the S3F consumer; the Configuration.Server branch covers the 1.20.2+ config phase. The module also pushes an empty S3F brand on join (lines 49-54) and on the refresh timer.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Photon's inbound twin is BrandChannelData, a ParsedPluginMessageListener that records the client brand into the user object; MessageChannel.MC_BRAND_CHANNEL is the shared channel constant.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Sibyl brand authentication (intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Mark the server for the Intave companion client: emit an S3F brand payload carrying the Intave identifier so the Sibyl client can authenticate.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On join, and again on every restart broadcast and whenever a player is not yet authenticated, the service calls authentication.sendMessageToClient(player, 'MC|Brand', 'INTAVE', null), which writes the payload into an outbound custom payload packet (SibylAuthentication.java builds the ProtocolLib container around line 251). The companion client recognizes the mark and replies over its own channel.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing cheat-related. It is the anticheat's outbound identification channel; the brand mark also lets the anticheat tell its own clients from vanilla ones.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/connect/sibyl/SibylIntegrationService.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/connect/sibyl/SibylIntegrationService.java =====
+package de.jpx3.intave.connect.sibyl;
+
+import de.jpx3.intave.IntaveControl;
+import de.jpx3.intave.IntavePlugin;
+import de.jpx3.intave.annotate.HighOrderService;
+import de.jpx3.intave.cleanup.GarbageCollector;
+import de.jpx3.intave.connect.sibyl.auth.SibylAuthentication;
+import de.jpx3.intave.connect.sibyl.data.SibylPacketReceiver;
+import de.jpx3.intave.connect.sibyl.data.SibylPacketTransmitter;
+import de.jpx3.intave.connect.sibyl.data.packet.*;
+import de.jpx3.intave.executor.Synchronizer;
+import de.jpx3.intave.module.linker.bukkit.BukkitEventSubscriber;
+import de.jpx3.intave.module.linker.bukkit.BukkitEventSubscription;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.Player;
+import org.bukkit.event.player.PlayerJoinEvent;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.SecretKeySpec;
+import java.security.Key;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Consumer;
+
+@HighOrderService
+public final class SibylIntegrationService implements BukkitEventSubscriber {
+  private final IntavePlugin plugin;
+  private final SibylAuthentication authentication;
+  private final SibylPacketTransmitter packetTransmitter;
+  private final SibylPacketReceiver packetReceiver;
+
+  public static final Set&lt;UUID&gt; ID_RECORDER = new HashSet&lt;&gt;();
+  private static final KeyPair globalKeyPair;
+  private static final byte[] verifyToken;
+  private static final Map&lt;UUID, Key&gt; KEYS = GarbageCollector.watch(new HashMap&lt;&gt;());
+
+  static {
+    KeyPair keyPair;
+    try {
+      KeyPairGenerator keypairgenerator = KeyPairGenerator.getInstance("RSA");
+      keypairgenerator.initialize(1024);
+      keyPair = keypairgenerator.generateKeyPair();
+    } catch (NoSuchAlgorithmException ignored) {
+      keyPair = null;
+    }
+    globalKeyPair = keyPair;
+    verifyToken = new byte[16];
+    ThreadLocalRandom.current().nextBytes(verifyToken);
+  }
+
+  public SibylIntegrationService(IntavePlugin plugin) {
+    this.plugin = plugin;
+    List&lt;Consumer&lt;UUID&gt;&gt; subscribers = new ArrayList&lt;&gt;();
+    subscribers.add(this::afterAuthentication);
+    this.authentication = new SibylAuthentication(plugin, subscribers);
+    this.packetTransmitter = new SibylPacketTransmitter(authentication, this);
+    this.packetReceiver = new SibylPacketReceiver(plugin, this);
+    this.plugin.eventLinker().registerEventsIn(this);
+    broadcastRestart();
+  }
+
+  private void afterAuthentication(UUID id) {
+    Player player = Bukkit.getPlayer(id);
+    if (player == null) {
+      return;
+    }
+    if (encryptionAvailable()) {
+      packetTransmitter.transmitPacket(player, new SibylPacketOutBeginEncryption(globalKeyPair.getPublic(), verifyToken));
+    }
+  }
+
+  public void confirmEncryption(Player player, SibylPacketInConfirmEncryption packet) {
+    if (!encryptionAvailable()) {
+      return;
+    }
+    if (!Arrays.equals(decryptRSA(packet.encryptedVerifyToken()), verifyToken)) {
+      if (IntaveControl.SIBYL_DEBUG) {
+        System.out.println("Sibyl: Invalid verify token for " + player.getName());
+      }
+      return;
+    }
+    byte[] keyBytes = decryptRSA(packet.encryptedSharedSecret());
+    if (keyBytes != null) {
+      try {
+        KEYS.put(player.getUniqueId(), new SecretKeySpec(keyBytes, "AES"));
+      } catch (Exception exception) {
+        exception.printStackTrace();
+        Synchronizer.synchronize(() -&gt; {
+          player.kickPlayer(ChatColor.RED + "Error authenticating");
+        });
+      }
+    }
+  }
+
+  private static byte[] decryptRSA(byte[] data) {
+    try {
+      Cipher cipher = Cipher.getInstance("RSA");
+      cipher.init(Cipher.DECRYPT_MODE, globalKeyPair.getPrivate());
+      return cipher.doFinal(data);
+    } catch (Exception exception) {
+      exception.printStackTrace();
+      return null;
+    }
+  }
+
+  public boolean encryptionActiveFor(Player player) {
+    return KEYS.containsKey(player.getUniqueId());
+  }
+
+  private void broadcastRestart() {
+    for (Player onlinePlayer : Bukkit.getOnlinePlayers()) {
+      authentication.sendMessageToClient(onlinePlayer, "MC|Brand", "INTAVE", null);
+    }
+  }
+
+  @BukkitEventSubscription
+  public void on(PlayerJoinEvent join) {
+    Synchronizer.synchronizeDelayed(() -&gt; authenticatePlayer(join.getPlayer()), 20);
+    ID_RECORDER.add(join.getPlayer().getUniqueId());
+    if (ID_RECORDER.size() &gt; 10000) {
+      ID_RECORDER.clear();
+    }
+  }
+
+  public void authenticatePlayer(Player player) {
+    if (!authentication.isAuthenticated(player)) {
+      authentication.sendMessageToClient(player, "MC|Brand", "INTAVE", null);
+    }
+  }
+
+  public static KeyPair globalKeyPair() {
+    return globalKeyPair;
+  }
+
+  public static byte[] verifyToken() {
+    return verifyToken;
+  }
+
+  public static boolean encryptionAvailable() {
+    return globalKeyPair != null &amp;&amp; verifyToken != null;
+  }
+
+  public void publishAttackCancel(Player attacker, Entity attacked, boolean damage) {
+    SibylPacketOutAttackCancel packet = new SibylPacketOutAttackCancel();
+    packet.setAttacker(attacker.getUniqueId());
+    packet.setAttackedLocation(attacked.getLocation().toVector());
+    packet.setDamage(damage);
+    broadcastTrustedPacket(packet);
+  }
+
+  public void publishDebug(Player player, int id, String fullMessage, String shortMessage) {
+    SibylPacketOutDebug packet = new SibylPacketOutDebug();
+    packet.setDebugId(id);
+    packet.setFullMessage(fullMessage);
+    packet.setShortMessage(shortMessage);
+    sendTrustedPacket(player, packet);
+  }
+
+  public void broadcastTrustedPacket(SibylPacket packet) {
+    for (Player player : Bukkit.getOnlinePlayers()) {
+      if (authentication.isAuthenticated(player)) {
+        packetTransmitter.transmitPacket(player, packet);
+      }
+    }
+  }
+
+  public void sendTrustedPacket(Player player, SibylPacket packet) {
+    if (!Bukkit.isPrimaryThread()) {
+      Synchronizer.synchronize(() -&gt; sendTrustedPacket(player, packet));
+      return;
+    }
+    if (authentication.isAuthenticated(player)) {
+      packetTransmitter.transmitPacket(player, packet);
+    }
+  }
+
+  public SibylPacketTransmitter packetTransmitter() {
+    return packetTransmitter;
+  }
+
+  public SibylAuthentication authentication() {
+    return authentication;
+  }
+
+  public boolean isAuthenticated(Player user) {
+    return authentication.isAuthenticated(user);
+  }
+
+  public Key keyOf(Player player) {
+    return KEYS.get(player.getUniqueId());
+  }
+}
+// NOTE (AI): The S3F emission is sendMessageToClient at lines 117 and 132; the ProtocolLib packet construction lives in SibylAuthentication.buildAuthenticationPacket.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The inbound side of the same system is PayloadInReader, a CUSTOM_PAYLOAD_IN reader that intave's SettingsTracker, CustomClientSupportService and LabymodClientListener consume for brand and LabyMod detection.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">FML mod probe (Negativity)</span>
+<span class="impl-module-clients">(Elikill58-Negativity)</span>
+</div>
+<p class="impl-pattern">Detect Forge clients by sending FML handshake payloads and reading the mod-list reply.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">initMods sends three FML|HS plugin messages (bytes {-2,0}, {0,2,0,0,0,0} and {2,0,0,0,0}) to the player when the outgoing FML channel is registered, the standard FML handshake sequence that makes Forge reply with its mod list. ChannelEvents handles the incoming FML data (the C17 side) and stores the result in the player's mod map, which feeds the mod-based cheat checks.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> The presence and version of Forge and its mods; server owners use the result to allow or block modded clients.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Elikill58-Negativity — src/com/elikill58/negativity/spigot/SpigotNegativityPlayer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Elikill58-Negativity — src/com/elikill58/negativity/spigot/SpigotNegativityPlayer.java =====
+package com.elikill58.negativity.spigot;
+
+import java.io.File;
+import java.io.IOException;
+import java.lang.ref.WeakReference;
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+import java.util.logging.Level;
+
+import org.bukkit.Bukkit;
+import org.bukkit.Color;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.Particle;
+import org.bukkit.World;
+import org.bukkit.entity.Damageable;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.EntityType;
+import org.bukkit.entity.IronGolem;
+import org.bukkit.entity.Player;
+import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
+import org.bukkit.plugin.Plugin;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+import org.bukkit.scheduler.BukkitTask;
+
+import com.elikill58.negativity.spigot.inventories.AbstractInventory;
+import com.elikill58.negativity.spigot.inventories.AbstractInventory.InventoryType;
+import com.elikill58.negativity.spigot.inventories.holders.CheckMenuHolder;
+import com.elikill58.negativity.spigot.listeners.PlayerCheatAlertEvent;
+import com.elikill58.negativity.spigot.listeners.PlayerPacketsClearEvent;
+import com.elikill58.negativity.spigot.protocols.InventoryMoveProtocol.InventoryMoveData;
+import com.elikill58.negativity.spigot.support.FloodGateSupportManager;
+import com.elikill58.negativity.spigot.support.GadgetMenuSupport;
+import com.elikill58.negativity.spigot.support.ProtocolSupportSupport;
+import com.elikill58.negativity.spigot.support.ViaVersionSupport;
+import com.elikill58.negativity.spigot.utils.HandUtils;
+import com.elikill58.negativity.spigot.utils.Utils;
+import com.elikill58.negativity.universal.Cheat;
+import com.elikill58.negativity.universal.Cheat.CheatCategory;
+import com.elikill58.negativity.universal.Cheat.CheatHover;
+import com.elikill58.negativity.universal.FlyingReason;
+import com.elikill58.negativity.universal.NegativityAccount;
+import com.elikill58.negativity.universal.NegativityAccountManager;
+import com.elikill58.negativity.universal.NegativityPlayer;
+import com.elikill58.negativity.universal.PacketType;
+import com.elikill58.negativity.universal.ReportType;
+import com.elikill58.negativity.universal.SimpleAccountManager;
+import com.elikill58.negativity.universal.Version;
+import com.elikill58.negativity.universal.adapter.Adapter;
+import com.elikill58.negativity.universal.permissions.Perm;
+import com.elikill58.negativity.universal.utils.UniversalUtils;
+
+public class SpigotNegativityPlayer extends NegativityPlayer {
+
+	private static final Map&lt;UUID, SpigotNegativityPlayer&gt; players = new HashMap&lt;&gt;();
+
+	public static ArrayList&lt;UUID&gt; INJECTED = new ArrayList&lt;&gt;();
+	public HashMap&lt;PacketType, Integer&gt; PACKETS = new HashMap&lt;&gt;();
+	public HashMap&lt;String, String&gt; MODS = new HashMap&lt;&gt;();
+	public HashMap&lt;String, Double&gt; contentDouble = new HashMap&lt;&gt;();
+	public HashMap&lt;String, Boolean&gt; contentBoolean = new HashMap&lt;&gt;();
+	public HashMap&lt;String, Integer&gt; contentInts = new HashMap&lt;&gt;();
+	public HashMap&lt;Cheat, List&lt;PlayerCheatAlertEvent&gt;&gt; ALERT_NOT_SHOWED = new HashMap&lt;&gt;();
+	public ArrayList&lt;PotionEffect&gt; POTION_EFFECTS = new ArrayList&lt;&gt;();
+	public ArrayList&lt;Integer&gt; TIMER_COUNT = new ArrayList&lt;&gt;();
+	public ArrayList&lt;Double&gt; flyMoveAmount = new ArrayList&lt;&gt;();
+	private WeakReference&lt;Player&gt; p;
+	// Packets
+	public int ALL = 0, MAX_FLYING;
+	// warns &amp; other
+	public int LAST_CLICK = 0, ACTUAL_CLICK = 0, SEC_ACTIVE = 0, SPIDER_SAME_DIST = 0, LAST_PING = -1;
+	// setBack
+	public int NO_FALL_DAMAGE = 0, BYPASS_SPEED = 0, LAST_SLOT_CLICK = -1, LAST_CHAT_MESSAGE_NB = 0, SPEED_NB = 0;
+	public double lastYDiff = -3.141592654;
+	public long TIME_INVINCIBILITY = 0, LAST_SHOT_BOW = 0, LAST_REGEN = 0, TIME_LAST_MESSAGE = 0, LAST_CLICK_INV = 0, LAST_BLOCK_PLACE = 0, TIME_REPORT = 0, LAST_BLOCK_BREAK = 0,
+			TIME_INVINCIBILITY_SPEED = 0, lastAlertCommandRan = 0;
+	public String LAST_CHAT_MESSAGE = "";
+	public boolean IS_LAST_SEC_SNEAK = false, isFreeze = false, isInvisible = false, isUsingSlimeBlock = false, isJumpingWithBlock = false, isOnLadders = false, lastClickInv = false,
+			useAntiNoFallSystem = false, canPingSpoof = false;
+	public boolean mustToBeSaved = false, wasFlying = false;
+	private boolean isOnGround = true, isBedrockPlayer = false;
+	public PacketType lastPacketType = null;
+	public FlyingReason flyingReason = FlyingReason.REGEN;
+	public Material eatMaterial = Material.AIR, lastClick = Material.AIR;
+	public Location lastSpiderLoc;
+	public InventoryMoveData inventoryMoveData = new InventoryMoveData();
+	public List&lt;String&gt; proof = new ArrayList&lt;&gt;();
+	public boolean isInFight = false;
+	public BukkitTask fightTask = null;
+	public String clientName;
+	public int ping = 0, protocolVersion = 0;
+	private Version playerVersion;
+
+	public SpigotNegativityPlayer(Player p) {
+		super(p.getUniqueId(), p.getName());
+		this.p = new WeakReference&lt;&gt;(p);
+		this.ping = Utils.getPing(p);
+		initMods(p);
+		this.clientName = "Not loaded";
+		isBedrockPlayer = FloodGateSupportManager.isBedrockPlayer(p.getUniqueId());
+		playerVersion = SpigotNegativity.viaVersionSupport ? ViaVersionSupport.getPlayerVersion(p)
+				: (SpigotNegativity.protocolSupportSupport ? ProtocolSupportSupport.getPlayerVersion(p) : Version.getVersion());
+	}
+
+	public SpigotNegativityPlayer(OfflinePlayer p) {
+		super(p.getUniqueId(), p.getName());
+		this.p = new WeakReference&lt;&gt;(null);
+		isBedrockPlayer = FloodGateSupportManager.isBedrockPlayer(p.getUniqueId());
+		playerVersion = Version.getVersion();
+	}
+
+	public void initMods(Player p) {
+		Plugin pl = SpigotNegativity.getInstance();
+		if (pl.isEnabled() &amp;&amp; pl.getServer().getMessenger().isOutgoingChannelRegistered(pl, SpigotNegativity.CHANNEL_NAME_FML)) { // if
+																																	// not,
+																																	// we
+																																	// ignore
+																																	// it
+			p.sendPluginMessage(pl, SpigotNegativity.CHANNEL_NAME_FML, new byte[] { -2, 0 });
+			p.sendPluginMessage(pl, SpigotNegativity.CHANNEL_NAME_FML, new byte[] { 0, 2, 0, 0, 0, 0 });
+			p.sendPluginMessage(pl, SpigotNegativity.CHANNEL_NAME_FML, new byte[] { 2, 0, 0, 0, 0 });
+		} else
+			MODS.put("Not checked", "0.0");
+	}
+
+	@Override
+	public Player getPlayer() {
+		Player cached = p != null ? p.get() : null;
+		if (cached == null) {
+			cached = Bukkit.getPlayer(getUUID());
+			if (p != null)
+				p.clear();
+
+			p = new WeakReference&lt;&gt;(cached);
+		}
+		return cached;
+	}
+
+	public String getIP() {
+		return getPlayer().getAddress().getAddress().getHostAddress();
+	}
+
+	@Override
+	public Version getPlayerVersion() {
+		return playerVersion;
+	}
+
+	public int getProtocolVersion() {
+		return protocolVersion;
+	}
+
+	public void setProtocolVersion(int protocolVersion) {
+		this.protocolVersion = protocolVersion;
+		this.playerVersion = Version.getVersionByProtocolID(protocolVersion);
+	}
+
+	public boolean isBedrockPlayer() {
+		return isBedrockPlayer;
+	}
+
+	public boolean hasDetectionActive(Cheat c) {
+		if (!c.isActive() || UniversalUtils.TPS_DROP)
+			return false;
+		if (TIME_INVINCIBILITY &gt; System.currentTimeMillis())
+			return false;
+		if (isInFight &amp;&amp; c.isBlockedInFight())
+			return false;
+		if (SpigotNegativity.tps_alert_stop &gt; Utils.getLastTPS()) // to make TPS go upper
+			return false;
+		Player p = getPlayer();
+		if (SpigotNegativity.gadgetMenuSupport &amp;&amp; c.getCheatCategory().equals(CheatCategory.MOVEMENT) &amp;&amp; GadgetMenuSupport.checkGadgetsMenuPreconditions(p))
+			return false;
+		if (c.getCheatCategory().equals(CheatCategory.MOVEMENT) &amp;&amp; isUsingRiptide())
+			return false;
+		if (WorldRegionBypass.hasBypass(c, p.getLocation()))
+			return false;
+		if (SpigotNegativity.hasBypass &amp;&amp; (Perm.hasPerm(this, "bypass." + c.getKey().toLowerCase(Locale.ROOT)) || Perm.hasPerm(this, "bypass.all")))
+			return false;
+		if (isBedrockPlayer &amp;&amp; FloodGateSupportManager.disabledCheat.contains(c.getKey()))
+			return false;
+		return ping &lt; c.getMaxAlertPing();
+	}
+
+	public String getWhyDetectionNotActive(Cheat c) {
+		if (!c.isActive())
+			return "Cheat disabled";
+		if (UniversalUtils.TPS_DROP)
+			return "TPS drop";
+		if (TIME_INVINCIBILITY &gt; System.currentTimeMillis())
+			return "Player invincibility";
+		if (isInFight &amp;&amp; c.isBlockedInFight())
+			return "In fight";
+		if (SpigotNegativity.tps_alert_stop &gt; Utils.getLastTPS()) // to make TPS go upper
+			return "Low TPS";
+		Player p = getPlayer();
+		if (SpigotNegativity.gadgetMenuSupport &amp;&amp; c.getCheatCategory().equals(CheatCategory.MOVEMENT) &amp;&amp; GadgetMenuSupport.checkGadgetsMenuPreconditions(p))
+			return "GadgetMenu bypass";
+		if (c.getCheatCategory().equals(CheatCategory.MOVEMENT) &amp;&amp; isUsingRiptide())
+			return "Riptide bypass";
+		if (WorldRegionBypass.hasBypass(c, p.getLocation()))
+			return "World bypass";
+		if (SpigotNegativity.hasBypass &amp;&amp; (Perm.hasPerm(this, "bypass." + c.getKey().toLowerCase(Locale.ROOT)) || Perm.hasPerm(this, "bypass.all")))
+			return "Permission bypass";
+		if (ping &gt; c.getMaxAlertPing())
+			return "Too high ping (" + ping + " &gt; " + c.getMaxAlertPing() + ")";
+		if (isBedrockPlayer &amp;&amp; FloodGateSupportManager.disabledCheat.contains(c.getKey()))
+			return "Bedrock player";
+		return "Unknown";
+	}
+
+	public void updateCheckMenu() {
+		for (Player p : Utils.getOnlinePlayers()) {
+			if (p.getOpenInventory() != null) {
+				Inventory topInv = p.getOpenInventory().getTopInventory();
+				if (topInv == null || !topInv.getType().equals(org.bukkit.event.inventory.InventoryType.CHEST)) {
+					continue;
+				}
+				InventoryHolder holder = topInv.getHolder();
+				if (holder instanceof CheckMenuHolder) {
+					AbstractInventory.getInventory(InventoryType.CHECK_MENU).ifPresent((inv) -&gt; inv.actualizeInventory(p, ((CheckMenuHolder) holder).getCible()));
+				}
+			}
+		}
+	}
+
+	public void setBetterClick(int click) {
+		NegativityAccount account = getAccount();
+		account.setMostClicksPerSecond(click);
+		Adapter.getAdapter().getAccountManager().save(account.getPlayerId());
+	}
+
+	public void addWarn(Cheat c, int reliability) {
+		addWarn(c, reliability, 1);
+	}
+
+	public int addWarn(Cheat c, int reliability, int amount) {
+		if (System.currentTimeMillis() &lt; TIME_INVINCIBILITY || c.getReliabilityAlert() &gt; reliability)
+			return -1;
+		NegativityAccount account = getAccount();
+		int old = account.getWarn(c);
+		account.setWarnCount(c, old + amount);
+		mustToBeSaved = true;
+		return old;
+	}
+
+	public void setWarn(Cheat c, int cheats) {
+		NegativityAccount account = getAccount();
+		account.setWarnCount(c, cheats);
+		Adapter.getAdapter().getAccountManager().save(account.getPlayerId());
+	}
+
+	public void setLang(String newLang) {
+		NegativityAccount account = getAccount();
+		account.setLang(newLang);
+		NegativityAccountManager accountManager = Adapter.getAdapter().getAccountManager();
+		accountManager.save(account.getPlayerId());
+		if (accountManager instanceof SimpleAccountManager.Server) {
+			try {
+				((SimpleAccountManager.Server) accountManager).sendAccountToProxy(account);
+			} catch (IOException e) {
+				SpigotNegativity.getInstance().getLogger().log(Level.SEVERE, "Could not send account update to proxy", e);
+			}
+		}
+	}
+
+	public void clearPackets() {
+		PlayerPacketsClearEvent event = new PlayerPacketsClearEvent(getPlayer(), this);
+		SpigotNegativity.callSyncEvent(event);
+		int flying = PACKETS.getOrDefault(PacketType.Client.FLYING, 0);
+		if (flying &gt; MAX_FLYING)
+			MAX_FLYING = flying;
+		ALL = 0;
+		PACKETS.clear();
+	}
+
+	public boolean getAllowFlight() {
+		return wasFlying || getPlayer().getAllowFlight();
+	}
+
+	@Override
+	public boolean isOp() {
+		return getPlayer().isOp();
+	}
+
+	@Override
+	public void startAnalyze(Cheat c) {
+		if (c.needPacket() &amp;&amp; !INJECTED.contains(getPlayer().getUniqueId()))
+			INJECTED.add(getPlayer().getUniqueId());
+	}
+
+	@Override
+	public void startAllAnalyze() {
+		INJECTED.add(getPlayer().getUniqueId());
+	}
+
+	@Override
+	public void stopAnalyze(Cheat c) {
+
+	}
+
+	@Override
+	public String getReason(Cheat c) {
+		String n = "";
+		for (Cheat all : Cheat.values())
+			if (getAllWarn(all) &gt; 5 &amp;&amp; all.isActive())
+				n = n + (n.equals("") ? "" : ", ") + all.getName();
+		if (!n.contains(c.getName()))
+			n = n + (n.equals("") ? "" : ", ") + c.getName();
+		return n;
+	}
+
+	public List&lt;PlayerCheatAlertEvent&gt; getAlertForAllCheat() {
+		final List&lt;PlayerCheatAlertEvent&gt; list = new ArrayList&lt;&gt;();
+		ALERT_NOT_SHOWED.forEach((c, listAlerts) -&gt; {
+			if (!listAlerts.isEmpty())
+				list.add(getAlertForCheat(c, listAlerts));
+		});
+		return list;
+	}
+
+	public PlayerCheatAlertEvent getAlertForCheat(Cheat c, List&lt;PlayerCheatAlertEvent&gt; list) {
+		int nb = 0, nbConsole = 0;
+		HashMap&lt;Integer, Integer&gt; relia = new HashMap&lt;&gt;();
+		HashMap&lt;Integer, Integer&gt; ping = new HashMap&lt;&gt;();
+		ReportType type = ReportType.NONE;
+		boolean hasRelia = false;
+		CheatHover hoverProof = null;
+		for (PlayerCheatAlertEvent e : list) {
+			nb += e.getNbAlert();
+
+			relia.put(e.getReliability(), relia.getOrDefault(e.getReliability(), 0) + 1);
+
+			ping.put(e.getPing(), ping.getOrDefault(e.getPing(), 0) + 1);
+
+			if (type == ReportType.NONE || (type == ReportType.WARNING &amp;&amp; e.getReportType() == ReportType.VIOLATION))
+				type = e.getReportType();
+
+			hasRelia = e.hasManyReliability() ? true : hasRelia;
+
+			if (hoverProof == null)
+				hoverProof = e.getHover();
+
+			nbConsole += e.getNbAlertConsole();
+			e.clearNbAlertConsole();
+		}
+		// Don't to 100% each times that there is more than 2 alerts, we made a summary,
+		// and a the nb of alert to upgrade it
+		int newRelia = UniversalUtils.parseInPorcent(UniversalUtils.sum(relia) + nb);
+		int newPing = UniversalUtils.sum(ping);
+		// we can ignore "proof" and "stats_send" because they have been already saved
+		// and they are NOT showed to player
+		return new PlayerCheatAlertEvent(type, getPlayer(), c, newRelia, hasRelia, newPing, "", hoverProof, nb, nbConsole);
+	}
+
+	public void logProof(String msg) {
+		proof.add(msg);
+	}
+
+	public void saveProof() {
+		if (mustToBeSaved) {
+			mustToBeSaved = false;
+			Adapter.getAdapter().getAccountManager().save(getUUID());
+		}
+		if (proof.size() == 0)
+			return;
+		try {
+			File folder = new File(new File(SpigotNegativity.getInstance().getDataFolder(), "user"), "proof");
+			if (!folder.exists())
+				folder.mkdirs();
+			File temp = new File(folder, getUUID() + ".txt");
+			if (!temp.exists())
+				temp.createNewFile();
+			String msg = "";
+			for (String s : proof)
+				msg += s + "\n";
+			Files.write(temp.toPath(), msg.getBytes(), StandardOpenOption.APPEND);
+			proof.clear();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+	}
+
+	private void destroy() {
+		saveProof();
+		UUID playerId = getUUID();
+		NegativityAccountManager accountManager = Adapter.getAdapter().getAccountManager();
+		accountManager.save(playerId);
+		accountManager.dispose(playerId);
+	}
+
+	@Override
+	public boolean hasDefaultPermission(String s) {
+		return getPlayer().hasPermission(s);
+	}
+
+	@Override
+	public double getLife() {
+		return ((Damageable) getPlayer()).getHealth();
+	}
+
+	@Override
+	public String getName() {
+		return getPlayer().getName();
+	}
+
+	@Override
+	public String getGameMode() {
+		return getPlayer().getGameMode().name();
+	}
+
+	@Override
+	public float getWalkSpeed() {
+		return getPlayer().getWalkSpeed();
+	}
+
+	@Override
+	public int getLevel() {
+		return getPlayer().getLevel();
+	}
+
+	@Override
+	public void kickPlayer(String reason, String time, String by, boolean def) {
+		getPlayer().kickPlayer(Messages.getMessage(getPlayer(), "ban.kick_" + (def ? "def" : "time"), "%reason%", reason, "%time%", String.valueOf(time), "%by%", by));
+	}
+
+	@SuppressWarnings("deprecation")
+	public boolean isOnGround() {
+		return isOnGround || getPlayer().isOnGround();
+	}
+
+	public void setOnGround(boolean b) {
+		this.isOnGround = b;
+	}
+
+	@Override
+	public void banEffect() {
+		int i = 2;
+		Location loc = getPlayer().getLocation();
+		World w = getPlayer().getWorld();
+		w.spawnEntity(loc, EntityType.FIREWORK);
+		w.spawnEntity(loc, EntityType.FIREWORK);
+		w.spawnEntity(loc, EntityType.FIREWORK);
+		w.spawnEntity(loc, EntityType.FIREWORK);
+		double baseY = loc.getY();
+		for (double y = baseY + 1.5; y &gt; baseY; y = y - 0.05) {
+			for (int u = 0; u &lt; 360; u += i) {
+				Location flameloc = loc.clone();
+				flameloc.setY(y);
+				flameloc.setZ(flameloc.getZ() + Math.cos(u) * i);
+				flameloc.setX(flameloc.getX() + Math.sin(u) * i);
+				if (Version.isNewerOrEquals(Version.getVersion(), Version.V1_13)) {
+					Particle.DustOptions dustOptions = new Particle.DustOptions(Color.ORANGE, 1);
+					w.spawnParticle(Particle.REDSTONE, flameloc, 1, 0, 0, 0, 0, dustOptions);
+				} else {
+					w.playEffect(flameloc.add(0, 1, 0), Utils.getEffect("COLOURED_DUST"), 1);
+				}
+			}
+		}
+	}
+
+	public void fight() {
+		isInFight = true;
+		if (fightTask != null)
+			fightTask.cancel();
+		fightTask = Bukkit.getScheduler().runTaskLater(SpigotNegativity.getInstance(), new Runnable() {
+			@Override
+			public void run() {
+				unfight();
+			}
+		}, 80);
+	}
+
+	public void unfight() {
+		isInFight = false;
+		if (fightTask != null)
+			fightTask.cancel();
+		fightTask = null;
+	}
+
+	public boolean hasElytra() {
+		return Version.getVersion().isNewerOrEquals(Version.V1_9) &amp;&amp; getPlayer().isGliding();
+	}
+
+	public boolean isUsingTrident() {
+		return Version.getVersion().isNewerOrEquals(Version.V1_13) &amp;&amp; (getPlayer().isRiptiding() || HandUtils.handUseItem(getPlayer(), "TRIDENT"));
+	}
+
+	public boolean isTargetByIronGolem() {
+		for (Entity et : getPlayer().getWorld().getEntities())
+			if (et instanceof IronGolem)
+				if (((IronGolem) et).getTarget() != null &amp;&amp; ((IronGolem) et).getTarget().equals(getPlayer()))
+					return true;
+		return false;
+	}
+
+	public boolean hasPotionEffect(String effectName) {
+		try {
+			PotionEffectType potionEffect = PotionEffectType.getByName(effectName);
+			if (potionEffect != null) // If optionEffect is null, it doesn't exist in this version
+				return getPlayer().hasPotionEffect(potionEffect);
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+		return false;
+	}
+
+	public boolean isUsingRiptide() {
+		return Version.getVersion().isNewerOrEquals(Version.V1_13) &amp;&amp; getPlayer().isRiptiding();
+	}
+
+	public PotionEffect getPotionEffect(PotionEffectType type) {
+		return getPlayer().getActivePotionEffects().stream().filter((pe) -&gt; pe.getType().equals(type)).findAny().orElse(null);
+	}
+
+	public static SpigotNegativityPlayer getNegativityPlayer(Player p) {
+		synchronized (players) {
+			return players.computeIfAbsent(p.getUniqueId(), id -&gt; new SpigotNegativityPlayer(p));
+		}
+	}
+
+	public static SpigotNegativityPlayer getNegativityPlayer(OfflinePlayer p) {
+		synchronized (players) {
+			return players.computeIfAbsent(p.getUniqueId(), id -&gt; new SpigotNegativityPlayer(p));
+		}
+	}
+
+	public static Map&lt;UUID, SpigotNegativityPlayer&gt; getAllPlayers() {
+		return players;
+	}
+
+	public static void removeFromCache(UUID playerId) {
+		SpigotNegativityPlayer cached = players.remove(playerId);
+		if (cached != null) {
+			cached.destroy();
+		}
+	}
+}
+// NOTE (AI): The probe is the outbound S3F side (lines 122-134). SpigotNegativity registers the FML and brand channels (SpigotNegativity.java lines 164-171), and ChannelEvents.java is the C17 reply reader.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Negativity's PacketType declares CUSTOM_PAYLOAD_IN and CUSTOM_PAYLOAD_OUT for both directions. No other anticheat probes FML; the modern anticheats read the brand channel instead.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../C17PacketCustomPayload/">C17PacketCustomPayload</a>
 <a class="related-chip" href="../S02PacketChat/">S02PacketChat</a>

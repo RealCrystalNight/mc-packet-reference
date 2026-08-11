@@ -748,6 +748,307 @@ public class NetworkAPI extends API {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent is the universal hook for the clientbound S00. Rise 6.x uses @EventLink listeners; Sigma uses its RegisterEvent EventPacket bus; the script path routes through NetworkAPI's class registry.</div>
 <div class="impl-clients">Rise 5.99 uses per-module onPacketReceive overrides; Rise 6.x uses component and @EventLink listener APIs with PacketUtil.receive/sendNoEvent for replay; Sigma mutates nothing on receive but stores the key for its send-side replay; Spicy, Memeware, Nekoware and Tenacity have no module-level reference in this corpus.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S00 is the server's keep-alive probe: the client must echo the id back in C00. Anticheats use the round trip as their latency clock: the server records when it sent each id and when the matching reply arrives, which yields the player's ping and exposes ping-spoof, timer and connection-manipulation cheats. The corpus shows the same echo-tracking pattern at every scale, from the four-line ConnectionManager in Frequency to NCP's keepalive-frequency check with kick actions and Grim's validation that the replied id was actually sent.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BadPacketsO (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Flags keep-alive replies whose id was never sent by the server, the signature of a spoofed or replayed keep-alive stream.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Tracks every OUT keep-alive id in a queue. On the IN keep-alive reply, searches the queue for the id: a match removes the id (pruning the queue) and passes, while a reply with an unknown id flags and cancels the packet.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping-spoof clients that fabricate keep-alive replies, and lag-switch or timer tools that replay stale ids.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsO.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsO.java =====
+package ac.grim.grimac.checks.impl.badpackets;
+
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PacketReceiveListener;
+import ac.grim.grimac.checks.type.PacketSendListener;
+import ac.grim.grimac.player.GrimPlayer;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientKeepAlive;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerKeepAlive;
+
+import java.util.LinkedList;
+
+@CheckData(name = "BadPacketsO", stableKey = "grim.badpackets.invalid_keepalive", description = "Responded with a keepalive ID that was not sent by the server")
+public class BadPacketsO extends Check implements PacketReceiveListener, PacketSendListener {
+    private static final Verbose V = Verbose.of("id={slong}");
+
+    private final LinkedList&lt;Long&gt; keepalives = new LinkedList&lt;&gt;();
+
+    public BadPacketsO(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.KEEP_ALIVE) {
+            keepalives.add(new WrapperPlayServerKeepAlive(event).getId());
+        }
+    }
+
+    @Override
+    public void onPacketReceive(PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.KEEP_ALIVE) {
+            final long id = new WrapperPlayClientKeepAlive(event).getId();
+
+            for (long keepalive : keepalives) {
+                if (keepalive == id) {
+                    // Found the ID, remove stuff until we get to it (to stop very slow memory leaks)
+                    Long data;
+                    do {
+                        data = keepalives.poll();
+                    } while (data != null &amp;&amp; data != id);
+
+                    return;
+                }
+            }
+
+            if (flag(V.write(verbose()).slong(id)) &amp;&amp; shouldModifyPackets()) {
+                event.setCancelled(true);
+                player.onPacketCancel();
+            }
+        }
+    }
+}
+// NOTE (AI): The queue pruning doubles as a memory guard: only ids the server actually sent are ever accepted.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro's KeepAliveTracker and Frequency's ConnectionManager implement the same echo matching; only Grim validates and cancels the reply.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KeepAliveAdapter + KeepAliveFrequency (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">Limits keep-alive reply frequency and records last keep-alive timing for the god-mode and moving checks.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">ProtocolLib adapter on both keep-alive directions: the receiving side always updates lastKeepAliveTime (even when the check is disabled, because fight.godmode depends on it) and runs the KeepAliveFrequency check, which cancels the reply when the frequency exceeds the configured limits; the sending side records the outgoing id so the expected-reply model stays consistent.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Keep-alive spam, timer manipulation that shows up as impossible reply frequency, and the desync that ping-spoofing produces.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/KeepAliveAdapter.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/KeepAliveAdapter.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.checks.net.protocollib;
+
+import java.util.Arrays;
+
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.Plugin;
+
+import com.comphenix.protocol.PacketType;
+import com.comphenix.protocol.events.ListenerPriority;
+import com.comphenix.protocol.events.PacketEvent;
+
+import fr.neatmonster.nocheatplus.NCPAPIProvider;
+import fr.neatmonster.nocheatplus.checks.CheckType;
+import fr.neatmonster.nocheatplus.checks.net.KeepAliveFrequency;
+import fr.neatmonster.nocheatplus.checks.net.NetConfig;
+import fr.neatmonster.nocheatplus.checks.net.NetData;
+import fr.neatmonster.nocheatplus.players.DataManager;
+import fr.neatmonster.nocheatplus.players.IPlayerData;
+
+/**
+ * Limit keep alive packet frequency, set lastKeepAliveTime (even if disabled,
+ * in case fight.godmode is enabled).
+ * 
+ * @author asofold
+ *
+ */
+public class KeepAliveAdapter extends BaseAdapter {
+
+    /** Dummy check for bypass checking and actions execution. */
+    private final KeepAliveFrequency frequencyCheck = new KeepAliveFrequency();
+
+    public KeepAliveAdapter(Plugin plugin) {
+        super(plugin, ListenerPriority.LOW, PacketType.Play.Client.KEEP_ALIVE, PacketType.Play.Server.KEEP_ALIVE);
+        this.checkType = CheckType.NET_KEEPALIVEFREQUENCY;
+        // Add feature tags for checks.
+        if (NCPAPIProvider.getNoCheatPlusAPI().getWorldDataManager().isActiveAnywhere(CheckType.NET_KEEPALIVEFREQUENCY)) {
+            NCPAPIProvider.getNoCheatPlusAPI().addFeatureTags("checks", Arrays.asList(KeepAliveFrequency.class.getSimpleName()));
+        }
+        NCPAPIProvider.getNoCheatPlusAPI().addComponent(frequencyCheck);
+    }
+
+    @Override
+    public void onPacketReceiving(final PacketEvent event) {
+        try {
+            if (event.isPlayerTemporary()) return;
+        } 
+        catch(NoSuchMethodError e) {}
+        final long time = System.currentTimeMillis();
+        final Player player = event.getPlayer();
+        if (player == null) {
+            counters.add(ProtocolLibComponent.idNullPlayer, 1);
+            event.setCancelled(true);
+            return;
+        }
+        // Always update last received time.
+        final IPlayerData pData = DataManager.getPlayerDataSafe(player);
+        if (pData == null) return;
+        final NetData data = pData.getGenericInstance(NetData.class);
+        recordKeepAlivePacketDetails(event, data, time);
+        data.lastKeepAliveTime = time;
+        final NetConfig cc = pData.getGenericInstance(NetConfig.class);
+
+        // Run check(s).
+        // KeepAlive model: outgoing server ids are recorded in onPacketSending; matching replies are expected.
+        // TODO: Better modeling of actual packet sequences (flying vs. keep alive vs. request/ping).
+        // TODO: Better integration with god-mode check / trigger reset ndt.
+        if (frequencyCheck.isEnabled(player, pData) 
+            &amp;&amp; frequencyCheck.check(player, time, data, cc, pData)) {
+            event.setCancelled(true);
+        }
+    }
+
+    private void recordKeepAlivePacketDetails(final PacketEvent event, final NetData data, final long time) {
+        final KeepAlivePacketInfo info = KeepAlivePacketInfo.read(event.getPacket());
+        data.recordKeepAlivePacket(time, info.idAvailable, info.id, info.idType, info.longCount, info.intCount,
+                event.isAsync(), Thread.currentThread().getName());
+    }
+
+    @Override
+    public void onPacketSending(PacketEvent event) {
+        final Player player = event.getPlayer();
+        if (player == null) {
+            return;
+        }
+        final IPlayerData pData = DataManager.getPlayerDataSafe(player);
+        if (pData == null) {
+            return;
+        }
+        final KeepAlivePacketInfo info = KeepAlivePacketInfo.read(event.getPacket());
+        pData.getGenericInstance(NetData.class).recordOutgoingKeepAlivePacket(System.currentTimeMillis(),
+                info.idAvailable, info.id, info.idType, info.longCount, info.intCount,
+                event.isAsync(), Thread.currentThread().getName());
+    }
+}
+// NOTE (AI): NCP also shares lastKeepAliveTime with the god-mode check, so the keep-alive stream doubles as a damage-timing clock.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Frequency's ConnectionManager keeps the same last-sent-time map but only computes ping; NCP adds frequency limits and actions.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KeepAliveTracker (Hydro)</span>
+<span class="impl-module-clients">(Incognitolol-Hydro)</span>
+</div>
+<p class="impl-pattern">Tracks the keep-alive round trip as the player's latency clock, feeding ping data to every other check.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On the OUT keep-alive, stores the id with a send timestamp in an expected map. On the IN reply, looks up the id, removes it and computes keepAlivePing as the receive timestamp minus the send timestamp, setting the acceptedKeepAlive flag. The ping value is displayed in the /hydro debug command and feeds the ping-based exclusions.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping spoofing is exposed because the computed ping diverges from the transport-level expectation; the tracker itself is data, not a flagger.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/KeepAliveTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Incognitolol-Hydro — src/main/java/integral/studios/hydro/model/tracker/impl/KeepAliveTracker.java =====
+package integral.studios.hydro.model.tracker.impl;
+
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientKeepAlive;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerKeepAlive;
+import integral.studios.hydro.model.tracker.Tracker;
+import integral.studios.hydro.model.PlayerData;
+import it.unimi.dsi.fastutil.longs.Long2LongArrayMap;
+import it.unimi.dsi.fastutil.longs.Long2LongMap;
+import lombok.Getter;
+
+@Getter
+public class KeepAliveTracker extends Tracker {
+    private final Long2LongMap expectedKeepAlives = new Long2LongArrayMap();
+
+    private boolean acceptedKeepAlive;
+
+    private long keepAlivePing;
+
+    public KeepAliveTracker(PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void registerIncomingPreHandler(PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.KEEP_ALIVE) {
+            WrapperPlayClientKeepAlive keepAlive = new WrapperPlayClientKeepAlive(event);
+
+            long key = keepAlive.getId();
+            long timestamp = event.getTimestamp();
+
+            if (expectedKeepAlives.containsKey(key)) {
+                keepAlivePing = timestamp - expectedKeepAlives.remove(key);
+                acceptedKeepAlive = true;
+            }
+        }
+    }
+
+    @Override
+    public void registerOutgoingPreHandler(PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.KEEP_ALIVE) {
+            WrapperPlayServerKeepAlive serverKeepAlive = new WrapperPlayServerKeepAlive(event);
+
+            expectedKeepAlives.put(serverKeepAlive.getId(), event.getTimestamp());
+        }
+    }
+}
+// NOTE (AI): Hydro also ships BadPacketsE and BadPacketsF, which flag spoofed and duplicate keep-alive ids on top of this tracker.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Frequency and Tecnio's ConnectionTracker use the identical map-and-measure pattern; Hydro exposes the value to its GUI and checks.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ConnectionManager (Frequency)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency)</span>
+</div>
+<p class="impl-pattern">Converts keep-alive and transaction echoes into a measured ping that every check reads for latency exemptions.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">TickManager sends the OUT keep-alive and stores the id with a timestamp; the incoming processor calls onKeepAlive when the reply arrives. ConnectionManager looks up the recorded send time for that id and stores the difference as keepAlivePing. PingSpoofA/B and the lag exemptions then compare this keep-alive ping against the transaction ping.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping-spoof and timer cheats: a keep-alive ping that disagrees with the transaction ping is the flag condition in PingSpoofA.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/data/impl/ConnectionManager.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/data/impl/ConnectionManager.java =====
+package xyz.elevated.frequency.data.impl;
+
+import lombok.RequiredArgsConstructor;
+import xyz.elevated.frequency.data.PlayerData;
+
+import java.util.Map;
+import java.util.Optional;
+
+@RequiredArgsConstructor
+public final class ConnectionManager {
+    private final PlayerData playerData;
+
+    public void onTransaction(final short actionNumber, final long now) {
+        final Optional&lt;Long&gt; entry = this.getTransactionTime(actionNumber);
+
+        entry.ifPresent(time -&gt; playerData.getTransactionPing().set(now - time));
+    }
+
+    public void onKeepAlive(final int identification, final long now) {
+        final Optional&lt;Long&gt; entry = this.getKeepAliveTime(identification);
+
+        entry.ifPresent(time -&gt; playerData.getKeepAlivePing().set(now - time));
+    }
+
+    public Optional&lt;Long&gt; getTransactionTime(final short actionNumber) {
+        final Map&lt;Short, Long&gt; entries = playerData.getTransactionUpdates();
+
+        if (entries.containsKey(actionNumber)) return Optional.of(entries.get(actionNumber));
+
+        return Optional.empty();
+    }
+
+    public Optional&lt;Long&gt; getKeepAliveTime(final int identification) {
+        final Map&lt;Integer, Long&gt; entries = playerData.getKeepAliveUpdates();
+
+        if (entries.containsKey(identification)) return Optional.of(entries.get(identification));
+
+        return Optional.empty();
+    }
+}
+// NOTE (AI): The same manager serves the transaction stream, which is how Frequency detects ping spoofing as a keep-alive-versus-transaction divergence.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Hydro's KeepAliveTracker is the same pattern; Frequency pairs it with the transaction clock, which Hydro handles in a separate tracker.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../C00PacketKeepAlive/">C00PacketKeepAlive</a>
 <a class="related-chip" href="../C0FPacketConfirmTransaction/">C0FPacketConfirmTransaction</a>

@@ -994,6 +994,308 @@ public final class NoSlowModule extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent on all clients. Rise 6.x pairs it with BlinkComponent.dispatch and the sendUnregisteredPacket raw path. Tenacity's PacketUtil counts C0D among packet types that bypass the send queue filter.</div>
 <div class="impl-clients">Classic clients cancel via event.cancel() or setCancelled. Rise 5.99 re-sends rewrapped packets via PacketUtil.sendPacketWithoutEvent. Rise 6.x distinguishes send (event bus) from sendUnregisteredPacket (raw NetworkManager). Spicy tracks open state and emits C0D from module methods rather than event interception.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">C0D is the one serverbound packet in this batch, and it is a state signal: closing a window flips the server-side inventory-open state, which is what inventory-move and chest-stealer detection keys on. Real consumers are Azure InvTweaksA (close while sprinting), Daedalus ActionProcessor (close clears openInventory), Intave InventoryTracker (close state plus the beacon special case) and Kauri's PacketHandler (both directions). The rest is wrappers (Artemis GPacketPlayClientWindowClose, FlopAC WrappedInCloseWindowPacket, BendEye-Perus isCloseWindow) and one keyword hit that never reads the packet: FlopAC InventoryC is a click-delay chest-stealer check driven by WINDOW_CLICK events.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InvTweaksA (Azure)</span>
+<span class="impl-module-clients">(AimbotPvP-azure-anticheat)</span>
+</div>
+<p class="impl-pattern">Classic inventory-tweaks detection: closing a window while sprinting is the walking-with-inventory-open tell.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">InvTweaksA hooks the inbound packet stream and checks the type: when PacketPlayInCloseWindow arrives while the Bukkit player is sprinting, it calls onViolation with a 60000 ms cooldown. Azure's PlayerStats also records the close-window type in its per-packet stats.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Inventory-tweaks and chest-stealer clients that close the GUI and keep sprinting, plus the walk-while-inventory-open pattern generally.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/misc/invtweaks/InvTweaksA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/misc/invtweaks/InvTweaksA.java =====
+package us.skidrevenant.azure.check.checks.misc.invtweaks;
+
+import net.minecraft.server.v1_8_R3.Packet;
+import net.minecraft.server.v1_8_R3.PacketPlayInCloseWindow;
+import us.skidrevenant.azure.check.Check;
+import us.skidrevenant.azure.stats.PlayerStats;
+
+/**
+ * @author SkidRevenant
+ * at 03/06/2018
+ */
+public class InvTweaksA extends Check {
+    public InvTweaksA(PlayerStats player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketReceiving(Class&lt;? extends Packet&gt; type, Packet packet) {
+        if (type == PacketPlayInCloseWindow.class &amp;&amp; player.getBukkitPlayer().isSprinting()) {
+            onViolation("InvTweaks Type A", 60000L, 0);
+        }
+    }
+}
+// NOTE (AI): The PacketPlayInCloseWindow branch is line 19; Azure PlayerStats.java line 68 also counts the close-window type in its packet stats.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Azure is the only classic anticheat with a dedicated close-window check. Its PlayerStats counter (line 68) records the type in the same hook. No other classic anticheat in the corpus flags the close packet directly.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ActionProcessor close-window state (Daedalus)</span>
+<span class="impl-module-clients">(funkemunky-Daedalus)</span>
+</div>
+<p class="impl-pattern">State sync: a close-window packet clears the openInventory flag that Daedalus's inventory and movement checks read.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">ActionProcessor is fed by PacketListeners, which wraps the inbound close-window packet (line 103) and calls the update overload. The close-window overload sets openInventory = false, paired with the C0B OPEN_INVENTORY branch of the entity-action overload that sets it true. Checks that must know whether the player has a GUI open read the flag.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly: state bookkeeping. It makes GUI-state-dependent checks such as inventory move and click timing accurate.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> funkemunky-Daedalus — Daedalus/src/cc/funkemunky/anticheat/api/data/processors/ActionProcessor.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: funkemunky-Daedalus — Daedalus/src/cc/funkemunky/anticheat/api/data/processors/ActionProcessor.java =====
+package cc.funkemunky.anticheat.api.data.processors;
+
+import cc.funkemunky.anticheat.api.data.PlayerData;
+import cc.funkemunky.api.Atlas;
+import cc.funkemunky.api.tinyprotocol.packet.in.WrappedInCloseWindowPacket;
+import cc.funkemunky.api.tinyprotocol.packet.in.WrappedInEntityActionPacket;
+import cc.funkemunky.api.utils.TickTimer;
+import lombok.Getter;
+
+@Getter
+public class ActionProcessor {
+    private boolean sprinting, openInventory, sneaking, flyFall, horseJump, isUsingItem;
+    private TickTimer lastUseItem = new TickTimer(10);
+
+    public void update(WrappedInEntityActionPacket packet) {
+        switch(packet.getAction()) {
+            case START_SPRINTING:
+                sprinting = true;
+                break;
+            case STOP_SPRINTING:
+                sprinting = false;
+                break;
+            case OPEN_INVENTORY:
+                openInventory = true;
+                break;
+            case START_SNEAKING:
+                sneaking = true;
+                break;
+            case STOP_SNEAKING:
+                sneaking = false;
+                break;
+            case START_FALL_FLYING:
+                flyFall = true;
+                break;
+            case START_RIDING_JUMP:
+                horseJump = true;
+                break;
+            case STOP_RIDING_JUMP:
+                horseJump = false;
+                break;
+        }
+    }
+
+    public void update(WrappedInCloseWindowPacket packet) {
+        openInventory = false;
+    }
+    
+    public void update(PlayerData data) {
+        if ((isUsingItem = Atlas.getInstance().getBlockBoxManager().getBlockBox().isUsingItem(data.getPlayer()))) {
+            lastUseItem.reset();
+        }
+    }
+}
+// NOTE (AI): The close-window overload is lines 44-46; the OPEN_INVENTORY counterpart is the entity-action overload at lines 15-42. PacketListeners.java line 103 constructs the WrappedInCloseWindowPacket that feeds this processor.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Kauri PacketHandler wraps both directions: the inbound CLOSE_WINDOW branch sets inventoryOpen false immediately (lines 271-273), and the server CLOSE_WINDOW branch defers the same write to a keepalive action (lines 538-540) so the state lands at the client's tick.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InventoryTracker close-window state (Intave)</span>
+<span class="impl-module-clients">(intave-intave)</span>
+</div>
+<p class="impl-pattern">Track the player's inventory-open state from the close-window packet, with a workaround for the beacon window that never sends one.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">InventoryTracker subscribes to the CLOSE_WINDOW inbound packet at LOW priority and closes the inventory: receiveCloseWindow calls closeInventory, which flips InventoryMetadata's open state to false. On the open side it special-cases the beacon container: since the client never sends a close packet for a beacon window, opening one skips the open-state update entirely, so the tracking never gets stuck with a stale open inventory.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Nothing directly: state tracking. The open and close state feeds the inventory-analysis checks, including the ChestStealer violations that the /intave history command reports.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> intave-intave — src/main/java/de/jpx3/intave/module/tracker/player/InventoryTracker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: intave-intave — src/main/java/de/jpx3/intave/module/tracker/player/InventoryTracker.java =====
+package de.jpx3.intave.module.tracker.player;
+
+import com.comphenix.protocol.events.PacketContainer;
+import com.comphenix.protocol.events.PacketEvent;
+import com.comphenix.protocol.wrappers.EnumWrappers;
+import com.comphenix.protocol.wrappers.WrappedChatComponent;
+import de.jpx3.intave.block.collision.Collision;
+import de.jpx3.intave.block.type.BlockTypeAccess;
+import de.jpx3.intave.module.Module;
+import de.jpx3.intave.module.Modules;
+import de.jpx3.intave.module.linker.packet.ListenerPriority;
+import de.jpx3.intave.module.linker.packet.PacketId;
+import de.jpx3.intave.module.linker.packet.PacketSubscription;
+import de.jpx3.intave.packet.reader.WindowItemReader;
+import de.jpx3.intave.user.User;
+import de.jpx3.intave.user.UserRepository;
+import de.jpx3.intave.user.meta.InventoryMetadata;
+import de.jpx3.intave.user.meta.MovementMetadata;
+import org.bukkit.entity.Player;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+import static de.jpx3.intave.module.linker.packet.PacketId.Client.CLIENT_COMMAND;
+import static de.jpx3.intave.module.linker.packet.PacketId.Server.*;
+
+public final class InventoryTracker extends Module {
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Open Inventory
+  //////////////////////////////////////////////////////////////////////////////
+
+  /**
+   * Tracks if the server forces a player to open an inventory by listening to
+   * the {@link de.jpx3.intave.module.linker.packet.PacketId.Server#OPEN_WINDOW}
+   * packet.
+   */
+  @PacketSubscription(
+    priority = ListenerPriority.HIGH,
+    packetsOut = {
+      OPEN_WINDOW
+    },
+    ignoreCancelled = false
+  )
+  public void sentOpenInventory(PacketEvent event) {
+    Player player = event.getPlayer();
+    User user = UserRepository.userOf(player);
+    InventoryMetadata inventoryData = user.meta().inventory();
+    PacketContainer packet = event.getPacket();
+
+    // For some reason the client doesn't send a close window packet after closing
+    // the beacon window. Therefore, we pretend the player does not have an open
+    // inventory if he opens the beacon window to avoid further issues.
+    WrappedChatComponent chatComponent = packet.getChatComponents().read(0);
+    String json = chatComponent.getJson();
+    boolean clientDoesNotSendCloseWindow = json.contains("container.beacon");
+
+    if (!clientDoesNotSendCloseWindow) {
+      Modules.feedback()
+        .synchronize(player, null, (p, x) -&gt; openInventory(p));
+      inventoryData.forceInventoryOnClickOpen = true;
+    } else {
+      inventoryData.forceInventoryOnClickOpen = false;
+    }
+  }
+
+  /**
+   * Tracks if the client opens the inventory by listening to the
+   * {@link de.jpx3.intave.module.linker.packet.PacketId.Client#CLIENT_COMMAND}
+   * packet.
+   * However, this functionality was removed in Minecraft 1.9.
+   */
+  @PacketSubscription(
+    priority = ListenerPriority.LOW,
+    packetsIn = {
+      CLIENT_COMMAND
+    }
+  )
+  public void receiveClientCommand(PacketEvent event) {
+    Player player = event.getPlayer();
+    EnumWrappers.ClientCommand clientCommand = event.getPacket().getClientCommands().read(0);
+    if (clientCommand == EnumWrappers.ClientCommand.OPEN_INVENTORY_ACHIEVEMENT) {
+      openInventory(player);
+    }
+  }
+
+  /**
+   * Updates the inventory's state of the specified player internally.
+   *
+   * @param player The player
+   */
+  private void openInventory(Player player) {
+    User user = UserRepository.userOf(player);
+    InventoryMetadata inventoryData = user.meta().inventory();
+
+    if (!inNetherPortal(user)) {
+      inventoryData.updateInventoryOpenState(true);
+    }
+  }
+
+  /**
+   * Checks whether the specified user is inside a nether portal.
+   *
+   * @param user The user
+   * @return whether the user is inside a nether portal
+   */
+  private boolean inNetherPortal(User user) {
+    MovementMetadata movementData = user.meta().movement();
+    return Collision.rasterizedTypeSearch(user, movementData.boundingBox(), BlockTypeAccess.NETHER_PORTAL);
+  }
+
+  //////////////////////////////////////////////////////////////////////////////
+  // Close Inventory
+  //////////////////////////////////////////////////////////////////////////////
+
+  /**
+   * Tracks if the server forces a player to close the inventory by listening to
+   * the {@link de.jpx3.intave.module.linker.packet.PacketId.Server#CLOSE_WINDOW}
+   * packet.
+   */
+  @PacketSubscription(
+    priority = ListenerPriority.HIGH,
+    packetsOut = {
+      PacketId.Server.CLOSE_WINDOW
+    },
+    ignoreCancelled = false
+  )
+  public void sentCloseInventory(PacketEvent event) {
+    Player player = event.getPlayer();
+    Modules.feedback()
+      .synchronize(player, null, (p, x) -&gt; closeInventory(p));
+  }
+
+  /**
+   * Tracks if the player closes the inventory by listening to the
+   * {@link de.jpx3.intave.module.linker.packet.PacketId.Client#CLOSE_WINDOW}
+   * packet.
+   */
+  @PacketSubscription(
+    priority = ListenerPriority.LOW,
+    packetsIn = {
+      PacketId.Client.CLOSE_WINDOW
+    }
+  )
+  public void receiveCloseWindow(PacketEvent event) {
+    closeInventory(event.getPlayer());
+  }
+
+  /**
+   * Updates the inventory's state of the specified internally.
+   *
+   * @param player The player
+   */
+  private void closeInventory(Player player) {
+    User user = UserRepository.userOf(player);
+    InventoryMetadata inventoryData = user.meta().inventory();
+    inventoryData.updateInventoryOpenState(false);
+  }
+
+  /**
+   * Closes a player's inventory if the player dies internally by listening to
+   * Bukkit's {@link org.bukkit.event.player.PlayerRespawnEvent}.
+   */
+  @PacketSubscription(
+    priority = ListenerPriority.HIGH,
+    packetsOut = {
+      RESPAWN
+    },
+    ignoreCancelled = false
+  )
+  public void sentRespawn(PacketEvent event) {
+    Player player = event.getPlayer();
+    User user = UserRepository.userOf(player);
+    InventoryMetadata inventoryData = user.meta().inventory();
+    inventoryData.updateInventoryOpenState(false);
+  }
+
+  @PacketSubscription(
+    packetsOut = {WINDOW_ITEMS}
+  )
+  public void on(
+    User user, WindowItemReader reader
+  ) {
+    if (reader.windowId() == 0) {
+      List&lt;String&gt; collect = reader.itemMap().values().stream().map(itemStack -&gt; itemStack.getType().name()).collect(Collectors.toList());
+      user.tickFeedback(() -&gt; user.meta().inventory().setItems(collect));
+//      System.out.println(collect);
+    }
+  }
+}
+// NOTE (AI): receiveCloseWindow is lines 144-149; the beacon no-close-window workaround is lines 50-63 inside sentOpenInventory. BaseStage.java line 475 reads the ChestStealer violation history produced from this tracker's state.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> FlopAC's InventoryC flags chest-stealer behavior from click-delay statistics but never reads the close-window packet; its C0D corpus hit is the flag message text only. Artemis's GPacketPlayClientWindowClose and FlopAC's WrappedInCloseWindowPacket are wrappers, and BendEye-Perus exposes isCloseWindow as a generic packet predicate.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S2DPacketOpenWindow/">S2DPacketOpenWindow</a>
 <a class="related-chip" href="../C0EPacketClickWindow/">C0EPacketClickWindow</a>

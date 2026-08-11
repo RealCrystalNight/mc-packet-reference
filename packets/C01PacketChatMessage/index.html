@@ -779,6 +779,584 @@ public class AutoGG extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent is universal. The vanilla send path is EntityPlayerSP.sendChatMessage; modules that want to bypass client-side command parsing construct C01 directly.</div>
 <div class="impl-clients">Memeware/Nekoware mutate or cancel the packet inside the event. Rise 5.99/6.x call event.setPacket to swap in a rewritten packet. Sigma routes through ChatUtil helpers so the rest of the client never touches packet construction.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The chat message packet carries every chat line and command the player types, which makes it the input surface for chat spam, captcha systems and text-based exploit attempts. Server-side anticheats split into two families: event-based chat systems that hook the Bukkit chat pipeline, and raw packet checks that validate the message bytes before the server processes them. The packet also carries the commands that log4j and similar exploits are delivered through, so payload scanning of chat is a standard mitigation.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ChatB (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Rejects chat messages and commands that the vanilla server would never accept, closing the spigot antispam bypass.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PreViaPacketReceiveListener that decodes CHAT_MESSAGE, CHAT_COMMAND and CHAT_COMMAND_UNSIGNED. A chat message is invalid if it is empty, has leading or trailing whitespace, or starts with / on 1.19+ where commands have their own packet. Commands are invalid if they carry trailing or surrounding whitespace. On flag it cancels the packet and calls onPacketCancel so downstream state stays consistent. The comment notes click-event edge cases can false flag on badly configured servers.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Empty or whitespace-padded chat messages, spigot antispam bypasses that smuggle text via formatting, and malformed command packets.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/chat/ChatB.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/chat/ChatB.java =====
+package ac.grim.grimac.checks.impl.chat;
+
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PreViaPacketReceiveListener;
+import ac.grim.grimac.player.GrimPlayer;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.player.ClientVersion;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientChatCommand;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientChatCommandUnsigned;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientChatMessage;
+
+// this can false from click events, but I doubt this would actually
+// happen unless they're trying to flag, or if the server is set up badly
+@CheckData(name = "ChatB", stableKey = "grim.exploit.spigot_antispam_bypass", description = "Invalid chat message")
+public class ChatB extends Check implements PreViaPacketReceiveListener {
+    private static final Verbose V = Verbose.of("[message|command]={str}");
+
+    public ChatB(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPreViaPacketReceive(PacketReceiveEvent event) {
+        if (event.getPacketType() == PacketType.Play.Client.CHAT_MESSAGE) {
+            String message = new WrapperPlayClientChatMessage(event).getMessage();
+            if (message.isEmpty() || !message.trim().equals(message)
+                    || message.startsWith("/") &amp;&amp; player.getClientVersion().isNewerThanOrEquals(ClientVersion.V_1_19)) {
+                if (flag(V.write(verbose()).bool(true).str(message)) &amp;&amp; shouldModifyPackets()) {
+                    player.onPacketCancel();
+                    event.setCancelled(true);
+                }
+            }
+        }
+
+        if (event.getPacketType() == PacketType.Play.Client.CHAT_COMMAND_UNSIGNED) {
+            String command = "/" + new WrapperPlayClientChatCommandUnsigned(event).getCommand();
+            if (!command.stripTrailing().equals(command) &amp;&amp; flag(V.write(verbose()).bool(false).str(command))) {
+                event.setCancelled(true);
+                player.onPacketCancel();
+            }
+        }
+
+        if (event.getPacketType() == PacketType.Play.Client.CHAT_COMMAND) {
+            String command = "/" + new WrapperPlayClientChatCommand(event).getCommand();
+            if (!command.trim().equals(command) &amp;&amp; flag(V.write(verbose()).bool(false).str(command))) {
+                event.setCancelled(true);
+                player.onPacketCancel();
+            }
+        }
+    }
+}
+
+// NOTE (AI): Grim runs this as a pre-Via check so the message is validated before any protocol translation.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> BetterAnticheat ImpossibleMessageCheck flags empty and space-prefixed messages, Photon ImpossibleChat flags chat while sprinting or in an inventory, and Kauri Log4J scans the message for JNDI syntax.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ChatListener (NoCheatPlus)</span>
+<span class="impl-module-clients">(Updated-NoCheatPlus-NoCheatPlus)</span>
+</div>
+<p class="impl-pattern">The classic chat pipeline: captcha, text spam, command spam, relog and login-rate checks dispatched from the Bukkit chat events.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">CheckListener that wires the Captcha, Commands, Logins, Text and Relog checks and registers ChatConfig and ChatData. AsyncPlayerChatEvent at LOWEST priority runs the Text check and cancels spam; PlayerCommandPreprocessEvent at LOWEST runs the command checks with left-trimmed messages and command alias resolution; PlayerLoginEvent runs captcha reset, fast relog and login-rate checks. It also records teleport-like commands for the net checks and maintains prefix trees for ignored and chat-handled commands.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Chat spam, command spam, captcha evasion, fast re-logging and login flooding.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/chat/ChatListener.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Updated-NoCheatPlus-NoCheatPlus — NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/chat/ChatListener.java =====
+/*
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see &lt;http://www.gnu.org/licenses/&gt;.
+ */
+package fr.neatmonster.nocheatplus.checks.chat;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import org.bukkit.Location;
+import org.bukkit.command.Command;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerLoginEvent;
+import org.bukkit.event.player.PlayerLoginEvent.Result;
+
+import fr.neatmonster.nocheatplus.NCPAPIProvider;
+import fr.neatmonster.nocheatplus.checks.CheckListener;
+import fr.neatmonster.nocheatplus.checks.CheckType;
+import fr.neatmonster.nocheatplus.checks.moving.MovingConfig;
+import fr.neatmonster.nocheatplus.checks.net.NetData;
+import fr.neatmonster.nocheatplus.command.CommandUtil;
+import fr.neatmonster.nocheatplus.compat.BridgeMisc;
+import fr.neatmonster.nocheatplus.compat.SchedulerHelper;
+import fr.neatmonster.nocheatplus.components.NoCheatPlusAPI;
+import fr.neatmonster.nocheatplus.components.data.ICheckData;
+import fr.neatmonster.nocheatplus.components.data.IData;
+import fr.neatmonster.nocheatplus.components.registry.factory.IFactoryOne;
+import fr.neatmonster.nocheatplus.components.registry.feature.INotifyReload;
+import fr.neatmonster.nocheatplus.components.registry.feature.JoinLeaveListener;
+import fr.neatmonster.nocheatplus.config.ConfPaths;
+import fr.neatmonster.nocheatplus.config.ConfigFile;
+import fr.neatmonster.nocheatplus.config.ConfigManager;
+import fr.neatmonster.nocheatplus.logging.Streams;
+import fr.neatmonster.nocheatplus.players.DataManager;
+import fr.neatmonster.nocheatplus.players.IPlayerData;
+import fr.neatmonster.nocheatplus.players.PlayerFactoryArgument;
+import fr.neatmonster.nocheatplus.utilities.StringUtil;
+import fr.neatmonster.nocheatplus.utilities.ds.prefixtree.SimpleCharPrefixTree;
+import fr.neatmonster.nocheatplus.utilities.moving.MovingUtil;
+import fr.neatmonster.nocheatplus.worlds.WorldFactoryArgument;
+
+/**
+ * Central location to listen to events that are relevant for the chat checks.
+ * 
+ * @see ChatEvent
+ */
+public class ChatListener extends CheckListener implements INotifyReload, JoinLeaveListener {
+
+    // Checks.
+    /** Captcha handler. */
+    private final Captcha captcha  = addCheck(new Captcha());  
+
+    /** Commands repetition check. */
+    private final Commands commands = addCheck(new Commands()); 
+
+    /** Logins check (global,how many simualtenous logins can the server accept in a specified time-frame) */
+    private final Logins logins = addCheck(new Logins());
+
+    /** Chat message check. */
+    private final Text text = addCheck(new Text());
+
+    /** Relogging check (per-player re-log time. */
+    private final Relog relog  = addCheck(new Relog());
+
+    // Auxiliary stuff.
+    /** Commands to be ignored completely. */
+    private final SimpleCharPrefixTree commandExclusions = new SimpleCharPrefixTree();
+
+    /** Commands to be handled as chat (thus handled by Text and not Command check). */
+    private final SimpleCharPrefixTree chatCommands = new SimpleCharPrefixTree();
+
+    /** Commands not to be executed in-game.  */
+    private final SimpleCharPrefixTree consoleOnlyCommands = new SimpleCharPrefixTree(); 
+
+    /** Set world to null after use, primary thread only. */
+    private final Location useLoc = new Location(null, 0, 0, 0);
+
+    @SuppressWarnings("unchecked")
+    public ChatListener() {
+        super(CheckType.CHAT);
+        ConfigFile config = ConfigManager.getConfigFile();
+        initFilters(config);
+        // (text inits in constructor.)
+        final NoCheatPlusAPI api = NCPAPIProvider.getNoCheatPlusAPI();
+        api.register(api.newRegistrationContext()
+                .registerConfigWorld(ChatConfig.class)
+                .factory(new IFactoryOne&lt;WorldFactoryArgument, ChatConfig&gt;() {
+                    @Override
+                    public ChatConfig getNewInstance(WorldFactoryArgument arg) {
+                        return new ChatConfig(arg.worldData);
+                    }
+                })
+                .registerConfigTypesPlayer()
+                .context() //
+                .registerDataPlayer(ChatData.class)
+                .factory(new IFactoryOne&lt;PlayerFactoryArgument, ChatData&gt;() {
+                    @Override
+                    public ChatData getNewInstance(PlayerFactoryArgument arg) {
+                        return new ChatData();
+                    }
+                })
+                .addToGroups(CheckType.CHAT, true, IData.class, ICheckData.class)
+                .context() //
+                );
+    }
+
+    @EventHandler(ignoreCancelled = false, priority = EventPriority.LOWEST)
+    public void onPlayerChat(final AsyncPlayerChatEvent event) {
+        final Player player = event.getPlayer();
+        final boolean alreadyCancelled = event.isCancelled();
+        if (!DataManager.getPlayerData(player).isCheckActive(CheckType.CHAT, player)) {
+            return;
+        }
+        // Tell TickTask to update cached permissions.
+        // (Might omit this if already cancelled.)
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final ChatConfig cc = pData.getGenericInstance(ChatConfig.class);
+        // Then the no chat check.
+        // TODO: isMainThread: Could consider event.isAsync ?
+        if (textChecks(player, event.getMessage(), cc, pData, false, alreadyCancelled)) {
+            event.setCancelled(true);
+        }
+
+    }
+
+    @EventHandler(priority = EventPriority.NORMAL)
+    public void onPlayerLogin(final PlayerLoginEvent event) {
+        if (event.getResult() != Result.ALLOWED) {
+            return;
+        }
+        final Player player = event.getPlayer();
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        if (!pData.isCheckActive(CheckType.CHAT, player)) {
+            return;
+        }
+        final ChatConfig cc = pData.getGenericInstance(ChatConfig.class);
+        final ChatData data = pData.getGenericInstance(ChatData.class);
+        // (No forced permission update, because the associated permissions are treated as hints rather.)
+        // Reset captcha of player if needed.
+        synchronized (data) {
+            captcha.resetCaptcha(player, cc, data, pData);
+        }
+        // Fast relog check.
+        if (relog.isEnabled(player, pData) &amp;&amp; relog.unsafeLoginCheck(player, cc, data,pData)) {
+            event.disallow(Result.KICK_OTHER, cc.relogKickMessage);
+        }
+        else if (logins.isEnabled(player, pData) &amp;&amp; logins.check(player, cc, data)) {
+            event.disallow(Result.KICK_OTHER, cc.loginsKickMessage);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlayerTeleportCommandMonitor(final PlayerCommandPreprocessEvent event) {
+        final String command = getTeleportLikeCommand(event.getMessage());
+        if (command != null) {
+            final Player player = event.getPlayer();
+            DataManager.getPlayerData(player).getGenericInstance(NetData.class)
+                    .recordTeleportCommand(command, player.getLocation(), System.currentTimeMillis());
+        }
+    }
+
+    /** We listen to PlayerCommandPreprocess events because commands can be used for spamming too. */
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onPlayerCommandPreprocess(final PlayerCommandPreprocessEvent event) {
+        final Player player = event.getPlayer();
+        // Tell TickTask to update cached permissions.
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final ChatConfig cc = pData.getGenericInstance(ChatConfig.class);
+        // Left-trim is necessary because the server accepts leading spaces with commands.
+        final String message = event.getMessage();
+        final String lcMessage = StringUtil.leftTrim(message).toLowerCase();
+        // TODO: Remove bukkit: etc.
+        final String[] split = lcMessage.split(" ", 2);
+        final String alias = split[0].substring(1);
+        final Command command = CommandUtil.getCommand(alias);
+
+        final List&lt;String&gt; messageVars = new ArrayList&lt;String&gt;(); // Could as well use an array and allow null on input of SimpleCharPrefixTree.
+        messageVars.add(lcMessage);
+        // Message to run chat checks on.
+        String checkMessage = message; 
+        if (command != null) {
+            messageVars.add("/" + command.getLabel().toLowerCase() + (split.length &gt; 1 ? (" " + split[1]) : ""));
+        }
+        if (alias.indexOf(":") != -1) {
+            final int index = message.indexOf(":") + 1;
+            if (index &lt; message.length()) {
+                checkMessage = message.substring(index);
+                messageVars.add(checkMessage.toLowerCase());
+            }
+        }
+        // Prevent commands from being used by players (e.g. /op /deop /reload).
+        if (cc.consoleOnlyCheck &amp;&amp; consoleOnlyCommands.hasAnyPrefixWords(messageVars)) {
+            if (command == null || command.testPermission(player)) {
+                player.sendMessage(cc.consoleOnlyMessage);
+            }
+            event.setCancelled(true);
+            return;
+        }
+        // Handle as chat or command.
+        if (chatCommands.hasAnyPrefixWords(messageVars)) {
+            // Treat as chat.
+            // TODO: Consider requesting permission updates on these, for consistency.
+            // TODO: Cut off the command ?.
+            if (textChecks(player, checkMessage, cc, pData, true, false)) {
+                event.setCancelled(true);
+            }
+        }
+        else if (!commandExclusions.hasAnyPrefixWords(messageVars)) {
+            // Treat as command.
+            if (commands.isEnabled(player, pData) &amp;&amp; commands.check(player, checkMessage, cc, pData, captcha)) {
+                event.setCancelled(true);
+            }
+            else {
+                // TODO: Consider always checking these?
+                // Note that this checks for prefixes, not prefix words.
+                final MovingConfig mcc = pData.getGenericInstance(MovingConfig.class);
+                if (mcc.passableUntrackedCommandCheck &amp;&amp; mcc.passableUntrackedCommandPrefixes.hasAnyPrefix(messageVars)) {
+                    if (checkUntrackedLocation(player, message, mcc, pData)) {
+                        event.setCancelled(true);
+                    }
+                }
+            }
+        }
+    }
+
+    private String getTeleportLikeCommand(final String message) {
+        if (message == null) {
+            return null;
+        }
+        final String lcMessage = StringUtil.leftTrim(message).toLowerCase();
+        if (lcMessage.length() &lt; 2 || lcMessage.charAt(0) != '/') {
+            return null;
+        }
+        final String[] split = lcMessage.split(" ", 2);
+        String command = split[0].substring(1);
+        final int namespaceIndex = command.indexOf(':');
+        if (namespaceIndex &gt;= 0 &amp;&amp; namespaceIndex + 1 &lt; command.length()) {
+            command = command.substring(namespaceIndex + 1);
+        }
+        return isTeleportLikeCommand(command) ? command : null;
+    }
+
+    private boolean isTeleportLikeCommand(final String command) {
+        return command.equals("rtp")
+            || command.equals("randomtp")
+            || command.equals("randomteleport")
+            || command.equals("wild")
+            || command.equals("wilderness")
+            || command.equals("spawn")
+            || command.equals("hub")
+            || command.equals("lobby")
+            || command.equals("home")
+            || command.equals("homes")
+            || command.equals("warp")
+            || command.equals("warps")
+            || command.equals("back")
+            || command.equals("tpa")
+            || command.equals("tpaccept")
+            || command.equals("tpahere")
+            || command.equals("tp")
+            || command.equals("teleport")
+            || command.equals("tphere");
+    }
+
+    private boolean checkUntrackedLocation(final Player player, final String message, 
+                                           final MovingConfig mcc, final IPlayerData pData) {
+        final Location loc = player.getLocation(useLoc);
+        boolean cancel = false;
+        if (MovingUtil.shouldCheckUntrackedLocation(player, loc, pData)) {
+            final Location newTo = MovingUtil.checkUntrackedLocation(loc);
+            if (newTo != null) {
+                if (mcc.passableUntrackedCommandTryTeleport 
+                    &amp;&amp; SchedulerHelper.teleportEntity(player, newTo, BridgeMisc.TELEPORT_CAUSE_CORRECTION_OF_POSITION)) {
+                    NCPAPIProvider.getNoCheatPlusAPI().getLogManager().info(Streams.TRACE_FILE, player.getName() + " runs the command '" + message + "' at an untracked location: " + loc + " , teleport to: " + newTo);
+                } 
+                else {
+                    NCPAPIProvider.getNoCheatPlusAPI().getLogManager().info(Streams.TRACE_FILE, player.getName() + " runs the command '" + message + "' at an untracked location: " + loc + " , cancel the command.");
+                    cancel = true;
+                }
+            }
+        }
+        useLoc.setWorld(null); // Cleanup.
+        return cancel;
+    }
+
+    private void initFilters(ConfigFile config) {
+        CommandUtil.feedCommands(consoleOnlyCommands, config, ConfPaths.PROTECT_COMMANDS_CONSOLEONLY_CMDS, true);
+        CommandUtil.feedCommands(chatCommands, config, ConfPaths.CHAT_COMMANDS_HANDLEASCHAT, true);
+        CommandUtil.feedCommands(commandExclusions, config, ConfPaths.CHAT_COMMANDS_EXCLUSIONS, true);
+    }
+
+    private boolean textChecks(final Player player, final String message, 
+                               final ChatConfig cc, final IPlayerData pData,
+                               final boolean isMainThread, final boolean alreadyCancelled) {
+        return text.isEnabled(player, pData) &amp;&amp; text.check(player, message, cc, pData, captcha, isMainThread, alreadyCancelled);
+    }
+
+    @Override
+    public void onReload() {
+        // Read some things from the global config file.
+        ConfigFile config = ConfigManager.getConfigFile();
+        initFilters(config);
+        text.onReload();
+        logins.onReload();
+    }
+
+    @Override
+    public void playerJoins(final Player player) {
+        final IPlayerData pData = DataManager.getPlayerData(player);
+        final ChatConfig cc = pData.getGenericInstance(ChatConfig.class);
+        final ChatData data = pData.getGenericInstance(ChatData.class);
+        /*
+         * TODO: The isEnabled check must be done with IWorldData (no locking).
+         * Specifically because enabling/disabling checks should be done in the
+         * primary thread, regardless of the capabilities of WorldDataManager
+         * implementation.
+         */
+        synchronized (data) {
+            if (captcha.isEnabled(player, pData)) {
+                if (captcha.shouldCheckCaptcha(player, cc, data, pData)) {
+                    // shouldCheckCaptcha: only if really enabled.
+                    // TODO: Later: add check for cc.captchaOnLogin or so (before shouldCheckCaptcha).
+                    // TODO: maybe schedule this to come after other plugins messages.
+                    captcha.sendNewCaptcha(player, cc, data);
+                }
+            }
+        }
+    }
+
+    @Override
+    public void playerLeaves(final Player player) {}
+}
+
+// NOTE (AI): NCP routes chat through Bukkit events rather than raw packets, so the listener is the dispatcher for the whole chat check family; the individual Text, Commands and Captcha files hold the scoring logic.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Photon ImpossibleChat runs on AsyncPlayerChatEvent too, Grim and BetterAnticheat validate the raw packet instead, and Kauri filters JNDI patterns from the chat stream.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ImpossibleMessageCheck (BetterAnticheat)</span>
+<span class="impl-module-clients">(amnoah-BetterAnticheat)</span>
+</div>
+<p class="impl-pattern">Flags chat messages that cannot exist: fully empty or space-only strings and messages starting with a space.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">handleReceivePlayPacket reads WrapperPlayClientChatMessage and checks the raw string: a trim that is empty fails with the code emp, a leading space fails with the code spc. Failures are recorded through the check base with the short codes as data.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Empty chat packets and space-prefixed messages used to bypass spam filters.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/check/impl/chat/ImpossibleMessageCheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: amnoah-BetterAnticheat — core/src/main/java/better/anticheat/core/check/impl/chat/ImpossibleMessageCheck.java =====
+package better.anticheat.core.check.impl.chat;
+
+import better.anticheat.core.BetterAnticheat;
+import better.anticheat.core.check.Check;
+import better.anticheat.core.check.CheckInfo;
+import better.anticheat.core.player.Player;
+import com.github.retrooper.packetevents.event.simple.PacketPlayReceiveEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientChatMessage;
+
+/**
+ * This check looks for impossible chat messages.
+ */
+@CheckInfo(name = "ImpossibleMessage", category = "chat")
+public class ImpossibleMessageCheck extends Check {
+
+    public ImpossibleMessageCheck(BetterAnticheat plugin, Player player) {
+        super(plugin, player);
+    }
+
+    @Override
+    public void handleReceivePlayPacket(PacketPlayReceiveEvent event) {
+
+        /*
+         * This check looks for messages that are either fully empty or only made up of spacing characters.
+         */
+
+        if (event.getPacketType() != PacketType.Play.Client.CHAT_MESSAGE) return;
+        WrapperPlayClientChatMessage wrapper = new WrapperPlayClientChatMessage(event);
+        String message = wrapper.getMessage();
+
+        // You cannot send empty messages or messages starting with spaces.
+        if (message.trim().isEmpty()) fail("emp");
+        else if (message.charAt(0) == ' ') fail("spc");
+    }
+}
+
+// NOTE (AI): BetterAnticheat is a modern PacketEvents-based anticheat; the check is minimal by design.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim ChatB also requires the message to be trim-equal and rejects / prefixes on modern versions; Photon ImpossibleChat covers the behavioral side instead.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Log4J (Kauri)</span>
+<span class="impl-module-clients">(funkemunky-KauriV3)</span>
+</div>
+<p class="impl-pattern">Scans chat messages for the JNDI lookup syntax used by the log4j exploit and cancels the packet.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">WCancellable bound to WrapperPlayClientChatMessage. It compiles the pattern \$\{.*} and, if the whole message matches, flags 'Tried to use JNDI exploit' and returns true to cancel; otherwise it debug-logs the message and lets it through.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Log4Shell payloads delivered through chat.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/check/impl/chat/Log4J.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: funkemunky-KauriV3 — Anticheat/src/main/java/dev/brighten/ac/check/impl/chat/Log4J.java =====
+package dev.brighten.ac.check.impl.chat;
+
+import com.github.retrooper.packetevents.wrapper.play.client.WrapperPlayClientChatMessage;
+import dev.brighten.ac.api.check.CheckType;
+import dev.brighten.ac.check.Check;
+import dev.brighten.ac.check.CheckData;
+import dev.brighten.ac.check.WCancellable;
+import dev.brighten.ac.data.APlayer;
+import dev.brighten.ac.utils.annotation.Bind;
+
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@CheckData(name = "Log4J", checkId = "log4j", type = CheckType.CHAT)
+public class Log4J extends Check {
+
+    public Log4J(APlayer player) {
+        super(player);
+    }
+
+    private final Pattern pattern = Pattern.compile("\\$\\{.*}");
+
+    @Bind
+    WCancellable&lt;WrapperPlayClientChatMessage&gt; chatPacket = packet -&gt; {
+        Matcher matcher = pattern.matcher(packet.getMessage());
+        if(matcher.matches()) {
+            flag("Tried to use JNDI exploit");
+            return true;
+        }
+
+        debug("Sent chat message: " + packet.getMessage());
+        return false;
+    };
+}
+
+// NOTE (AI): Kauri's check binding model attaches this WCancellable to the chat packet stream; the check is a direct response to the log4j vulnerability wave.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Intave filters the same syntax in its CommandFilter and Log4JExploitFilter modules; Grim and BetterAnticheat validate chat shape rather than content.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ImpossibleChat (Photon)</span>
+<span class="impl-module-clients">(Photon-GitHub-AntiCheatAddition)</span>
+</div>
+<p class="impl-pattern">Flags chat sent while the player is in a state where the client physically cannot be chatting: sprinting, sneaking, blocking, dead, or inside a long-open inventory.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">EventListener on AsyncPlayerChatEvent. If the user is sprinting, sneaking, blocking, dead, or has had an inventory open for over a second, it flags with +25 VL and cancels the event at the configured cancel VL (default 75). Violation management decays 25 VL every 600 ms.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Chat modules that send messages while the client is in an impossible state, and inventory-based chat bypasses.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/checks/impossiblechat/ImpossibleChat.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Photon-GitHub-AntiCheatAddition — src/main/java/de/photon/anticheataddition/modules/checks/impossiblechat/ImpossibleChat.java =====
+package de.photon.anticheataddition.modules.checks.impossiblechat;
+
+import de.photon.anticheataddition.modules.ViolationModule;
+import de.photon.anticheataddition.user.User;
+import de.photon.anticheataddition.util.violationlevels.Flag;
+import de.photon.anticheataddition.util.violationlevels.ViolationLevelManagement;
+import de.photon.anticheataddition.util.violationlevels.ViolationManagement;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+
+public final class ImpossibleChat extends ViolationModule implements Listener
+{
+    public static final ImpossibleChat INSTANCE = new ImpossibleChat();
+
+    private final int cancelVl = loadInt(".cancel_vl", 75);
+
+    private ImpossibleChat()
+    {
+        super("ImpossibleChat");
+    }
+
+    @EventHandler
+    public void onAsyncChat(final AsyncPlayerChatEvent event)
+    {
+        final var user = User.getUser(event.getPlayer());
+        if (User.isUserInvalid(user, this)) return;
+
+        if (user.getPlayer().isSprinting() ||
+            user.getPlayer().isSneaking() ||
+            user.getPlayer().isBlocking() ||
+            user.getPlayer().isDead() ||
+            // Have the inventory opened for some time
+            (user.hasOpenInventory() &amp;&amp; user.notRecentlyOpenedInventory(1000)))
+        {
+            this.getManagement().flag(Flag.of(user).setAddedVl(25).setCancelAction(cancelVl, () -&gt; event.setCancelled(true)));
+        }
+    }
+
+    @Override
+    protected ViolationManagement createViolationManagement()
+    {
+        return ViolationLevelManagement.builder(this).loadThresholdsToManagement().withDecay(600, 25).build();
+    }
+}
+
+// NOTE (AI): Photon listens on the Bukkit chat event rather than the packet; the inventory-open timing requirement uses the user's open-inventory tracker.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim ChatC flags moving while chatting from the raw packet stream; NoCheatPlus runs its Text and Captcha checks on the same event.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S02PacketChat/">S02PacketChat</a>
 <a class="related-chip" href="../S42PacketCombatEvent/">S42PacketCombatEvent</a>

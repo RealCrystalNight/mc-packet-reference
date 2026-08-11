@@ -716,6 +716,486 @@ public final class PingSpoofComponent extends Component {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent is universal; the packet is re-set on the event in Rise (event.setPacket) and mutated or cancelled in place on classic event buses (Memeware, Nekoware, Sigma, Spicy). Rise 6.x handles it through the component system and the Velocity module's Mode classes.</div>
 <div class="impl-clients">Memeware/Nekoware cancel inside PacketInEvent; Spicy mutates the packet object and cancels the event; Tenacity cancels or scales via IEventListener; Rise 5.99 replaces the packet on the event; Rise 6.x re-sets it and additionally buffers it in PingSpoofComponent; Sigma mutates or cancels and injects C04 for the AACFlag mode.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">S12 is the server telling the client to apply a velocity vector, normally knockback, and every anticheat treats it as a promise: the client's next movement ticks must reflect the vector it was sent. The corpus splits into direct statistical checks (Azure VelocityA compares the vertical delta against the sent vector) and transaction-ordered simulation checks (Grim KnockbackHandler, Artemis VelocityPreProcessor, Frequency VelocityManager) that know exactly when the packet arrived at the client and require the knockback in the following prediction. This packet is the reason anti-knockback cheats cancel or alter S12 specifically.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KnockbackHandler / AntiKB (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Requires the client's simulated motion to include the exact knockback vector the server sent, flagging any reduction or delay.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On the OUT side, wraps each entity-velocity packet for the player (or their vehicle) between two transaction packets, recording the vector with the first transaction id. As client transactions arrive, knockbacks move from a future queue into known-taken state; the prediction engine then compares the player's actual movement against the required knockback, accumulating a threshold-bounded buffer and triggering a setback above the immediate threshold.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Anti-knockback, velocity cancel and velocity reduction cheats, including selective cancels that take partial knockback.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/velocity/KnockbackHandler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/velocity/KnockbackHandler.java =====
+package ac.grim.grimac.checks.impl.velocity;
+
+import ac.grim.grimac.api.config.ConfigManager;
+import ac.grim.grimac.api.storage.verbose.Verbose;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PacketSendListener;
+import ac.grim.grimac.checks.type.PostPredictionListener;
+import ac.grim.grimac.player.GrimPlayer;
+import ac.grim.grimac.utils.anticheat.update.PredictionComplete;
+import ac.grim.grimac.utils.data.Pair;
+import ac.grim.grimac.utils.data.VectorData;
+import ac.grim.grimac.utils.data.VelocityData;
+import ac.grim.grimac.utils.math.Vector3dm;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.util.Vector3d;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerEntityVelocity;
+import lombok.Getter;
+import org.jetbrains.annotations.NotNull;
+
+import java.util.Deque;
+import java.util.LinkedList;
+
+// We are making a velocity sandwich between two pieces of transaction packets (bread)
+@CheckData(name = "AntiKB", stableKey = "grim.velocity.anti_knockback", alternativeName = "AntiKnockback", configName = "Knockback", description = "Did not take the expected entity knockback", setback = 10, decay = 0.025)
+public class KnockbackHandler extends Check implements PacketSendListener, PostPredictionListener {
+    private static final Verbose V = Verbose.of("[ignored knockback|o: {offset}]");
+
+    private final Deque&lt;VelocityData&gt; firstBreadMap = new LinkedList&lt;&gt;();
+
+    private final Deque&lt;VelocityData&gt; lastKnockbackKnownTaken = new LinkedList&lt;&gt;();
+    private VelocityData firstBreadOnlyKnockback = null;
+    @Getter
+    private boolean knockbackPointThree = false;
+
+    private double offsetToFlag;
+    private double maxAdv, immediate, ceiling, multiplier;
+
+    private double threshold;
+
+    public KnockbackHandler(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketSend(final PacketSendEvent event) {
+        if (event.getPacketType() == PacketType.Play.Server.ENTITY_VELOCITY) {
+            WrapperPlayServerEntityVelocity velocity = new WrapperPlayServerEntityVelocity(event);
+            int entityId = velocity.getEntityId();
+
+            // Detect whether this knockback packet affects the player or if it is useless
+            // Mojang sends extra useless knockback packets for no apparent reason
+            if (player.compensatedEntities.serverPlayerVehicle != null &amp;&amp; entityId != player.compensatedEntities.serverPlayerVehicle) {
+                return;
+            }
+            if (player.compensatedEntities.serverPlayerVehicle == null &amp;&amp; entityId != player.entityID) {
+                return;
+            }
+
+            // If the player isn't in a vehicle and the ID is for the player, the player will take kb
+            // If the player is in a vehicle and the ID is for the player's vehicle, the player will take kb
+            Vector3d playerVelocity = velocity.getVelocity();
+
+            // Blacklist problemated vector until mojang fixes a client-sided bug
+            if (playerVelocity.getY() == -0.04) {
+                velocity.setVelocity(playerVelocity.add(new Vector3d(0, 1 / 8000D, 0)));
+                playerVelocity = velocity.getVelocity();
+                event.markForReEncode(true);
+            }
+
+            playerVelocity = VectorPrecisionConverter.convert(player.getClientVersion(), playerVelocity);
+
+            // Wrap velocity between two transactions
+            player.sendTransaction();
+            addPlayerKnockback(entityId, player.lastTransactionSent.get(), new Vector3dm(playerVelocity.getX(), playerVelocity.getY(), playerVelocity.getZ()));
+            event.getTasksAfterSend().add(player::sendTransaction);
+        }
+    }
+
+    @NotNull
+    public Pair&lt;VelocityData, Vector3dm&gt; getFutureKnockback() {
+        // Chronologically in the future
+        if (!firstBreadMap.isEmpty()) {
+            VelocityData data = firstBreadMap.peek();
+            return new Pair&lt;&gt;(data, data != null ? data.vector : null);
+        }
+
+        // Less in the future
+        if (!lastKnockbackKnownTaken.isEmpty()) {
+            VelocityData data = lastKnockbackKnownTaken.peek();
+            return new Pair&lt;&gt;(data, data != null ? data.vector : null);
+        }
+
+        // Uncertain, might be in the future
+        if (player.firstBreadKB != null &amp;&amp; player.likelyKB == null) {
+            VelocityData data = player.firstBreadKB;
+            return new Pair&lt;&gt;(data, data.vector.clone());
+        } else if (player.likelyKB != null) { // Known to be in the present
+            VelocityData data = player.likelyKB;
+            return new Pair&lt;&gt;(data, data.vector.clone());
+        }
+        return new Pair&lt;&gt;(null, null);
+    }
+
+    private void addPlayerKnockback(int entityID, int breadOne, @NotNull Vector3dm knockback) {
+        firstBreadMap.add(new VelocityData(entityID, breadOne, player.getSetbackTeleportUtil().isSendingSetback, knockback));
+    }
+
+    public VelocityData calculateRequiredKB(int entityID, int transaction, boolean isJustTesting) {
+        tickKnockback(transaction);
+
+        VelocityData returnLastKB = null;
+        for (VelocityData data : lastKnockbackKnownTaken) {
+            if (data.entityID == entityID)
+                returnLastKB = data;
+        }
+
+        if (!isJustTesting) {
+            lastKnockbackKnownTaken.clear();
+        }
+        return returnLastKB;
+    }
+
+    private void tickKnockback(int transactionID) {
+        firstBreadOnlyKnockback = null;
+        if (firstBreadMap.isEmpty()) return;
+        VelocityData data = firstBreadMap.peek();
+        while (data != null) {
+            if (data.transaction == transactionID) { // First bread knockback
+                firstBreadOnlyKnockback = new VelocityData(data.entityID, data.transaction, data.isSetback, data.vector);
+                //firstBreadMap.poll();
+                break; // All knockback after this will have not been applied
+            } else if (data.transaction &lt; transactionID) { // This kb has 100% arrived to the player
+                VelocityData velocityData = new VelocityData(data.entityID, data.transaction, data.isSetback, data.vector);
+
+                if (firstBreadOnlyKnockback != null) { // Don't require kb twice
+                    velocityData.offset = data.offset;
+                }
+
+                lastKnockbackKnownTaken.add(velocityData);
+
+                // Knockback has been applied and is now required, remove it from first bread
+                firstBreadOnlyKnockback = null;
+                firstBreadMap.poll();
+                data = firstBreadMap.peek();
+            } else { // We are too far ahead in the future
+                break;
+            }
+        }
+    }
+
+    public void forceExempt() {
+        // Unsure knockback was taken
+        if (player.firstBreadKB != null) {
+            player.firstBreadKB.offset = 0;
+        }
+
+        if (player.likelyKB != null) {
+            player.likelyKB.offset = 0;
+        }
+    }
+
+    public void setPointThree(boolean isPointThree) {
+        knockbackPointThree = knockbackPointThree || isPointThree;
+    }
+
+    public void handlePredictionAnalysis(double offset) {
+        if (player.firstBreadKB != null) {
+            player.firstBreadKB.offset = Math.min(player.firstBreadKB.offset, offset);
+        }
+
+        if (player.likelyKB != null) {
+            player.likelyKB.offset = Math.min(player.likelyKB.offset, offset);
+        }
+    }
+
+    @Override
+    public void onPredictionComplete(final PredictionComplete predictionComplete) {
+        double offset = predictionComplete.getOffset();
+        if (!predictionComplete.isChecked() || predictionComplete.getData().isTeleport()) {
+            forceExempt();
+            return;
+        }
+
+        boolean wasZero = knockbackPointThree;
+        knockbackPointThree = false;
+
+        if (player.likelyKB == null &amp;&amp; player.firstBreadKB == null) {
+            return;
+        }
+
+        if (player.predictedVelocity.isFirstBreadKb()) {
+            firstBreadOnlyKnockback = null;
+            firstBreadMap.poll(); // Remove from map so we don't pull it again
+        }
+
+        if (wasZero || player.predictedVelocity.isKnockback()) {
+            // Unsure knockback was taken
+            if (player.firstBreadKB != null) {
+                player.firstBreadKB.offset = Math.min(player.firstBreadKB.offset, offset);
+            }
+
+            // 100% known kb was taken
+            if (player.likelyKB != null) {
+                player.likelyKB.offset = Math.min(player.likelyKB.offset, offset);
+            }
+        }
+
+        if (player.likelyKB != null) {
+            if (player.likelyKB.offset &gt; offsetToFlag) {
+                threshold = Math.min(threshold + player.likelyKB.offset, ceiling);
+                if (player.likelyKB.isSetback) { // Don't increase violations if this velocity was setback, just teleport and resend them velocity.
+                    if (!isNoSetbackPermission()) {
+                        player.getSetbackTeleportUtil().executeViolationSetback();
+                    }
+                } else {
+                    boolean ignored = player.likelyKB.offset == Integer.MAX_VALUE;
+                    if (flag(V.write(verbose()).bool(ignored).f64(player.likelyKB.offset))) { // This velocity was sent by the server.
+                        if (player.likelyKB.offset &gt;= immediate || threshold &gt;= maxAdv) {
+                            setbackIfAboveSetbackVL();
+                        }
+                    } else {
+                        reward();
+                    }
+                }
+            } else if (threshold &gt; 0.05) {
+                threshold *= multiplier;
+            }
+        }
+    }
+
+    public boolean shouldIgnoreForPrediction(VectorData data) {
+        if (data.isKnockback() &amp;&amp; data.isFirstBreadKb()) {
+            return player.firstBreadKB.offset &gt; offsetToFlag;
+        }
+        return false;
+    }
+
+    public boolean wouldFlag() {
+        return (player.likelyKB != null &amp;&amp; player.likelyKB.offset &gt; offsetToFlag) || (player.firstBreadKB != null &amp;&amp; player.firstBreadKB.offset &gt; offsetToFlag);
+    }
+
+    public VelocityData calculateFirstBreadKnockback(int entityID, int transaction) {
+        tickKnockback(transaction);
+        if (firstBreadOnlyKnockback != null &amp;&amp; firstBreadOnlyKnockback.entityID == entityID)
+            return firstBreadOnlyKnockback;
+        return null;
+    }
+
+    @Override
+    public void onReload(@NotNull ConfigManager config) {
+        offsetToFlag = config.getDoubleElse("Knockback.threshold", 0.001);
+        maxAdv = config.getDoubleElse("Knockback.max-advantage", 1);
+        immediate = config.getDoubleElse("Knockback.immediate-setback-threshold", 0.1);
+        multiplier = config.getDoubleElse("Knockback.setback-decay-multiplier", 0.999);
+        ceiling = config.getDoubleElse("Knockback.max-ceiling", 4);
+        if (maxAdv &lt; 0) maxAdv = Double.MAX_VALUE;
+        if (immediate &lt; 0) immediate = Double.MAX_VALUE;
+    }
+
+}
+// NOTE (AI): Grim even rewrites a vanilla bug vector (Y = -0.04) before recording it, so the required knockback matches what the client actually applies.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Artemis VelocityPreProcessor applies the velocity in a transaction-confirmed pre action; Grim instead leaves it in a queue until the client's transactions prove arrival.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">VelocityA (Azure)</span>
+<span class="impl-module-clients">(AimbotPvP-azure-anticheat)</span>
+</div>
+<p class="impl-pattern">Classic 1.8 statistical check: the reported upward move after a knockback packet must be at least 77 percent of the sent vertical velocity.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Reads the OUT entity-velocity packet, keeps the vertical component (field c divided by 8000.0) when the entity id matches the player, and skips causes that do not produce knockback (starvation, fire, drowning, poison, wither, thorns, fall, lava). On the next upward move it compares deltaY to the recorded velocity and reports the taken percentage as a violation.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Anti-knockback that reduces or zeroes vertical velocity; the percentage reported makes the flag self-documenting.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/combat/velocity/VelocityA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/combat/velocity/VelocityA.java =====
+package us.skidrevenant.azure.check.checks.combat.velocity;
+
+import net.minecraft.server.v1_8_R3.Packet;
+import net.minecraft.server.v1_8_R3.PacketPlayOutEntityVelocity;
+import org.bukkit.Location;
+import org.bukkit.event.player.PlayerMoveEvent;
+import us.skidrevenant.azure.check.Check;
+import us.skidrevenant.azure.stats.PlayerStats;
+import us.skidrevenant.azure.util.reflection.ReflectionUtil;
+
+/**
+ * @author SkidRevenant
+ * at 30/05/2018
+ */
+public class VelocityA extends Check {
+
+    private double verticalVelocity;
+
+    public VelocityA(PlayerStats player) {
+        super(player);
+    }
+
+    @Override
+    public void onMove(Location from, Location to, PlayerMoveEvent event) {
+        if (from.getY() &gt;= to.getY()) {
+            return;
+        }
+
+        double deltaY = to.getY() - from.getY();
+
+        if (deltaY &gt; 0 &amp;&amp; deltaY &lt; 0.42 &amp;&amp; deltaY &lt; verticalVelocity * 0.77) {
+            long velocity = Math.round(100.0 * deltaY / verticalVelocity);
+            verticalVelocity = 0;
+
+            onViolation(String.format("Velocity Type A (%d%%)", velocity), 10000L, 4);
+        }
+    }
+
+    @Override
+    public void onPacketSend(Class&lt;? extends Packet&gt; type, Packet packet) {
+        if (type == PacketPlayOutEntityVelocity.class) {
+            PacketPlayOutEntityVelocity entityVelocity = (PacketPlayOutEntityVelocity) packet;
+
+            int entityId = ReflectionUtil.getFieldValue(ReflectionUtil.getField(PacketPlayOutEntityVelocity.class, "a", int.class), entityVelocity);
+
+            if (entityId == player.getBukkitPlayer().getEntityId()) {
+
+                if (player.getBukkitPlayer().getLastDamageCause() != null) {
+                    switch (player.getBukkitPlayer().getLastDamageCause().getCause()) {
+                        case STARVATION:
+                        case FIRE_TICK:
+                        case DROWNING:
+                        case POISON:
+                        case WITHER:
+                        case THORNS:
+                        case FALL:
+                        case LAVA:
+                        case FIRE:
+
+                            verticalVelocity = 0;
+                            return;
+                    }
+                }
+
+                verticalVelocity = (int) ReflectionUtil.getFieldValue(ReflectionUtil.getField(PacketPlayOutEntityVelocity.class, "c", int.class), entityVelocity) / 8000.0;
+            }
+
+        }
+    }
+}
+// NOTE (AI): Reflection-based field access is used instead of a wrapper, typical of the 1.8 generation.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rammelkast VelocityCheck and MIU AntiVelocity use the same sent-vector-vs-delta comparison; Grim and Artemis add transaction ordering on top.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">VelocityManager feed (Frequency)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency)</span>
+</div>
+<p class="impl-pattern">Records every player-targeted S12 into a short-lived velocity window that all movement checks read for exemptions and baselines.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The outgoing packet processor wraps each entity-velocity packet, and when the entity id is the player, pushes the vector into the VelocityManager. The manager keeps snapshots with horizontal and vertical magnitudes for two seconds, exposing max values that the speed and invalid checks add to their expected baselines, and the VELOCITY exemption type switches off checks while a recent velocity is active.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Anti-knockback cheats are detected by the speed and invalid checks because the expected velocity baseline is missing or reduced.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/processor/impl/OutgoingPacketProcessor.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/processor/impl/OutgoingPacketProcessor.java =====
+package xyz.elevated.frequency.processor.impl;
+
+import net.minecraft.server.v1_8_R3.*;
+import xyz.elevated.frequency.data.PlayerData;
+import xyz.elevated.frequency.processor.type.Processor;
+import xyz.elevated.frequency.wrapper.impl.server.WrappedPlayOutKeepAlive;
+import xyz.elevated.frequency.wrapper.impl.server.WrappedPlayOutEntityVelocity;
+import xyz.elevated.frequency.wrapper.impl.server.WrappedPlayOutTeleport;
+import xyz.elevated.frequency.wrapper.impl.server.WrappedPlayOutTransaction;
+
+public final class OutgoingPacketProcessor implements Processor&lt;Packet&lt;PacketListenerPlayOut&gt;&gt; {
+
+    @Override
+    public void process(final PlayerData playerData, final Packet&lt;PacketListenerPlayOut&gt; packet) {
+        if (packet instanceof PacketPlayOutEntityVelocity) {
+            final WrappedPlayOutEntityVelocity wrapper = new WrappedPlayOutEntityVelocity(packet);
+
+            final int packetEntityId = wrapper.getEntityId();
+            final int playerEntityId = playerData.getBukkitPlayer().getEntityId();
+
+            if (packetEntityId == playerEntityId) {
+                final double velocityX = wrapper.getX();
+                final double velocityY = wrapper.getY();
+                final double velocityZ = wrapper.getZ();
+
+                playerData.getVelocityManager().addVelocityEntry(velocityX, velocityY, velocityZ);
+            }
+        } else if (packet instanceof PacketPlayOutEntityTeleport) {
+            final WrappedPlayOutTeleport wrapper = new WrappedPlayOutTeleport(packet);
+
+            final int entityId = wrapper.getEntityId();
+            final int playerId = playerData.getBukkitPlayer().getEntityId();
+
+            if (entityId == playerId) {
+                playerData.getActionManager().onTeleport();
+            }
+        } else if (packet instanceof PacketPlayOutPosition) {
+            playerData.getActionManager().onTeleport();
+        }
+    }
+}
+// NOTE (AI): The processor also feeds teleport events (entity teleport and position packets) into the action manager, keeping velocity and teleport exemptions in one stream.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Azure VelocityA keeps a single vertical velocity scalar; Frequency keeps a time-windowed deque so exemptions decay naturally.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">VelocityPreProcessor (Artemis)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Applies the S12 velocity to the movement holder only after the client confirms the packet, so prediction checks see it in the correct tick.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Matches the OUT entity-velocity packet for the player's entity id, builds a Velocity object, and registers it in the connection's transaction confirmation. The pre action moves the current velocity into lastVelocity and installs the new vector as processed; the post action clears the processed flag when the transaction returns.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Velocity spoofing where a client applies knockback at the wrong time or not at all, which shows up as a prediction residual.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/velocity/VelocityPreProcessor.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.core/src/main/java/ac/artemis/core/v4/processor/velocity/VelocityPreProcessor.java =====
+package ac.artemis.core.v4.processor.velocity;
+
+import ac.artemis.core.v4.check.TeleportHandler;
+import ac.artemis.core.v4.check.VelocityHandler;
+import ac.artemis.core.v4.data.PlayerData;
+import ac.artemis.core.v4.data.holders.ConnectionHolder;
+import ac.artemis.core.v4.processor.AbstractHandler;
+import ac.artemis.core.v4.utils.chat.Chat;
+import ac.artemis.core.v4.utils.function.PacketAction;
+import cc.ghast.packet.PacketAPI;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import cc.ghast.packet.wrapper.packet.play.client.GPacketPlayClientTransaction;
+import ac.artemis.core.v4.utils.position.Velocity;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerEntityVelocity;
+import cc.ghast.packet.wrapper.packet.play.server.GPacketPlayServerTransaction;
+
+import java.util.*;
+
+public class VelocityPreProcessor extends AbstractHandler {
+
+    public VelocityPreProcessor(final PlayerData data) {
+        super("Velocity [0x01]", data);
+    }
+
+    @Override
+    public void handle(final GPacket packet) {
+        // If the packet is a velocity packet
+        if (packet instanceof GPacketPlayServerEntityVelocity) {
+
+            // Assign the packet
+            final GPacketPlayServerEntityVelocity vel = (GPacketPlayServerEntityVelocity) packet;
+
+            // Ensure the packet's entity id corresponds to the player's
+            if (vel.getEntityId() == data.getPlayer().getEntityId()) {
+
+                // Create a new velocity object
+                final Velocity velocity = new Velocity(vel.getValueX(), vel.getValueY(), vel.getZ());
+
+                data.connection.confirmFunction(ConnectionHolder.ConfirmationType.TRANSACTION, new PacketAction() {
+                    @Override
+                    public void pre() {
+                        // If the previous velocity isn't null, assign it to this variable
+                        if (data.movement.getVelocity() != null) data.movement.setLastVelocity(data.movement.getVelocity());
+
+                        // Assign the velocity
+                        data.movement.setVelocity(velocity);
+
+                        // Set the boolean as processed
+                        data.movement.setProcessedVelocity(true);
+                    }
+
+                    @Override
+                    public void post() {
+                        data.movement.setProcessedVelocity(false);
+                    }
+                });
+            }
+        }
+    }
+}
+// NOTE (AI): Keeping lastVelocity lets checks distinguish a fresh knockback from a stale one across the confirm boundary.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim queues knockbacks against transaction ids; Artemis installs them in a confirmation callback, which is the same ordering idea with different storage.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S27PacketExplosion/">S27PacketExplosion</a>
 <a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>

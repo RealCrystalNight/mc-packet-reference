@@ -964,6 +964,311 @@ public final class NoVoid extends Module {
 <div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent (cancel/mutate C0F), PacketReceiveEvent (S32 trigger), motion/tick events for release timing; Rise 6.x uses component-based parking (PingSpoofComponent, TransactionFixComponent).</div>
 <div class="impl-clients">Classic clients cancel or mutate the live packet in the event (Memeware, Sigma, Spicy, Tenacity). Rise 5.99 uses PacketUtil.sendPacketWithoutEvent to replay forged C0F. Rise 6.x routes through PacketUtil.send/sendNoEvent and its PingSpoofComponent/TimedPacket queue; TransactionFixComponent (6.2.4/6.1.30) repairs transaction state under ViaVersion.</div>
 </div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The transaction confirmation packet is the client's acknowledgement of a server transaction, and it gives anticheats a clean client-to-server round trip that is independent of the keepalive channel. That makes it the timing primitive for the timer and pingspoof check domains: Grim's Timer anchors the movement clock to the first confirmation after each movement, Frequency PingSpoofA compares the transaction ping against the keepalive ping, and classic timers (Azure, Negativity) use the same packet stream to discipline the movement rate.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Timer (Grim)</span>
+<span class="impl-module-clients">(GrimAnticheat-Grim)</span>
+</div>
+<p class="impl-pattern">Ping-anchored timer check: the movement clock must never run ahead of the transaction round trip.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PrePredictionPacketReceiveListener. When a movement has been seen and the next WINDOW_CONFIRMATION (or PONG) arrives, it updates the known player clock from the movement clock. Each tick packet adds 50 ms to a real-time balance; when the balance overtakes System.nanoTime() the client is running faster than real time, the check flags, cancels the packet, and executes a setback. A clock-drift floor keeps the balance from falling behind the player's ping.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Timer cheats from about 1.01x upward, including clients that fake movement rate while keeping the transaction channel honest.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: GrimAnticheat-Grim — common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java =====
+package ac.grim.grimac.checks.impl.timer;
+
+import ac.grim.grimac.api.config.ConfigManager;
+import ac.grim.grimac.checks.Check;
+import ac.grim.grimac.checks.CheckData;
+import ac.grim.grimac.checks.type.PrePredictionPacketReceiveListener;
+import ac.grim.grimac.player.GrimPlayer;
+import com.github.retrooper.packetevents.event.PacketReceiveEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.packettype.PacketTypeCommon;
+import org.jetbrains.annotations.NotNull;
+
+@CheckData(name = "Timer", stableKey = "grim.timer.timer", configName = "TimerA", description = "The players game is running faster than normal", setback = 10)
+public class Timer extends Check implements PrePredictionPacketReceiveListener {
+    protected long timerBalanceRealTime = 0;
+
+    // Default value is real time minus max keep-alive time
+    protected long knownPlayerClockTime = (long) (System.nanoTime() - 6e10);
+    protected long lastMovementPlayerClock = (long) (System.nanoTime() - 6e10);
+
+    // How long should the player be able to fall back behind their ping? (nanos)
+    // Default: 120 milliseconds
+    protected long clockDrift;
+
+    protected boolean hasGottenMovementAfterTransaction = false;
+
+    // Proof for this timer check
+    // https://i.imgur.com/Hk2Wb6c.png
+    //
+    // The largest gap will always be the transaction ping (server -&gt; client -&gt; server)
+    // Proof lies that client -&gt; server ping will always be lower
+    //
+    // The largest gap is the floor for movements
+    // If the smaller gap surpasses the larger gap, the player is cheating
+    //
+    // This usually flags 1.01 on low ping extremely quickly
+    // Higher ping/low fps scales proportionately, and will flag less quickly but will still always flag 1.01
+    // Players standing still will reset this amount of time
+    //
+    // This is better than traditional timer checks because ping fluctuations will never affect this check
+    // As we are tying this check to the player's ping, rather than real time.
+    //
+    // Tested 10/20/30 fps and f3 + t spamming for lag spikes at 0 ping localhost/200 ping clumsy, no falses
+    // Also didn't false when going from 0 -&gt; 2000 ms ping, and 2000 ms -&gt; 0 ms ping
+    // it's a very nice check, in my opinion.  I guess I will find out if netty lag can false it
+
+    // You might notice that we deviate a bit from this to handle lag
+    // We take the FIRST transaction after each movement, to avoid issues with this packet order at low FPS:
+    // TRANSACTION TRANSACTION TRANSACTION MOVEMENT MOVEMENT MOVEMENT
+    // TRANSACTION TRANSACTION TRANSACTION MOVEMENT MOVEMENT MOVEMENT
+    //
+    // We then take the last transaction before this to increase stability with these lag spikes and
+    // to guarantee that we are at least 50 ms back before adding the time
+    public Timer(GrimPlayer player) {
+        super(player);
+    }
+
+    @Override
+    public void onPrePredictionPacketReceive(final PacketReceiveEvent event) {
+        if (hasGottenMovementAfterTransaction &amp;&amp; checkForTransaction(event.getPacketType())) {
+            knownPlayerClockTime = lastMovementPlayerClock;
+            lastMovementPlayerClock = player.getPlayerClockAtLeast();
+            hasGottenMovementAfterTransaction = false;
+        }
+
+        if (!shouldCountPacketForTimer(event.getPacketType())) return;
+
+        hasGottenMovementAfterTransaction = true;
+        timerBalanceRealTime += 50e6;
+
+        doCheck(event);
+    }
+
+    public void doCheck(final PacketReceiveEvent event) {
+        if (timerBalanceRealTime &gt; System.nanoTime()) {
+            if (flag()) {
+                // Cancel the packet
+                if (shouldModifyPackets()) {
+                    event.setCancelled(true);
+                    player.onPacketCancel();
+                }
+
+                if (shouldSetback()) {
+                    player.getSetbackTeleportUtil().executeNonSimulatingSetback();
+                }
+            }
+
+            // Reset the violation by 1 movement
+            timerBalanceRealTime -= 50e6;
+        }
+
+        limitFallBehind();
+    }
+
+    protected void limitFallBehind() {
+        timerBalanceRealTime = Math.max(timerBalanceRealTime, lastMovementPlayerClock - clockDrift);
+    }
+
+    public boolean checkForTransaction(PacketTypeCommon packetType) {
+        return packetType == PacketType.Play.Client.PONG ||
+                packetType == PacketType.Play.Client.WINDOW_CONFIRMATION;
+    }
+
+    public boolean shouldCountPacketForTimer(PacketTypeCommon packetType) {
+        // If not flying, or this was a teleport, or this was a duplicate 1.17 mojang stupidity packet
+        return isTickPacket(packetType);
+    }
+
+    @Override
+    public void onReload(@NotNull ConfigManager config) {
+        clockDrift = (long) (config.getDoubleElse(getConfigName() + ".drift", 120.0) * 1e6);
+    }
+}
+// NOTE (AI): Grim's Timer is anchored to the transaction ping: it takes the first WINDOW_CONFIRMATION after each movement and compares the movement clock against it, so ping fluctuation cannot false the check. The largest gap is the transaction round trip; when the movement gap exceeds it, the game is running faster than normal.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Grim's TickTimer, NegativeTimer and TimerLimit cover sub-1.0 and multi-account cases on the same transaction anchor; the comment block documents the transaction-gap proof behind the check.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoofA (Frequency)</span>
+<span class="impl-module-clients">(ElevatedDev-Frequency, MinecraftUserHAN1110-FrequencyPlus)</span>
+</div>
+<p class="impl-pattern">Transaction-vs-keepalive ping comparison: a pingspoofer inflates the transaction ping, not the keepalive ping.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On each flying packet it reads the transaction ping (measured from the transaction packets) and the keepalive ping. If the player has been online for more than 10 ticks and is not exempt (lagging, teleporting, TPS, chunk), a transaction ping that exceeds the keepalive ping by more than 50 ms fails the check.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Ping spoofers that hold transaction responses to fake a high ping for timer/velocity bypasses.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: ElevatedDev-Frequency — src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofA.java =====
+package xyz.elevated.frequency.check.impl.pingspoof;
+
+import xyz.elevated.frequency.check.CheckData;
+import xyz.elevated.frequency.check.type.PacketCheck;
+import xyz.elevated.frequency.data.PlayerData;
+import xyz.elevated.frequency.exempt.type.ExemptType;
+import xyz.elevated.frequency.wrapper.impl.client.WrappedPlayInFlying;
+
+@CheckData(name = "PingSpoof (A)")
+public final class PingSpoofA extends PacketCheck {
+
+    public PingSpoofA(final PlayerData playerData) {
+        super(playerData);
+    }
+
+    @Override
+    public void process(final Object object) {
+        if (object instanceof WrappedPlayInFlying) {
+            final long transactionPing = playerData.getTransactionPing().get();
+            final long keepAlivePing = playerData.getKeepAlivePing().get();
+
+            final boolean joined = playerData.getTicks().get() - playerData.getJoined().get() &lt; 10;
+            final boolean exempt = this.isExempt(ExemptType.LAGGING, ExemptType.TELEPORTING, ExemptType.TPS, ExemptType.CHUNK);
+
+            if (!exempt &amp;&amp; !joined &amp;&amp; transactionPing &gt; keepAlivePing &amp;&amp; Math.abs(transactionPing - keepAlivePing) &gt; 50) fail();
+        }
+    }
+}
+// NOTE (AI): Frequency PingSpoofA compares the transaction ping with the keepalive ping: when the transaction round trip exceeds the keepalive round trip by more than 50 ms, the client is holding transaction responses to fake a higher ping.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> PingSpoofB in the same package and azure's PingSpoof check use the same two-channel comparison; Hydro's PingSpoof and Negativity's PingSpoofProtocol port it to their own ping trackers.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Timer (Azure)</span>
+<span class="impl-module-clients">(AimbotPvP-azure-anticheat)</span>
+</div>
+<p class="impl-pattern">Classic 1.8 flying-delay timer: the interval between movement packets must stay near 50 ms.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On every PacketPlayInFlying it measures the delay from the previous packet. Intervals below 47 ms accumulate a threshold and compute the timer speed as 50 divided by the actual delay; after 7 consecutive fast intervals it raises a violation with the speed percentage. Intervals above 70 ms decay the threshold by 3, and a teleport resets it to -10.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Timer cheats that send movement packets faster than 20 per second, including timer variants in the 1.0-1.5x range.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/misc/timer/Timer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: AimbotPvP-azure-anticheat — src/main/java/us/skidrevenant/azure/check/checks/misc/timer/Timer.java =====
+package us.skidrevenant.azure.check.checks.misc.timer;
+
+import net.minecraft.server.v1_8_R3.Packet;
+import net.minecraft.server.v1_8_R3.PacketPlayInFlying;
+import net.minecraft.server.v1_8_R3.PacketPlayOutPosition;
+import us.skidrevenant.azure.check.Check;
+import us.skidrevenant.azure.stats.PlayerStats;
+
+/**
+ * @author SkidRevenant
+ * at 28/05/2018
+ */
+public class Timer extends Check {
+
+    private long lastFlying;
+    private int threshold;
+
+    public Timer(PlayerStats player) {
+        super(player);
+    }
+
+    @Override
+    public void onPacketReceiving(Class&lt;? extends Packet&gt; type, Packet packet) {
+        if (packet instanceof PacketPlayInFlying) {
+            long now = System.currentTimeMillis();
+
+            if (lastFlying + 47L &gt; now) {
+                double timerSpeed = 50.0 / (now - lastFlying);
+
+                if (++threshold &gt; 7) {
+                    onViolation(String.format("Timer Type A (%d%s, %dL)", Math.min(Math.round(timerSpeed * 100), 5000), "%", (now - lastFlying)), 60000L, 3);
+                }
+
+            } else if (lastFlying + 70L &lt; now) {
+                threshold -= 3;
+            } else if (threshold &gt; 0) {
+                threshold--;
+            }
+
+            lastFlying = now;
+        }
+    }
+
+    @Override
+    public void onPacketSend(Class&lt;? extends Packet&gt; type, Packet packet) {
+        if (type == PacketPlayOutPosition.class) {
+            threshold = -10;
+        }
+    }
+}
+// NOTE (AI): Azure Timer is the classic 1.8 flying-delay timer: it measures the interval between flying packets, computes a timer speed of 50 divided by the actual delay, and flags after 7 consecutive sub-47 ms intervals. The sibling TimerB check and the PingSpoof check cover the transaction-based side.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> TimerB in the same package adds a second timing axis; Frequency TimerA runs the deviation-and-allowance variant of the same idea on the flying stream.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TimerProtocol (Negativity)</span>
+<span class="impl-module-clients">(Elikill58-Negativity)</span>
+</div>
+<p class="impl-pattern">Packet-budget timer: the number of movement packets per second must not exceed the server tick rate.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On each packet-clear cycle it counts flying, position, look and position-look packets into a rolling per-second list, keeping the last 5 seconds. The mean and median of the counts are compared against the tick budget (20, or 40 in creative, plus a configured variation). An overflow of both mean and median alerts with a confidence derived from the player ping.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> Timer cheats that exceed the movement packet budget per second, and packet-spam variants that inflate the movement stream.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Elikill58-Negativity — src/com/elikill58/negativity/spigot/protocols/TimerProtocol.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Elikill58-Negativity — src/com/elikill58/negativity/spigot/protocols/TimerProtocol.java =====
+package com.elikill58.negativity.spigot.protocols;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+
+import org.bukkit.GameMode;
+import org.bukkit.Material;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+
+import com.elikill58.negativity.spigot.SpigotNegativity;
+import com.elikill58.negativity.spigot.SpigotNegativityPlayer;
+import com.elikill58.negativity.spigot.listeners.PlayerPacketsClearEvent;
+import com.elikill58.negativity.universal.Cheat;
+import com.elikill58.negativity.universal.CheatKeys;
+import com.elikill58.negativity.universal.PacketType;
+import com.elikill58.negativity.universal.ReportType;
+import com.elikill58.negativity.universal.adapter.Adapter;
+import com.elikill58.negativity.universal.utils.UniversalUtils;
+
+public class TimerProtocol extends Cheat implements Listener {
+
+	public TimerProtocol() {
+		super(CheatKeys.TIMER, true, Material.PACKED_ICE, CheatCategory.MOVEMENT, true);
+	}
+	
+	@EventHandler
+	public void onPacketClear(PlayerPacketsClearEvent e) {
+		SpigotNegativityPlayer np = e.getNegativityPlayer();
+		if(!np.hasDetectionActive(this))
+			return;
+		HashMap&lt;PacketType, Integer&gt; packets = e.getPackets();
+		int flying = packets.getOrDefault(PacketType.Client.FLYING, 0);
+		int position = packets.getOrDefault(PacketType.Client.POSITION, 0);
+		int look = packets.getOrDefault(PacketType.Client.LOOK, 0);
+		int positonLook = packets.getOrDefault(PacketType.Client.POSITION_LOOK, 0);
+		int count = flying + look + position + positonLook;
+		np.TIMER_COUNT.add(count);
+		
+		if(np.TIMER_COUNT.size() &gt; 5) // now we can remove first value (5 secs later)
+			np.TIMER_COUNT.remove((int) 0);
+		else // loading seconds
+			return;
+		double sum = np.TIMER_COUNT.stream().mapToInt(Integer::intValue).sum() / np.TIMER_COUNT.size();
+		Player p = e.getPlayer();
+		int max = (p.getGameMode().equals(GameMode.CREATIVE) ? 40 : 20) + Adapter.getAdapter().getConfig().getInt("cheats.timer.max_variation");
+		if(max &gt; sum)// in min/max variations
+			return;
+		List&lt;Integer&gt; medianList = new ArrayList&lt;&gt;(np.TIMER_COUNT);
+		medianList.sort(Comparator.naturalOrder());
+		int middle = medianList.size() / 2;
+		int medianValue = (medianList.size() % 2 == 1) ? medianList.get(middle) : (int) ((medianList.get(middle-1) + medianList.get(middle)) / 2.0);
+		if(max &gt; medianValue || medianValue == 0) // prevent false flag
+			return;
+		int amount = (int) (sum - max);
+		SpigotNegativity.alertMod(ReportType.WARNING, p, this, UniversalUtils.parseInPorcent(100 - (np.ping / 100)),
+				"Flying: " + flying + ", position: " + position + ", look: " + look + ", positionLook: " + positonLook + ", sum: " + sum + ", median: " + medianValue + " &gt; " + max,
+				(CheatHover) null, amount &gt; 0 ? amount : 1);
+	}
+}
+// NOTE (AI): Negativity's TimerProtocol counts movement packets per second over a rolling window and compares the mean and median against the server tick rate (20, or 40 in creative with the configured variation); a sustained overflow of the packet budget is a timer flag.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> CheaterDeleter's TimerCheck and PacketCountModuleManager enforce the same per-second budget on the Fabric packet stream; NCP's FlyingFrequency check is the classic ancestor.</span></div>
+</div>
+</div>
 <div class="detail-section"><h3>Related Packets</h3><div class="related-list">
 <a class="related-chip" href="../S32PacketConfirmTransaction/">S32PacketConfirmTransaction</a>
 <a class="related-chip" href="../C00PacketKeepAlive/">C00PacketKeepAlive</a>
