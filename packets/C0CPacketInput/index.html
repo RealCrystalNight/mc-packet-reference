@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C0CPacketInput (0x0C): Player steers a vehicle (boat or horse). Sends sideways/forward movement, jump flag, and unmount flag.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="BoatFly, HorseJump, VehicleSpeed">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Disabler, VehicleDisabler / InputDisabler / GhostlyDisabler, Fly">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C0CPacketInput — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C0CPacketInput — Minecraft 1.8.9 Packet Reference","description":"The vehicle input packet. No client in the corpus uses C0C for direct BoatFly-style speed; every real use is a disabler injecting empty or extreme C0C values to corrupt server-side input state, plus Spicy cancelling it and Nekoware pairing it with fall packets in Fly.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -75,41 +75,358 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Sent every tick while riding a vehicle. Rise 6.0 uses C0CPacketInput in its Disabler module for three different modes: VehicleDisabler (send empty C0C on pre-motion), InputDisabler (send C0C with fix- ed values on strafe), and GhostlyDisabler (send C0C alongside C03 movement). The empty constructor C0CPacketInput() defaults to (0,0,false,false) which freezes the boat.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>The vehicle steering packet. Every tick while the player rides a boat, horse or pig, EntityPlayerSP.onUpdateWalkingPlayer sends C0CPacketInput with strafeSpeed (moveStrafing), forwardSpeed (moveForward), the jump flag and the sneak/unmount flag. The server applies these to the ridden entity via setEntityActionState, which drives boat paddling, horse jump charging and pig steering. The empty constructor used by every module in the corpus defaults to (0.0F, 0.0F, false, false): a request to stop all input.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayServer.processInput calls playerEntity.setEntityActionState(strafeSpeed, forwardSpeed, isJumping, isSneaking) with no validation on the floats. The values feed the ridden entity on the next tick: forward and sideways map to boat rowing velocity and pig steering angle, the jump flag charges a horse jump. Because the floats are applied directly, absurd magnitudes propagate straight into vehicle motion.</p>
+<h4>Why clients touch it</h4>
+<p>Every real use in the 8 clients is disabler-side. Memeware's AACv1.9.10 and Ghostly modes inject an empty C0C before each C03PacketPlayer; Nekoware's Ghostly mode sends one every 10 ticks; Rise 5.99's Disabler sends empty C0C (verusOld, ghostly), (0.98F, 0.0F, false, false) (coc) and (Float.MAX_VALUE, Float.MAX_VALUE, false, false) (funnyCraft); Spicy's Disabler cancels C0C outright. Rise 6.x splits the pattern into VehicleDisabler, InputDisabler and GhostlyDisabler modes. Nekoware's Fly Damage mode sends empty C0C before its fall packets.</p>
+<h4>Exploit surface</h4>
+<p>The server applies input floats without clamping, so extreme values distort vehicle physics and desync the server's vehicle state from the player's C03 position stream, which movement anti-cheats then flag. An empty C0C freezes the boat server-side while the client moves freely, the classic BoatFly primitive. Cancelling C0C (Spicy) makes the server keep the player's input stale, which some anti-cheat versions read as a mounted state inconsistent with C03 movement.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processInput forwards the four fields verbatim into setEntityActionState; EntityPlayer feeds them to the ridden entity each tick. Boat motion is rowing ticks derived from forward input, horse jump is a charged power from the jump flag hold, and the sneak flag dismounts. There is no clamp, no rate limit, and no check that the player is actually riding.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Four fields: two floats (strafe, forward), two booleans (jump, sneak/unmount). Sent once per tick while ridingEntity is non-null; vanilla sends it even when all inputs are zero. The default constructor (0, 0, false, false) is the module workhorse, injected as a stop-input reset. Float.MAX_VALUE pairs decode normally and are applied unclamped. Wire order: strafe, forward, jump, sneak.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Vehicle checks compare C0C input against the motion the server applies to the boat or horse and against the player's C03 position stream. Float.MAX_VALUE input alongside normal C03 movement is a classic desync flag; empty C0C spam is low risk because zero input is legitimate when standing still in a boat. NCP-era disablers used the empty-C0C reset to clear vehicle and water checks right before each C03.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BoatFly</span>
-<span class="impl-module-clients">(Monsoon 3.0-A6, Tenacity 6.0)</span>
+<p class="impl-pattern">The vehicle input packet. No client in the corpus uses C0C for direct BoatFly-style speed; every real use is a disabler injecting empty or extreme C0C values to corrupt server-side input state, plus Spicy cancelling it and Nekoware pairing it with fall packets in Fly.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99, Spicy)</span>
 </div>
-<p class="impl-pattern">Spoof vehicle input values (sideways, forward, jump/unmount flags) for vehicle speed hacks.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof C0CPacketInput) {
-  C0CPacketInput c0c = (C0CPacketInput) event.getPacket();
-  // modify sideways/forward for speed
-  c0c.forward = 1.0f; // max forward
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Break anti-cheat vehicle and input-state heuristics by cancelling C0C or injecting synthetic input packets.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Mode-dependent. Spicy cancels every outgoing C0C in EventSendPacket pre. Memeware AACv1.9.10 sends an empty C0C before each C03 (with y bumped by 7.0E-9D to reset critical checks) and Ghostly sends one before each C03. Nekoware Ghostly sends empty C0C every 10 ticks from a packet-in event. Rise 5.99 sends empty C0C in verusOld and ghostly modes, (0.98F, 0.0F, false, false) in coc, and the Float.MAX_VALUE pair in funnyCraft.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy — info/spicyclient/modules/player/Disabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/player/Disabler.java =====
+package info.spicyclient.modules.player;
+
+import java.util.ArrayList;
+import java.util.Random;
+
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.SpicyClient;
+import info.spicyclient.chatCommands.Command;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventPacket;
+import info.spicyclient.events.listeners.EventSendPacket;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.notifications.Color;
+import info.spicyclient.notifications.NotificationManager;
+import info.spicyclient.notifications.Type;
+import info.spicyclient.util.MovementUtils;
+import info.spicyclient.util.Timer;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.Packet;
+import net.minecraft.network.handshake.client.C00Handshake;
+import net.minecraft.network.login.server.S00PacketDisconnect;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0CPacketInput;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C13PacketPlayerAbilities;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
+
+public class Disabler extends Module {
+	public Disabler() {
+		super("Disabler", Keyboard.KEY_NONE, Category.PLAYER);
+	}
+	
+	public static transient boolean watchdog = false;
+	public static transient ArrayList&lt;C0FPacketConfirmTransaction&gt; C0FPackets = new ArrayList&lt;C0FPacketConfirmTransaction&gt;();
+	public static transient Timer ping = new Timer();
+	
+	@Override
+	public void onEnable() {
+		NotificationManager.getNotificationManager().createNotification("Relog for the disabler to take effect", "", true, 5000, Type.INFO, Color.PINK);
+		watchdog = false;
+	}
+	
+	@Override
+	public void onDisable() {
+		watchdog = false;
+		
+		for (C0FPacketConfirmTransaction p : C0FPackets) {
+			
+			mc.getNetHandler().getNetworkManager().sendPacketNoEvent(p);
+			
+		}
+		
+		C0FPackets.clear();
+		
+	}
+	
+	@Override
+	public void onEvent(Event e) {
+		
+		if (e instanceof EventUpdate &amp;&amp; e.isPre()) {
+			
+			this.additionalInformation = "Hypixel";
+			
+            PlayerCapabilities playerCapabilities = new PlayerCapabilities();
+            playerCapabilities.isFlying = true;
+            playerCapabilities.allowFlying = true;
+            //playerCapabilities.setFlySpeed((float) ((Math.random() * (9.0 - 0.1)) + 0.1));
+            playerCapabilities.setFlySpeed((float) ((Math.random() * (9.0 - 0.1)) + 0.1));
+            playerCapabilities.isCreativeMode = true;
+            mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C13PacketPlayerAbilities(playerCapabilities));
+            
+            // Added this
+            if (SpicyClient.config.fly.isEnabled()) {
+            	mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C13PacketPlayerAbilities(playerCapabilities));
+            }
+            
+            if (ping.hasTimeElapsed(500 + (new Random()).nextInt(750), true) &amp;&amp; C0FPackets.size() &gt; 0) {
+            	mc.getNetHandler().getNetworkManager().sendPacketNoEvent(C0FPackets.get(0));
+            	C0FPackets.remove(0);
+            }
+            
+		}
+		
+		if (e instanceof EventPacket &amp;&amp; e.isPre()) {
+			
+			if (((EventPacket)e).packet instanceof S00PacketDisconnect) {
+				C0FPackets.clear();
+			}
+			
+		}
+		
+		if (e instanceof EventSendPacket &amp;&amp; e.isPre()) {
+			
+			EventSendPacket event = (EventSendPacket) e;
+			
+			if (event.packet instanceof C00Handshake) {
+				C0FPackets.clear();
+			}
+			
+            if (event.packet instanceof C0FPacketConfirmTransaction) {
+            	
+                C0FPacketConfirmTransaction packetConfirmTransaction = (C0FPacketConfirmTransaction)event.packet;
+                
+                //mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C0FPacketConfirmTransaction(2147483647, packetConfirmTransaction.getUid(), false));
+                //mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C0FPacketConfirmTransaction(1147483647, packetConfirmTransaction.getUid(), false));
+                
+                
+                //packetConfirmTransaction.setAccepted(new Random().nextBoolean());
+                //packetConfirmTransaction.setWindowId(Integer.MIN_VALUE + new Random().nextInt(1000));
+                //packetConfirmTransaction.setUid(Short.MAX_VALUE);
+            	//mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C0FPacketConfirmTransaction(Integer.MIN_VALUE, Short.MAX_VALUE, true));
+                
+                C0FPackets.add(packetConfirmTransaction);
+                e.setCanceled(true);
+            }
+
+            if (event.packet instanceof C00PacketKeepAlive) {
+            	
+            	//mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C00PacketKeepAlive(-2147483648 + (new Random()).nextInt(100)));
+                //e.setCanceled(true);
+                
+            }
+            
+			if (event.packet instanceof C0CPacketInput) {
+				e.setCanceled(true);
+			}
+            
+		}
+		
+	}
+	
+}
+// NOTE (AI): Spicy is the cancel variant: C0C never reaches the server, so the server's input state for the player stays stale. Memeware, Nekoware and Rise 5.99 do the opposite, injecting empty or extreme C0C values, which shows the two sides of the same disabler idea.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (pre) for the cancel; UpdateEvent and packet events for injection in the other clients.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancelling C0C is invisible per packet (the packet just never exists) but changes the server's mounted-input state; extreme-value injection is visible in the floats and flags on anti-cheats that validate input magnitude.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware injects via PacketUtil.sendPacketSilent, Nekoware via addToSendQueue, Rise 5.99 via PacketUtil.sendPacketWithoutEvent. Rise 5.99's ghostly mode also rounds the C03 y to the 0.015625 grid and forces onGround true after the C0C send.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">HorseJump</span>
-<span class="impl-module-clients">(Monsoon 3.0-A6, Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">VehicleDisabler / InputDisabler / GhostlyDisabler</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Spoof vehicle input values (sideways, forward, jump/unmount flags) for vehicle speed hacks.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof C0CPacketInput) {
-  C0CPacketInput c0c = (C0CPacketInput) event.getPacket();
-  // modify sideways/forward for speed
-  c0c.forward = 1.0f; // max forward
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Rise 6.x disabler suite, three modes that each abuse C0C differently to keep server-side input state consistent with spoofed movement.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">VehicleDisabler sends an empty C0C on every PreMotionEvent, resetting any vehicle-input expectation. InputDisabler sends (0.98f, 0, true, true) on StrafeEvent, feeding a fixed strafe with jump and sneak set. GhostlyDisabler sends an empty C0C immediately before rewriting the outgoing C03: y rounded to the 0.015625 grid and onGround forced true.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/VehicleDisabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/VehicleDisabler.java =====
+package com.alan.clients.module.impl.exploit.disabler;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.module.impl.exploit.Disabler;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.value.Mode;
+import net.minecraft.network.play.client.C0CPacketInput;
+
+public class VehicleDisabler extends Mode&lt;Disabler&gt; {
+
+    public VehicleDisabler(String name, Disabler parent) {
+        super(name, parent);
+    }
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        PacketUtil.send(new C0CPacketInput());
+    };
+}
+// NOTE (AI): VehicleDisabler is the minimal form: one empty C0C per pre-motion. InputDisabler and GhostlyDisabler (both under 45 lines) extend the same idea on StrafeEvent and PacketSendEvent respectively.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreMotionEvent, StrafeEvent, PacketSendEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The empty and fixed-value sends are stealthy because they are valid packet shapes; the Ghostly C03 rewrite (grid y, forced ground) is the part anti-cheats can measure.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical files in 6.1.30 and 6.2.4. Rise 6.1.30 and 6.2.4 also expose C0C to scripts via PacketAPI.sendInput(strafeSpeed, forwardSpeed, jumping, sneaking), and PingSpoofComponent lists C0C in its blink tuple so blink windows hold input packets too.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">VehicleSpeed</span>
-<span class="impl-module-clients">(Monsoon 3.0-A6, Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Fly</span>
+<span class="impl-module-clients">(Nekoware v1 private)</span>
 </div>
-<p class="impl-pattern">Spoof vehicle input values (sideways, forward, jump/unmount flags) for vehicle speed hacks.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof C0CPacketInput) {
-  C0CPacketInput c0c = (C0CPacketInput) event.getPacket();
-  // modify sideways/forward for speed
-  c0c.forward = 1.0f; // max forward
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Reset server-side input state during the damage-based fly sequence so the fall packets read as stationary input.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Damage mode sends an empty C0C followed by C03PacketPlayer(true) on every pre-update, after the enable-time fall sequence (C04 up 3.05, back down, up 0.41999998688697815 on ground). The C0C pins the server's input state to zero while the position packets move the player.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Nekoware v1 private — me/nekoWare/client/module/movement/Fly.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Nekoware v1 private — me/nekoWare/client/module/movement/Fly.java =====
+package me.nekoWare.client.module.movement;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.nekoWare.client.event.events.EventCollide;
+import me.nekoWare.client.event.events.MovementEvent;
+import me.nekoWare.client.event.events.PacketOutEvent;
+import me.nekoWare.client.event.events.UpdateEvent;
+import me.nekoWare.client.module.Module;
+import me.nekoWare.client.util.blocks.misc.BlockUtil;
+import me.nekoWare.client.util.misc.Timer;
+import me.nekoWare.client.util.movement.MovementUtils;
+import me.nekoWare.client.util.packet.PacketUtil;
+import net.minecraft.init.Blocks;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C09PacketHeldItemChange;
+import net.minecraft.network.play.client.C0CPacketInput;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C18PacketSpectate;
+import net.minecraft.util.AxisAlignedBB;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.MovementInput;
+import org.apache.commons.lang3.RandomUtils;
+
+import java.util.function.Consumer;
+
+public class Fly extends Module {
+
+    private Timer timer = new Timer();
+
+    private double y;
+
+    public Fly() {
+        super("Fly", 34, Module.Category.MOVEMENT);
+        this.addDouble("Speed", 2.5, 0.1, 5.0);
+        this.addModes("Vanilla", "Damage", "Verus");
+        this.addBoolean("Anti-Kick", false);
+    }
+
+    @Handler
+    public Consumer&lt;MovementEvent&gt; eventConsumer0 = event -&gt; {
+
+    };
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer1 = (event) -&gt; {
+
+        if (isMode("Vanilla")) {
+            mc.timer.timerSpeed = 1f;
+            if (event.isPre()) {
+                float speed = getDouble("Speed").floatValue();
+                MovementInput movementInput = mc.thePlayer.movementInput;
+                mc.thePlayer.motionY = movementInput.isJumping() ? speed * 0.5F
+                        : movementInput.isSneaking() ? -speed * 0.5F
+                        : 0.0F;
+                MovementUtils.setMoveSpeed(speed);
+                if (getBool("Anti-Kick") &amp;&amp; timer.delay(700.0f)) {
+                    MovementUtils.fallPacket();
+                    MovementUtils.ascendPacket();
+                    timer.reset();
+                }
+            }
+        }
+        
+        if (isMode("Damage")) {
+        	
+        	
+            mc.timer.timerSpeed = 1f;
+			if (event.isPre()) {
+				mc.thePlayer.sendQueue.addToSendQueue(new C0CPacketInput());
+				mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer(true));
+				mc.thePlayer.onGround = false;
+				float speed = getDouble("Speed").floatValue();
+				MovementInput movementInput = mc.thePlayer.movementInput;
+				mc.thePlayer.motionY = movementInput.isJumping() ? speed * 0.5F
+						: movementInput.isSneaking() ? -speed * 0.5F : 0.0F;
+				MovementUtils.setMoveSpeed(speed);
+			}
+        }
+        
+        if (isMode("Verus")) {
+        	
+
+        	mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1.5, mc.thePlayer.posZ), 1, new ItemStack(Blocks.stone.getItem(mc.theWorld, new BlockPos(-1, -1, -1))), 0, 0.94f, 0));
+            MovementUtils.setMoveSpeed(0.36);
+            mc.timer.timerSpeed = 1f;
+
+
+
+            if (y &gt;= 11) {
+                y = 0;
+            }
+
+            y++;
+
+    mc.thePlayer.motionY = 0f;
+        }
+    };
+
+    @Handler
+    public Consumer&lt;PacketOutEvent&gt; eventConsumer11 = (event) -&gt; {
+        if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
+            event.cancel();
+
+            timer.reset();
+        }
+        
+        if (event.getPacket() instanceof C00PacketKeepAlive) {
+            event.cancel();
+
+            timer.reset();
+        }
+    };
+
+    @Override
+    public void onEnable() {
+if(this.isMode("Damage")) {
+    	mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX,
+				mc.thePlayer.posY + 3.05, mc.thePlayer.posZ, false));
+		mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX,
+				mc.thePlayer.posY, mc.thePlayer.posZ, false));
+		mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX,
+				mc.thePlayer.posY + 0.41999998688697815, mc.thePlayer.posZ, true));
+		mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY + 0.5, mc.thePlayer.posZ);
+		}
+    }
+
+    @Override
+    public void onDisable() {
+
+    	MovementUtils.setMoveSpeed(0);
+    	
+    }
+}
+// NOTE (AI): The C0C sits directly before the C03(true) in the Damage mode loop. The same file cancels C00 keepalive and C0F transaction as collateral, so this is the full disabler-style packet diet inside a movement module.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent pre phase.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Empty C0C is legitimate input; the flag surface is the vertical teleport sequence itself, not the input packet.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus for this pattern; Nekoware's Disabler also sends empty C0C in its Ghostly mode, and Memeware's Disabler covers the same ground.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent / EventSendPacket for cancels, UpdateEvent and packet events for injection. Rise 6.x also references C0C inside PingSpoofComponent's blink class list and PacketAPI's script-facing sendInput helper.</div>
+<div class="impl-clients">Memeware and Nekoware inject through PacketUtil.sendPacketSilent or addToSendQueue; Rise 5.99 uses PacketUtil.sendPacketWithoutEvent; Rise 6.x uses PacketUtil.send and sendNoEvent; Spicy cancels via event.setCanceled(true). Tenacity's AdvancedDisablerModule references C0C only in commented-out code, and its PacketUtil counts C0C among packet types that bypass the send queue.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C03PacketPlayer/">C03PacketPlayer</a>
+<a class="related-chip" href="../C0BPacketEntityAction/">C0BPacketEntityAction</a>
+<a class="related-chip" href="../S0EPacketSpawnObject/">S0EPacketSpawnObject</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

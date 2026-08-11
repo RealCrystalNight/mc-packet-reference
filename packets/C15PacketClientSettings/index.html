@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C15PacketClientSettings (0x15): Client sends its locale, view distance, chat mode, chat colors, difficulty preference, and cape visibility.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ServerCrasher, LocalSpoof">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="PingSpoofComponent (blink hold), PacketAPI (script bridge)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C15PacketClientSettings — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C15PacketClientSettings — Minecraft 1.8.9 Packet Reference","description":"The settings declaration packet. No locale-spoof module exists in the 8 clients; C15 shows up only inside Rise 6.x's blink-hold component and the script PacketAPI, plus dead imports in Spicy Bhop.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -79,18 +79,304 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Sent by vanilla client every time settings change. The server stores locale for player language detection. View distance affects how many chunks the server sends. Rise 6.0 ClientSpoofer sends spoofed C15 to change the locale string for server-side language detection bypass and to set a fake view distance.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C15 declares client preferences: locale string, render distance byte, chat visibility enum, chat colors flag and a model-part bitmask. Vanilla re-sends it from GameSettings whenever any of those settings change, and the server stores the values on the player. It is the only serverbound packet that carries the client's locale, which makes it the hook for server-side language detection.</p>
+<h4>Vanilla handling</h4>
+<p>processClientSettings delegates to EntityPlayerMP.handleClientSettings, which stores translator (locale), chatVisibility and chatColours on the player and pushes the model-part flags into DataWatcher slot 10. The render distance byte is parsed but not stored by the bundled 1.8.9 handler; chunk streaming distance stays server-configured. The locale is what language-detection plugins read.</p>
+<h4>Why clients touch it</h4>
+<p>None of the 8 clients ships a locale-spoof module; the corpus hits are indirect. Rise 6.x PingSpoofComponent lists C15 in its blink tuple so settings packets are held and replayed during blink spoofs, and the script PacketAPI exposes sendSettings(). Spicy's Bhop imports C15 without using it. Clients known to cancel C15 for locale bypasses exist outside this corpus.</p>
+<h4>Exploit surface</h4>
+<p>The packet is informational and server-validated trivially, so abuse is limited to two corners: re-sending it to reset the server's stored locale after a language change (defeating per-locale chat filters), and the blink interaction, where holding C15 for the blink window freezes the server's view of client settings. The model-part bitmask is the only field that reaches other players (via DataWatcher), so a corrupted mask is the only client-visible side effect.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processClientSettings -&gt; EntityPlayerMP.handleClientSettings: stores locale, chat visibility and colors; model-part flags go to DataWatcher slot 10 (broadcast to other players). Render distance is parsed and discarded in the bundled 1.8.9 sources. No validation beyond String length.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>String locale + byte viewDistance + byte chatVisibility enum + bool colors + byte modelPartFlags (bitmask for cape/jacket/sleeves/pants/hat). Re-sent on every settings change, so a settings GUI session naturally emits several. The locale is a plain String and is never matched against a known list.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>No anti-cheat measures C15. Language-detection and anti-spam plugins key off the locale string; spoofing it changes plugin behavior, not server physics. The blink-hold interaction matters to anti-cheats only insofar as the same component also holds C03 and C0F packets, which is where the actual detection signal lives.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ServerCrasher</span>
+<p class="impl-pattern">The settings declaration packet. No locale-spoof module exists in the 8 clients; C15 shows up only inside Rise 6.x's blink-hold component and the script PacketAPI, plus dead imports in Spicy Bhop.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoofComponent (blink hold)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Send fake locale/view distance settings. Can be part of server crash exploits.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Hold C15 (with C13, C17, C18, C19 and movement packets) while the client blinks, then replay it in order.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">C15 is in the blink class tuple. When blink() enables the regular and blink tuples, onPacket cancels matching packets and parks them with a timestamp; PostMotionEvent replays entries whose delay elapsed and dispatch() flushes the rest on world change.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/PingSpoofComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/PingSpoofComponent.java =====
+package com.alan.clients.component.impl.player;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.CancellableEvent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PostMotionEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.util.packet.PacketUtil;
+import net.minecraft.client.gui.GuiDownloadTerrain;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.Tuple;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+public final class PingSpoofComponent extends Component {
+    public static ConcurrentLinkedQueue&lt;PacketUtil.TimedPacket&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+    static StopWatch enabledTimer = new StopWatch();
+    public static boolean enabled;
+    static long amount;
+    static Tuple&lt;Class[], Boolean&gt; regular = new Tuple&lt;&gt;(new Class[]{C0FPacketConfirmTransaction.class, C00PacketKeepAlive.class, S1CPacketEntityMetadata.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; velocity = new Tuple&lt;&gt;(new Class[]{S12PacketEntityVelocity.class, S27PacketExplosion.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; teleports = new Tuple&lt;&gt;(new Class[]{S08PacketPlayerPosLook.class, S39PacketPlayerAbilities.class, S09PacketHeldItemChange.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; players = new Tuple&lt;&gt;(new Class[]{S13PacketDestroyEntities.class, S14PacketEntity.class, S14PacketEntity.S16PacketEntityLook.class, S14PacketEntity.S15PacketEntityRelMove.class, S14PacketEntity.S17PacketEntityLookMove.class, S18PacketEntityTeleport.class, S20PacketEntityProperties.class, S19PacketEntityHeadLook.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; blink = new Tuple&lt;&gt;(new Class[]{C02PacketUseEntity.class, C0DPacketCloseWindow.class, C0EPacketClickWindow.class, C0CPacketInput.class, C0BPacketEntityAction.class, C08PacketPlayerBlockPlacement.class, C07PacketPlayerDigging.class, C09PacketHeldItemChange.class, C13PacketPlayerAbilities.class, C15PacketClientSettings.class, C16PacketClientStatus.class, C17PacketCustomPayload.class, C18PacketSpectate.class, C19PacketResourcePackStatus.class, C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class, C0APacketAnimation.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; movement = new Tuple&lt;&gt;(new Class[]{C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class}, false);
+
+    public static Tuple&lt;Class[], Boolean&gt;[] types = new Tuple[]{regular, velocity, teleports, players, blink, movement};
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; send = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; receive = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    public CancellableEvent onPacket(Packet&lt;?&gt; packet, CancellableEvent event) {
+        if (!event.isCancelled() &amp;&amp; enabled &amp;&amp; Arrays.stream(types).anyMatch(tuple -&gt; tuple.getSecond() &amp;&amp; Arrays.stream(tuple.getFirst()).anyMatch(regularpacket -&gt; regularpacket == packet.getClass()))) {
+            event.setCancelled();
+            packets.add(new PacketUtil.TimedPacket(packet));
+        }
+
+        return event;
+    }
+
+    public static void dispatch() {
+        if (!packets.isEmpty()) {
+            // Stops the packets from being called twice
+            boolean enabled = PingSpoofComponent.enabled;
+            PingSpoofComponent.enabled = false;
+            packets.forEach(timedPacket -&gt; PacketUtil.queue(timedPacket.getPacket()));
+            PingSpoofComponent.enabled = enabled;
+            packets.clear();
+        }
+    }
+
+    public static void disable() {
+        enabled = false;
+        enabledTimer.setMillis(enabledTimer.millis - 999999999);
+    }
+
+    @EventLink
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; dispatch();
+
+    @EventLink
+    public final Listener&lt;PostMotionEvent&gt; onPostMotion = event -&gt; {
+        if (!(enabled = !enabledTimer.finished(100) &amp;&amp; !(mc.currentScreen instanceof GuiDownloadTerrain))) {
+            dispatch();
+        } else {
+            // Stops the packets from being called twice
+            enabled = false;
+
+            packets.forEach(packet -&gt; {
+                if (packet.getTime() + amount &lt; System.currentTimeMillis()) {
+                    PacketUtil.queue(packet.getPacket());
+                    packets.remove(packet);
+                }
+            });
+
+            enabled = true;
+        }
+    };
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players) {
+        spoof(amount, regular, velocity, teleports, players, false);
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink, boolean movement) {
+        enabledTimer.reset();
+
+        PingSpoofComponent.regular.setSecond(regular);
+        PingSpoofComponent.velocity.setSecond(velocity);
+        PingSpoofComponent.teleports.setSecond(teleports);
+        PingSpoofComponent.players.setSecond(players);
+        PingSpoofComponent.blink.setSecond(blink);
+        PingSpoofComponent.movement.setSecond(movement);
+        PingSpoofComponent.amount = amount;
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink) {
+        spoof(amount, regular, velocity, teleports, players, blink, false);
+    }
+
+    public static void blink() {
+        spoof(9999999, true, false, false, false, true);
+    }
+}
+// NOTE (AI): PingSpoofComponent is the Rise 6.x packet-hold engine. C15 sits in the 'blink' tuple, one of six packet class lists. The tuples' boolean flags are flipped by spoof(amount, regular, velocity, teleports, players, blink, movement); blink() calls spoof(9999999, true, false, false, false, true), so during a blink every packet in the regular and blink tuples, C15 included, is cancelled and parked in the timed queue, then replayed by dispatch() or the PostMotionEvent flush when the hold window elapses. C13, C17, C18 and C19 share the same tuple, which is why this component reappears on their impl pages.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent, PacketReceiveEvent, PostMotionEvent, WorldChangeEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Holding C15 is invisible; the component's value is holding C0F/C00/C03 together so the server sees a consistent, delayed stream. The blink window is what movement anti-cheats measure.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical component in Rise 6.1.30.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">LocalSpoof</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PacketAPI (script bridge)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Send fake locale/view distance settings. Can be part of server crash exploits.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Expose a settings re-declaration to the scripting layer.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">sendSettings() constructs a default C15PacketClientSettings and sends it via PacketUtil.send.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/script/api/PacketAPI.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/script/api/PacketAPI.java =====
+package com.alan.clients.script.api;
+
+import com.alan.clients.Client;
+import com.alan.clients.component.impl.player.Slot;
+import com.alan.clients.script.api.wrapper.impl.ScriptEntity;
+import com.alan.clients.script.api.wrapper.impl.ScriptItemStack;
+import com.alan.clients.script.api.wrapper.impl.vector.ScriptVector3d;
+import com.alan.clients.util.packet.PacketUtil;
+import net.minecraft.client.Minecraft;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.play.client.*;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.Vec3;
+
+public class PacketAPI extends API {
+
+    public void sendKeepAlive(final int key) {
+        PacketUtil.send(new C00PacketKeepAlive(key));
+    }
+
+    public void sendMessage(final String message) {
+        PacketUtil.send(new C01PacketChatMessage(message));
+    }
+
+    public void sendUseEntity(final ScriptEntity entity, final String action) {
+        sendUseEntity(entity.getEntityId(), action);
+    }
+
+    public void sendUseEntity(final int entityID, final String action) {
+        PacketUtil.send(new C02PacketUseEntity(Minecraft.getMinecraft().theWorld.getEntityByID(entityID),
+                C02PacketUseEntity.Action.valueOf(action)));
+    }
+
+    public void sendUseEntity(final int entityID, ScriptVector3d vector) {
+        PacketUtil.send(new C02PacketUseEntity(Minecraft.getMinecraft().theWorld.getEntityByID(entityID),
+                new Vec3(vector.getX(), vector.getY(), vector.getZ())));
+    }
+
+    public void sendUseEntity(final ScriptEntity entity, ScriptVector3d vector) {
+        sendUseEntity(entity.getEntityId(), vector);
+    }
+
+    public void sendPosition(boolean ground) {
+        PacketUtil.send(new C03PacketPlayer(ground));
+    }
+
+    public void sendPosition(double x, double y, double z, boolean ground) {
+        PacketUtil.send(new C03PacketPlayer.C04PacketPlayerPosition(x, y, z, ground));
+    }
+
+    public void sendPosition(double x, double y, double z, float yaw, float pitch, boolean ground) {
+        PacketUtil.send(new C03PacketPlayer.C06PacketPlayerPosLook(x, y, z, yaw, pitch, ground));
+    }
+
+    public void sendDigging(String status, ScriptVector3d vector3d, String facing) {
+        PacketUtil.send(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.valueOf(status),
+                new BlockPos(vector3d.getX(), vector3d.getY(), vector3d.getZ()), EnumFacing.valueOf(facing)));
+    }
+
+    public void sendPlacement() {
+        PacketUtil.send(new C08PacketPlayerBlockPlacement(Client.INSTANCE.getComponentManager().get(Slot.class).getItemStack()));
+    }
+
+    public void sendPlacement(ScriptVector3d vector3d, int direction, float x, float y, float z) {
+        PacketUtil.send(new C08PacketPlayerBlockPlacement(new BlockPos(vector3d.getX(), vector3d.getY(), vector3d.getZ()),
+                direction, Client.INSTANCE.getComponentManager().get(Slot.class).getItemStack(), x, y, z));
+    }
+
+    public void sendPlacement(ScriptVector3d vector3d, int direction, ScriptItemStack itemStack, float x, float y, float z) {
+        PacketUtil.send(new C08PacketPlayerBlockPlacement(new BlockPos(vector3d.getX(), vector3d.getY(), vector3d.getZ()),
+                direction, itemStack.getWrapped(), x, y, z));
+    }
+
+    public void sendChangeItem(int slot) {
+        PacketUtil.send(new C09PacketHeldItemChange(slot));
+    }
+
+    public void sendAnimation(int entityID, String animation) {
+        PacketUtil.send(new C0APacketAnimation());
+    }
+
+    public void sendEntityAction(int entityID, String action) {
+        PacketUtil.send(new C0BPacketEntityAction(Minecraft.getMinecraft().theWorld.getEntityByID(entityID),
+                C0BPacketEntityAction.Action.valueOf(action)));
+    }
+
+    public void sendInput(final float strafeSpeed, final float forwardSpeed, final boolean jumping, final boolean sneaking) {
+        PacketUtil.send(new C0CPacketInput(strafeSpeed, forwardSpeed, jumping, sneaking));
+    }
+
+    public void sendCloseWindow(int windowId) {
+        PacketUtil.send(new C0DPacketCloseWindow(windowId));
+    }
+
+    public void sendCloseWindow() {
+        PacketUtil.send(new C0DPacketCloseWindow(Minecraft.getMinecraft().thePlayer.openContainer.windowId));
+    }
+
+    public void sendEnchantItem(int windowId, int enchantment) {
+        PacketUtil.send(new C11PacketEnchantItem(windowId, enchantment));
+    }
+
+    public void sendEnchantItem(int enchantment) {
+        PacketUtil.send(new C11PacketEnchantItem(Minecraft.getMinecraft().thePlayer.openContainer.windowId, enchantment));
+    }
+
+    public void sendTransaction(int windowId, short actionNumber, boolean accepted) {
+        PacketUtil.send(new C0FPacketConfirmTransaction(windowId, actionNumber, accepted));
+    }
+
+    public void sendAbilities() {
+        PacketUtil.send(new C13PacketPlayerAbilities(Minecraft.getMinecraft().thePlayer.capabilities));
+    }
+
+    public void sendAbilities(boolean flying, boolean allowFlying, boolean creativeMode) {
+        PlayerCapabilities capabilities = new PlayerCapabilities();
+        capabilities.isFlying = flying;
+        capabilities.allowFlying = allowFlying;
+        capabilities.isCreativeMode = creativeMode;
+        PacketUtil.send(new C13PacketPlayerAbilities(capabilities));
+    }
+
+    public void sendTabComplete(String message) {
+        PacketUtil.send(new C14PacketTabComplete(message));
+    }
+
+    public void sendTabComplete(String message, ScriptVector3d vector3d) {
+        PacketUtil.send(new C14PacketTabComplete(message, new BlockPos(vector3d.getX(), vector3d.getY(), vector3d.getZ())));
+    }
+
+    public void sendStatus(String status) {
+        PacketUtil.send(new C16PacketClientStatus(C16PacketClientStatus.EnumState.valueOf(status)));
+    }
+
+    public void sendSettings() {
+        PacketUtil.send(new C15PacketClientSettings());
+    }
+}
+// NOTE (AI): sendSettings() builds a default C15PacketClientSettings and pushes it through PacketUtil.send. The no-arg constructor leaves the fields at vanilla defaults (locale en_US, view distance and chat settings from the packet's field initializers), so the call is a settings re-declaration rather than a spoof.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> No event hook; direct PacketUtil.send from script code.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None; a default settings packet is indistinguishable from a vanilla re-send.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical PacketAPI in Rise 6.1.30.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">No module-level C15 hook in the corpus; the packet is handled by component infrastructure (Rise 6.x) or script calls.</div>
+<div class="impl-clients">Vanilla GameSettings emits C15 on settings change in every client; Rise 6.x adds the blink tuple and script bridge. Spicy Bhop carries dead imports of C15 (and C14, C17, C18, C19) with no call sites.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C16PacketClientStatus/">C16PacketClientStatus</a>
+<a class="related-chip" href="../S39PacketPlayerAbilities/">S39PacketPlayerAbilities</a>
+<a class="related-chip" href="../S01PacketJoinGame/">S01PacketJoinGame</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

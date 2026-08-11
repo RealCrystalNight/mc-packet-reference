@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S13PacketDestroyEntities (0x13): Removes one or more entities from the client's render list.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ESP, TargetManager, KillAura">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Ranking, PingSpoofComponent (players buffer), PacketType / TranslationComponent (DESTROY_ENTITY)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S13PacketDestroyEntities — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S13PacketDestroyEntities — Minecraft 1.8.9 Packet Reference","description":"The batch entity-removal packet. In the 8-client corpus its handlers are all cache pruning: Sigma's Ranking drops hit/prosecutor records, Rise's TranslationComponent removes map entries through DESTROY_ENTITY, and Rise's PingSpoofComponent buffers it with the entity stream so destruction stays order","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -70,38 +70,560 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">This is how entities are removed when they die, despawn, or players disconnect.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>The batch removal packet: a VarInt count followed by that many VarInt entity ids. The server flushes it from EntityPlayerMP.destroyEntitiesInWorld each tick with the accumulated destroy list, and sends the single-id form when a specific entity is removed (player disconnect, entity despawn). The client removes each id from the world's loaded entity list and clears the render manager's entry in handleDestroyEntities, which is how dead mobs, picked-up items and left players vanish.</p>
+<h4>Vanilla handling</h4>
+<p>EntityPlayerMP accumulates entity ids to destroy and sends one S13 per tick in destroyEntitiesInWorld; the single-id constructor is used by removeEntity and on player disconnects. NetHandlerPlayClient.handleDestroyEntities iterates the ids, removes each from world.loadedEntityList, clears the entity's render state and drops it from the client's entity lookup. Because removal is id-based and immediate, any client cache keyed by entity id must prune itself on S13 or it will hold stale entries.</p>
+<h4>Why clients touch it</h4>
+<p>Cleanup is the theme. Sigma 4.11 Ranking removes hit and prosecutor records for destroyed ids so a kill stat cannot fire after the target despawns. Rise's TranslationComponent maps S13 through the DESTROY_ENTITY entry of its PacketType enum, deleting the entity's position from the bypass map. Rise's PingSpoofComponent buffers S13 inside the players tuple so destruction stays ordered relative to held entity updates. KillAura and ESP target lists in these clients hold entity objects from the world list, so the vanilla removal handles them with no packet hook.</p>
+<h4>Exploit surface</h4>
+<p>S13 is a pure removal vector: the server despawns arbitrary ids, and the client has no say in it. The abuse angle is timing: entities destroyed on the server remain attackable client-side only if the client delays the packet, which is exactly what buffering S13 in PingSpoofComponent does, keeping ghost entities alive for the spoof window. Anti-cheats watch for players attacking ids that were destroyed server-side (attack-after-desync), the signature of ghost-entity kill aura; a client that buffers S13 must also stop targeting those ids when the flush lands.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityPlayerMP.destroyEntitiesInWorld collects pending entity ids and sends a single S13 per tick; the single-id form is sent by removeEntity and on player disconnects. The client handler iterates the ids, removes each entity from world.loadedEntityList, clears its render state and drops it from the entity lookup. No validation is applied to the id list, so ids that do not exist are ignored.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>VarInt count, then count VarInt entity ids. The count field makes the packet self-describing; 1.8 clients accept any count including 0. Entity ids are server-assigned and unique per world session, which is why id-keyed caches (Sigma's hit maps, Rise's translation map) can prune by id without ambiguity. The packet is emitted every tick the destroy list is non-empty, so it arrives in bursts.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>The packet itself is never flagged; its timing is. Attack-after-desync detection compares the ids a client attacks with the ids the server destroyed, so any buffering or replay of S13 that outlives the destroy is the detectable pattern. Ping-spoof buffering of S13 is safe only while the flush stays inside the anticheat's entity-desync tolerance, which is why Rise pairs the component with per-anticheat velocity and teleport handling.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ESP</span>
-<span class="impl-module-clients">(Tenacity 6.0, Sigma 3.9)</span>
+<p class="impl-pattern">The batch entity-removal packet. In the 8-client corpus its handlers are all cache pruning: Sigma's Ranking drops hit/prosecutor records, Rise's TranslationComponent removes map entries through DESTROY_ENTITY, and Rise's PingSpoofComponent buffers it with the entity stream so destruction stays ordered while ping spoofing. KillAura and ESP need no hook because their target lists are world-entity objects.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Ranking</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Remove destroyed entities from target/ESP lists.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S13PacketDestroyEntities) {
-  S13PacketDestroyEntities s13 = (S13PacketDestroyEntities) event.getPacket();
-  for (int id : s13.getEntityIDs()) targetList.remove(id);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Track kills and deaths against named players and report stats, pruning records when targets despawn.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Hidden module that records attacked players in hitEntities and suspects in prosecutorEntities via EventAttack, correlates S0B animation with S06 health drops and S02 chat messages to attribute kills, and on S13 iterates the destroyed ids through onEntityRemoved so a removed player's record cannot later fire a kill stat. S18 teleport and S08 respawn share the cleanup paths.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/other/Ranking.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/other/Ranking.java =====
+package info.sigmaclient.module.impl.other;
+
+import info.sigmaclient.Client;
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventAttack;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.event.impl.EventUpdate;
+import info.sigmaclient.management.users.TTSystem;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.util.Timer;
+import info.sigmaclient.util.misc.ChatUtil;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.entity.EntityPlayerSP;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.*;
+
+import java.io.IOException;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ConcurrentModificationException;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.UUID;
+
+public class Ranking extends Module {
+    private HashMap&lt;Integer, HitEntity&gt; hitEntities = new HashMap&lt;&gt;();
+    private HashMap&lt;Integer, HitEntity&gt; prosecutorEntities = new HashMap&lt;&gt;();
+    private HashMap&lt;Integer, Long&gt; lastAnimationTimestamp = new HashMap&lt;&gt;();
+    private info.sigmaclient.util.Timer delay = new Timer();
+
+    public Ranking(ModuleData data) {
+        super(data);
+        setHidden(true);
+        if (!isEnabled()) {
+            toggle();
+        }
+    }
+
+    @Override
+    @RegisterEvent(events = {EventAttack.class, EventPacket.class, EventUpdate.class})
+    public void onEvent(Event e) {
+        if (e instanceof EventAttack) {
+            EventAttack ea = (EventAttack) e;
+            if (ea.getEntity() instanceof EntityPlayer) {
+                EntityPlayer ep = (EntityPlayer) ea.getEntity();
+                if (!ep.getName().isEmpty()) {
+                    if (!hitEntities.containsKey(ep.getEntityId())) {
+                        hitEntities.put(ep.getEntityId(), new HitEntity(ep));
+                    } else {
+                        hitEntities.get(ep.getEntityId()).refresh();
+                    }
+                }
+            }
+        } else if (e instanceof EventPacket) {
+            EventPacket ep = (EventPacket) e;
+            Packet packet = ep.getPacket();
+            if (packet instanceof S0BPacketAnimation) {
+                S0BPacketAnimation packetAnimation = (S0BPacketAnimation) packet;
+                lastAnimationTimestamp.put(packetAnimation.func_148978_c(), System.currentTimeMillis());
+            }
+            if (packet instanceof S06PacketUpdateHealth) {
+                S06PacketUpdateHealth packetUpdateHealth = (S06PacketUpdateHealth) packet;
+                if (packetUpdateHealth.getHealth() &lt;= Minecraft.getMinecraft().thePlayer.getHealth()) {
+                	try{
+                		for (Object o : mc.theWorld.getLoadedEntityList()) {
+                            if (o instanceof EntityPlayer) {
+                                EntityPlayer entityPlayer = (EntityPlayer) o;
+                                if (!(entityPlayer instanceof EntityPlayerSP) &amp;&amp; lastAnimationTimestamp.containsKey(entityPlayer.getEntityId())) {
+                                    if (lastAnimationTimestamp.get(entityPlayer.getEntityId()) &gt; System.currentTimeMillis() - 70 &amp;&amp; entityPlayer.getPositionVector().squareDistanceTo(Minecraft.getMinecraft().thePlayer.getPositionVector()) &lt; 9 * 9) {
+                                        if (!prosecutorEntities.containsKey(entityPlayer.getEntityId())) {
+                                            prosecutorEntities.put(entityPlayer.getEntityId(), new HitEntity(entityPlayer, true));
+                                        } else {
+                                            prosecutorEntities.get(entityPlayer.getEntityId()).refresh();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                	}catch(ConcurrentModificationException ee){};
+                    
+                }
+                if (packetUpdateHealth.getHealth() &lt;= 0) {
+                    onDeath();
+                }
+            }
+            if (packet instanceof S02PacketChat) {
+                S02PacketChat packetChat = (S02PacketChat) packet;
+                String message = packetChat.func_148915_c().getUnformattedText();
+
+                Iterator it = hitEntities.entrySet().iterator();
+                while (it.hasNext()) {
+                    HitEntity hitEntity = ((Map.Entry&lt;Integer, HitEntity&gt;) it.next()).getValue();
+                    if (hitEntity.getTime() &gt; System.currentTimeMillis() - 3000 &amp;&amp; message.contains(hitEntity.getName())) {
+                        if (hitEntity.onChatMessage()) {
+                            it.remove();
+                        }
+                    }
+                }
+
+                Iterator it2 = prosecutorEntities.entrySet().iterator();
+                while (it2.hasNext()) {
+                    HitEntity hitEntity = ((Map.Entry&lt;Integer, HitEntity&gt;) it2.next()).getValue();
+                    if (hitEntity.getTime() &gt; System.currentTimeMillis() - 3000 &amp;&amp; message.contains(hitEntity.getName()) &amp;&amp; message.contains(Minecraft.getMinecraft().thePlayer.getName())) {
+                        if (hitEntity.onChatMessage()) {
+                            it2.remove();
+                        }
+                    }
+                }
+            } else if (packet instanceof S18PacketEntityTeleport) {
+                S18PacketEntityTeleport packetTeleport = (S18PacketEntityTeleport) packet;
+                int entityId = packetTeleport.func_149451_c();
+
+                onEntityRemoved(entityId);
+            } else if (packet instanceof S08PacketPlayerPosLook) {
+                onDeath();
+            } else if (packet instanceof S13PacketDestroyEntities) {
+                S13PacketDestroyEntities packetDestroyEntities = (S13PacketDestroyEntities) packet;
+                for (int entityId : packetDestroyEntities.func_149098_c()) {
+                    onEntityRemoved(entityId);
+                }
+            } else if (packet instanceof S40PacketDisconnect) {
+                S40PacketDisconnect packetDisconnect = (S40PacketDisconnect) packet;
+                if (packetDisconnect.func_149165_c().getUnformattedText().toLowerCase().contains("ban") &amp;&amp; Minecraft.getMinecraft().thePlayer != null &amp;&amp; Minecraft.getMinecraft().thePlayer.ticksExisted &gt; 15 * 20) {
+                    sendStat("ban", "");
+                }
+            }
+        } else if (e instanceof EventUpdate) {
+            if (delay.delay(1000 * 60 * 10)) {
+                delay.reset();
+                sendStat("tick", "");
+            }
+        }
+    }
+
+    private void onDeath() {
+        Iterator it2 = prosecutorEntities.entrySet().iterator();
+        while (it2.hasNext()) {
+            HitEntity hitEntity = ((Map.Entry&lt;Integer, HitEntity&gt;) it2.next()).getValue();
+            if (hitEntity.getTime() &gt; System.currentTimeMillis() - 3000) {
+                if (hitEntity.onRemoved()) {
+                    it2.remove();
+                }
+            }
+        }
+    }
+
+    private void onEntityRemoved(int entityId) {
+        Iterator it = hitEntities.entrySet().iterator();
+        while (it.hasNext()) {
+            HitEntity hitEntity = ((Map.Entry&lt;Integer, HitEntity&gt;) it.next()).getValue();
+            if (hitEntity.getTime() &gt; System.currentTimeMillis() - 3000 &amp;&amp; entityId == hitEntity.getEntityId()) {
+                if (hitEntity.onRemoved()) {
+                    it.remove();
+                }
+            }
+        }
+    }
+
+    public void sendStat(String type, String data) {
+
+    }
+
+    private class HitEntity {
+        private long time = System.currentTimeMillis();
+        private UUID uuid;
+        private String name;
+        private int entityId;
+        private boolean removed = false;
+        private boolean chatMessage = false;
+        private boolean prosecutor = false;
+
+        public HitEntity(EntityPlayer ep) {
+            uuid = ep.getUniqueID();
+            name = ep.getName();
+            entityId = ep.getEntityId();
+        }
+
+        public HitEntity(EntityPlayer ep, boolean prosecutor) {
+            uuid = ep.getUniqueID();
+            name = ep.getName();
+            entityId = ep.getEntityId();
+            this.prosecutor = prosecutor;
+        }
+
+        public boolean onRemoved() {
+            removed = true;
+            if (chatMessage) {
+                if (prosecutor) {
+                    prosecuted();
+                } else {
+                    killed();
+                }
+                return true;
+            }
+            return false;
+        }
+
+        public boolean onChatMessage() {
+            chatMessage = true;
+            if (removed) {
+                if (prosecutor) {
+                    prosecuted();
+                } else {
+                    killed();
+                }
+                return true;
+            }
+            return false;
+        }
+
+        private void killed() {
+            //ChatUtil.printChat("Kill (" + name + ") " + uuid.toString());
+            sendStat("kill", "&amp;uuid=" + uuid.toString().replaceAll("-", ""));
+        }
+
+        public void refresh() {
+            time = System.currentTimeMillis();
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public long getTime() {
+            return time;
+        }
+
+        public int getEntityId() {
+            return entityId;
+        }
+
+        public void prosecuted() {
+            //ChatUtil.printChat("Prosecuted (" + name + ") " + uuid.toString());
+            sendStat("death", "&amp;uuid=" + uuid.toString().replaceAll("-", ""));
+        }
+    }
+}
+// NOTE (AI): Hidden stat-tracking module: records attacked players and prosecutors, correlates S0B animation with S06 health drops to attribute kills, and watches S02 chat for kill messages. S13 is the cleanup path: destroyed entity ids are matched against the hit and prosecutor maps so stale records cannot fire a kill stat after the target despawns. S18 teleport and S08 respawn share the same onEntityRemoved and onDeath paths.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventAttack, EventPacket, EventUpdate (RegisterEvent list).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Stat tracking is invisible to anti-cheats. The S13 handling matters for correctness, not stealth: without it, a killed player's record would fire a duplicate kill when the death message arrives after the destroy packet.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Only Sigma 4.11 ships a module of this shape in the corpus; the sendStat() body is stubbed, so the tracking exists but the telemetry sink is disabled in this build.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TargetManager</span>
-<span class="impl-module-clients">(Tenacity 6.0, Sigma 3.9)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoofComponent (players buffer)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Remove destroyed entities from target/ESP lists.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S13PacketDestroyEntities) {
-  S13PacketDestroyEntities s13 = (S13PacketDestroyEntities) event.getPacket();
-  for (int id : s13.getEntityIDs()) targetList.remove(id);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Hold S13 in the entity-stream buffer while ping spoofing so destruction stays ordered relative to buffered entity updates.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">S13 is listed in the players tuple of the component's packet classification. While a spoof is active, matching packets are cancelled from the event stream and parked in a timestamped queue; onPostMotion flushes entries whose delay elapsed. Holding S13 alongside S14/S16/S15/S17/S18/S19/S20 keeps replay order coherent so a flushed destroy cannot land before the entity updates that precede it.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 — com/alan/clients/component/impl/player/PingSpoofComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/component/impl/player/PingSpoofComponent.java =====
+package com.alan.clients.component.impl.player;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.CancellableEvent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PostMotionEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.util.packet.PacketUtil;
+import net.minecraft.client.gui.GuiDownloadTerrain;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.Tuple;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+public final class PingSpoofComponent extends Component {
+    public static ConcurrentLinkedQueue&lt;PacketUtil.TimedPacket&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+    static StopWatch enabledTimer = new StopWatch();
+    public static boolean enabled;
+    static long amount;
+    static Tuple&lt;Class[], Boolean&gt; regular = new Tuple&lt;&gt;(new Class[]{C0FPacketConfirmTransaction.class, C00PacketKeepAlive.class, S1CPacketEntityMetadata.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; velocity = new Tuple&lt;&gt;(new Class[]{S12PacketEntityVelocity.class, S27PacketExplosion.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; teleports = new Tuple&lt;&gt;(new Class[]{S08PacketPlayerPosLook.class, S39PacketPlayerAbilities.class, S09PacketHeldItemChange.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; players = new Tuple&lt;&gt;(new Class[]{S13PacketDestroyEntities.class, S14PacketEntity.class, S14PacketEntity.S16PacketEntityLook.class, S14PacketEntity.S15PacketEntityRelMove.class, S14PacketEntity.S17PacketEntityLookMove.class, S18PacketEntityTeleport.class, S20PacketEntityProperties.class, S19PacketEntityHeadLook.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; blink = new Tuple&lt;&gt;(new Class[]{C02PacketUseEntity.class, C0DPacketCloseWindow.class, C0EPacketClickWindow.class, C0CPacketInput.class, C0BPacketEntityAction.class, C08PacketPlayerBlockPlacement.class, C07PacketPlayerDigging.class, C09PacketHeldItemChange.class, C13PacketPlayerAbilities.class, C15PacketClientSettings.class, C16PacketClientStatus.class, C17PacketCustomPayload.class, C18PacketSpectate.class, C19PacketResourcePackStatus.class, C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class, C0APacketAnimation.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; movement = new Tuple&lt;&gt;(new Class[]{C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class}, false);
+
+    public static Tuple&lt;Class[], Boolean&gt;[] types = new Tuple[]{regular, velocity, teleports, players, blink, movement};
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; send = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; receive = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    public CancellableEvent onPacket(Packet&lt;?&gt; packet, CancellableEvent event) {
+        if (!event.isCancelled() &amp;&amp; enabled &amp;&amp; Arrays.stream(types).anyMatch(tuple -&gt; tuple.getSecond() &amp;&amp; Arrays.stream(tuple.getFirst()).anyMatch(regularpacket -&gt; regularpacket == packet.getClass()))) {
+            event.setCancelled();
+            packets.add(new PacketUtil.TimedPacket(packet));
+        }
+
+        return event;
+    }
+
+    public static void dispatch() {
+        if (!packets.isEmpty()) {
+            // Stops the packets from being called twice
+            boolean enabled = PingSpoofComponent.enabled;
+            PingSpoofComponent.enabled = false;
+            packets.forEach(timedPacket -&gt; PacketUtil.queue(timedPacket.getPacket()));
+            PingSpoofComponent.enabled = enabled;
+            packets.clear();
+        }
+    }
+
+    public static void disable() {
+        enabled = false;
+        enabledTimer.setMillis(enabledTimer.millis - 999999999);
+    }
+
+    @EventLink
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; dispatch();
+
+    @EventLink
+    public final Listener&lt;PostMotionEvent&gt; onPostMotion = event -&gt; {
+        if (!(enabled = !enabledTimer.finished(100) &amp;&amp; !(mc.currentScreen instanceof GuiDownloadTerrain))) {
+            dispatch();
+        } else {
+            // Stops the packets from being called twice
+            enabled = false;
+
+            packets.forEach(packet -&gt; {
+                if (packet.getTime() + amount &lt; System.currentTimeMillis()) {
+                    PacketUtil.queue(packet.getPacket());
+                    packets.remove(packet);
+                }
+            });
+
+            enabled = true;
+        }
+    };
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players) {
+        spoof(amount, regular, velocity, teleports, players, false);
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink, boolean movement) {
+        enabledTimer.reset();
+
+        PingSpoofComponent.regular.setSecond(regular);
+        PingSpoofComponent.velocity.setSecond(velocity);
+        PingSpoofComponent.teleports.setSecond(teleports);
+        PingSpoofComponent.players.setSecond(players);
+        PingSpoofComponent.blink.setSecond(blink);
+        PingSpoofComponent.movement.setSecond(movement);
+        PingSpoofComponent.amount = amount;
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink) {
+        spoof(amount, regular, velocity, teleports, players, blink, false);
+    }
+
+    public static void blink() {
+        spoof(9999999, true, false, false, false, true);
+    }
+}
+// NOTE (AI): S13 is one of the classes in the players tuple, the entity-stream buffer the component holds while ping spoofing. Buffering destruction keeps entity removal ordered relative to held S14/S18/S19/S20 updates, so replayed packets do not resurrect or desync ghost entities. In this corpus S13 is the only destroy-class packet the buffer covers.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent, PacketReceiveEvent, PostMotionEvent, WorldChangeEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Buffered destruction keeps ghost entities alive client-side for the spoof window; modules that target entities must respect the flush or they attack ids the server already destroyed, which is the attack-after-desync flag.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical component in 6.1.30 and 6.2.4, driven by PingSpoof and Timer through the static spoof() entry points.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KillAura</span>
-<span class="impl-module-clients">(Tenacity 6.0, Sigma 3.9)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PacketType / TranslationComponent (DESTROY_ENTITY)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Remove destroyed entities from target/ESP lists.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S13PacketDestroyEntities) {
-  S13PacketDestroyEntities s13 = (S13PacketDestroyEntities) event.getPacket();
-  for (int id : s13.getEntityIDs()) targetList.remove(id);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Remove destroyed entity ids from the entity-position map the Translation bypass maintains.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The DESTROY_ENTITY entry of the PacketType enum casts to S13PacketDestroyEntities, iterates getEntityIDs() and removes each from the entityPositions map. The map is the single source of truth for the Translation component's entity tracking, so a missed removal would let the bypass interpolate a despawned entity.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/translation/PacketType.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/translation/PacketType.java =====
+package com.alan.clients.component.impl.player.translation;
+
+import lombok.Getter;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.*;
+
+import java.util.Map;
+import java.util.function.BiFunction;
+
+public enum PacketType {
+    SPAWN_MOB(S0FPacketSpawnMob.class, (packet, entityPositions) -&gt; {
+        S0FPacketSpawnMob spawnMobPacket = (S0FPacketSpawnMob) packet;
+        int entityId = spawnMobPacket.getEntityID();
+        double posX = spawnMobPacket.getX() / 32.0;
+        double posY = spawnMobPacket.getY() / 32.0;
+        double posZ = spawnMobPacket.getZ() / 32.0;
+        float yaw = (spawnMobPacket.getYaw() * 360) / 256.0F;
+        float pitch = (spawnMobPacket.getPitch() * 360) / 256.0F;
+
+        Position newPosition = new Position(posX, posY, posZ, yaw, pitch);
+        entityPositions.put(entityId, newPosition);
+        return entityPositions;
+    }),
+
+    ENTITY_TELEPORT(S18PacketEntityTeleport.class, (packet, entityPositions) -&gt; {
+        S18PacketEntityTeleport teleportPacket = (S18PacketEntityTeleport) packet;
+        int entityId = teleportPacket.getEntityId();
+        double posX = teleportPacket.getX() / 32.0;
+        double posY = teleportPacket.getY() / 32.0;
+        double posZ = teleportPacket.getZ() / 32.0;
+        float yaw = (teleportPacket.getYaw() * 360) / 256.0F;
+        float pitch = (teleportPacket.getPitch() * 360) / 256.0F;
+
+        Position newPosition = new Position(posX, posY, posZ, yaw, pitch);
+        entityPositions.put(entityId, newPosition);
+        return entityPositions;
+    }),
+
+    ENTITY_REL_MOVE(S14PacketEntity.S15PacketEntityRelMove.class, (packet, entityPositions) -&gt; {
+        S14PacketEntity.S15PacketEntityRelMove relMovePacket = (S14PacketEntity.S15PacketEntityRelMove) packet;
+        int entityId = relMovePacket.entityId;
+
+        Position currentPosition = entityPositions.get(entityId);
+
+        if (currentPosition != null) {
+            double newPosX = currentPosition.posX + relMovePacket.getPosX() / 32.0;
+            double newPosY = currentPosition.posY + relMovePacket.getPosY() / 32.0;
+            double newPosZ = currentPosition.posZ + relMovePacket.getPosZ() / 32.0;
+            float yaw = currentPosition.yaw;
+            float pitch = currentPosition.pitch;
+
+            Position newPosition = new Position(newPosX, newPosY, newPosZ, yaw, pitch);
+            entityPositions.put(entityId, newPosition);
+            return entityPositions;
+        }
+
+        return null;
+    }),
+
+    ENTITY_LOOK_MOVE(S14PacketEntity.S17PacketEntityLookMove.class, (packet, entityPositions) -&gt; {
+        S14PacketEntity.S17PacketEntityLookMove lookMovePacket = (S14PacketEntity.S17PacketEntityLookMove) packet;
+        int entityId = lookMovePacket.getEntityId();
+        double deltaX = lookMovePacket.getPosX() / 32.0;
+        double deltaY = lookMovePacket.getPosY() / 32.0;
+        double deltaZ = lookMovePacket.getPosZ() / 32.0;
+        float yaw = (lookMovePacket.getYaw() * 360) / 256.0F;
+        float pitch = (lookMovePacket.getPitch() * 360) / 256.0F;
+
+        Position currentPosition = entityPositions.get(entityId);
+
+        if (currentPosition != null) {
+            double newPosX = currentPosition.posX + deltaX;
+            double newPosY = currentPosition.posY + deltaY;
+            double newPosZ = currentPosition.posZ + deltaZ;
+
+            // Ensure yaw and pitch are updated
+            Position newPosition = new Position(newPosX, newPosY, newPosZ, yaw, pitch);
+            entityPositions.put(entityId, newPosition);
+            return entityPositions;
+        }
+
+        return null;
+    }),
+
+    ENTITY_LOOK(S14PacketEntity.S16PacketEntityLook.class, (packet, entityPositions) -&gt; {
+        S14PacketEntity.S16PacketEntityLook lookPacket = (S14PacketEntity.S16PacketEntityLook) packet;
+        int entityId = lookPacket.getEntityId();
+        float yaw = (lookPacket.getYaw() * 360) / 256.0F;
+        float pitch = (lookPacket.getPitch() * 360) / 256.0F;
+
+        Position currentPosition = entityPositions.get(entityId);
+
+        if (currentPosition != null) {
+            Position newPosition = new Position(currentPosition.posX, currentPosition.posY, currentPosition.posZ, yaw, pitch);
+            entityPositions.put(entityId, newPosition);
+            return entityPositions;
+        }
+
+        return null;
+    }),
+
+    DESTROY_ENTITY(S13PacketDestroyEntities.class, (packet, entityPositions) -&gt; {
+        S13PacketDestroyEntities destroyEntitiesPacket = (S13PacketDestroyEntities) packet;
+        int[] entityIds = destroyEntitiesPacket.getEntityIDs();
+
+        for (int entityId : entityIds) {
+            entityPositions.remove(entityId);
+        }
+
+        return entityPositions;
+    }),
+
+    ENTITY_HEAD_LOOK(S19PacketEntityHeadLook.class, (packet, entityPositions) -&gt; {
+        S19PacketEntityHeadLook headLookPacket = (S19PacketEntityHeadLook) packet;
+        int entityId = headLookPacket.getEntityId();
+        float headYaw = (headLookPacket.getYaw() * 360) / 256.0F;
+
+        Position currentPosition = entityPositions.get(entityId);
+
+        if (currentPosition != null) {
+            Position newPosition = new Position(currentPosition.posX, currentPosition.posY, currentPosition.posZ, headYaw, currentPosition.pitch);
+            entityPositions.put(entityId, newPosition);
+            return entityPositions;
+        }
+
+        return null;
+    });
+
+    @Getter
+    private final Class&lt;? extends Packet&lt;?&gt;&gt; packetClass;
+    private final BiFunction&lt;Packet&lt;?&gt;, Map&lt;Integer, Position&gt;, Map&lt;Integer, Position&gt;&gt; handler;
+
+    PacketType(Class&lt;? extends Packet&lt;?&gt;&gt; packetClass, BiFunction&lt;Packet&lt;?&gt;, Map&lt;Integer, Position&gt;, Map&lt;Integer, Position&gt;&gt; handler) {
+        this.packetClass = packetClass;
+        this.handler = handler;
+    }
+
+    public Map&lt;Integer, Position&gt; handle(Packet&lt;?&gt; packet, Map&lt;Integer, Position&gt; positions) {
+        return handler.apply(packet, positions);
+    }
+}
+// NOTE (AI): The TranslationComponent packet registry. SPAWN_MOB decodes the fixed-point spawn coordinates (x32) and byte rotations (x256/360) into the entityPositions map that the Translation bypass feeds on, so the client keeps its own copy of every mob's server-side position. DESTROY_ENTITY removes entries when S13 arrives, and the same enum covers S18 teleport, S14 relative moves and looks, and S19 head look.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, consumed by TranslationComponent in both Rise versions.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Pure cache hygiene: without the removal the translation map leaks positions for despawned entities, which only corrupts the bypass's own rendering. No anti-cheat interaction beyond the general desync surface of the Translation feature.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Same enum in 6.1.30 and 6.2.4; the 6.2.4 build also carries ENTITY_HEAD_LOOK. This is the only non-vanilla entity-cache reference to S13 besides PingSpoofComponent in the corpus.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent on every corpus hit; the module-level hook appears only in Sigma's Ranking (EventPacket), while Rise processes S13 through components (PingSpoofComponent, TranslationComponent).</div>
+<div class="impl-clients">Sigma cancels nothing and only reads ids. Rise does not read the ids at all in PingSpoofComponent (the packet is buffered by class) and reads them only in TranslationComponent. Memeware, Nekoware, Spicy and Tenacity touch S13 solely through bundled vanilla code.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S0EPacketSpawnObject/">S0EPacketSpawnObject</a>
+<a class="related-chip" href="../S0FPacketSpawnMob/">S0FPacketSpawnMob</a>
+<a class="related-chip" href="../S12PacketEntityVelocity/">S12PacketEntityVelocity</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S27PacketExplosion (0x27): Server notifies the client of an explosion (TNT, creeper, bed in Nether/End, etc).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Velocity, AntiKnockback">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Velocity / AntiKnockback, StandardVelocity / VulcanVelocity / RedeskyVelocity / UniversoCraftVelocity / BufferAbuseVelocity, Fly / LongJump, AntiExploit, Debugger">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S27PacketExplosion — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S27PacketExplosion — Minecraft 1.8.9 Packet Reference","description":"The explosion broadcast that carries both destroyed-block positions and a per-player knockback vector. Every velocity module in the corpus filters it alongside S12PacketEntityVelocity; Rise 6.x dedicates five per-server modes to it, movement modules cancel it to shape knockback, and Tenacity's AntiE","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -80,34 +80,1293 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Affected blocks are sent as byte triplets (x, y, z) relative to the explosion center. The client applies particle effects and knockback to the local player.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S27 is the server's explosion broadcast: center x/y/z floats, strength, a list of affected block positions encoded as byte triplets relative to the center, and a per-player knockback vector as three floats. WorldServer sends one S27 per affected player (corpus line 901), with the knockback floats computed per player from the explosion's player knockback map. The client both renders the destroyed blocks and applies the knockback vector to the local player, which is why it is the second half of every velocity module's packet filter alongside S12PacketEntityVelocity.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleExplosion builds an Explosion object from the center and strength, calls doExplosionB(true) to spawn particles and sounds, then adds the packet's motion floats straight into thePlayer.motionX/Y/Z. Critically, the knockback is applied unconditionally on the main thread; there is no entity-ID check because the packet is per-player. That makes S27 the standard fallback for anti-cheat velocity implementations: servers that hide S12 knockback in explosion packets still deliver S27, so clients must filter both.</p>
+<h4>Why clients touch it</h4>
+<p>S27 is the most-touched clientbound packet in this batch. Every velocity module in the corpus filters it: Memeware and Nekoware cancel it in a shared combat/Velocity pattern, Rise 5.99's Velocity scales or cancels it, Sigma's AntiVelocity handles it in basic mode, Spicy's AntiKnockback cancels it, and Tenacity's VelocityModule scales it by the same horizontal/vertical settings as S12. Rise 6.x splits this into a suite of per-server modes (Standard, Vulcan, Redesky, UniversoCraft, BufferAbuse), all of which touch S27. Movement modules also consume it: Rise 5.99's Fly (Minemenclub) and LongJump (Hycraft, Vulcan) cancel S27 to control knockback timing, and Sigma's Fly uses it for explosion-based boosting.</p>
+<h4>Exploit surface</h4>
+<p>The exploit surface is bidirectional. Client-side, scaling or cancelling the knockback floats is invisible to the server because S27 is one-way; anti-cheats can only infer from resulting motion, which is why velocity modules keep the S12 and S27 paths symmetric. Server-side, a hostile server can send S27 with huge motion floats (Rise's ExplosionCheck guards against motion &gt;= Byte.MAX_VALUE) or enormous affected-block lists to stall the client's block-position loop, which is exactly the flood Tenacity's AntiExploit rate-limits. Rise's ItemDamageComponent also counts S27 as a damage source to resync the player's health model.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>WorldServer.createExplosion computes the affected block list and a per-player knockback Vec3 from the blast, then sends a dedicated S27 to each EntityPlayerMP (corpus line 901). The knockback map is filled only for players the explosion actually hits, so players outside the blast receive an S27 with zero motion floats but still get the visual. No client acknowledgement and no rate limiting in vanilla.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Wire format: three floats (center), float strength, int record count, then count byte triplets as offsets from the center (each block position is center + signed byte), then three floats of player motion. The triplet encoding caps the block list extent at 127 blocks from the center, which is why ExplosionCheck thresholds at Byte.MAX_VALUE. PLAY state only.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats cannot see the mutation, so they infer velocity removal from motion deltas: after a flagged hit they compare the player's acceleration against the expected knockback curve. That is why legit-looking modes exist: Tenacity's horizontal/vertical percentages, Rise 6.x's per-server modes, and movement modules that cancel S27 only while airborne. The Rise 6.x BufferAbuse and PingSpoofComponent keep the S27 path consistent with transaction buffering, since a desynced knockback stream is a strong velocity flag on Vulcan and Watchdog.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Velocity</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Raze v1.5b, Gugustus, Jello 0.1, Helium B41420)</span>
+<p class="impl-pattern">The explosion broadcast that carries both destroyed-block positions and a per-player knockback vector. Every velocity module in the corpus filters it alongside S12PacketEntityVelocity; Rise 6.x dedicates five per-server modes to it, movement modules cancel it to shape knockback, and Tenacity's AntiExploit rate-limits it against crash floods. The packet is one-way, so all client abuse is invisible to the server.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Velocity / AntiKnockback</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99, Sigma 4.11, Spicy, Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">Cancel or scale explosion velocity alongside S12PacketEntityVelocity.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Cancel
-if (event.getPacket() instanceof S27PacketExplosion) {
-  S27PacketExplosion s27 = (S27PacketExplosion) event.getPacket();
-  s27.motionX *= horizontal / 100.0;
-  s27.motionY *= vertical / 100.0;
-  s27.motionZ *= horizontal / 100.0;
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Cancel or scale explosion knockback so hits from TNT, creepers and beds apply reduced or zero motion.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketReceiveEvent filter: if the packet is S27PacketExplosion, either cancel it outright or multiply motionX/Y/Z by horizontal/vertical percentage settings before the vanilla handler applies them. Tenacity scales in place; Memeware/Nekoware/Spicy cancel; Rise 5.99 and Sigma switch behavior per configured mode.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/module/impl/movement/VelocityModule.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/movement/VelocityModule.java =====
+package dev.tenacity.module.impl.movement;
+
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.packet.PacketReceiveEvent;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.ModuleCategory;
+import dev.tenacity.setting.impl.NumberSetting;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S27PacketExplosion;
+
+public final class VelocityModule extends Module {
+
+    private final NumberSetting horizontalVelocity = new NumberSetting("Horizontal Velocity", 0, 0, 100, 0.1),
+            verticalVelocity = new NumberSetting("Vertical Velocity", 0, 0, 100, 0.1);
+
+
+    public VelocityModule() {
+        super("Velocity", "Removes your velocity movement aspect", ModuleCategory.MOVEMENT);
+        initializeSettings(horizontalVelocity, verticalVelocity);
+    }
+
+    private final IEventListener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+
+
+        if(event.getPacket() instanceof S12PacketEntityVelocity) {
+            final S12PacketEntityVelocity s12 = (S12PacketEntityVelocity) event.getPacket();
+            if(s12.getEntityID() == mc.thePlayer.getEntityId()) {
+                if(horizontalVelocity.getCurrentValue() == 0 &amp;&amp; verticalVelocity.getCurrentValue() == 0) {
+                    event.cancel();
+                    return;
+                }
+                s12.motionX *= (int) (horizontalVelocity.getCurrentValue() / 100);
+                s12.motionY *= (int) (verticalVelocity.getCurrentValue() / 100);
+                s12.motionZ *= (int) (horizontalVelocity.getCurrentValue() / 100);
+            }
+        }
+        if(event.getPacket() instanceof S27PacketExplosion) {
+            final S27PacketExplosion s27 = (S27PacketExplosion) event.getPacket();
+            if(horizontalVelocity.getCurrentValue() == 0 &amp;&amp; verticalVelocity.getCurrentValue() == 0) {
+                event.cancel();
+                return;
+            }
+            s27.motionX *= (float) (horizontalVelocity.getCurrentValue() / 100);
+            s27.motionY *= (float) (verticalVelocity.getCurrentValue() / 100);
+            s27.motionZ *= (float) (horizontalVelocity.getCurrentValue() / 100);
+        }
+    };
+}
+// NOTE (AI): Tenacity's implementation is the cleanest scaling example: the same PacketReceiveEvent handler covers S12 and S27, cancels when both sliders are 0, otherwise scales the float fields in place. Note the S27 branch has no entity-ID check (the packet is per-player) while the S12 branch does. Memeware and Nekoware ship a shorter cancel-only variant; Spicy's AntiKnockback cancels S27 in the same event shape.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>In-place scaling is safer than cancel: the server still sees a packet pass and the client motion delta stays consistent with a legitimately weaker explosion. Full cancel flags on anti-cheats that measure knockback absence, which is why modes like Rise's Minemenclub variants only zero S27 while airborne.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware and Nekoware cancel S27 in combat/Velocity. Rise 5.99 scales per mode (Cancel/Push/etc.). Sigma AntiVelocity handles S27 in basic mode only. Spicy AntiKnockback cancels it. All six clients pair the S27 filter with the S12PacketEntityVelocity filter in the same handler.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiKnockback</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Raze v1.5b, Gugustus, Jello 0.1, Helium B41420)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">StandardVelocity / VulcanVelocity / RedeskyVelocity / UniversoCraftVelocity / BufferAbuseVelocity</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Cancel or scale explosion velocity alongside S12PacketEntityVelocity.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Cancel
-if (event.getPacket() instanceof S27PacketExplosion) {
-  S27PacketExplosion s27 = (S27PacketExplosion) event.getPacket();
-  s27.motionX *= horizontal / 100.0;
-  s27.motionY *= vertical / 100.0;
-  s27.motionZ *= horizontal / 100.0;
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Per-server velocity modes that each define their own S27 (and S12) handling, from full cancel to percentage scaling to transaction-buffered removal.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Each mode is a Rise Mode<Velocity> subclass with an @EventLink PacketReceiveEvent listener. StandardVelocity scales or cancels S27 based on horizontal/vertical sliders and an Explosion Ignore boolean. VulcanVelocity, RedeskyVelocity and UniversoCraftVelocity cancel or mutate S27 to match each server's knockback checks. BufferAbuseVelocity folds S27 into the client's transaction-buffer manipulation so the knockback stream stays consistent while transactions are delayed.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/StandardVelocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/StandardVelocity.java =====
+package com.alan.clients.module.impl.combat.velocity;
+
+import com.alan.clients.Client;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.other.TeleportEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.impl.combat.Criticals;
+import com.alan.clients.module.impl.combat.Velocity;
+import com.alan.clients.module.impl.movement.Speed;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.NumberValue;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S27PacketExplosion;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+
+public final class StandardVelocity extends Mode&lt;Velocity&gt; {
+    public Boolean disable2 = false;
+
+    private Integer time = 0;
+    private Speed speed = null;
+
+    private String mode = null;
+
+    private int amount;
+
+    private final NumberValue horizontal = new NumberValue("Horizontal", this, 0, 0, 100, 1);
+    private final NumberValue vertical = new NumberValue("Vertical", this, 0, 0, 100, 1);
+
+    private final BooleanValue onExplode = new BooleanValue("Explosion Ignore", this, false);
+
+
+    @Override
+    public void onEnable() {
+      time = 0;
+    setDisable2(false);
+    }
+
+    public StandardVelocity(String name, Velocity parent) {
+        super(name, parent);
+    }
+
+    @EventLink(value = Priorities.VERY_LOW)
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        if ((getParent().onSwing.getValue() &amp;&amp; !mc.thePlayer.isSwingInProgress) || event.isCancelled()) {
+            return;
+        }
+
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        final double horizontal = this.horizontal.getValue().doubleValue();
+        final double vertical = this.vertical.getValue().doubleValue();
+        final boolean onExplode = this.onExplode.getValue();
+
+        if (p instanceof S12PacketEntityVelocity) {
+
+            final S12PacketEntityVelocity wrapper = (S12PacketEntityVelocity) p;
+
+            if (wrapper.getEntityID() == mc.thePlayer.getEntityId()) {
+
+
+    if (horizontal == 0) {
+        if (vertical != 0 &amp;&amp; !event.isCancelled()) {
+
+            mc.thePlayer.motionY = wrapper.getMotionY() / 8000.0D;
+        }
+
+
+        event.setCancelled();
+        return;
+    }
+
+    wrapper.motionX *= horizontal / 100;
+    wrapper.motionY *= vertical / 100;
+    wrapper.motionZ *= horizontal / 100;
+
+    event.setPacket(wrapper);
+
+
+            }
+        } else if (p instanceof S27PacketExplosion) {
+            final S27PacketExplosion wrapper = (S27PacketExplosion) p;
+
+            if (onExplode) {
+                event.setCancelled();
+                return;
+            }
+
+            wrapper.posX *= horizontal / 100;
+            wrapper.posY *= vertical / 100;
+            wrapper.posZ *= horizontal / 100;
+
+            event.setPacket(wrapper);
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (speed == null) {
+            speed = getModule(Speed.class);
+
+        }
+
+
+/*
+if(speed.isEnabled() &amp;&amp; Client.INSTANCE.getModuleManager().get(Speed.class).mode.getValue().getName().equals("Watchdog")) {
+
+        if (mc.thePlayer.hurtTime &gt; 9) {
+            mc.thePlayer.motionZ *= 0;
+            mc.thePlayer.motionX *= 0;
+            time++;
+
+            if (!MoveUtil.isMoving()) {
+                mc.thePlayer.motionZ *= 0;
+                mc.thePlayer.motionX *= 0;
+            }
+        }
+
+        if (mc.thePlayer.hurtTime == 9) {
+            if (MoveUtil.isMoving() &amp;&amp; !mc.thePlayer.onGround &amp;&amp; !( mc.thePlayer.offGroundTicks == 1)) {
+               // MoveUtil.partialStrafePercent(99);
+                double speed =1;
+                speed = Math.random()/50;
+                MoveUtil.strafe(.3);
+                  // mc.thePlayer.motionZ *= .95;
+                 //  mc.thePlayer.motionX *= .95;
+            } else {
+                mc.thePlayer.motionZ *= -.2;
+                mc.thePlayer.motionX *= -.2;
+            }
+
+
+        }
+    }
+
+ */
+
+    };
+
+    @EventLink
+    public final Listener&lt;TeleportEvent&gt; onTeleport = event -&gt; {
+        if (event.getPosY() &lt; mc.thePlayer.posY - 2);
+
+
+    };
+
+    public Boolean getDisable2() {
+        return disable2;
+    }
+
+    public void setDisable2(Boolean disable2) {
+        this.disable2 = disable2;
+    }
+}
+// NOTE (AI): StandardVelocity shows the shared skeleton: horizontal/vertical NumberValues, an Explosion Ignore toggle, and one PacketReceiveEvent that branches S12 vs S27. The S27 branch scales posX/posY/posZ (Rise renamed the motion fields) and re-sets the packet on the event. The commented block in onPreMotionEvent is dead Watchdog-era code, kept in the file. Vulcan/Redesky/UniversoCraft variants in the same folder are shorter and mostly cancel S27 outright.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, PreMotionEvent, TeleportEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The per-server split exists because each anti-cheat (Vulcan, Redesky, UniversoCraft, etc.) measures knockback differently. Percentage modes are low-risk; full-cancel modes only run when the server's velocity check is known to be weak, and BufferAbuse keeps S27 consistent with the buffered transaction stream so the two cannot be cross-correlated.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The same five modes exist in Rise 6.1.30 and 6.2.4 with near-identical bodies; 6.2.4 adds WatchdogPredictionVelocity and Grim-family modes that do not reference S27. PingSpoofComponent in both versions lists S27PacketExplosion in the velocity packet class set it buffers, and ItemDamageComponent counts S27 as a damage input.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Fly / LongJump</span>
+<span class="impl-module-clients">(Rise 5.99, Sigma 4.11)</span>
 </div>
+<p class="impl-pattern">Cancel explosion knockback inside movement exploits so a mid-air boost or long jump is not interrupted by server-applied velocity.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 5.99's LongJump cancels S27 (and S12) in onPacketReceive when the Hycraft or Vulcan mode is active; its Fly cancels S27 in the Minemenclub mode. Sigma's Fly treats S27 as a velocity source for explosion-boost movement. The cancel keeps the server's knockback from perturbing the carefully staged motion values the module computes each tick.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/movement/LongJump.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/movement/LongJump.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.movement;
+
+import de.gerrygames.viarewind.utils.ChatUtil;
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.other.MoveButtonEvent;
+import dev.rise.event.impl.other.MoveEvent;
+import dev.rise.event.impl.other.StrafeEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.event.impl.packet.PacketSendEvent;
+import dev.rise.event.impl.render.Render2DEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.math.MathUtil;
+import dev.rise.util.player.DamageUtil;
+import dev.rise.util.player.MoveUtil;
+import dev.rise.util.player.PacketUtil;
+import dev.rise.util.player.PlayerUtil;
+import dev.rise.util.render.RenderUtil;
+import dev.rise.util.render.theme.ThemeType;
+import dev.rise.util.render.theme.ThemeUtil;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockAir;
+import net.minecraft.client.gui.Gui;
+import net.minecraft.client.gui.ScaledResolution;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.item.*;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S27PacketExplosion;
+import net.minecraft.potion.Potion;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.MathHelper;
+import org.apache.commons.lang3.RandomUtils;
+
+import java.awt.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+
+@ModuleInfo(name = "LongJump", description = "Does a long jump", category = Category.MOVEMENT)
+public final class LongJump extends Module {
+
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Redesky", "Redesky", "Redesky 2", "Cubecraft", "Hypixel", "NCP", "Minemenclub", "Minemenclub Safe", "Vulcan", "Taka");
+    private final ModeSetting ncpMode = new ModeSetting("NCP Mode", this, "Normal", "Normal", "Damage");
+    private final BooleanSetting smoothCamera = new BooleanSetting("Smooth Camera", this, false);
+    private final BooleanSetting autoDisable = new BooleanSetting("Auto Disable", this, true);
+    private final NumberSetting onGroundSpeed = new NumberSetting("On Ground Speed", this, 0.4, 0.1, 3, 0.1);
+    private final NumberSetting offGroundSpeed = new NumberSetting("Off Ground Speed", this, 1.4, 0.1, 3, 0.1);
+    private final NumberSetting timer = new NumberSetting("Timer", this, 1, 0.1, 2, 0.1);
+    private final NumberSetting viewBobbing = new NumberSetting("View Bobbing", this, 0, 0, 0.1, 0.01);
+    private final NumberSetting hypixelTimer = new NumberSetting("Hypixel Timer", this, 1, .1, 2.25, 0.05);
+
+    private boolean beingDmged, jumped, reset, glide, receivedDamage, boosted;
+    private int offGroundTicks, stage, jumps;
+    private int ticks, i;
+    private int waitTicks;
+    private float oPositionY;
+    private double moveSpeed, lastDist, startX, startY, startZ;
+    private final ConcurrentLinkedQueue&lt;Packet&lt;?&gt;&gt; packetList = new ConcurrentLinkedQueue&lt;&gt;();
+
+    @Override
+    public void onUpdateAlwaysInGui() {
+        offGroundSpeed.hidden = onGroundSpeed.hidden = !(mode.is("NCP") &amp;&amp; ncpMode.is("Normal"));
+
+        timer.hidden = !(mode.is("NCP"));
+
+        ncpMode.hidden = !mode.is("NCP");
+        hypixelTimer.hidden = !mode.is("Hypixel");
+    }
+
+    @Override
+    protected void onEnable() {
+        waitTicks = 0;
+        offGroundTicks = 0;
+        reset = glide = receivedDamage = boosted = false;
+        ticks = stage = i = jumps = 0;
+        startX = mc.thePlayer.posX;
+        startY = mc.thePlayer.posY;
+        startZ = mc.thePlayer.posZ;
+
+        switch (mode.getMode()) {
+            case "Hycraft":
+                if (!mc.thePlayer.onGround) {
+                    this.registerNotification("Cannot enable " + this.getModuleInfo().name() + " in air.");
+                    this.toggleModule();
+                }
+                break;
+            case "Taka":
+                mc.timer.timerSpeed = 0.2F;
+
+                for (int i = 0; i &lt; 8; i++) {
+                    PacketUtil.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY + 0.42F, mc.thePlayer.posZ, false));
+                    PacketUtil.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, false));
+                }
+                break;
+
+            case "Vulcan":
+                if (!mc.thePlayer.onGround) {
+                    this.registerNotification("Cannot enable " + this.getModuleInfo().name() + " in air.");
+                    this.toggleModule();
+                }
+                break;
+        }
+
+        oPositionY = (float) mc.thePlayer.posY;
+    }
+
+    @Override
+    protected void onDisable() {
+        boosted = false;
+        mc.thePlayer.speedInAir = 0.02f;
+        mc.thePlayer.jumpMovementFactor = 0.02F;
+        mc.timer.timerSpeed = 1;
+        EntityPlayer.enableCameraYOffset = false;
+        moveSpeed = lastDist = 0;
+        beingDmged = false;
+        jumped = false;
+
+        switch (mode.getMode()) {
+            case "NCP":
+                if (ncpMode.is("Damage") &amp;&amp; mc.thePlayer.inventory.currentItem != i)
+                    PacketUtil.sendPacketWithoutEvent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));
+                break;
+        }
+
+        if (!mc.isIntegratedServerRunning()) {
+        }
+
+    }
+
+    @Override
+    public void onMove(final MoveEvent event) {
+        switch (mode.getMode()) {
+            case "NCP":
+                if (ncpMode.is("Damage")) {
+                    if (mc.thePlayer.hurtTime &gt; 0)
+                        jumped = true;
+
+                    if (!jumped)
+                        return;
+
+                    if (MoveUtil.isMoving() &amp;&amp; !mc.thePlayer.isCollidedHorizontally) {
+                        mc.timer.timerSpeed = (float) timer.getValue();
+                        if (mc.thePlayer.onGround) {
+                            moveSpeed = Math.max(0.2873 * 2.15, moveSpeed);
+                            reset = true;
+                        } else if (reset) {
+                            moveSpeed += 0.15 * (moveSpeed - 0.2873);
+                            reset = false;
+                        } else {
+                            moveSpeed = lastDist - lastDist / 159.998;
+                        }
+                    } else {
+                        mc.timer.timerSpeed = 1;
+                        moveSpeed = 0;
+                    }
+
+                    MoveUtil.setMoveEventSpeed(event, Math.max(moveSpeed, 0.2873));
+
+                    switch (stage) {
+                        case 0:
+                            if (mc.thePlayer.onGround) {
+                                event.setY(mc.thePlayer.motionY = (0.424 - Math.random() / 500));
+                                stage++;
+                            }
+                            break;
+
+                        case 1:
+                            event.setY(mc.thePlayer.motionY = 0.42F);
+                            stage++;
+                            break;
+
+                        case 2:
+                        case 3:
+                        case 4:
+                        case 5:
+                            stage++;
+                            break;
+                    }
+
+                    if (glide) {
+                        event.setY(mc.thePlayer.motionY += (0.045 - Math.random() / 500));
+                        stage++;
+                    }
+                }
+                break;
+
+        }
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        final Packet&lt;?&gt; p = event.getPacket();
+        if (mode.is("Hycraft") &amp;&amp; (p instanceof S12PacketEntityVelocity || p instanceof S27PacketExplosion)) {
+            event.setCancelled(true);
+        }
+        if (mode.is("Vulcan") &amp;&amp; (p instanceof S12PacketEntityVelocity || p instanceof S27PacketExplosion))
+            event.setCancelled(true);
+    }
+
+    @Override
+    public void onPacketSend(final PacketSendEvent event) {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        switch (mode.getMode()) {
+            case "Vulcan":
+                if (!receivedDamage &amp;&amp; p instanceof C03PacketPlayer)
+                    event.setCancelled(true);
+
+                if (p instanceof C0FPacketConfirmTransaction || p instanceof C00PacketKeepAlive) {
+                    packetList.add(p);
+                    event.setCancelled(true);
+                }
+                break;
+
+            case "Hypixel":
+                break;
+        }
+    }
+
+    @Override
+    public void onStrafe(final StrafeEvent event) {
+        switch (mode.getMode()) {
+            case "Minemenclub":
+            case "Minemenclub Safe":
+                if (!jumped)
+                    event.setCancelled(true);
+                break;
+
+            case "NCP":
+                if (ncpMode.is("Damage") &amp;&amp; !jumped)
+                    event.setCancelled(true);
+                break;
+
+            case "Vulcan":
+                if (!receivedDamage)
+                    event.setCancelled(true);
+                break;
+
+        }
+    }
+
+    @Override
+    public void onRender2DEvent(final Render2DEvent event) {
+//        if(mode.is("Hypixel")) {
+//            final float x = (float) 445;
+//            final float y = (float) 260;
+//
+//            final float width = (float) (5 + (waitTicks * 1.935));
+//            final float height = 6;
+//            RenderUtil.rect(x, y, 68.9, height, new Color(0, 0, 0, 100));
+//
+//            RenderUtil.rect(x, y, width, height, ThemeUtil.getThemeColor(ThemeType.GENERAL));
+//        }
+    }
+
+    @Override
+    public void onMoveButton(MoveButtonEvent event) {
+        if (mode.is("Hypixel")) {
+            if (ticks &lt;= 11 * 3) {
+                event.setForward(false);
+                event.setBackward(false);
+                event.setLeft(false);
+                event.setRight(false);
+            }
+        }
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        //Utils
+        ++ticks;
+
+        if (mc.thePlayer.ticksExisted == 1) {
+            toggleModule();
+        }
+
+        if (mc.thePlayer.onGround) {
+            if (autoDisable.isEnabled() &amp;&amp; (!(mode.is("Minemenclub") || mode.is("Minemenclub Safe")) ? offGroundTicks &gt; 0 : offGroundTicks &gt; 5) &amp;&amp; !mode.getMode().equals("Hypixel")) {
+                this.toggleModule();
+                return;
+            }
+
+            offGroundTicks = 0;
+        } else {
+            offGroundTicks++;
+        }
+
+        final double x = mc.thePlayer.posX - mc.thePlayer.prevPosX;
+        final double z = mc.thePlayer.posZ - mc.thePlayer.prevPosZ;
+        lastDist = Math.hypot(x, z);
+
+        EntityPlayer.enableCameraYOffset = false;
+
+        if (smoothCamera.isEnabled()) {
+            if (mc.thePlayer.posY &gt; oPositionY) {
+                EntityPlayer.enableCameraYOffset = true;
+                EntityPlayer.cameraYPosition = oPositionY;
+            }
+        }
+
+        mc.thePlayer.cameraYaw = (float) viewBobbing.getValue();
+
+        switch (mode.getMode()) {
+            case "Redesky":
+
+                if (mc.thePlayer.onGround) {
+                    mc.thePlayer.jump();
+                    mc.thePlayer.motionZ *= 1.2;
+                    mc.thePlayer.motionX *= 1.2;
+                }
+
+                if (offGroundTicks == 1) {
+                    mc.thePlayer.motionZ *= 1.2;
+                    mc.thePlayer.motionX *= 1.2;
+                }
+
+                break;
+
+            case "Redesky 2":
+
+                if (mc.thePlayer.isCollidedHorizontally) {
+                    toggleModule();
+                    return;
+                }
+
+                final Block block2 = mc.thePlayer.worldObj.getBlockState(new BlockPos(
+                        MathHelper.floor_double(mc.thePlayer.posX),
+                        MathHelper.floor_double(mc.thePlayer.getEntityBoundingBox().minY - 0.5) - 1,
+                        MathHelper.floor_double(mc.thePlayer.posZ))).getBlock();
+
+                if (ticks &gt; 10 &amp;&amp; !(block2 instanceof BlockAir)) {
+                    toggleModule();
+                    return;
+                }
+
+                mc.timer.timerSpeed = (float) (0.5 + Math.random() / 10);
+
+                if (mc.thePlayer.onGround) {
+                    mc.thePlayer.jump();
+                }
+
+                if (!mc.thePlayer.onGround) {
+                    mc.thePlayer.jumpMovementFactor = 0.18f;
+
+                    mc.thePlayer.motionY += mc.thePlayer.motionY &gt; 0.0 ? 0.055 : mc.thePlayer.motionY &lt; 0.3 ? 0.01 : 0.03;
+                }
+
+
+                break;
+
+            case "Minemenclub Safe":
+                if (MoveUtil.isMoving() &amp;&amp; (PlayerUtil.isOnServer("minemen") || PlayerUtil.isOnServer("mineman"))) {
+                    if (mc.thePlayer.onGround) {
+                        if (!beingDmged) {
+                            event.setY(event.getY() - (2.5 - Math.random() / 100));
+                            jumped = false;
+                            moveSpeed = 0;
+                        } else {
+                            jumped = true;
+                            moveSpeed = MoveUtil.getBaseMoveSpeed() + (0.32 - Math.random() / 100);
+                            mc.thePlayer.jump();
+                            mc.thePlayer.motionY = MoveUtil.getJumpMotion((float) (0.6 - Math.random() / 100));
+                        }
+                    } else
+                        MoveUtil.strafe();
+                } else
+                    moveSpeed = 0;
+
+                beingDmged = mc.thePlayer.onGround &amp;&amp; mc.thePlayer.hurtTime &gt; 0;
+
+                MoveUtil.strafe(moveSpeed);
+                break;
+
+            case "Minemenclub":
+                if (MoveUtil.isMoving() &amp;&amp; (PlayerUtil.isOnServer("minemen") || PlayerUtil.isOnServer("mineman"))) {
+                    if (mc.thePlayer.onGround) {
+                        if (!beingDmged) {
+                            event.setY(event.getY() - (2.5 - Math.random() / 100));
+                            jumped = false;
+                            moveSpeed = 0;
+                        } else {
+                            jumped = true;
+                            moveSpeed = MoveUtil.getBaseMoveSpeed() + (1 - Math.random() / 100);
+                            mc.thePlayer.motionY = MoveUtil.getJumpMotion((float) (0.6 - Math.random() / 100));
+                        }
+                    } else
+                        MoveUtil.strafe();
+                } else
+                    moveSpeed = 0;
+
+                beingDmged = mc.thePlayer.onGround &amp;&amp; mc.thePlayer.hurtTime &gt; 0;
+
+                MoveUtil.strafe(moveSpeed);
+                break;
+
+            case "Cubecraft":
+                if (MoveUtil.isMoving()) {
+                    switch (offGroundTicks) {
+                        case 0:
+                            DamageUtil.damagePlayer(DamageUtil.DamageType.POSITION, 0.0465, false, true);
+
+                            mc.thePlayer.jump();
+                            mc.thePlayer.motionY = MoveUtil.getJumpMotion((float) (0.6 + (Math.random() / 100)));
+                            MoveUtil.strafe(0.4 - (Math.random() / 500));
+                            break;
+
+                        case 1:
+                            MoveUtil.strafe(0.6 - (Math.random() / 500));
+                            break;
+                    }
+
+                    if (mc.thePlayer.fallDistance &gt; 0 &amp;&amp; mc.thePlayer.fallDistance &lt; 3)
+                        mc.thePlayer.motionY += 0.0425 + (Math.random() / 500);
+                } else
+                    MoveUtil.stop();
+                MoveUtil.strafe();
+                break;
+
+            case "NCP":
+                switch (ncpMode.getMode()) {
+                    case "Normal": {
+                        if (MoveUtil.isMoving()) {
+                            if (mc.thePlayer.onGround) {
+                                mc.thePlayer.jump();
+                                mc.thePlayer.motionY = MoveUtil.getJumpMotion((float) (0.424 - Math.random() / 500));
+                                MoveUtil.strafe(onGroundSpeed.getValue());
+                            }
+
+                            if (offGroundTicks == 1)
+                                MoveUtil.strafe(offGroundSpeed.getValue());
+
+                            if (mc.thePlayer.fallDistance &gt; 0 &amp;&amp; mc.thePlayer.fallDistance &lt; 3)
+                                mc.thePlayer.motionY += 0.03 + Math.random() / 500;
+
+                            mc.timer.timerSpeed = (float) timer.getValue();
+                        } else {
+                            MoveUtil.stop();
+                            mc.timer.timerSpeed = 1;
+                        }
+                        MoveUtil.strafe();
+                        break;
+                    }
+
+                    case "Damage": {
+                        ItemStack itemStack;
+
+                        if (!jumped)
+                            event.setPitch(-RandomUtils.nextFloat(89, 90));
+
+                        int sexySlot = -1;
+                        int shitSlot = -1;
+
+                        if (!beingDmged) {
+                            for (i = 0; i &lt; 9; ++i) {
+                                itemStack = mc.thePlayer.inventoryContainer.getSlot(i + 36).getStack();
+
+                                if (itemStack != null) {
+                                    final Item item = itemStack.getItem();
+
+                                    if (itemStack.getItem() instanceof ItemBow) {
+                                        for (int i = 0; i &lt; mc.thePlayer.inventory.mainInventory.length; i++) {
+                                            final ItemStack stack = mc.thePlayer.inventory.mainInventory[i];
+
+                                            if (stack != null) {
+                                                if (stack.getItem().getUnlocalizedName().contains("arrow")) {
+                                                    sexySlot = this.i;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (item instanceof ItemFishingRod || item instanceof ItemSnowball || item instanceof ItemEgg) {
+                                        shitSlot = i;
+                                    }
+                                }
+                            }
+
+                            if (sexySlot != -1) {
+                                itemStack = mc.thePlayer.inventoryContainer.getSlot(sexySlot + 36).getStack();
+
+                                if (mc.thePlayer.inventory.currentItem != sexySlot &amp;&amp; ticks == 1) {
+                                    PacketUtil.sendPacketWithoutEvent(new C09PacketHeldItemChange(sexySlot));
+                                }
+
+                                if (ticks == 5 + randomInt(0, 1)) {
+                                    mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(itemStack));
+                                }
+
+                                ticks++;
+
+                                if (ticks == 11 + randomInt(1, 2)) {
+                                    PacketUtil.sendPacketWithoutEvent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+                                    beingDmged = true;
+                                }
+                            } else if (shitSlot != -1) {
+                                itemStack = mc.thePlayer.inventoryContainer.getSlot(shitSlot + 36).getStack();
+
+                                if (mc.thePlayer.inventory.currentItem != shitSlot)
+                                    PacketUtil.sendPacketWithoutEvent(new C09PacketHeldItemChange(shitSlot));
+
+                                mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(itemStack));
+
+                                beingDmged = true;
+                            }
+                        }
+                        break;
+                    }
+                }
+                break;
+
+            case "Vulcan": {
+                final double[] jumpValues = new double[]{0.42F, 0.33319999363422365, 0.24813599859094576, 0.16477328182606651, 0.08307781780646721, 0.0030162615090425808};
+
+                if (mc.thePlayer.onGround &amp;&amp; ticks == 5 &amp;&amp; !beingDmged) {
+                    for (int i = 0; i &lt; 6; i++) {
+                        double position = mc.thePlayer.posY;
+                        for (final double value : jumpValues) {
+                            position += value;
+
+                            PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, position, mc.thePlayer.posZ, false));
+                        }
+                    }
+                    PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer(true));
+                    event.setGround(true);
+
+                    beingDmged = true;
+                }
+
+                if (mc.thePlayer.hurtTime &gt; 0)
+                    receivedDamage = true;
+
+                if (receivedDamage) {
+                    mc.timer.timerSpeed = 1;
+
+                    if (!boosted) {
+                        float motion = 0.6F;
+
+                        if (PlayerUtil.getBlockRelativeToPlayer(0, -0.5, 0).getUnlocalizedName().contains("bed"))
+                            motion = 1.5F;
+
+                        mc.thePlayer.motionY = motion - (Math.random() / 100);
+                        MoveUtil.strafe(9.5 - (Math.random() / 500));
+                        boosted = true;
+                    } else if (offGroundTicks == 1)
+                        MoveUtil.strafe(0.5 - (Math.random() / 500));
+
+                    if (mc.thePlayer.fallDistance &gt; 0)
+                        mc.thePlayer.motionY += 0.02 - (Math.random() / 10000);
+                }
+                break;
+            }
+
+            case "Taka": {
+                if (mc.thePlayer.hurtTime == 9) {
+                    ticks = 0;
+
+                    mc.timer.timerSpeed = 1.0F;
+
+                    MoveUtil.strafe(9.85F);
+                    mc.thePlayer.motionY = 0.42F;
+                }
+
+                if (ticks &lt; 13) {
+                    MoveUtil.strafe(9.85F);
+                }
+
+                if (ticks == 13) {
+                    MoveUtil.strafe(0.25F);
+                }
+
+                break;
+            }
+
+            case "Hypixel": {
+
+                MoveUtil.strafe();
+
+                if (ticks &lt;= 11 * 3) {
+                    waitTicks++;
+                    mc.timer.timerSpeed = 5.25F;
+                    if (mc.thePlayer.onGround) {
+                        mc.thePlayer.motionY = 0.42f;
+                    }
+
+                    mc.thePlayer.cameraYaw = 0;
+                    mc.thePlayer.cameraPitch = 0;
+                    mc.thePlayer.posY -= mc.thePlayer.posY - mc.thePlayer.lastTickPosY;
+                    mc.thePlayer.lastTickPosY -= mc.thePlayer.posY - mc.thePlayer.lastTickPosY;
+
+                    MoveUtil.stop();
+                    event.setGround(false);
+                    if (mc.thePlayer.hurtTime &gt; 0) {
+                        toggleModule();
+                        this.registerNotification("Disabled " + this.getModuleInfo().name() + " due to damage before intial jump.");
+
+                    }
+                } else {
+                    mc.timer.timerSpeed = (float) hypixelTimer.getValue();
+                    if (mc.thePlayer.hurtTime &gt; 0) {
+                        receivedDamage = true;
+                    }
+                    if (mc.thePlayer.onGround) {
+                        if (ticks &lt;= 11 * 4) {
+                            mc.thePlayer.motionY = 0.76 - Math.random() / 100;
+                        } else if (autoDisable.isEnabled()) {
+                            toggleModule();
+                        }
+                    }
+
+                    if (offGroundTicks &gt; 15) {
+                        MoveUtil.strafe();
+                        return;
+                    }
+
+                    switch (offGroundTicks) {
+                        case 1:
+                            if (!mc.thePlayer.isPotionActive(Potion.moveSpeed)) {
+                                MoveUtil.strafe(MoveUtil.getBaseMoveSpeed() * 1.6 - Math.random() / 100);
+                            } else {
+                                MoveUtil.strafe(MoveUtil.getBaseMoveSpeed() * 1.7 - Math.random() / 100);
+                            }
+                            break;
+
+                    }
+                    if (offGroundTicks &gt; 1 &amp;&amp; !mc.thePlayer.isPotionActive(Potion.moveSpeed)) {
+                        MoveUtil.strafe(MoveUtil.getBaseMoveSpeed() * 1.07 - Math.random() / 100);
+
+                    }
+                    if (offGroundTicks &gt; 1 &amp;&amp; mc.thePlayer.isPotionActive(Potion.moveSpeed)) {
+                        MoveUtil.strafe(MoveUtil.getBaseMoveSpeed() * 1.02 - Math.random() / 100);
+                    }
+
+                    if (!mc.thePlayer.onGround) {
+                        mc.thePlayer.motionY += 0.027f - Math.random() / 100;
+                    }
+
+                    if (offGroundTicks &lt;= 5 &amp;&amp; offGroundTicks &gt; 1) {
+                        MoveUtil.strafe(MoveUtil.getSpeed() * 1.29);
+                    }
+                }
+
+                break;
+            }
+        }
+
+    }
+}
+// NOTE (AI): The relevant surface is onPacketReceive: Hycraft and Vulcan modes cancel both S12 and S27 before the vanilla handler can apply them. The rest of the file is the staged jump state machine (position spoofing for Vulcan, damage-triggered boosts, timer manipulation). This is a movement module that treats S27 purely as an obstacle to filter, unlike a velocity module that scales it.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (onPacketReceive).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancelling S27 mid-jump is one of the oldest velocity tells because the motion discontinuity is measurable. These modes rely on the server's knockback check being absent or on the jump's speed exceeding what the anti-cheat expects, which is why they are mode-gated to specific servers.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 Fly handles S27 in Minemenclub mode; Sigma Fly uses S27 as an explosion boost input in its packet handler; Sigma's InfiniteAura imports S27 (the corpus shows the import only, unused in the visible body).</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiExploit</span>
+<span class="impl-module-clients">(Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Block crash-exploit S27 floods from malicious servers by bounding explosion strength and arrival rate.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketReceiveEvent handler: cancels S27 when abs(strength) > 1 or when two explosions arrive within 1 ms, printing a blocked-exploit chat message. The same handler covers resource-pack, camera, particle and teleport crash vectors with the same pattern, and a separate packet-count throttle kicks the client-side watchdog when inbound packet rate exceeds 100/sec.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/module/impl/misc/AntiExploit.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/misc/AntiExploit.java =====
+package dev.tenacity.module.impl.misc;
+
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.packet.PacketReceiveEvent;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.ModuleCategory;
+import dev.tenacity.util.misc.ChatUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C19PacketResourcePackStatus;
+import net.minecraft.network.play.server.*;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+
+public class AntiExploit extends Module {
+
+
+
+    private long lastExplosion = 0, lastExperience = 0;
+    private int invalidExperience = 0;
+   final int PACKET_THRESHOLD = 100;
+    final long CHECK_INTERVAL = 1000;
+    int packetCount = 0;
+
+    public AntiExploit() {
+        super("AntiExploit", "Prevents server exploits", ModuleCategory.MISC);
+    }
+
+    private final IEventListener&lt;PacketReceiveEvent&gt; onReceivePacket = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+        handlePacketCount();
+        if(packet instanceof S48PacketResourcePackSend) {
+            S48PacketResourcePackSend resourcePack = (S48PacketResourcePackSend) packet;
+
+            try {
+                URI uri = new URI(resourcePack.getURL());
+                String scheme = uri.getScheme();
+
+                boolean isLevelProtocol = scheme.equalsIgnoreCase("level");
+                boolean isHttpProtocol = scheme.equalsIgnoreCase("http");
+                boolean isHttpsProtocol = scheme.equalsIgnoreCase("https");
+
+                if(!isHttpProtocol &amp;&amp; !isHttpsProtocol &amp;&amp; !isLevelProtocol) {
+                    ChatUtil.print("§cBlocked Exploit: Resource Pack");
+                    event.cancel();
+                } else if(isLevelProtocol &amp;&amp; (resourcePack.getURL().contains("..") || !((S48PacketResourcePackSend) packet).getURL().endsWith("/resources.zip"))) {
+                    ChatUtil.print("§cBlocked Exploit: File Access");
+                    event.cancel();
+                    mc.getNetHandler().addToSendQueue(new C19PacketResourcePackStatus(((S48PacketResourcePackSend) packet).getHash(), C19PacketResourcePackStatus.Action.FAILED_DOWNLOAD));
+                }
+            } catch (URISyntaxException exception) {
+                ChatUtil.print("§cBlocked Exploit: Resource Pack");
+                event.cancel();
+                mc.getNetHandler().addToSendQueue(new C19PacketResourcePackStatus(((S48PacketResourcePackSend) packet).getHash(), C19PacketResourcePackStatus.Action.FAILED_DOWNLOAD));
+            }
+        } else if(packet instanceof S43PacketCamera &amp;&amp; !mc.thePlayer.isSpectator()) {
+            ChatUtil.print("§cBlocked Exploit: Crash");
+            event.cancel();
+        } else if(packet instanceof S2APacketParticles) {
+            S2APacketParticles particles = (S2APacketParticles) packet;
+            if(Math.abs(particles.getParticleSpeed()) &gt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Particles");
+                event.cancel();
+            } else if(((S2APacketParticles) packet).getParticleCount() &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            }
+        } else if(packet instanceof S27PacketExplosion) {
+            S27PacketExplosion explosion = (S27PacketExplosion) packet;
+
+            if(Math.abs(explosion.getStrength()) &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            } else if(System.currentTimeMillis() - lastExplosion &lt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            } else if(packet instanceof S2APacketParticles) {
+            S2APacketParticles particles = (S2APacketParticles) packet;
+
+            if(Math.abs(particles.getParticleSpeed()) &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Particles");
+                event.cancel();
+            } else if(particles.getParticleCount() &gt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            }
+        }
+
+            lastExplosion = System.currentTimeMillis();
+        } else if(packet instanceof S18PacketEntityTeleport) {
+            S18PacketEntityTeleport teleport = (S18PacketEntityTeleport) packet;
+
+            double packetX = Math.abs(teleport.getX());
+            double packetY = Math.abs(teleport.getY());
+            double packetZ = Math.abs(teleport.getZ());
+
+            if(packetX &gt; 30000000 || packetY &gt; 30000000 || packetZ &gt; 30000000) {
+                ChatUtil.print("§cBlocked Exploit: Teleport");
+                event.cancel();
+            }
+        } else if(packet instanceof S11PacketSpawnExperienceOrb) {
+            if(System.currentTimeMillis() - lastExperience &lt;= 1) {
+                invalidExperience++;
+
+                if(invalidExperience &gt;= 2) {
+                    ChatUtil.print("§cBlocked Exploit: Crash");
+                    event.cancel();
+                }
+            } else {
+                invalidExperience = 0;
+            }
+            lastExperience = System.currentTimeMillis();
+        }
+
+    };
+
+    private void triggerKick() {
+        ChatUtil.print("§cAbnormal packet activity detected. Kicking player...");
+    }
+        private void handlePacketCount() {
+            long currentTime = System.currentTimeMillis();
+
+            long lastPacketCheckTime = 0;
+            if (currentTime - lastPacketCheckTime &gt; CHECK_INTERVAL) {
+                packetCount = 0;
+                lastPacketCheckTime = currentTime;
+            }
+            packetCount++;
+            if (packetCount &gt; PACKET_THRESHOLD) {
+                triggerKick();
+                packetCount = 0;
+        }
+
+    }
+
+}
+// NOTE (AI): The S27 branch is the third check in the chain: strength bound, then a 1 ms inter-arrival gate keyed on lastExplosion. The threshold is deliberately strict because vanilla explosion strength is at most ~4.0 for TNT and ~6.0 for beds, so anything above 1.0 is already anomalous. Note the duplicated S2A branch and the packet-count throttle, which protect against the same flood from the particle side.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Not a cheat at all, it is client-side self-defense against lag machines. Nothing flags it because it only cancels inbound packets. Its strength heuristic is coarser than Rise's ExplosionCheck, which thresholds the motion floats at Byte.MAX_VALUE instead of the strength float.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30/6.2.4 ship the equivalent as a security feature, ExplosionCheck.java, which cancels S27 when any motion float exceeds Byte.MAX_VALUE (mirroring the wire format's signed-byte block offsets).</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Debugger</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
+</div>
+<p class="impl-pattern">Print explosion velocity values to chat as part of a packet-level debug overlay for development and bypass work.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketReceiveEvent handler: when the Velocity toggle is on and the packet is S27PacketExplosion, prints DeltaX/DeltaY/DeltaZ from func_149149_c / func_149144_d / func_149147_e, the same motion floats velocity modules mutate. The debug output shows the exact knockback vector a server sends, letting a developer tune a velocity mode's scaling against real traffic.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/other/Debugger.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/other/Debugger.java =====
+package com.alan.clients.module.impl.other;
+
+import com.alan.clients.Client;
+import com.alan.clients.component.impl.player.BlinkComponent;
+import com.alan.clients.component.impl.render.ESPComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.event.impl.render.Render2DEvent;
+import com.alan.clients.module.Module;
+import com.alan.clients.module.api.Category;
+import com.alan.clients.module.api.ModuleInfo;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.interfaces.ThreadAccess;
+import com.alan.clients.util.math.MathUtil;
+import com.alan.clients.util.render.RenderUtil;
+import com.alan.clients.util.vector.Vector2d;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.DragValue;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.EnumChatFormatting;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.awt.*;
+import java.lang.reflect.Field;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+
+import static com.alan.clients.layer.Layers.*;
+
+@ModuleInfo(aliases = {"module.other.debugger.name"}, category = Category.PLAYER, description = "module.other.debugger.description")
+public final class Debugger extends Module implements ThreadAccess {
+
+    private final BooleanValue transaction = new BooleanValue("Transactions", this, true);
+    private final BooleanValue keepAlive = new BooleanValue("Keep Alive", this, true);
+    private final BooleanValue teleport = new BooleanValue("Teleport", this, true);
+    private final BooleanValue velocity = new BooleanValue("Velocity", this, true);
+    private final BooleanValue abilities = new BooleanValue("Abilities", this, true);
+    private final BooleanValue displayAll = new BooleanValue("Display All", this, true);
+    private final BooleanValue blacklist = new BooleanValue("Blacklist", this, true, () -&gt; !displayAll.getValue());
+    private final BooleanValue time = new BooleanValue("Time Since Move", this, true, () -&gt; !displayAll.getValue());
+    private final BooleanValue devPanel = new BooleanValue("Dev Panel", this, false);
+    private final BooleanValue eventCalls = new BooleanValue("Event Calls", this, false);
+
+    private final DragValue position = new DragValue("", this, new Vector2d(200, 200), true);
+
+    private final DateTimeFormatter date = DateTimeFormatter.ofPattern("MM/dd/yyyy");
+    private final ArrayList&lt;String&gt; blacklisted = new ArrayList&lt;&gt;();
+
+    public static HashMap&lt;String, Integer&gt; calls = new HashMap&lt;&gt;();
+    private long threadLag;
+    private boolean measuring;
+    private StopWatch stopWatch = new StopWatch();
+
+    @Override
+    public void onEnable() {
+        blacklisted.clear();
+    }
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        if (!Client.DEVELOPMENT_SWITCH) return;
+
+        final Packet&lt;?&gt; packet = event.getPacket();
+        if (packet instanceof C03PacketPlayer &amp;&amp; teleport.getValue()) {
+
+            stopWatch.reset();
+        }
+
+        if (displayAll.getValue()) {
+            String name = packet.getClass().getSimpleName();
+
+            if (blacklist.getValue()) {
+                if (!blacklisted.contains(name)) {
+                    ChatUtil.display(EnumChatFormatting.BLACK + " BlackListed Packet " + EnumChatFormatting.RESET + " (ID: %s)", name);
+                    blacklisted.add(name);
+                }
+            } else if (!blacklisted.contains(name)) {
+                ChatUtil.display(EnumChatFormatting.GOLD + " Packet " + EnumChatFormatting.RESET + " (ID: %s)", name);
+
+                for (Field field : packet.getClass().getDeclaredFields()) {
+                    field.setAccessible(true);
+
+                    try {
+                        ChatUtil.display(EnumChatFormatting.YELLOW + " %s:" + EnumChatFormatting.GRAY + " %s", field.getName(), field.get(packet));
+                    } catch (IllegalAccessException e) {
+                        e.printStackTrace();
+                    }
+                }
+
+                if (time.getValue()) ChatUtil.display(EnumChatFormatting.YELLOW + " %s:" + EnumChatFormatting.GRAY + " %s", "time since movement", stopWatch.getElapsedTime());
+
+                ChatUtil.display("");
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (transaction.getValue() &amp;&amp; packet instanceof S32PacketConfirmTransaction) {
+            final S32PacketConfirmTransaction transaction = ((S32PacketConfirmTransaction) packet);
+
+            ChatUtil.display(EnumChatFormatting.RED + " Transaction " + EnumChatFormatting.RESET + " (ID: %s)   (WindowID: %s)", transaction.actionNumber, transaction.windowId);
+        } else if (keepAlive.getValue() &amp;&amp; packet instanceof S00PacketKeepAlive) {
+            final S00PacketKeepAlive wrapper = ((S00PacketKeepAlive) packet);
+
+            ChatUtil.display(EnumChatFormatting.GREEN + " Keep Alive " + EnumChatFormatting.RESET + " (ID: %s)", wrapper.func_149134_c());
+        } else if (teleport.getValue() &amp;&amp; packet instanceof S08PacketPlayerPosLook) {
+            final S08PacketPlayerPosLook wrapper = ((S08PacketPlayerPosLook) packet);
+
+            ChatUtil.display(EnumChatFormatting.BLUE + " Server Teleport " + EnumChatFormatting.RESET + " (Position: %s)",
+                    MathUtil.round(wrapper.x, 3) + " " +
+                            MathUtil.round(wrapper.y, 3) + " " +
+                            MathUtil.round(wrapper.z, 3));
+        } else if (velocity.getValue() &amp;&amp; packet instanceof S12PacketEntityVelocity) {
+            final S12PacketEntityVelocity wrapper = ((S12PacketEntityVelocity) packet);
+
+            if (wrapper.getEntityID() == mc.thePlayer.getEntityId()) {
+                ChatUtil.display(EnumChatFormatting.LIGHT_PURPLE + " Velocity " + EnumChatFormatting.RESET + " (DeltaX: %s) (DeltaY: %s)  (DeltaZ: %s) ",
+                        wrapper.motionX / 8000D, wrapper.motionY / 8000D, wrapper.motionZ / 8000D);
+            }
+        } else if (velocity.getValue() &amp;&amp; packet instanceof S27PacketExplosion) {
+            S27PacketExplosion explosion = ((S27PacketExplosion) packet);
+            ChatUtil.display(EnumChatFormatting.LIGHT_PURPLE + " Explosion (Velocity) " + EnumChatFormatting.RESET + " (DeltaX: %s) (DeltaY: %s)  (DeltaZ: %s) ",
+                    explosion.func_149149_c(), explosion.func_149144_d(), explosion.func_149147_e());
+        } else if (abilities.getValue() &amp;&amp; packet instanceof S39PacketPlayerAbilities) {
+            S39PacketPlayerAbilities abilitiesp = ((S39PacketPlayerAbilities) packet);
+            ChatUtil.display(EnumChatFormatting.YELLOW + " Abilities " + abilitiesp.getFlySpeed() + " " + abilitiesp.isAllowFlying() + " " + abilitiesp.isFlying());
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;Render2DEvent&gt; onRender2D = event -&gt; {
+        if (devPanel.getValue()) {
+            double padding = 10;
+            position.scale = new Vector2d(180, 207);
+
+            getLayer(REGULAR, 1).add(() -&gt; RenderUtil.roundedRectangle(position.position.x, position.position.y, position.scale.x, position.scale.y, getTheme().getRound(), getTheme().getBackgroundShade()));
+            getLayer(BLUR).add(() -&gt; RenderUtil.roundedRectangle(position.position.x, position.position.y, position.scale.x, position.scale.y, getTheme().getRound(), Color.BLACK));
+            getLayer(BLOOM).add(() -&gt; RenderUtil.roundedRectangle(position.position.x, position.position.y, position.scale.x, position.scale.y, getTheme().getRound(), getTheme().getDropShadow()));
+
+            getLayer(REGULAR, 1).add(() -&gt; {
+                mc.fontRendererObj.drawWithShadow(Client.NAME + " " + Client.VERSION + " INDEV " + date.format(LocalDateTime.now()), position.position.x + padding, position.position.y + padding, new Color(255, 255, 0).getRGB());
+                mc.fontRendererObj.drawWithShadow("FPS: " + Minecraft.getDebugFPS() + " [target " + mc.getLimitFramerate() + "]", position.position.x + padding, position.position.y + padding * 2, new Color(255, 255, 0).getRGB());
+
+                mc.fontRendererObj.draw("Debugger", position.position.x + padding, position.position.y + padding * 4, getTheme().getFirstColor().hashCode());
+
+                if (Client.DEVELOPMENT_SWITCH) {
+                    mc.fontRendererObj.draw("Blink: " + BlinkComponent.blinking, position.position.x + padding, position.position.y + padding * 6, Color.WHITE.hashCode());
+                } else {
+                    mc.fontRendererObj.draw("Hidden due to not in dev mode", position.position.x + padding, position.position.y + padding * 5, Color.WHITE.hashCode());
+                    mc.fontRendererObj.draw("Hidden due to not in dev mode", position.position.x + padding, position.position.y + padding * 6, Color.WHITE.hashCode());
+                }
+
+//                mc.fontRendererObj.drawString("Bot Amount: " + Client.INSTANCE.getBotManager().size(), position.position.x + padding, position.position.y + padding * 7, Color.WHITE.hashCode());
+                mc.fontRendererObj.draw("ESPs Amount: " + ESPComponent.esps.size(), position.position.x + padding, position.position.y + padding * 8, Color.WHITE.hashCode());
+
+                mc.fontRendererObj.draw("Performance", position.position.x + padding, position.position.y + padding * 9, getTheme().getFirstColor().hashCode());
+                mc.fontRendererObj.draw("ThreadLag: " + threadLag, position.position.x + padding, position.position.y + padding * 16, Color.WHITE.hashCode());
+
+                mc.fontRendererObj.draw("Other", position.position.x + padding, position.position.y + padding * 18, getTheme().getFirstColor().hashCode());
+                mc.fontRendererObj.draw("Timer: " + mc.timer.timerSpeed, position.position.x + padding, position.position.y + padding * 19, Color.WHITE.hashCode());
+            });
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (measuring) return;
+
+        long systemTime = System.currentTimeMillis();
+        measuring = true;
+
+        boolean run = mc.thePlayer.ticksExisted % 100 == 0 &amp;&amp; eventCalls.getValue();
+        threadPool.execute(() -&gt; {
+            threadLag = System.currentTimeMillis() - systemTime;
+            measuring = false;
+
+            if (run) {
+                ChatUtil.display("Displaying Calls: ");
+
+                for (String name : calls.keySet()) {
+                    ChatUtil.display(name + ": " + calls.get(name));
+                }
+
+                calls.clear();
+            }
+        });
+    };
+}
+// NOTE (AI): The S27 branch is a narrow slice of a much larger diagnostic module that also logs transactions, keepalives, teleports and S12 velocity. The explosion branch prints the three motion floats via the func_1491xx accessors. Debugger is gated behind the module's own toggles, not the development switch, so it works in release builds.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, PacketSendEvent, Render2DEvent, PreMotionEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Read-only; prints to chat only. It exists to make the velocity suite's tuning data visible, and it is the only module in the corpus that reads S27 without mutating or cancelling it.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical in Rise 6.1.30 and 6.2.4. Rise 5.99 has a PacketDebugger module for the same role, but the corpus shows no S27 reference in it.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent is the universal hook: every S27 consumer in the corpus registers on the receive path before the vanilla handler applies the knockback.</div>
+<div class="impl-clients">Classic clients mutate or cancel the packet object inside the event. Rise 5.99/6.x call event.setPacket / event.setCancelled on their own event bus. Tenacity and Spicy use IEventListener-style lambda handlers. Rise 6.x additionally routes S27 through components (ItemDamageComponent, PingSpoofComponent) and a security layer (ExplosionCheck) in addition to modules.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S12PacketEntityVelocity/">S12PacketEntityVelocity</a>
+<a class="related-chip" href="../S28PacketEffect/">S28PacketEffect</a>
+<a class="related-chip" href="../C03PacketPlayer/">C03PacketPlayer</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

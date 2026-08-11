@@ -112,51 +112,50 @@
   "handler": "INetHandlerPlayClient",
   "notes": "Entity types: 50=creeper, 51=skeleton, 52=spider, 53=giant, 54=zombie, 55=slime, 56=ghast, 57=zombiePigman, 58=enderman, 59=caveSpider, 60=silverfish, 61=blaze, 62=magmaCube, 63=enderDragon, 64=wither, 65=bats, 66=witch, 67=endermite, 68=guardian, 69=shulker, 90=pig, 91=sheep, 92=cow, 93=chicken, 94=squid, 95=wolf, 96=mooshroom, 97=snowman, 98=ocelot, 99=ironGolem, 100=horse, 101=rabbit, 120=villager.",
   "implementation": {
+    "writeup": [
+      {
+        "h": "Role in the protocol",
+        "p": "The living-entity counterpart of S0E: mobs, animals and monsters spawn through S0F instead of S0E. EntityTrackerEntry.getPacket returns it for every EntityLivingBase; the payload carries the entity id, the EntityList type code (50=creeper up through 120=villager), fixed-point position (x32), yaw/pitch/head rotations (x256/360), velocity shorts (x8000) and a full DataWatcher block. The metadata is what renders health, potion effects and nametags without follow-up packets, which makes S0F one of the heaviest spawn packets on the wire."
+      },
+      {
+        "h": "Vanilla handling",
+        "p": "handleSpawnMob creates the living entity through EntityList.createEntityByID, sets position and rotations, applies the velocity and reads the DataWatcher. Server side, EntityTrackerEntry deliberately suppresses the velocity-update packet on the spawn tick: the sendVelocityUpdates branch skips entities that just arrived via S0F because the spawn packet already carries the initial motion, avoiding a redundant S12 immediately after spawn."
+      },
+      {
+        "h": "Why clients touch it",
+        "p": "No user-facing module in the 8 clients references S0F. Mob ESP, KillAura target lists and Tracers here iterate the loaded entity list each render frame rather than hooking spawn packets, so they consume the spawned EntityLivingBase objects after vanilla handling instead of the packet itself. The only non-vanilla client code is Rise's TranslationComponent (the PacketType enum's SPAWN_MOB entry decodes the fixed-point coordinates into the entity-position map used by the Translation bypass) and the NetworkAPI script registry listing the class."
+      },
+      {
+        "h": "Exploit surface",
+        "p": "The DataWatcher is the attack surface: a crafted metadata block can declare absurd health, invisible flags or armor values, and mob spawn floods are the classic lag vector. The type byte is unvalidated by the client, so a proxy-crafted id despawns the entity silently. For bypass engineering the interesting property is that S0F is the only clientbound packet that fully defines an entity's state at once, which is why the Translation component hooks it: rewriting the spawn position desyncs the client's rendering from the server's simulation without emitting a single movement packet."
+      }
+    ],
+    "overview": "The spawn packet for every living mob, carrying a full DataWatcher. No module in the 8 clients hooks it: ESP and KillAura read the world entity list instead. The one piece of real client code is Rise's TranslationComponent, whose PacketType enum decodes S0F spawn coordinates into the position map that powers its spawn-repositioning bypass.",
+    "server_handling": "EntityTrackerEntry.getPacket returns new S0FPacketSpawnMob((EntityLivingBase) trackedEntity) for any tracked living entity, and the sendVelocityUpdates branch skips S12 on the same tick the mob spawns because the spawn packet already carries initial velocity. The packet constructor snapshots position, rotations, velocity and the full DataWatcher at tracking time. The client handler reverses this: create entity, set transform, apply motion, read metadata.",
+    "protocol_notes": "Same fixed-point layout as S0E: VarInt entity id, unsigned byte type, three x32 ints, three rotation bytes, three x8000 velocity shorts, then the DataWatcher block which is mandatory for living entities and can run to dozens of bytes. Because the type id is the EntityList id and not the entity class, the client must have a matching entity registry or the spawn is dropped.",
+    "anticheat_landscape": "Anti-cheats use S0F as a state anchor: knockback checks know the mob's spawn velocity, and bot-detection heuristics on some servers correlate S0F rate with chunk activity. The Translation-style spawn repositioning is a rendering-layer desync, invisible to server-side movement checks but detectable by servers that verify client-reported entity positions. No reference client ships a module that abuses it; the corpus hit is purely the component infrastructure.",
     "modules": [
       {
-        "name": "ESP",
+        "name": "PacketType / TranslationComponent (SPAWN_MOB)",
         "found_in": [
-          "Tenacity 6.0",
-          "Sigma 3.9",
-          "Gugustus"
+          "Rise 6.1.30",
+          "Rise 6.2.4"
         ],
-        "purpose": "Detect mob spawns. KillAura adds to target list. AntiBot filters mobs for bot detection. ESP shows mob info.",
-        "how_it_works": "",
-        "vanilla_hook": "EventReceivePacket"
-      },
-      {
-        "name": "AntiBot",
-        "found_in": [
-          "Tenacity 6.0",
-          "Sigma 3.9",
-          "Gugustus"
-        ],
-        "purpose": "Detect mob spawns. KillAura adds to target list. AntiBot filters mobs for bot detection. ESP shows mob info.",
-        "how_it_works": "",
-        "vanilla_hook": "EventReceivePacket"
-      },
-      {
-        "name": "Tracers",
-        "found_in": [
-          "Tenacity 6.0",
-          "Sigma 3.9",
-          "Gugustus"
-        ],
-        "purpose": "Detect mob spawns. KillAura adds to target list. AntiBot filters mobs for bot detection. ESP shows mob info.",
-        "how_it_works": "",
-        "vanilla_hook": "EventReceivePacket"
-      },
-      {
-        "name": "KillAura",
-        "found_in": [
-          "Tenacity 6.0",
-          "Sigma 3.9",
-          "Gugustus"
-        ],
-        "purpose": "Detect mob spawns. KillAura adds to target list. AntiBot filters mobs for bot detection. ESP shows mob info.",
-        "how_it_works": "",
-        "vanilla_hook": "EventReceivePacket"
+        "purpose": "Decode S0F spawn coordinates and rotations into the entity-position map that the Translation bypass feeds on.",
+        "how_it_works": "PacketType is an enum registry consumed by TranslationComponent on every PacketReceiveEvent: the SPAWN_MOB entry casts to S0FPacketSpawnMob, converts x32 ints to doubles and x256/360 bytes to floats, and stores a Position in the entityPositions map keyed by entity id. Subsequent S14/S18 packets update the same map, and S13 removes entries.",
+        "detailed_code": "// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/translation/PacketType.java =====\npackage com.alan.clients.component.impl.player.translation;\n\nimport lombok.Getter;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.play.server.*;\n\nimport java.util.Map;\nimport java.util.function.BiFunction;\n\npublic enum PacketType {\n    SPAWN_MOB(S0FPacketSpawnMob.class, (packet, entityPositions) -> {\n        S0FPacketSpawnMob spawnMobPacket = (S0FPacketSpawnMob) packet;\n        int entityId = spawnMobPacket.getEntityID();\n        double posX = spawnMobPacket.getX() / 32.0;\n        double posY = spawnMobPacket.getY() / 32.0;\n        double posZ = spawnMobPacket.getZ() / 32.0;\n        float yaw = (spawnMobPacket.getYaw() * 360) / 256.0F;\n        float pitch = (spawnMobPacket.getPitch() * 360) / 256.0F;\n\n        Position newPosition = new Position(posX, posY, posZ, yaw, pitch);\n        entityPositions.put(entityId, newPosition);\n        return entityPositions;\n    }),\n\n    ENTITY_TELEPORT(S18PacketEntityTeleport.class, (packet, entityPositions) -> {\n        S18PacketEntityTeleport teleportPacket = (S18PacketEntityTeleport) packet;\n        int entityId = teleportPacket.getEntityId();\n        double posX = teleportPacket.getX() / 32.0;\n        double posY = teleportPacket.getY() / 32.0;\n        double posZ = teleportPacket.getZ() / 32.0;\n        float yaw = (teleportPacket.getYaw() * 360) / 256.0F;\n        float pitch = (teleportPacket.getPitch() * 360) / 256.0F;\n\n        Position newPosition = new Position(posX, posY, posZ, yaw, pitch);\n        entityPositions.put(entityId, newPosition);\n        return entityPositions;\n    }),\n\n    ENTITY_REL_MOVE(S14PacketEntity.S15PacketEntityRelMove.class, (packet, entityPositions) -> {\n        S14PacketEntity.S15PacketEntityRelMove relMovePacket = (S14PacketEntity.S15PacketEntityRelMove) packet;\n        int entityId = relMovePacket.entityId;\n\n        Position currentPosition = entityPositions.get(entityId);\n\n        if (currentPosition != null) {\n            double newPosX = currentPosition.posX + relMovePacket.getPosX() / 32.0;\n            double newPosY = currentPosition.posY + relMovePacket.getPosY() / 32.0;\n            double newPosZ = currentPosition.posZ + relMovePacket.getPosZ() / 32.0;\n            float yaw = currentPosition.yaw;\n            float pitch = currentPosition.pitch;\n\n            Position newPosition = new Position(newPosX, newPosY, newPosZ, yaw, pitch);\n            entityPositions.put(entityId, newPosition);\n            return entityPositions;\n        }\n\n        return null;\n    }),\n\n    ENTITY_LOOK_MOVE(S14PacketEntity.S17PacketEntityLookMove.class, (packet, entityPositions) -> {\n        S14PacketEntity.S17PacketEntityLookMove lookMovePacket = (S14PacketEntity.S17PacketEntityLookMove) packet;\n        int entityId = lookMovePacket.getEntityId();\n        double deltaX = lookMovePacket.getPosX() / 32.0;\n        double deltaY = lookMovePacket.getPosY() / 32.0;\n        double deltaZ = lookMovePacket.getPosZ() / 32.0;\n        float yaw = (lookMovePacket.getYaw() * 360) / 256.0F;\n        float pitch = (lookMovePacket.getPitch() * 360) / 256.0F;\n\n        Position currentPosition = entityPositions.get(entityId);\n\n        if (currentPosition != null) {\n            double newPosX = currentPosition.posX + deltaX;\n            double newPosY = currentPosition.posY + deltaY;\n            double newPosZ = currentPosition.posZ + deltaZ;\n\n            // Ensure yaw and pitch are updated\n            Position newPosition = new Position(newPosX, newPosY, newPosZ, yaw, pitch);\n            entityPositions.put(entityId, newPosition);\n            return entityPositions;\n        }\n\n        return null;\n    }),\n\n    ENTITY_LOOK(S14PacketEntity.S16PacketEntityLook.class, (packet, entityPositions) -> {\n        S14PacketEntity.S16PacketEntityLook lookPacket = (S14PacketEntity.S16PacketEntityLook) packet;\n        int entityId = lookPacket.getEntityId();\n        float yaw = (lookPacket.getYaw() * 360) / 256.0F;\n        float pitch = (lookPacket.getPitch() * 360) / 256.0F;\n\n        Position currentPosition = entityPositions.get(entityId);\n\n        if (currentPosition != null) {\n            Position newPosition = new Position(currentPosition.posX, currentPosition.posY, currentPosition.posZ, yaw, pitch);\n            entityPositions.put(entityId, newPosition);\n            return entityPositions;\n        }\n\n        return null;\n    }),\n\n    DESTROY_ENTITY(S13PacketDestroyEntities.class, (packet, entityPositions) -> {\n        S13PacketDestroyEntities destroyEntitiesPacket = (S13PacketDestroyEntities) packet;\n        int[] entityIds = destroyEntitiesPacket.getEntityIDs();\n\n        for (int entityId : entityIds) {\n            entityPositions.remove(entityId);\n        }\n\n        return entityPositions;\n    }),\n\n    ENTITY_HEAD_LOOK(S19PacketEntityHeadLook.class, (packet, entityPositions) -> {\n        S19PacketEntityHeadLook headLookPacket = (S19PacketEntityHeadLook) packet;\n        int entityId = headLookPacket.getEntityId();\n        float headYaw = (headLookPacket.getYaw() * 360) / 256.0F;\n\n        Position currentPosition = entityPositions.get(entityId);\n\n        if (currentPosition != null) {\n            Position newPosition = new Position(currentPosition.posX, currentPosition.posY, currentPosition.posZ, headYaw, currentPosition.pitch);\n            entityPositions.put(entityId, newPosition);\n            return entityPositions;\n        }\n\n        return null;\n    });\n\n    @Getter\n    private final Class<? extends Packet<?>> packetClass;\n    private final BiFunction<Packet<?>, Map<Integer, Position>, Map<Integer, Position>> handler;\n\n    PacketType(Class<? extends Packet<?>> packetClass, BiFunction<Packet<?>, Map<Integer, Position>, Map<Integer, Position>> handler) {\n        this.packetClass = packetClass;\n        this.handler = handler;\n    }\n\n    public Map<Integer, Position> handle(Packet<?> packet, Map<Integer, Position> positions) {\n        return handler.apply(packet, positions);\n    }\n}\n// NOTE (AI): The TranslationComponent packet registry. SPAWN_MOB decodes the fixed-point spawn coordinates (x32) and byte rotations (x256/360) into the entityPositions map that the Translation bypass feeds on, so the client keeps its own copy of every mob's server-side position. DESTROY_ENTITY removes entries when S13 arrives, and the same enum covers S18 teleport, S14 relative moves and looks, and S19 head look.",
+        "code_source": "Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/translation/PacketType.java",
+        "vanilla_hook": "PacketReceiveEvent, consumed by the TranslationComponent in both Rise 6.1.30 and 6.2.4.",
+        "anti_cheat_notes": "Repositioning on spawn is a rendering desync, not a movement cheat: the server never sees it because no serverbound packet is involved. It only matters to servers that reconcile client-rendered entity positions, and it carries no flag risk for the player's own movement.",
+        "variations": "The PacketType enum is byte-identical in intent across 6.1.30 and 6.2.4; 6.2.4 also carries ENTITY_HEAD_LOOK. This is the only non-vanilla reference to S0F in the 8-client corpus."
       }
+    ],
+    "general_hooks": "No module-level hooks exist for S0F in the corpus; the only hook surface is Rise's TranslationComponent component consuming PacketReceiveEvent.",
+    "client_variations": "All other clients touch S0F only through the bundled vanilla handler; Rise additionally exposes it in NetworkAPI's script packet list.",
+    "related": [
+      "S0EPacketSpawnObject",
+      "S12PacketEntityVelocity",
+      "S13PacketDestroyEntities"
     ]
   }
 }

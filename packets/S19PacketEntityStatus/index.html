@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S19PacketEntityStatus (0x19): Sends a status event for an entity (death sound, hurt effect, taming, wolf shaking, etc.).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ESP, DamageIndicator, KillAura">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="GrimVelocity">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S19PacketEntityStatus — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S19PacketEntityStatus — Minecraft 1.8.9 Packet Reference","description":"The status opcode channel is nearly invisible to the 8 clients: one module, GrimVelocity in Rise 6.x, uses opcode 2 as the trigger for a velocity bypass, and the script API whitelists it. Everything else in the corpus is the vanilla dispatch handler.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -71,26 +71,108 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Status codes: 2=hurt, 3=death, 6=taming, 7=tamed, 8=shaking, 9=hearts, 10=wolfSmoke, 11=accept, 12=witherSpawn, 15=redstoneTorches, 16=ironGolem, 17=sheepEat, 18=trueGod, 19=endermanScream, 20=zombieVillagerCure, 21=guardianElder, 22=petWolf, 23=zombieVillagerReplacing, 24=arrowCount, 25=particles, 26=thorns, 27=snowParticles, 28=shulkerTeleport, 29=ironGolemGiveRose.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S19PacketEntityStatus carries a single opcode byte for one entity: the client-bound event channel for hurt (2), death (3), wolf taming, hearts, wither spawn and a dozen more codes. The server broadcasts it through WorldServer.setEntityState, which routes to the entity tracker (corpus line 880), and EntityPlayerMP sends code 9 to the player itself (line 893). For a cheat client the only actionable signal is the hurt/death transition of the local player, which is why the sole module consumer is a velocity module.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleEntityStatus (Memeware 7.3 bundle, line 897) special-cases opcode 21 (guardian sound) and otherwise forwards the code to entity.handleHealthUpdate, which plays the hurt/death sounds, wolf effects, totem-like particles and so on. The handler is a pure dispatch table: no state is stored, no position is involved.</p>
+<h4>Why clients touch it</h4>
+<p>The corpus has exactly one module consumer: Rise 6.x GrimVelocity, in both 6.1.30 and 6.2.4, which uses opcode 2 (hurt) on the local player as the precondition for cancelling the following S12 velocity. Rise's NetworkAPI whitelists the packet for scripts in both versions. Memeware, Nekoware, Sigma, Spicy and Tenacity reference it only through the vanilla handler. The thinness is structural: the packet has no position or rotation data, so movement, render and combat modules have nothing to consume; only the hurt-to-knockback contract matters.</p>
+<h4>Exploit surface</h4>
+<p>The S19(2) then S12 pairing is the knockback contract: the server announces damage, then the velocity that results from it. Cancelling S12 after seeing the hurt status is the classic velocity bypass, and GrimVelocity hardens it by sending a C07 dig packet at the player's own position on the next PreUpdate, so the server observes a legitimate block interaction on the damaged tick instead of a missing motion change. Anticheats that detect velocity cancel measure the absent motionY after a confirmed hurt status; the dig packet is the counter because it gives the server an acceptable action to attach the tick to.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>Clientbound only. WorldServer.setEntityState broadcasts the opcode through the entity tracker to every tracking player; EntityPlayerMP sends code 9 (the eating effect) to the player directly. The client dispatch is entity.handleHealthUpdate with a special case for 21. There is no per-player state kept on either side; the packet is a one-shot event.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>VarInt entityId plus one unsigned byte opcode. The opcode set is defined by Entity.handleHealthUpdate: 2 = hurt, 3 = death, 6 = taming, 7 = tamed, 8 = wolf shaking, 9 = eating, 10 = wolf smoke, 11 = accept, 12 = wither spawn, 15 = redstone torches, 16 = iron golem, 17 = sheep eating, 19 = enderman scream, 20 = zombie villager cure, 21 = guardian elder, 22 = pet wolf, 24 = arrow count, 26 = thorns, 27 = snow particles, 28 = shulker teleport, 29 = iron golem rose. The opcode for the local player arrives on the same connection as the S12 that follows.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Velocity detection is the only anticheat interaction: the hurt status confirms damage, and the subsequent S12 must produce the expected motion change. Cancelling S12 without a substitute is the classic flag; GrimVelocity's substitute is the C07 dig at the player's own position, which the server processes as a normal block interaction. Server anticheats cannot see the client's S19 handling at all, so the entire exploit surface is the S12 side of the pairing.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ESP</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<p class="impl-pattern">The status opcode channel is nearly invisible to the 8 clients: one module, GrimVelocity in Rise 6.x, uses opcode 2 as the trigger for a velocity bypass, and the script API whitelists it. Everything else in the corpus is the vanilla dispatch handler.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">GrimVelocity</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Detect entity status changes (2=damage, 3=death, 9=eating) for visual effects.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Grim-targeted velocity bypass: cancel the knockback S12 after confirming the hurt status, then emit a benign C07 dig so the damaged tick still carries a legitimate server action.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A VERY_LOW priority PacketReceiveEvent handler checks S19PacketEntityStatus first: when the entity is the local player and the opcode is 2, it sets realVelocity. The next S12PacketEntityVelocity for the local player is then cancelled, realVelocity clears and velocity is set. On the following PreUpdateEvent, if velocity is set, it sends C07PacketPlayerDigging (START_DESTROY_BLOCK while looking at a block and swinging, otherwise STOP_DESTROY_BLOCK) at the player's own position and clears the flag.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/GrimVelocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/GrimVelocity.java =====
+package com.alan.clients.module.impl.combat.velocity;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreUpdateEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.impl.combat.Velocity;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.value.Mode;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S19PacketEntityStatus;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.MovingObjectPosition;
+
+public final class GrimVelocity extends Mode&lt;Velocity&gt; {
+
+    public GrimVelocity(String name, Velocity parent) {
+        super(name, parent);
+    }
+
+    private boolean realVelocity, velocity;
+
+    @EventLink(value = Priorities.VERY_LOW)
+    public final Listener&lt;PreUpdateEvent&gt; onPreUpdate = event -&gt; {
+        if (velocity) {
+            PacketUtil.send(new C07PacketPlayerDigging((mc.objectMouseOver != null &amp;&amp; mc.thePlayer.isSwingInProgress &amp;&amp; mc.objectMouseOver.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK ? C07PacketPlayerDigging.Action.START_DESTROY_BLOCK : C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK),
+                    new BlockPos(mc.thePlayer), EnumFacing.UP));
+
+            velocity = false;
+        }
+    };
+    @EventLink(value = Priorities.VERY_LOW)
+    public final Listener&lt;PacketReceiveEvent&gt; onReceiveLow = event -&gt; {
+        final Packet&lt;?&gt; packet = event.getPacket();
+        if (event.isCancelled()) return;
+
+        if(packet instanceof S19PacketEntityStatus) {
+            final S19PacketEntityStatus wrapper = (S19PacketEntityStatus) event.getPacket();
+
+            if(wrapper.getEntity(mc.theWorld) != mc.thePlayer || wrapper.getOpCode() != 2) {
+                return;
+            }
+
+            realVelocity = true;
+        }
+
+        if (packet instanceof S12PacketEntityVelocity &amp;&amp; realVelocity) {
+            final S12PacketEntityVelocity wrapper = (S12PacketEntityVelocity) packet;
+
+            if (wrapper.getEntityID() == mc.thePlayer.getEntityId()) {
+                event.setCancelled();
+
+                realVelocity = false;
+                velocity = true;
+            }
+        }
+    };
+}
+
+// NOTE (AI): S19PacketEntityStatus opcode 2 (hurt) on the player is the precondition for the velocity
+// NOTE (AI): cancel: the next S12 for self is dropped and a C07PacketPlayerDigging is sent at the
+// NOTE (AI): player's own position on the following PreUpdate, giving the server a legitimate
+// NOTE (AI): block-interaction action to attach the tick to instead of a missing knockback.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (VERY_LOW), PreUpdateEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The hurt-status gate prevents cancelling velocities that never arrived. The C07 dig at the player's own feet is a no-op block action that still registers server-side, giving the anticheat a legitimate interaction instead of a bare missing knockback.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical in Rise 6.1.30 and 6.2.4 (same package com/alan/clients/module/impl/combat/velocity).</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">DamageIndicator</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent in Rise 6.x; no other hook exists in the corpus.</div>
+<div class="impl-clients">Only Rise 6.x touches the packet outside vanilla. The 6.1.30 and 6.2.4 GrimVelocity files are identical apart from the corpus path prefix.</div>
 </div>
-<p class="impl-pattern">Detect entity status changes (2=damage, 3=death, 9=eating) for visual effects.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KillAura</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
-</div>
-<p class="impl-pattern">Detect entity status changes (2=damage, 3=death, 9=eating) for visual effects.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S12PacketEntityVelocity/">S12PacketEntityVelocity</a>
+<a class="related-chip" href="../S06PacketUpdateHealth/">S06PacketUpdateHealth</a>
+<a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C07PacketPlayerDigging (0x07): Player starts/cancels/ends mining a block, or drops an item (press Q).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Nuker, Fucker, Scaffold, NoSlowdown, Autoblock, FastBreak, SpeedMine">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Nuker, Breaker, SpeedMine, NoSlowdown / NoSlow, FastBow">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C07PacketPlayerDigging — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C07PacketPlayerDigging — Minecraft 1.8.9 Packet Reference","description":"The mining and item-use control packet: six status values over a packed position and facing byte. Nuker and Breaker forge START+STOP pairs for instant mining, Tenacity's SpeedMine runs the block math client-side, FastBow releases the bow early through RELEASE_USE_ITEM, and NoSlow pairs the release w","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -73,230 +73,620 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">RELEASE_USE_ITEM (5) is used when the player stops eating/drinking/using a bow.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C07PacketPlayerDigging is the serverbound mining and item-use control channel. The wire form is a packed BlockPos (long), a facing byte, and a status enum byte: START_DESTROY_BLOCK, ABORT_DESTROY_BLOCK, STOP_DESTROY_BLOCK, DROP_ALL_ITEMS, DROP_ITEM, RELEASE_USE_ITEM. It is the only way the server learns that the player began mining, finished or cancelled a dig, dropped an item, or released a use-item action such as a bow draw, eating, or blocking. Client-side it is emitted from PlayerControllerMP.clickBlock (START), onPlayerDamageBlock (ABORT), onPlayerDestroyBlock (STOP), EntityPlayerSP.dropOneItem (DROP) and PlayerControllerMP.onStoppedUsingItem (RELEASE_USE_ITEM).</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayServer.processPlayerDigging switches on the status. DROP_ITEM and DROP_ALL_ITEMS call dropOneItem(false/true) unless the player is a spectator. RELEASE_USE_ITEM calls stopUsingItem, which ends the bow draw or eating and computes the fired arrow or consumed food server-side. The three dig actions share a distance gate: squared distance from the player to the block center (with a +1.5 Y bias) must be under 36.0 and the block Y below the build limit. START calls ItemInWorldManager.tryHarvestBlock when the block is not protected and inside the world border, otherwise the server replies with an S23 block change. STOP calls onPlayerDestroyBlock and ABORT cancels the dig; after STOP or ABORT an S23 is re-sent if the block is not air. There is no per-action rate limit.</p>
+<h4>Why clients touch it</h4>
+<p>Four families dominate the corpus. Mining automation: Nuker in Rise 5.99 and 6.x sends START+STOP pairs around every block in a radius, with Teleport and Area modes that walk to the target first; Breaker in Memeware, Rise 5.99 and the Rise 6.x Breaker/NewBreaker/NewNewBreaker suite destroys cake, beds and targeted blocks; Tenacity's SpeedMine accumulates block damage client-side and finishes the dig itself. Item-use automation: FastBow in Memeware, Rise 5.99 and Sigma fires fully charged arrows by releasing early; the Rise 5.99 AutoGap/AutoPot/AutoHead/AutoSoup family and Sigma's FastUse use RELEASE_USE_ITEM to end eating, potting and item use instantly. NoSlow lives in Memeware, Rise 5.99, Rise 6.x (Legit/NCP/Intave), Sigma and Spicy, pairing RELEASE_USE_ITEM with a C08 re-place to cancel the slow. Combat auras in every client use RELEASE_USE_ITEM for autoblock, and Rise 6.x velocity and disabler modules spoof dig state for anti-cheat bypasses.</p>
+<h4>Exploit surface</h4>
+<p>The server processes a START+STOP pair as a complete break with no client-side damage accounting, so any module can mine instantly at the packet level; the only server-side evidence is the block's hardness versus the reported dig duration. RELEASE_USE_ITEM ignores the BlockPos entirely, so Spicy's NoSlow can send it with a random double-range position and the server reads only the status. The 36.0 distance gate is generous versus the client's 6-block reach, and Teleport-mode Nuker satisfies it by walking before digging. DROP_ITEM is a free inventory channel. Anti-cheats counter with dig-speed measurement (hardness versus START-to-STOP gap), per-second block counts for nuker patterns, and the release+re-place gap for NoSlow.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processPlayerDigging resolves the block position, then switches on the status ordinal. Drop actions skip the distance check entirely and go straight to dropOneItem; the spectator gate is the only guard. RELEASE_USE_ITEM also skips position validation and calls stopUsingItem, which is why the random-position trick works: the server reads the enum and nothing else. Dig actions enforce the 36.0 squared-distance gate with the +1.5 Y bias, the build-limit clamp, the world-border check and the block-protection check (an S23 is sent back when the dig is refused). STOP_DESTROY_BLOCK is what actually breaks the block via onPlayerDestroyBlock; START only enters the mining state. The ItemInWorldManager tracks the dig progress server-side, but a module that sends START then STOP back-to-back completes the state machine in one round trip.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>The BlockPos is packed into a single long as ((x &amp; 0x3FFFFFF) &lt;&lt; 38) | ((y &amp; 0xFFF) &lt;&lt; 26) | (z &amp; 0x3FFFFFF). The facing byte and the status byte follow; MCP reads both via readEnumValue, so both are VarInts on the wire. Status ordinals: 0 START_DESTROY_BLOCK, 1 ABORT_DESTROY_BLOCK, 2 STOP_DESTROY_BLOCK, 3 DROP_ALL_ITEMS, 4 DROP_ITEM, 5 RELEASE_USE_ITEM. Drop packets conventionally use BlockPos.ORIGIN with EnumFacing.DOWN; modules copy that convention even for release packets, and Spicy's NoSlow deliberately breaks it with random coordinates. The packet is registered at 0x07 in the SERVERBOUND play state table.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>NCP and Matrix measure the START-to-STOP gap against the block's hardness and flag instant breaks; Nuker patterns are caught by counting unique blocks destroyed per second, which is why Rise 5.99's Nuker ships a Tick throttle and an Instant Only mode that refuses hardness above 0. SpeedMine avoids the dig-speed flag by never lying about the gap: it finishes the client-side damage model and only then sends STOP. NoSlow is detected by the release+re-place packet pattern and by position comparison on the C07, which is what Spicy's random BlockPos defeats. GrimVelocity and StandardVelocity in Rise 6.x spoof START/STOP to satisfy mining-state checks during knockback, and the CubeCraft and Vulcan disablers send STOP/START at the player's own position to reset server dig state. The item-use family (FastBow, FastUse) is flagged by charge-time measurement between the C08 use and the C07 release.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
+<p class="impl-pattern">The mining and item-use control packet: six status values over a packed position and facing byte. Nuker and Breaker forge START+STOP pairs for instant mining, Tenacity's SpeedMine runs the block math client-side, FastBow releases the bow early through RELEASE_USE_ITEM, and NoSlow pairs the release with a C08 re-place to cancel eating and blocking slows. Autoblock auras in every client fire RELEASE_USE_ITEM around each attack.</p>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Nuker</span>
-<span class="impl-module-clients">(Slice v15, Mint B1, Gugustus, Koks v1, Swift Developer Alpha, Tenacity 6.0)</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">START/STOP_DESTROY_BLOCK for nuker/speedmine. RELEASE_USE_ITEM for autoblock (releases right-click after attack). DROP_ITEM for inventory management or NoSlow bypass.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Nuker
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, pos, EnumFacing.UP));
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, pos, EnumFacing.UP));
-// Autoblock
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
-// NoSlow
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / onTick</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Fucker</span>
-<span class="impl-module-clients">(Slice v15, Mint B1, Gugustus, Koks v1, Swift Developer Alpha, Tenacity 6.0)</span>
-</div>
-<p class="impl-pattern">START/STOP_DESTROY_BLOCK for nuker/speedmine. RELEASE_USE_ITEM for autoblock (releases right-click after attack). DROP_ITEM for inventory management or NoSlow bypass.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Nuker
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, pos, EnumFacing.UP));
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, pos, EnumFacing.UP));
-// Autoblock
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
-// NoSlow
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / onTick</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold</span>
-<span class="impl-module-clients">(Slice v15, Mint B1, Gugustus, Koks v1, Swift Developer Alpha, Tenacity 6.0)</span>
-</div>
-<p class="impl-pattern">START/STOP_DESTROY_BLOCK for nuker/speedmine. RELEASE_USE_ITEM for autoblock (releases right-click after attack). DROP_ITEM for inventory management or NoSlow bypass.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>package net.SliceClient.modules;
+<p class="impl-pattern">Break every block in a radius cube by sending START+STOP pairs at the packet level, with teleport and area variants.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On update, every N ticks, iterate the radius-minus-1 cube; skip air and, in Instant Only mode, any block with hardness above 0; send START_DESTROY_BLOCK then STOP_DESTROY_BLOCK for each target via sendPacketWithoutEvent, with an optional swing. Teleport mode ray-traces 999 blocks on use, pathfinds to the target with C04 packets, nukes, and walks back; Area mode picks a random point inside the .setarea box. An S02 chat filter cancels the plot-protection message.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/Nuker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/Nuker.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.other;
+
+import dev.rise.Rise;
+import dev.rise.command.impl.SetArea;
+import dev.rise.event.impl.other.UpdateEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.module.impl.render.Freecam;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.math.TimeUtil;
+import dev.rise.util.pathfinding.MainPathFinder;
+import dev.rise.util.pathfinding.Vec3;
+import dev.rise.util.player.PacketUtil;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockAir;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
 
 import java.util.ArrayList;
-import net.SliceClient.module.Category;
-import net.SliceClient.module.Module;
-import net.SliceClient.module.ModuleManager;
-import net.minecraft.block.BlockAir;
-import net.minecraft.block.state.IBlockState;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.entity.EntityPlayerSP;
-import net.minecraft.client.multiplayer.PlayerControllerMP;
-import net.minecraft.client.network.NetHandlerPlayClient;
-import net.minecraft.entity.player.EntityPlayer;
-import net.minecraft.entity.player.InventoryPlayer;
-import net.minecraft.network.NetworkManager;
-import net.minecraft.network.play.client.C03PacketPlayer.C05PacketPlayerLook;
-import net.minecraft.util.AxisAlignedBB;
-import net.minecraft.util.BlockPos;
-import net.minecraft.util.Vec3;
-import net.minecraft.world.World;
+import java.util.Collections;
+import java.util.Objects;
+import java.util.Random;
 
+@ModuleInfo(name = "Nuker", description = "Breaks blocks around you", category = Category.OTHER)
+public final class Nuker extends Module {
 
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Normal", "Normal", "Teleport", "Area");
+    private final NumberSetting delay = new NumberSetting("Delay", this, 100, 0, 5000, 50);
+    private final NumberSetting range = new NumberSetting("Range", this, 4, 1, 7, 0.5);
+    private final NumberSetting tick = new NumberSetting("Tick", this, 1, 1, 20, 1);
+    private final BooleanSetting instantOnly = new BooleanSetting("Instant Only", this, false);
+    private final BooleanSetting scatter = new BooleanSetting("Scatter", this, false);
+    private final BooleanSetting swing = new BooleanSetting("Swing", this, true);
 
-public class ScaffoldWalk
-  extends Module
-{
-  private transient int delay = 0;
-  private boolean safewalkWasActive;
-  
-  public ScaffoldWalk() {
-    super("ScaffoldWalk", Category.PLAYER, 16376546);
-  }
-  
-  public void onToggle()
-  {
-    if (ModuleManager.getModule(ScaffoldWalk.class).isEnabled())
-      ModuleManager.getModule(SafeWalk.class).isEnabled();
-  }
-  
-  public void onUpdate() {
-    if (!getState()) {
-      return;
+    private final TimeUtil timer = new TimeUtil();
+
+    @Override
+    public void onUpdateAlwaysInGui() {
+        delay.hidden = !(mode.is("Teleport") || mode.is("Area"));
+
+        tick.hidden = !mode.is("Normal");
     }
-    EntityPlayerSP p = Minecraft.thePlayer;
-    
-    if (delay &gt; 0) {
-      delay -= 1;
-    }
-    if (delay &lt;= 0)
-    {
-      ArrayList&lt;BlockPos&gt; blockStandOn = getSurroundingBlocks();
-      
-      ArrayList&lt;BlockPos&gt; collisionBlocks = getCollisionBlocks();
-      
-      for (BlockPos posCollision : collisionBlocks) {
-        IBlockState blockOnCollision = worldObj.getBlockState(posCollision);
-        if ((blockOnCollision.getBlock() instanceof BlockAir))
-        {
-          for (BlockPos posStandOn : blockStandOn) {
-            IBlockState blockInReach = worldObj.getBlockState(posStandOn);
-            
-            if (!(blockInReach.getBlock() instanceof BlockAir))
-            {
-              if (!posStandOn.equals(posCollision))
-              {
-                if (posStandOn.offset(p.func_174811_aO()).equals(posCollision))
-                {
-                  sendQueue.netManager.sendPacket(new C03PacketPlayer.C05PacketPlayerLook(thePlayerrotationYaw, 90.0F, true));
-                  
-                  if (Minecraft.playerController.func_178890_a(Minecraft.thePlayer, Minecraft.theWorld, inventory.getCurrentItem(), posStandOn.add(0, 0, 0), p.func_174811_aO(), new Vec3(posStandOn.getX(), posStandOn.getY(), posStandOn.getZ()))) {
-                    p.swingItem();
+
+    @Override
+    public void onUpdate(final UpdateEvent event) {
+        final double radius = this.range.getValue() - 1;
+
+        if (mc.thePlayer.ticksExisted &lt; 5) {
+            this.toggleModule();
+            this.registerNotification("Disabled " + this.getModuleInfo().name() + " due to world change.");
+            return;
+        }
+
+        if (mc.thePlayer.ticksExisted % tick.getValue() == 0 || !mode.is("Normal")) {
+            switch (mode.getMode()) {
+                case "Normal": {
+                    nuke(radius, mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ);
                     break;
-                  }
                 }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  
 
-  private ArrayList&lt;BlockPos&gt; getCollisionBlocks()
-  {
-    ArrayList&lt;BlockPos&gt; collisionBlocks = new ArrayList();
-    EntityPlayer p = Minecraft.thePlayer;
-    
-    BlockPos var1 = new BlockPos(getEntityBoundingBoxminX + 0.1D, getEntityBoundingBoxminY - 0.001D, getEntityBoundingBoxminZ + 0.1D);
-    BlockPos var2 = new BlockPos(getEntityBoundingBoxmaxX - 0.1D, getEntityBoundingBoxmaxY + 0.001D, getEntityBoundingBoxmaxZ - 0.1D);
-    
-    for (int var3 = var1.getX(); var3 &lt;= var2.getX(); var3++) {
-      for (int var4 = var1.getY(); var4 &lt;= var2.getY(); var4++) {
-        for (int var5 = var1.getZ(); var5 &lt;= var2.getZ(); var5++)
-        {
-          BlockPos blockPos = new BlockPos(var3, var4, var5);
-          IBlockState var7 = worldObj.getBlockState(blockPos);
-          try
-          {
-            if ((var4 &gt; posY - 2.0D) &amp;&amp; (var4 &lt;= posY - 1.0D)) {
-              collisionBlocks.add(blockPos);
+                case "Teleport": {
+                    if (mc.gameSettings.keyBindUseItem.isKeyDown() &amp;&amp; timer.hasReached((long) delay.getValue())) {
+                        final boolean freecamEnabled = Objects.requireNonNull(Rise.INSTANCE.getModuleManager().getModule("Freecam")).isEnabled();
+
+                        final BlockPos pos = mc.thePlayer.rayTrace(999, 1).getBlockPos();
+
+                        if (mc.theWorld.getBlockState(pos).getBlock() instanceof BlockAir)
+                            return;
+
+                        new Thread(() -&gt; {
+                            double x = mc.thePlayer.posX;
+                            double y = mc.thePlayer.posY;
+                            double z = mc.thePlayer.posZ;
+
+                            if (freecamEnabled) {
+                                x = Freecam.startX;
+                                y = Freecam.startY;
+                                z = Freecam.startZ;
+                            }
+
+                            final ArrayList&lt;Vec3&gt; path = MainPathFinder.computePath(new Vec3(x, y, z), new Vec3(pos.getX(), pos.getY(), pos.getZ()));
+
+                            for (final Vec3 vec : path)
+                                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(vec.getX(), vec.getY(), vec.getZ(), true));
+
+                            nuke(radius, pos.getX(), pos.getY(), pos.getZ());
+                            Collections.reverse(path);
+
+                            for (final Vec3 vec : path)
+                                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(vec.getX(), vec.getY(), vec.getZ(), true));
+                        }).start();
+
+                        timer.reset();
+                    }
+                    break;
+                }
+
+                case "Area": {
+                    final Vec3 pos1 = SetArea.pos1;
+                    final Vec3 pos2 = SetArea.pos2;
+
+                    if (pos1 == null || pos2 == null) {
+                        this.registerNotification("Set a position for Area Nuker by doing .setarea &lt;1/2/reset&gt; at the positions.");
+                        this.toggleModule();
+                        return;
+                    }
+
+                    if (timer.hasReached((long) delay.getValue())) {
+                        final boolean freecamEnabled = Objects.requireNonNull(Rise.INSTANCE.getModuleManager().getModule("Freecam")).isEnabled();
+                        final double nukeX = randomPoint(pos1.getX(), pos2.getX());
+                        final double nukeY = randomPoint(pos1.getY(), pos2.getY());
+                        final double nukeZ = randomPoint(pos1.getZ(), pos2.getZ());
+
+                        new Thread(() -&gt; {
+                            double x = mc.thePlayer.posX;
+                            double y = mc.thePlayer.posY;
+                            double z = mc.thePlayer.posZ;
+
+                            if (freecamEnabled) {
+                                x = Freecam.startX;
+                                y = Freecam.startY;
+                                z = Freecam.startZ;
+                            }
+
+                            final ArrayList&lt;Vec3&gt; path = MainPathFinder.computePath(new Vec3(x, y, z), new Vec3(nukeX, nukeY, nukeZ));
+
+                            for (final Vec3 vec : path)
+                                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(vec.getX(), vec.getY(), vec.getZ(), true));
+
+                            nuke(radius, nukeX, nukeY, nukeZ);
+                            Collections.reverse(path);
+
+                            for (final Vec3 vec : path)
+                                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(vec.getX(), vec.getY(), vec.getZ(), true));
+                        }).start();
+                    }
+                    break;
+                }
             }
-          }
-          catch (Throwable localThrowable) {}
         }
-      }
     }
-    
-    return collisionBlocks;
-  }
-  
-  private ArrayList&lt;BlockPos&gt; getSurroundingBlocks() {
-    ArrayList&lt;BlockPos&gt; blocksStandOn = new ArrayList();
-    EntityPlayer p = Minecraft.thePlayer;
-    
-    for (int var3 = (int)posX - 1; var3 &lt;= (int)posX + 1; var3++) {
-      for (int var4 = (int)posY - 1; var4 &lt;= (int)posY; var4++) {
-        for (int var5 = (int)posZ - 1; var5 &lt;= (int)posZ + 1; var5++)
-        {
-          if ((var3 == Math.floor(posX)) || (var5 == Math.floor(posZ)))
-          {
-            BlockPos blockPos = new BlockPos(var3, var4, var5);
-            try
-            {
-              if ((var4 &gt; posY - 2.0D) &amp;&amp; (var4 &lt;= posY - 1.0D)) {
-                blocksStandOn.add(blockPos);
-              }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (p instanceof S02PacketChat) {
+            final S02PacketChat packetChat = (S02PacketChat) p;
+            final String message = packetChat.getChatComponent().getUnformattedText();
+            if (!packetChat.isChat() &amp;&amp; message.equals("You can't build outside the plot!"))
+                event.setCancelled(true);
+        }
+    }
+
+    private void nuke(final double range, final double xPos, final double yPos, final double zPos) {
+        if (range == 0) {
+            final BlockPos blockPos = new BlockPos(xPos, yPos, zPos);
+            final Block block = mc.theWorld.getBlockState(blockPos).getBlock();
+
+            if (block instanceof BlockAir || (block.getBlockHardness() &gt; 0 &amp;&amp; instantOnly.isEnabled()))
+                return;
+
+            PacketUtil.sendPacketWithoutEvent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, EnumFacing.UP));
+            PacketUtil.sendPacketWithoutEvent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, blockPos, EnumFacing.UP));
+
+            if (swing.isEnabled())
+                mc.thePlayer.swingItem();
+        } else {
+            for (double x = -range; x &lt; range; x++) {
+                for (double y = range; y &gt; -range; y--) {
+                    for (double z = -range; z &lt; range; z++) {
+                        if (scatter.isEnabled() &amp;&amp; !((mc.thePlayer.ticksExisted % 2 == 0 ? x : z) % 2 == 0))
+                            continue;
+
+                        final BlockPos blockPos = new BlockPos(xPos + x, yPos + y, zPos + z);
+                        final Block block = mc.theWorld.getBlockState(blockPos).getBlock();
+
+                        if (block instanceof BlockAir || (block.getBlockHardness() &gt; 0 &amp;&amp; instantOnly.isEnabled()))
+                            continue;
+
+                        PacketUtil.sendPacketWithoutEvent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, EnumFacing.UP));
+                        PacketUtil.sendPacketWithoutEvent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, blockPos, EnumFacing.UP));
+
+                        if (swing.isEnabled())
+                            mc.thePlayer.swingItem();
+                    }
+                }
             }
-            catch (Throwable localThrowable) {}
-          }
         }
-      }
     }
-    
-    return blocksStandOn;
-  }
+
+    private double randomPoint(final double one, final double two) {
+        if (one == two)
+            return one;
+
+        final double delta = two - one;
+        final double offset = new Random().nextFloat() * delta;
+        return one + offset;
+    }
 }
+
+
+// NOTE (AI): The nuke() core sends START_DESTROY_BLOCK then immediately STOP_DESTROY_BLOCK for every non-air block in the radius cube, via sendPacketWithoutEvent so no other module sees the flood. The server processes the pair as a complete break: START calls ItemInWorldManager.func_180784_a (tryHarvestBlock) and STOP calls onPlayerDestroyBlock, so instant mining is achieved at the packet level with no client-side damage accumulation. Instant Only mode skips any block with hardness above 0, which limits the server-side tell. Teleport and Area modes pathfind to the target with C04 packets (also without event), nuke, and walk back, which keeps the C07 distance check (36.0 squared) satisfied. The S02 chat cancel hides the plot-protection message the server would otherwise send back.
 </code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / onTick</span></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent for the dig loop; PacketReceiveEvent for the chat cancel.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Instant START+STOP on high-hardness blocks is the canonical nuker flag; the Tick throttle bounds blocks-per-tick and Instant Only bounds the tell. The Teleport mode trips movement checks if the C04 walk is not replayed, so the pathfinding round trip doubles as the anti-movement-check measure.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 and 6.2.4 ship the same module but send only START_DESTROY_BLOCK and rely on the client's own PlayerControllerMP loop to finish the dig, trading instant breaks for a subtler packet stream.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoSlowdown</span>
-<span class="impl-module-clients">(Slice v15, Mint B1, Gugustus, Koks v1, Swift Developer Alpha, Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Breaker</span>
+<span class="impl-module-clients">(Memeware 7.3, Rise 5.99, Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">START/STOP_DESTROY_BLOCK for nuker/speedmine. RELEASE_USE_ITEM for autoblock (releases right-click after attack). DROP_ITEM for inventory management or NoSlow bypass.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Nuker
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, pos, EnumFacing.UP));
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, pos, EnumFacing.UP));
-// Autoblock
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
-// NoSlow
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / onTick</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Autoblock</span>
-<span class="impl-module-clients">(Slice v15, Mint B1, Gugustus, Koks v1, Swift Developer Alpha, Tenacity 6.0)</span>
-</div>
-<p class="impl-pattern">START/STOP_DESTROY_BLOCK for nuker/speedmine. RELEASE_USE_ITEM for autoblock (releases right-click after attack). DROP_ITEM for inventory management or NoSlow bypass.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Nuker
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, pos, EnumFacing.UP));
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, pos, EnumFacing.UP));
-// Autoblock
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
-// NoSlow
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / onTick</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">FastBreak</span>
-<span class="impl-module-clients">(Slice v15, Mint B1, Gugustus, Koks v1, Swift Developer Alpha, Tenacity 6.0)</span>
-</div>
-<p class="impl-pattern">START/STOP_DESTROY_BLOCK for nuker/speedmine. RELEASE_USE_ITEM for autoblock (releases right-click after attack). DROP_ITEM for inventory management or NoSlow bypass.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Nuker
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, pos, EnumFacing.UP));
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, pos, EnumFacing.UP));
-// Autoblock
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
-// NoSlow
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / onTick</span></div>
+<p class="impl-pattern">Destroy specific blocks (cake, beds, wool, end stone) in a radius for bedwars-style play.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Memeware's Breaker, registered as BlockFucker, scans a 5-block cube every update and, when the block is cake or end stone, sends START then STOP with EnumFacing.NORTH via sendPacketSilent. The target list is a BlockSelectionSetting defaulting to cake, bed, wool and end stone; the pickaxeSlot, cakeBesideOrAt and cakeCovered helpers are dead code left in the file.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/misc/Breaker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/misc/Breaker.java =====
+
+package me.memewaredevs.client.module.misc;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.Memeware;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+import me.memewaredevs.client.option.BlockSelectionSetting;
+import me.memewaredevs.client.util.packet.PacketUtil;
+import net.minecraft.block.Block;
+import net.minecraft.init.Blocks;
+import net.minecraft.item.ItemPickaxe;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+
+import java.util.ArrayList;
+import java.util.function.Consumer;
+
+public class Breaker extends Module {
+    public Breaker() {
+        super("BlockFucker", 0, Module.Category.MISC);
+        ArrayList&lt;Block&gt; defaultList = new ArrayList&lt;&gt;();
+        defaultList.add(Blocks.cake);
+        defaultList.add(Blocks.bed);
+        defaultList.add(Blocks.wool);
+        defaultList.add(Blocks.end_stone);
+        this.addBlockSelection("Target Blocks", defaultList);
+        this.addBoolean("Cake Check", true);
+    }
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; onEvent = (event) -&gt; {
+        final int radius = 5;
+        BlockSelectionSetting setting = (BlockSelectionSetting) Memeware.INSTANCE.getSettingsManager().getSettingByMod(this.getClass(), "Target Blocks");
+        for (int x = -radius; x &lt; radius; ++x) {
+            for (int y2 = radius; y2 &gt; -radius; --y2) {
+                for (int z = -radius; z &lt; radius; ++z) {
+                    final int xPos = (int) this.mc.thePlayer.posX + x;
+                    final int yPos = (int) this.mc.thePlayer.posY + y2;
+                    final int zPos = (int) this.mc.thePlayer.posZ + z;
+                    final BlockPos blockPos = new BlockPos(xPos, yPos, zPos);
+                    final Block block = this.mc.theWorld.getBlockState(blockPos).getBlock();
+                    if (block == Blocks.cake || block == Blocks.end_stone) {
+                        PacketUtil.sendPacketSilent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, EnumFacing.NORTH));
+                        PacketUtil.sendPacketSilent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, blockPos, EnumFacing.NORTH));
+                    }
+                }
+            }
+        }
+    };
+
+    private void breakBlock(BlockPos blockPos) {
+        PacketUtil.sendPacketSilent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, EnumFacing.NORTH));
+        PacketUtil.sendPacketSilent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, blockPos, EnumFacing.NORTH));
+    }
+
+    private int pickaxeSlot() {
+        for (int j = 0; j &lt; 8; ++j) {
+            ItemStack stack = mc.thePlayer.inventory.mainInventory[j];
+            if (stack != null &amp;&amp; stack.getItem() instanceof ItemPickaxe) {
+                return j;
+            }
+        }
+        return -10;
+    }
+
+    private boolean cakeBesideOrAt(BlockPos blockPos) {
+        for (EnumFacing face : new EnumFacing[] {EnumFacing.NORTH, EnumFacing.SOUTH, EnumFacing.WEST, EnumFacing.EAST, EnumFacing.DOWN}) {
+            if (mc.theWorld.getBlockState(blockPos.offset(face)).getBlock() == Blocks.cake) {
+                return true;
+            }
+        }
+        return mc.theWorld.getBlockState(blockPos).getBlock() == Blocks.cake;
+    }
+
+    private boolean cakeCovered(BlockPos blockPos) {
+        for (EnumFacing face : new EnumFacing[] {EnumFacing.NORTH, EnumFacing.SOUTH, EnumFacing.WEST, EnumFacing.EAST, EnumFacing.UP}) {
+            if (mc.theWorld.getBlockState(blockPos.offset(face)).getBlock() == Blocks.air) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+
+// NOTE (AI): Registered as BlockFucker. The UpdateEvent handler scans a 5-block cube around the player and, when the block is cake or end stone, sends START then STOP with EnumFacing.NORTH via sendPacketSilent (the bus-bypassing path). The pickaxeSlot, cakeBesideOrAt and cakeCovered helpers are dead code; the actual target list comes from the BlockSelectionSetting populated with cake, bed, wool and end stone defaults. This is the bedwars-style block destroyer: it only ever touches C07 and never sends C08 placements or C0A swings, so the only server-side evidence is the instant-break packet pair.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Same instant-break surface as Nuker; on bedwars servers the flag is per-block-count rather than hardness, since cake and beds are already low-hardness. The silent send path keeps the pairs off the event bus so no other module reacts.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99's Breaker sends START+STOP with EnumFacing.UP and more target configuration. Rise 6.x carries three generations: Breaker and NewBreaker (START+STOP, EnumFacing.UP) and NewNewBreaker (EnumFacing.DOWN, with block-state tracking before the dig).</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">SpeedMine</span>
-<span class="impl-module-clients">(Slice v15, Mint B1, Gugustus, Koks v1, Swift Developer Alpha, Tenacity 6.0)</span>
+<span class="impl-module-clients">(Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">START/STOP_DESTROY_BLOCK for nuker/speedmine. RELEASE_USE_ITEM for autoblock (releases right-click after attack). DROP_ITEM for inventory management or NoSlow bypass.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Nuker
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, pos, EnumFacing.UP));
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, pos, EnumFacing.UP));
-// Autoblock
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
-// NoSlow
-mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / onTick</span></div>
+<p class="impl-pattern">Mine faster by running the block-breaking math client-side and finishing the dig with a single STOP packet.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketSendEvent it arms on START_DESTROY_BLOCK, records position and facing, and disarms on ABORT or STOP. While armed, every pre-motion tick accumulates damage += playerRelativeBlockHardness * speed; when damage reaches 1 it swaps the block to air client-side and sends STOP_DESTROY_BLOCK via sendPacketNoEvent. blockHitDelay is zeroed so the next block starts immediately.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/event/impl/player/SpeedMine.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/event/impl/player/SpeedMine.java =====
+package dev.tenacity.event.impl.player;
+
+import dev.tenacity.module.ModuleCategory;
+import dev.tenacity.module.Module;
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.network.PacketSendEvent;
+import dev.tenacity.event.impl.player.MotionEvent;
+import dev.tenacity.setting.impl.NumberSetting;
+import dev.tenacity.util.network.PacketUtils;
+import net.minecraft.block.state.IBlockState;
+import net.minecraft.init.Blocks;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+
+public class SpeedMine extends Module {
+
+    private final NumberSetting speed = new NumberSetting("Speed", 1.5, 1, 3, 0.1);
+    private EnumFacing facing;
+    private BlockPos pos;
+    private boolean boost;
+    private float damage;
+
+    public SpeedMine() {
+        super("SpeedMine", "mines blocks faster", ModuleCategory.PLAYER);
+       initializeSettings(speed);
+    }
+
+    private final IEventListener&lt;MotionEvent&gt; onMotion = e -&gt; {
+        if (e.isPre()) {
+            mc.playerController.blockHitDelay = 0;
+            if (pos != null &amp;&amp; boost) {
+                IBlockState blockState = mc.theWorld.getBlockState(pos);
+                if (blockState == null) return;
+
+                try {
+                    damage += (float) (blockState.getBlock().getPlayerRelativeBlockHardness(mc.thePlayer, mc.theWorld, pos) * speed.getCurrentValue());
+                } catch (Exception ex) {
+                    ex.printStackTrace();
+                    return;
+                }
+
+                if (damage &gt;= 1) {
+                    try {
+                        mc.theWorld.setBlockState(pos, Blocks.air.getDefaultState(), 11);
+                    } catch (Exception ex) {
+                        ex.printStackTrace();
+                        return;
+                    }
+                    PacketUtils.sendPacketNoEvent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, pos, facing));
+                    damage = 0;
+                    boost = false;
+                }
+            }
+        }
+    };
+
+    private final IEventListener&lt;PacketSendEvent&gt; onPacketSend = e -&gt; {
+        if (e.getPacket() instanceof C07PacketPlayerDigging) {
+            C07PacketPlayerDigging packet = (C07PacketPlayerDigging) e.getPacket();
+            if (packet.getStatus() == C07PacketPlayerDigging.Action.START_DESTROY_BLOCK) {
+                boost = true;
+                pos = packet.getPosition();
+                facing = packet.getFacing();
+                damage = 0;
+            } else if (packet.getStatus() == C07PacketPlayerDigging.Action.ABORT_DESTROY_BLOCK | packet.getStatus() == C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK) {
+                boost = false;
+                pos = null;
+                facing = null;
+            }
+        }
+    };
+
+}
+
+
+// NOTE (AI): SpeedMine sits in the event package but is a real Module. It does not fake the dig time; it runs the block-breaking math client-side. On PacketSendEvent it arms on START_DESTROY_BLOCK, records pos and facing, and disarms on ABORT or STOP. While armed, every pre-motion tick accumulates damage += playerRelativeBlockHardness * speed, and when damage reaches 1 it swaps the block to air client-side (setBlockState) and sends STOP_DESTROY_BLOCK without event. The server receives a legitimately-timed STOP and processes the break normally; the client-side air swap is what makes the block vanish instantly for the local player, and the server's own damage counter never has to reach the threshold. blockHitDelay=0 removes the vanilla post-hit delay that would otherwise slow the next block.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent for the dig state machine; MotionEvent pre for damage accumulation.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The server receives a legitimately timed STOP, so dig-speed checks that measure the START-to-STOP gap see a plausible duration; the client-side air swap is invisible to the server, which only ever sees the completed break. Anti-cheats that simulate hardness independently still flag the effective speed multiplier.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other client in the corpus implements client-side damage accumulation for this packet; Memeware, Rise and Sigma achieve speed mining purely through packet pairs or by letting PlayerControllerMP run.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoSlowdown / NoSlow</span>
+<span class="impl-module-clients">(Memeware 7.3, Rise 5.99, Rise 6.1.30, Rise 6.2.4, Sigma 4.11, Spicy)</span>
 </div>
+<p class="impl-pattern">Cancel the movement slow applied while eating or blocking by releasing the use-item state and immediately re-placing.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Spicy's NoSlow, on pre update while blocking with a sword, moving, on ground within 0.42 and with no killaura target, sends RELEASE_USE_ITEM with a BlockPos built from RandomUtils.nextDouble(4.9E-324D, 1.7976931348623157E308D) on every axis, then on post sends C08PacketPlayerBlockPlacement at (-1,-1,-1) with the held item to re-enter the block state. The server reads only the status of the release, so the random position is harmless to vanilla but defeats position-comparing heuristics.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy — info/spicyclient/modules/movement/NoSlow.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/movement/NoSlow.java =====
+package info.spicyclient.modules.movement;
+
+import org.apache.commons.lang3.RandomUtils;
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.SpicyClient;
+import info.spicyclient.chatCommands.Command;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.modules.combat.Killaura;
+import info.spicyclient.util.MovementUtils;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C07PacketPlayerDigging.Action;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+
+public class NoSlow extends Module {
+
+	public NoSlow() {
+		super("NoSlow", Keyboard.KEY_NONE, Category.MOVEMENT);
+	}
+
+	
+	public void onEnable() {
+		
+	}
+	
+	public void onDisable() {
+		
+	}
+	
+	public void onEvent(Event e) {
+		
+		if (e instanceof EventUpdate &amp;&amp; e.isPre()) {
+			
+	        if (mc.thePlayer.isBlocking() &amp;&amp; MovementUtils.isMoving() &amp;&amp; MovementUtils.isOnGround(0.42D) &amp;&amp; SpicyClient.config.killaura.target == null) {
+	            if (e.isPre()) {
+	                mc.getNetHandler().getNetworkManager().sendPacket(new C07PacketPlayerDigging(Action.RELEASE_USE_ITEM, new BlockPos(RandomUtils.nextDouble(4.9E-324D, 1.7976931348623157E308D), RandomUtils.nextDouble(4.9E-324D, 1.7976931348623157E308D), RandomUtils.nextDouble(4.9E-324D, 1.7976931348623157E308D)), EnumFacing.DOWN));
+	            } else {
+	                mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, mc.thePlayer.getHeldItem(), 0.0F, 0.0F, 0.0F));
+	            }
+	        }
+			
+		}
+		
+	}
+	
+}
+
+
+// NOTE (AI): The NoSlow bypass in 50 lines. On pre update, while blocking with a sword, moving, on ground within 0.42, and with no active killaura target, it sends RELEASE_USE_ITEM with a BlockPos built from RandomUtils.nextDouble(4.9E-324D, 1.7976931348623157E308D) for every axis, then on post sends the C08 re-place at (-1,-1,-1) with the held item. The server only reads the status field of RELEASE_USE_ITEM, so the random position is ignored by vanilla, but it defeats anti-cheats that compare the C07 position against the player's location as a heuristic. The release+re-place pair cancels the eating/blocking slow without ever dropping the block state.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventUpdate pre (release) and post (re-place).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The release+re-place pair is the detectable pattern: anti-cheats measure the gap between the C07 release and the C08 place, and some compare the C07 position to the player's location, which the random BlockPos defeats. LegitNoSlow in Rise 6.x deliberately mirrors vanilla timing to minimize the gap signature.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware's NoSlow is the same release-plus-place pattern. Rise 5.99's NoSlow sends RELEASE_USE_ITEM pairs from its packet handler. Rise 6.x splits LegitNoSlow (watches C07 releases and replays the C08), NCPNoSlow and IntaveNoSlow. Sigma's NoSlowdown sends RELEASE_USE_ITEM on a timer.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">FastBow</span>
+<span class="impl-module-clients">(Memeware 7.3, Rise 5.99, Sigma 4.11)</span>
+</div>
+<p class="impl-pattern">Fire fully charged arrows without holding the draw, by releasing the use-item state early and faking the charge.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">While the use key is held with a bow, reset the item damage to -1, call sendUseItem to enter the use state, then send 20 C06PacketPlayerPosLook packets aimed at the target with onGround true so the server registers continuous rotation during the charge. Fire RELEASE_USE_ITEM, then call onPlayerStoppedUsing directly with a charge tick of 10, which fixes the arrow power as a 10-tick draw regardless of real draw time. A trailing bare C03 keeps the movement stream alive.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/combat/FastBow.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/combat/FastBow.java =====
+
+package me.memewaredevs.client.module.combat;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+import me.memewaredevs.client.util.combat.RotationUtils;
+import me.memewaredevs.client.util.packet.PacketUtil;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.item.ItemBow;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+
+public class FastBow extends Module {
+
+    public FastBow() {
+        super("Fast Bow", 0, Module.Category.COMBAT);
+    }
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; update = event -&gt; {
+        if (event.isPre()) {
+            this.getTarg().forEach(target -&gt; {
+                if (doCheck()) {
+                    mc.thePlayer.inventory.getCurrentItem().setItemDamage(-1);
+                    duraHack(9, this.mc.thePlayer.inventory.currentItem);
+                    mc.playerController.sendUseItem(mc.thePlayer,
+                            mc.theWorld,
+                            mc.thePlayer.inventory.getCurrentItem());
+                    mc.thePlayer.inventory.getCurrentItem().getItem().onItemRightClick(
+                            mc.thePlayer.inventory.getCurrentItem(),
+                            mc.theWorld, mc.thePlayer);
+                    final float[] rotations = RotationUtils.getBowAngles(target);
+                    for (int i2 = 0; i2 &lt; 20; ++i2) {
+                        this.mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C06PacketPlayerPosLook(
+                                this.mc.thePlayer.posX, this.mc.thePlayer.posY, this.mc.thePlayer.posZ, rotations[0],
+                                rotations[1], true));
+                    }
+                    ;
+                    duraHack(9, this.mc.thePlayer.inventory.currentItem);
+                    mc.getNetHandler().addToSendQueue(new C07PacketPlayerDigging(
+                            C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.UP));
+                    mc.thePlayer.inventory.getCurrentItem().getItem().onPlayerStoppedUsing(
+                            mc.thePlayer.inventory.getCurrentItem(),
+                            mc.theWorld, mc.thePlayer, 10);
+                    PacketUtil.sendPacket(new C03PacketPlayer());
+                }
+            });
+        }
+    };
+
+    @Override
+    public void onEnable() {
+    }
+
+    private boolean doCheck() {
+        boolean b = mc.thePlayer.getHealth() &lt;= 0.0f
+                || !mc.thePlayer.isCollidedVertically
+                &amp;&amp; !mc.thePlayer.capabilities.isCreativeMode
+                || mc.thePlayer.inventory.getCurrentItem() == null
+                || !(mc.thePlayer.inventory.getCurrentItem().getItem() instanceof ItemBow)
+                || !mc.gameSettings.keyBindUseItem.getIsKeyPressed();
+        return !b;
+    }
+
+    @SuppressWarnings("unused")
+    private void duraHack(int slot, int hotbarNum) {
+        for (int unused : new int[2]) {
+            mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, slot, hotbarNum, 2, mc.thePlayer);
+        }
+    }
+
+    @Override
+    public void onDisable() {
+
+
+    }
+
+    private List&lt;EntityLivingBase&gt; getTarg() {
+        return mc.theWorld.playerEntities.stream()
+                .filter(ent -&gt; mc.thePlayer.canEntityBeSeen(ent) &amp;&amp; mc.thePlayer.getDistanceToEntity(ent) &lt;= 25
+                        &amp;&amp; mc.thePlayer != ent)
+                .limit(10).collect(Collectors.toCollection(ArrayList::new));
+    }
+}
+
+
+// NOTE (AI): The bow-charge exploit. While the use key is held with a bow, it resets the item damage to -1, calls sendUseItem to enter the use state, then spams 20 C06PacketPlayerPosLook packets aimed at the target (onGround true) so the server registers continuous rotation updates during the charge. It then fires RELEASE_USE_ITEM and calls onPlayerStoppedUsing directly with a charge tick of 10, which is what sets the arrow power: the client computes the shot as a 10-tick draw even though the player clicked a moment earlier. The duraHack windowClick double-swap is a separate durability-fix exploit. The trailing bare C03PacketPlayer() keeps the movement stream alive after the release.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent pre; the release goes through addToSendQueue, the item callback is invoked directly.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Charge-time checks measure the gap between the C08 use and the C07 release; a sub-tick gap with a full-power arrow is the tell. The 20 look packets also fake an aiming window for rotation checks. The duraHack windowClick double-swap is a separate durability exploit and a visible inventory-packet pattern.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99's FastBow sends C04 y-0.5 and C06 look packets before the release. Sigma's FastBow sends C04 offset pairs plus RELEASE_USE_ITEM through addToSendQueue.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Dig and drop automation hooks UpdateEvent or MotionEvent and sends C07 directly. Item-use and NoSlow modules hook the same events but split pre and post phases: release on pre, re-place on post. Packet-listener modules (Tenacity SpeedMine, Rise 6.x LegitNoSlow, Sigma Scaffold, Rise Infinite) instead hook the outgoing packet event and inspect getStatus() to react to the vanilla dig state machine.</div>
+<div class="impl-clients">Send paths: PacketUtil.sendPacket and sendPacketSilent in Memeware, addToSendQueue in Nekoware and Tenacity, PacketUtil.sendPacket and sendPacketWithoutEvent in Rise 5.99, PacketUtil.send and sendNoEvent in Rise 6.x, addToSendQueue and NetworkManager.sendPacketNoEvent in Sigma and Spicy. Rise 5.99 and 6.x also expose C07 to their scripting APIs (PacketAPI.send with Action.valueOf). The facing byte varies by module: EnumFacing.UP for nuker and breaker floods, EnumFacing.DOWN for release and drop packets, EnumFacing.NORTH in Memeware's Breaker.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C08PacketPlayerBlockPlacement/">C08PacketPlayerBlockPlacement</a>
+<a class="related-chip" href="../C02PacketUseEntity/">C02PacketUseEntity</a>
+<a class="related-chip" href="../C03PacketPlayer/">C03PacketPlayer</a>
+<a class="related-chip" href="../S23PacketBlockChange/">S23PacketBlockChange</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

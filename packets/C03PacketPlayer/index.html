@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C03PacketPlayer (0x03): Updates the player's position on the server. Has subclasses for different update types.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Flight, Speed, NoFall, Blink, Criticals, Damage, Phase, Step, NoVoid, Scaffold, AntiVoid, Regen">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="NoFall, Flight / Fly, Blink, Step, Speed / Bhop, Disabler">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C03PacketPlayer — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C03PacketPlayer — Minecraft 1.8.9 Packet Reference","description":"The movement spine of 1.8.9: one onGround byte plus optional position and rotation, emitted 20 times a second, trusted by the server for position integration, jump physics and fall damage. NoFall ground-spoofs it, Flight/Speed/Step/Phase forge its coordinates, Blink buffers it, Criticals and Damage ","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -84,945 +84,1021 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">S03PacketPlayer is the abstract base. C04/C05/C06 each have their own packet ID. The client sends C04 when only position changes, C05 when only rotation changes, and C06 when both change. onGround is ALWAYS present.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C03PacketPlayer is the abstract base of the serverbound movement family: four registered packet ids (0x03 bare, 0x04 position, 0x05 look, 0x06 pos+look) share one class with subclasses, and the vanilla client emits one of them every tick from EntityPlayerSP.onUpdateWalkingPlayer. The payload is a single onGround byte plus optional x/y/z doubles and yaw/pitch floats. Every server-side movement decision derives from it: position integration, ground state, fall distance, rotation, and the server's own movement validation. It is the most-sent packet in the play state and by far the most-abused one in the 8-client corpus, which references it in over 300 mined locations.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayServer.processPlayer snapshots lastPos, computes the squared delta, and arms a hasMoved flag on the first small movement. Position values beyond +-3.0E7 on X or Z kick with "Illegal position". A reported Y of -999.0 disables the movement flag entirely (the client sends it when falling out of the world). The vanilla anti-cheat is the "moved too quickly" check: the sum of min(|delta|, |motion|) squared per axis must stay under 100.0, otherwise the player is teleported back with a warning. A residual delta over 0.0625 squared after moveEntity logs "moved wrongly" and snaps the player back. If the client reports onGround=false while the server thinks the player is grounded and Y is rising, the server calls jump(). Fall damage is applied from the server's own simulated fall state, which is what ground spoofing attacks.</p>
+<h4>Why clients touch it</h4>
+<p>The corpus splits into five families. Ground-state spoofers: NoFall in all eight clients, plus FastUse and Regen that send C03(true) or bare C03() to force the server-side regen tick. Movement engines: Flight (Nekoware, Rise 5.99, the 13+ mode Rise 6.x flight suite, Sigma, Spicy, Tenacity), Speed and Bhop (Rise 5.99, Rise 6.x, Sigma, Spicy), Step (Memeware, Nekoware, Rise 5.99, Rise 6.x, Sigma), Phase (Memeware, Rise 5.99, Rise 6.x NormalPhase, Sigma). Buffer and replay: Blink in Rise 5.99, Rise 6.x components, Sigma, Spicy and Tenacity. Position injection: Criticals offset ladders, TPAura and Infinite path walks, Damage utilities, AntiVoid, LongJump, and teleport modules. Disablers: Memeware, Rise 5.99, the Rise 6.x per-server suite, Sigma, Spicy and Tenacity all rewrite, cancel or re-inject C03 to break anti-cheat position timing.</p>
+<h4>Exploit surface</h4>
+<p>onGround is a single trusted bit that drives server-side jump physics and fall-damage accumulation: NoFall reports ground every tick so the server's entity never accrues fall distance. The 100.0 and 0.0625 squared-delta gates are the real vanilla anti-cheat, so every movement module must keep reported deltas under them or accept the teleport-back. The -999.0 Y sentinel is a free pass for vertical state: modules and commands use it to reset position without moving the player. Disablers weaponize the packet stream itself: cancelling C03 while Hypixel's watchdog is armed freezes the player server-side, and rewriting C06 into C04 (or the reverse) breaks anti-cheats that count packet-type ratios. Rotation is never validated against motion in vanilla, so spinbot and rotation-spoof modules can report any yaw/pitch.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processPlayer runs on the server thread and, for position-carrying variants, compares the packet position against the stored lastPos. The hasMoved gate requires the first reported movement to be under 0.25 squared before any validation starts. The "moved too quickly" check uses min(|delta|, |motion|) per axis, so large instantaneous deltas are masked by small motion values; the check teleports back via setPlayerLocation instead of kicking. "moved wrongly" fires when the post-integration residual exceeds 0.0625 squared and the player is not sleeping or in creative, also teleporting back. When the client reports onGround=false while the server-side player is grounded and Y is rising, the server calls jump(), which is the mechanism both criticals and the watchdog-disabler +0.16/+0.07 packet pairs exploit. The flight check runs when the player has no block collision under the bounding box and flight is disabled, kicking on sustained airborne motion.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Four distinct ids map to one class: C03PacketPlayer (onGround only), C04PacketPlayerPosition (+x,y,z), C05PacketPlayerLook (+yaw,pitch), C06PacketPlayerPosLook (+both). The moving flag (field_149480_h) is set by the position constructors and the rotating flag by the look constructors; writePacketData emits the onGround byte first, then the doubles and floats conditionally. The -999.0 Y convention is a wire-level sentinel: the client sends C06 with y=-999 when falling out of the world, and the server clears the moving flag when it sees it. EntityPlayerSP selects the subclass by what changed this tick, and NetHandlerPlayClient answers S08 teleports with a C06 confirming the new position.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>NCP checks ground-state consistency (onGround true while falling), horizontal acceleration for speed, vertical acceleration for flight, and packet gaps for blink. Verus and AAC correlate rotation with motion, which is why Rise 6.x's PacketNoRotate rewrites C06 into C04 to strip rotations. Hypixel's watchdog is fought with the ground-truth +0.16/+0.07 jump-flag pair followed by full C03 cancellation for the watchdog window, disarmed by S08. Grim and Vulcan target packet-order and buffer abuse, countered by Rise 6.x modes like BufferAbuseFlight and the ConvertMovingPackets disabler. Timer-based flight and bhop (Spicy's 26.5 tps) flag timer checks unless the keepalive and transaction streams are delayed in lockstep, which is the disabler's second job.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Flight</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
-</div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
-}
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Speed</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
-</div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
-}
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
-</div>
+<p class="impl-pattern">The movement spine of 1.8.9: one onGround byte plus optional position and rotation, emitted 20 times a second, trusted by the server for position integration, jump physics and fall damage. NoFall ground-spoofs it, Flight/Speed/Step/Phase forge its coordinates, Blink buffers it, Criticals and Damage inject offset ladders into it, and the disabler suites cancel or rewrite it to freeze the server-side player.</p>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoFall</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99, Rise 6.1.30, Rise 6.2.4, Sigma 4.11, Spicy, Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
+<p class="impl-pattern">Eliminate fall damage by reporting onGround=true while falling, so the server-side entity never accumulates fall distance.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Memeware's Hypixel mode fires C03(true) through sendPacketSilent (bus-bypassing) the moment fallDistance reaches 2 with ground below, then resets the local fallDistance; the Ground Spoof mode mutates the UpdateEvent ground flag so the vanilla emitter sends onGround=true in every packet while falling past 2.5 blocks. The two modes cover servers that do and do not validate extra packets.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/movement/NoFall.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/movement/NoFall.java =====
+
+package me.memewaredevs.client.module.movement;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+import me.memewaredevs.client.util.packet.PacketUtil;
+import net.minecraft.network.play.client.C03PacketPlayer;
+
+import java.util.function.Consumer;
+
+public class NoFall extends Module {
+    public NoFall() {
+        super("No Fall", 0, Module.Category.MISC);
+        this.addModes("Ground Spoof", "Hypixel");
+    }
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer0 = (e) -&gt; {
+
+        if (isMode("Hypixel")) {
+            if (mc.thePlayer.fallDistance &gt;= 2F &amp;&amp; AntiFall.isBlockUnder()) {
+                PacketUtil.sendPacketSilent(new C03PacketPlayer(true));
+                mc.thePlayer.fallDistance = 0;
+            }
+        }
+        if(isMode("Ground Spoof")) {
+        	if (mc.thePlayer.fallDistance &gt; 2.5F) {
+        		e.setGround(true);
+        	}
+        }
+        
+    };
 }
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
+
+
+// NOTE (AI): The Hypixel mode sends C03(true) through sendPacketSilent, which bypasses the packet event bus, the moment fallDistance reaches 2 blocks while there is ground below (AntiFall.isBlockUnder). Reporting onGround=true resets the server-side entity's fallDistance accumulation, so the server never applies fall damage. Ground Spoof mode instead mutates the UpdateEvent's ground flag, which flows into the vanilla C03 emission in EntityPlayerSP.onUpdateWalkingPlayer, so the same effect is achieved without injecting an extra packet. The 2.5 fallDistance threshold keeps the spoof from running during normal jumping.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent; the injected C03(true) bypasses the packet event bus.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>NCP's ground check compares onGround against the simulated fall state; reporting ground mid-air is its classic flag, so packet-based NoFall is mostly caught by modern checks while ground-spoof variants that keep the arc believable last longer.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Nekoware sends C03(true) via sendPacketSilent on the same condition. Rise 5.99 sends C03(true) or a C06 with onGround true. Rise 6.x splits PacketNoFall (C03 true), FlagNoFall (C06 response spoof), PlaceNoFall, VulcanAndVerusNoFall and WatchdogNoFall. Sigma and Spicy send C03(true) on fallDistance thresholds; Tenacity's NoFallModule appears in the corpus via import only.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Flight / Fly</span>
+<span class="impl-module-clients">(Nekoware v1 private, Rise 5.99, Rise 6.1.30, Rise 6.2.4, Sigma 4.11, Spicy, Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Move vertically and horizontally without the server's flight permission, by driving client physics and shaping the C03 stream the vanilla emitter sends.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Nekoware's Vanilla mode sets motionY from input and horizontal speed directly and sends nothing, using a fall/ascend C04 pair every 700ms as anti-kick. Damage mode floods C0CPacketInput plus C03(true) each pre tick and starts with the fall-damage C04 ladder (y+3.05, y, y+0.41999998688697815) to gain the damage boost that defeats NCP flight checks. Verus mode places a C08 block below and zeroes motionY. The PacketOutEvent handler cancels C0F and C00 so the position stream is not correlated against transaction timing.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Nekoware v1 private — me/nekoWare/client/module/movement/Fly.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Nekoware v1 private — me/nekoWare/client/module/movement/Fly.java =====
+package me.nekoWare.client.module.movement;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.nekoWare.client.event.events.EventCollide;
+import me.nekoWare.client.event.events.MovementEvent;
+import me.nekoWare.client.event.events.PacketOutEvent;
+import me.nekoWare.client.event.events.UpdateEvent;
+import me.nekoWare.client.module.Module;
+import me.nekoWare.client.util.blocks.misc.BlockUtil;
+import me.nekoWare.client.util.misc.Timer;
+import me.nekoWare.client.util.movement.MovementUtils;
+import me.nekoWare.client.util.packet.PacketUtil;
+import net.minecraft.init.Blocks;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C09PacketHeldItemChange;
+import net.minecraft.network.play.client.C0CPacketInput;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C18PacketSpectate;
+import net.minecraft.util.AxisAlignedBB;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.MovementInput;
+import org.apache.commons.lang3.RandomUtils;
+
+import java.util.function.Consumer;
+
+public class Fly extends Module {
+
+    private Timer timer = new Timer();
+
+    private double y;
+
+    public Fly() {
+        super("Fly", 34, Module.Category.MOVEMENT);
+        this.addDouble("Speed", 2.5, 0.1, 5.0);
+        this.addModes("Vanilla", "Damage", "Verus");
+        this.addBoolean("Anti-Kick", false);
+    }
+
+    @Handler
+    public Consumer&lt;MovementEvent&gt; eventConsumer0 = event -&gt; {
+
+    };
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer1 = (event) -&gt; {
+
+        if (isMode("Vanilla")) {
+            mc.timer.timerSpeed = 1f;
+            if (event.isPre()) {
+                float speed = getDouble("Speed").floatValue();
+                MovementInput movementInput = mc.thePlayer.movementInput;
+                mc.thePlayer.motionY = movementInput.isJumping() ? speed * 0.5F
+                        : movementInput.isSneaking() ? -speed * 0.5F
+                        : 0.0F;
+                MovementUtils.setMoveSpeed(speed);
+                if (getBool("Anti-Kick") &amp;&amp; timer.delay(700.0f)) {
+                    MovementUtils.fallPacket();
+                    MovementUtils.ascendPacket();
+                    timer.reset();
+                }
+            }
+        }
+        
+        if (isMode("Damage")) {
+        	
+        	
+            mc.timer.timerSpeed = 1f;
+			if (event.isPre()) {
+				mc.thePlayer.sendQueue.addToSendQueue(new C0CPacketInput());
+				mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer(true));
+				mc.thePlayer.onGround = false;
+				float speed = getDouble("Speed").floatValue();
+				MovementInput movementInput = mc.thePlayer.movementInput;
+				mc.thePlayer.motionY = movementInput.isJumping() ? speed * 0.5F
+						: movementInput.isSneaking() ? -speed * 0.5F : 0.0F;
+				MovementUtils.setMoveSpeed(speed);
+			}
+        }
+        
+        if (isMode("Verus")) {
+        	
+
+        	mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1.5, mc.thePlayer.posZ), 1, new ItemStack(Blocks.stone.getItem(mc.theWorld, new BlockPos(-1, -1, -1))), 0, 0.94f, 0));
+            MovementUtils.setMoveSpeed(0.36);
+            mc.timer.timerSpeed = 1f;
+
+
+
+            if (y &gt;= 11) {
+                y = 0;
+            }
+
+            y++;
+
+    mc.thePlayer.motionY = 0f;
+        }
+    };
+
+    @Handler
+    public Consumer&lt;PacketOutEvent&gt; eventConsumer11 = (event) -&gt; {
+        if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
+            event.cancel();
+
+            timer.reset();
+        }
+        
+        if (event.getPacket() instanceof C00PacketKeepAlive) {
+            event.cancel();
+
+            timer.reset();
+        }
+    };
+
+    @Override
+    public void onEnable() {
+if(this.isMode("Damage")) {
+    	mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX,
+				mc.thePlayer.posY + 3.05, mc.thePlayer.posZ, false));
+		mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX,
+				mc.thePlayer.posY, mc.thePlayer.posZ, false));
+		mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX,
+				mc.thePlayer.posY + 0.41999998688697815, mc.thePlayer.posZ, true));
+		mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY + 0.5, mc.thePlayer.posZ);
+		}
+    }
+
+    @Override
+    public void onDisable() {
+
+    	MovementUtils.setMoveSpeed(0);
+    	
+    }
 }
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
+
+
+// NOTE (AI): Three flight families in one file. Vanilla mode is client-side physics only: it drives motionY and horizontal speed and sends no packets at all, with an anti-kick fall/ascend packet pair every 700ms so the server keeps receiving vertical oscillation. Damage mode floods C0CPacketInput + C03(true) every pre tick and triggers the fall-damage self-hit on enable with the canonical C04 ladder (y+3.05 false, y false, y+0.41999998688697815 true), which grants the damage boost that lets flight bypass NCP's flight checks. Verus mode uses a C08 block placement below the player plus motionY=0. The PacketOutEvent handler cancels C0FPacketConfirmTransaction and C00PacketKeepAlive entirely, which is what lets the position stream survive on servers that correlate transaction timing.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent for physics, PacketOutEvent for the keepalive/transaction cancel, onEnable for the damage ladder.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The damage ladder leaves a fallDistance anomaly and requires taking fall damage at enable; the periodic anti-kick packets produce a Y sawtooth that NCP's flight check averages out over time. Cancelling C0F/C00 freezes ping and transaction state, which itself is a flag on transaction-aware servers.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99's Fly is a 2000+ line multi-mode module covering packet, ground, damage, S08-cancel and anti-cheat-specific variants. Rise 6.x ships 13+ named flight modes (AstralMC, BlockDrop, BufferAbuse, Creative, Funcraft, Grim, LatestNCP, MMC, MineLand, Vulcan, Watchdog). Sigma's Fly has multiple packet modes plus PremiumFlyAddon. Spicy's Fly mirrors BackupFly's 0.0624986421/0.0625/0.0000013579 C04 offset ladder. Tenacity's FlightModule sends C04 +0.3/+0.1 offsets and C03(false).</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Blink</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.1.30, Rise 6.2.4, Sigma 4.11, Spicy, Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
+<p class="impl-pattern">Freeze the server-side player by buffering every C03 (or every packet) and replaying the queue in order on disable, creating fake lag.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketSendEvent, with All Packets on, every outgoing packet is parked in a ConcurrentLinkedQueue and cancelled; with it off only C03PacketPlayer (and its subclasses) is held. Pulse mode flushes the queue every N ticks with a 10% random skip to bound the blink windows. onDisable replays everything with sendPacketWithoutEvent in FIFO order. An optional EntityOtherPlayerMP renders the frozen position to other players.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/player/Blink.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/player/Blink.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.player;
+
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.packet.PacketSendEvent;
+import dev.rise.event.impl.render.Render3DEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.player.PacketUtil;
+import dev.rise.util.render.RenderUtil;
+import net.minecraft.client.entity.EntityOtherPlayerMP;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.util.Vec3;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+/**
+ * This module basically is fake lag, when enabled it cancels every packet and stores them on a list with an ORDER.
+ * When the module is disabled all the packets are quickly sent with order.
+ * &lt;p&gt;
+ * This module has a setting which allows it to only cancel position packets in order to blink infinitely.
+ * However this has a cost of being easily detectable with basic checks.
+ */
+@ModuleInfo(name = "Blink", description = "Lags you serverside", category = Category.PLAYER)
+public final class Blink extends Module {
+
+    private final BooleanSetting allPackets = new BooleanSetting("All Packets", this, true);
+    private final BooleanSetting showPlayer = new BooleanSetting("Show Player", this, false);
+    private final ConcurrentLinkedQueue&lt;Packet&lt;?&gt;&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+
+    private final BooleanSetting pulse = new BooleanSetting("Pulse", this, false);
+    private final NumberSetting delayPulse = new NumberSetting("Pulse Delay", this, 20, 4, 100, 0.1);
+    private final BooleanSetting randomisePulse = new BooleanSetting("Randomise Pulse", this, false);
+
+    private EntityOtherPlayerMP blinkEntity;
+
+    List&lt;Vec3&gt; path = new ArrayList&lt;&gt;();
+
+    @Override
+    public void onPacketSend(final PacketSendEvent event) {
+        if (mc.thePlayer == null || mc.thePlayer.isDead || mc.isSingleplayer() || mc.thePlayer.ticksExisted &lt; 150) {
+            packets.clear();
+            return;
+        }
+
+        if (allPackets.isEnabled()) {
+            packets.add(event.getPacket());
+            event.setCancelled(true);
+        } else {
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                packets.add(event.getPacket());
+                event.setCancelled(true);
+            }
+        }
+
+        if (pulse.isEnabled() &amp;&amp; event.getPacket() instanceof C03PacketPlayer) {
+            if (!packets.isEmpty() &amp;&amp; mc.thePlayer.ticksExisted % (int) delayPulse.getValue() == 0 &amp;&amp; Math.random() &gt; 0.1) {
+                packets.forEach(PacketUtil::sendPacketWithoutEvent);
+                packets.clear();
+            }
+        }
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        if (mc.thePlayer.ticksExisted &lt; 150) return;
+
+        if (mc.thePlayer.lastTickPosX != mc.thePlayer.posX || mc.thePlayer.lastTickPosY != mc.thePlayer.posY || mc.thePlayer.lastTickPosZ != mc.thePlayer.posZ) {
+            path.add(new Vec3(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ));
+        }
+
+        if (pulse.isEnabled()) {
+            while (path.size() &gt; (int) delayPulse.getValue()) {
+                path.remove(0);
+            }
+        }
+
+        if (pulse.isEnabled() &amp;&amp; blinkEntity != null) {
+            mc.theWorld.removeEntityFromWorld(blinkEntity.getEntityId());
+        }
+    }
+
+    @Override
+    public void onRender3DEvent(final Render3DEvent event) {
+        RenderUtil.renderBreadCrumbs(path);
+    }
+
+    @Override
+    protected void onEnable() {
+        path.clear();
+
+        if (!pulse.isEnabled() &amp;&amp; showPlayer.isEnabled()) {
+            blinkEntity = new EntityOtherPlayerMP(mc.theWorld, mc.thePlayer.getGameProfile());
+            blinkEntity.setPositionAndRotation(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch);
+            blinkEntity.rotationYawHead = mc.thePlayer.rotationYawHead;
+            blinkEntity.setSprinting(mc.thePlayer.isSprinting());
+            blinkEntity.setInvisible(mc.thePlayer.isInvisible());
+            blinkEntity.setSneaking(mc.thePlayer.isSneaking());
+
+            mc.theWorld.addEntityToWorld(blinkEntity.getEntityId(), blinkEntity);
+        }
+    }
+
+    @Override
+    protected void onDisable() {
+        packets.forEach(PacketUtil::sendPacketWithoutEvent);
+        packets.clear();
+
+        if (showPlayer.isEnabled()) {
+            if (blinkEntity != null) {
+                mc.theWorld.removeEntityFromWorld(blinkEntity.getEntityId());
+            }
+        }
+    }
+
+    @Override
+    public void onUpdateAlwaysInGui() {
+        delayPulse.hidden = !pulse.enabled;
+        showPlayer.hidden = pulse.enabled;
+    }
 }
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Criticals</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
-</div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
-}
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Damage</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
-</div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
-}
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Phase</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
-</div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
-}
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
+
+
+// NOTE (AI): The canonical buffer-and-release implementation. With All Packets on, every serverbound packet is parked in a ConcurrentLinkedQueue and cancelled; with it off, only C03PacketPlayer (including C04/C05/C06 subclasses, since they extend it) is held, letting clicks and inventory actions through. Pulse mode flushes the whole queue every N ticks with a 10% random skip so the blink windows are bounded and irregular. On disable, packets.forEach(PacketUtil::sendPacketWithoutEvent) replays everything in FIFO order, and the optional EntityOtherPlayerMP renders where the player 'was' for observers. The 150-tick guard clears the queue on world join, and singleplayer is excluded outright.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent (queue + cancel), PreMotionEvent (pulse bookkeeping), onDisable (flush).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Any anti-cheat that measures the gap between movement packets flags long blinks; pulse mode bounds the gap and the random skip breaks periodicity. The flushed burst is also a tell, since the server sees a jump in position on release.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.x moves this into BlinkComponent and MovementBlinkComponent (position-only) shared by Blink, BlinkAntiVoid and WatchdogAntiVoid. Sigma's Blink cancels C03 and C00 together on outgoing pre. Spicy's Blink cancels outgoing packets on its EventSendPacket. Tenacity's Blink event handles the C04/C05/C06 subclasses separately.</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Step</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99, Rise 6.1.30, Rise 6.2.4, Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
+<p class="impl-pattern">Climb blocks higher than the vanilla 0.6 limit by reporting intermediate C04 positions that hide the vertical delta.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Nekoware's NCP mode watches the ClimbSlabEvent; when the bounding box has risen past 0.6, it sends C04 at y+0.42 and y+0.75 with onGround false, then drops timerSpeed to 0.4 for two ticks so the faster climb does not trip horizontal speed checks. Vanilla mode just sets stepHeight locally. The 0.42/0.75 pair mirrors the NCP speed/bhop arc, which is why the module refuses to run while the client's Speed module is on.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Nekoware v1 private — me/nekoWare/client/module/movement/Step.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Nekoware v1 private — me/nekoWare/client/module/movement/Step.java =====
+package me.nekoWare.client.module.movement;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.nekoWare.client.Nekoware;
+import me.nekoWare.client.event.events.ClimbSlabEvent;
+import me.nekoWare.client.event.events.UpdateEvent;
+import me.nekoWare.client.module.Module;
+import net.minecraft.network.play.client.C03PacketPlayer;
+
+import java.util.function.Consumer;
+
+public class Step extends Module {
+
+    private int timerSlow;
+    private float height;
+
+    public Step() {
+        super("Step", 0, Module.Category.MOVEMENT);
+        this.addModes("Vanilla", "NCP");
+        this.addDouble("Height", 1, 1, 10);
+    }
+
+    @Override
+    public void onDisable() {
+        mc.thePlayer.stepHeight = 0.6F;
+    }
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer = (event) -&gt; {
+        height = this.getDouble("Height").floatValue();
+
+        if (isMode("Vanilla")) {
+            mc.thePlayer.stepHeight = height;
+        } else {
+            mc.thePlayer.stepHeight = 0.6F;
+        }
+    };
+
+    @Handler
+    public Consumer&lt;ClimbSlabEvent&gt; eventConsumer0 = (event) -&gt; {
+        if (isMode("NCP")) {
+            double posX = mc.thePlayer.posX;
+            double posY = mc.thePlayer.posY;
+            double posZ = mc.thePlayer.posZ;
+            if (event.isPre() &amp;&amp; !Nekoware.INSTANCE.getModuleManager().getModule("Speed").isToggled()) {
+                event.setStepHeight(1.0F);
+            } else {
+                double height = mc.thePlayer.getEntityBoundingBox().minY - mc.thePlayer.posY;
+                if (height &gt; 0.6F &amp;&amp; height &lt;= 1.0F) {
+                    float[] values = { 0.42F, 0.75F };
+                    for (float value : values)
+                        mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(posX, posY + value, posZ, false));
+                    mc.timer.timerSpeed = 0.4F;
+                }
+                timerSlow = 2;
+            }
+        }
+    };
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer1 = (event) -&gt; {
+        if (isMode("NCP")) {
+            if (timerSlow &lt;= 0 &amp;&amp; timerSlow &gt;= -2) {
+                mc.timer.timerSpeed = 1.0F;
+            }
+            timerSlow--;
+        }
+    };
+
 }
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoVoid</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
-</div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
-}
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
-</div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>//package net.augustus.modules.world;
-//
-//import com.sun.javafx.geom.Vec2d;
-//import java.awt.Color;
-//import java.util.ArrayList;
-//import java.util.Comparator;
-//import java.util.HashMap;
-//import net.augustus.Augustus;
-//import net.augustus.events.EventClick;
-//import net.augustus.events.EventEarlyTick;
-//import net.augustus.events.EventJump;
-//import net.augustus.events.EventMove;
-//import net.augustus.events.EventRayCast;
-//import net.augustus.events.EventRender3D;
-//import net.augustus.events.EventSilent;
-//import net.augustus.events.EventSilentMove;
-//import net.augustus.modules.Categorys;
-//import net.augustus.modules.Module;
-//import net.augustus.settings.BooleanValue;
-//import net.augustus.settings.DoubleValue;
-//import net.augustus.settings.StringValue;
-//import net.augustus.utils.RenderUtil;
-//import net.augustus.utils.RotationUtil;
-//import net.augustus.utils.TimeHelper;
-//import net.lenni0451.eventapi.reflection.EventTarget;
-//import net.minecraft.block.Block;
-//import net.minecraft.block.BlockAir;
-//import net.minecraft.block.BlockChest;
-//import net.minecraft.block.BlockFurnace;
-//import net.minecraft.block.BlockLiquid;
-//import net.minecraft.block.material.Material;
-//import net.minecraft.client.renderer.GlStateManager;
-//import net.minecraft.item.ItemBlock;
-//import net.minecraft.item.ItemStack;
-//import net.minecraft.util.BlockPos;
-//import net.minecraft.util.EnumFacing;
-//import net.minecraft.util.MathHelper;
-//import net.minecraft.util.MovingObjectPosition;
-//import net.minecraft.util.Vec3;
-//import org.lwjgl.input.Keyboard;
-//import org.lwjgl.opengl.GL11;
-//
-//public class NewScaffold extends Module {
-//   private final TimeHelper startTimeHelper = new TimeHelper();
-//   private final TimeHelper startTimeHelper2 = new TimeHelper();
-//   private final TimeHelper adTimeHelper = new TimeHelper();
-//   private final RotationUtil rotationUtil;
-//   private final double[] lastXYZ = new double[3];
-//   private final HashMap&lt;float[], MovingObjectPosition&gt; hashMap = new HashMap&lt;&gt;();
-//   public StringValue mode = new StringValue(8, "Mode", this, "Legit", new String[]{"Legit", "Basic"});
-//   public DoubleValue yawSpeed = new DoubleValue(3, "YawSpeed", this, 40.0, 0.0, 180.0, 0);
-//   public DoubleValue pitchSpeed = new DoubleValue(4, "PitchSpeed", this, 40.0, 0.0, 180.0, 0);
-//   public BooleanValue moveFix = new BooleanValue(7, "MoveFix", this, true);
-//   public BooleanValue esp = new BooleanValue(5, "ESP", this, true);
-//   public BooleanValue adStrafe = new BooleanValue(11, "AdStrafe", this, true);
-//   public StringValue silentMode = new StringValue(6, "SilentMode", this, "Spoof", new String[]{"Switch", "Spoof", "None"});
-//   ArrayList&lt;double[]&gt; hitpoints = new ArrayList&lt;&gt;();
-//   private float[] lastRots = new float[]{0.0F, 0.0F};
-//   private float[] rots = new float[]{0.0F, 0.0F};
-//   private int slotID;
-//   private ItemStack block;
-//   private int lastSlotID;
-//   private EnumFacing enumFacing;
-//   private BlockPos blockPos;
-//   private boolean start = true;
-//   private double[] xyz = new double[3];
-//   private MovingObjectPosition objectPosition = null;
-//
-//   public NewScaffold() {
-//      super("ScaffoldWalk", new Color(18, 35, 50), Categorys.WORLD);
-//      this.rotationUtil = new RotationUtil();
-//   }
-//
-//   @Override
-//   public void onEnable() {
-//      super.onEnable();
-//      if (mc.thePlayer != null &amp;&amp; mc.theWorld != null) {
-//         this.restRotation();
-//         this.slotID = mc.thePlayer.inventory.currentItem;
-//         this.lastSlotID = mc.thePlayer.inventory.currentItem;
-//         this.start = true;
-//         this.startTimeHelper.reset();
-//      }
-//   }
-//
-//   @Override
-//   public void onDisable() {
-//      super.onDisable();
-//      if (mc.thePlayer.inventory.currentItem != this.slotID) {
-//      }
-//
-//      this.slotID = mc.thePlayer.inventory.currentItem;
-//   }
-//
-//   @EventTarget
-//   public void onEventEarlyTick(EventEarlyTick eventEarlyTick) {
-//      if (mc.thePlayer != null &amp;&amp; mc.theWorld != null) {
-//         this.blockPos = this.getAimBlockPos();
-//         this.start = mc.thePlayer.motionX == 0.0 &amp;&amp; mc.thePlayer.motionZ == 0.0 &amp;&amp; mc.thePlayer.onGround || !this.startTimeHelper.reached(200L);
-//         if (this.start) {
-//            this.startTimeHelper2.reset();
-//         }
-//
-//         if (this.blockPos != null) {
-//            float[] floats = new float[]{1.0F, 1.0F};
-//            String var3 = this.mode.getSelected();
-//            switch(var3) {
-//               case "Legit":
-//                  floats = this.getNearestRotation();
-//                  break;
-//               case "Basic":
-//                  floats = this.basicRotation();
-//            }
-//
-//            this.lastRots = this.rots;
-//            if (floats != null) {
-//               this.rots = floats;
-//            }
-//
-//            this.setRotation();
-//         }
-//      }
-//   }
-//
-//   @EventTarget
-//   public void onEventRayCastPost(EventRayCast eventRayCast) {
-//      if (this.objectPosition != null) {
-//         mc.objectMouseOver = this.objectPosition;
-//      }
-//   }
-//
-//   private float[] basicRotation() {
-//      double x = mc.thePlayer.posX;
-//      double z = mc.thePlayer.posZ;
-//      double add1 = 1.05;
-//      double add2 = 0.05;
-//      this.xyz = new double[]{mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ};
-//      double maX = (double)this.blockPos.getX() + add1;
-//      double miX = (double)this.blockPos.getX() - add2;
-//      double maZ = (double)this.blockPos.getZ() + add1;
-//      double miZ = (double)this.blockPos.getZ() - add2;
-//      if (!(x &gt; maX) &amp;&amp; !(x &lt; miX) &amp;&amp; !(z &gt; maZ) &amp;&amp; !(z &lt; miZ)) {
-//         return new float[]{mc.thePlayer.rotationYaw - 180.0F, this.rots[1]};
-//      } else {
-//         double[] ex = this.getAdvancedDiagonalExpandXZ(this.blockPos);
-//         float[] f = this.rotationUtil
-//            .scaffoldRots(
-//               (double)this.blockPos.getX() + ex[0],
-//               (double)this.blockPos.getY() + 0.85,
-//               (double)this.blockPos.getZ() + ex[1],
-//               this.lastRots[0],
-//               this.lastRots[1],
-//               (float)this.yawSpeed.getValue(),
-//               (float)this.pitchSpeed.getValue(),
-//               false
-//            );
-//         return new float[]{mc.thePlayer.rotationYaw - 180.0F, f[1]};
-//      }
-//   }
-//
-//   private float[] getNearestRotation() {
-//      this.objectPosition = null;
-//      float[] floats = this.rots;
-//      BlockPos b = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 0.5, mc.thePlayer.posZ);
-//      this.hashMap.clear();
-//      if (this.start) {
-//         float yaw = this.rotationUtil.rotateToYaw((float)this.yawSpeed.getValue(), this.rots[0], Augustus.getInstance().getYawPitchHelper().realYaw - 180.0F);
-//         RotationUtil.mouseSens(yaw, 80.34F, this.rots[0], this.rots[1]);
-//         floats[1] = 80.34F;
-//         floats[0] = yaw;
-//      } else {
-//         float yaww = Augustus.getInstance().getYawPitchHelper().realYaw - 180.0F;
-//         floats[0] = yaww;
-//         double x = mc.thePlayer.posX;
-//         double z = mc.thePlayer.posZ;
-//         double add1 = 1.288;
-//         double add2 = 0.288;
-//         if (!this.buildForward()) {
-//            x += mc.thePlayer.posX - this.xyz[0];
-//            z += mc.thePlayer.posZ - this.xyz[2];
-//         }
-//
-//         this.xyz = new double[]{mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ};
-//         double maX = (double)this.blockPos.getX() + add1;
-//         double miX = (double)this.blockPos.getX() - add2;
-//         double maZ = (double)this.blockPos.getZ() + add1;
-//         double miZ = (double)this.blockPos.getZ() - add2;
-//         if (!(x &gt; maX) &amp;&amp; !(x &lt; miX) &amp;&amp; !(z &gt; maZ) &amp;&amp; !(z &lt; miZ)) {
-//            floats[1] = this.rots[1];
-//         } else {
-//            ArrayList&lt;MovingObjectPosition&gt; movingObjectPositions = new ArrayList&lt;&gt;();
-//            ArrayList&lt;Float&gt; pitchs = new ArrayList&lt;&gt;();
-//
-//            for(float i = Math.max(this.rots[1] - 20.0F, -90.0F); i &lt; Math.min(this.rots[1] + 20.0F, 90.0F); i += 0.05F) {
-//               float[] f = RotationUtil.mouseSens(yaww, i, this.rots[0], this.rots[1]);
-//               MovingObjectPosition m4 = mc.thePlayer.customRayTrace(4.5, 1.0F, yaww, f[1]);
-//               if (m4.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK
-//                  &amp;&amp; this.isOkBlock(m4.getBlockPos())
-//                  &amp;&amp; !movingObjectPositions.contains(m4)
-//                  &amp;&amp; m4.getBlockPos().equalsBlockPos(this.blockPos)
-//                  &amp;&amp; m4.sideHit != EnumFacing.DOWN
-//                  &amp;&amp; m4.sideHit != EnumFacing.UP
-//                  &amp;&amp; m4.getBlockPos().getY() &lt;= b.getY()) {
-//                  movingObjectPositions.add(m4);
-//                  this.hashMap.put(f, m4);
-//                  pitchs.add(f[1]);
-//               }
-//            }
-//
-//            movingObjectPositions.sort(Comparator.comparingDouble(m -&gt; mc.thePlayer.getDistanceSq(m.getBlockPos().add(0.5, 0.5, 0.5))));
-//            MovingObjectPosition mm = null;
-//            if (movingObjectPositions.size() &gt; 0) {
-//               mm = movingObjectPositions.get(0);
-//            }
-//
-//            if (mm != null) {
-//               floats[0] = yaww;
-//               pitchs.sort(Comparator.comparingDouble(this::distanceToLastPitch));
-//               if (!pitchs.isEmpty()) {
-//                  floats[1] = pitchs.get(0);
-//                  this.objectPosition = this.hashMap.get(floats);
-//               }
-//
-//               return floats;
-//            }
-//         }
-//      }
-//
-//      return floats;
-//   }
-//
-//   private boolean canPlace(float[] yawPitch) {
-//      BlockPos b = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 0.5, mc.thePlayer.posZ);
-//      MovingObjectPosition m4 = mc.thePlayer.customRayTrace(4.5, 1.0F, yawPitch[0], yawPitch[1]);
-//      if (m4.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK
-//         &amp;&amp; this.isOkBlock(m4.getBlockPos())
-//         &amp;&amp; m4.getBlockPos().equalsBlockPos(this.blockPos)
-//         &amp;&amp; m4.sideHit != EnumFacing.DOWN
-//         &amp;&amp; m4.sideHit != EnumFacing.UP
-//         &amp;&amp; m4.getBlockPos().getY() &lt;= b.getY()) {
-//         this.hashMap.put(yawPitch, m4);
-//         return true;
-//      } else {
-//         return false;
-//      }
-//   }
-//
-//   private double distanceToLastRots(float[] predictRots) {
-//      float diff1 = Math.abs(predictRots[0] - this.rots[0]);
-//      float diff2 = Math.abs(predictRots[1] - this.rots[1]);
-//      return (double)(diff1 * diff1 + diff2 * diff2);
-//   }
-//
-//   private double distanceToLastPitch(float pitch) {
-//      return (double)Math.abs(pitch - this.rots[1]);
-//   }
-//
-//   private double[] getAdvancedDiagonalExpandXZ(BlockPos blockPos) {
-//      double[] xz = new double[2];
-//      Vec2d difference = new Vec2d((double)blockPos.getX() - mc.thePlayer.posX, (double)blockPos.getZ() - mc.thePlayer.posZ);
-//      if (difference.x &gt; -1.0 &amp;&amp; difference.x &lt; 0.0 &amp;&amp; difference.y &lt; -1.0) {
-//         this.enumFacing = EnumFacing.SOUTH;
-//         xz[0] = difference.x * -1.0;
-//         xz[1] = 1.0;
-//      }
-//
-//      if (difference.y &lt; 0.0 &amp;&amp; difference.y &gt; -1.0 &amp;&amp; difference.x &lt; -1.0) {
-//         this.enumFacing = EnumFacing.EAST;
-//         xz[0] = 1.0;
-//         xz[1] = difference.y * -1.0;
-//      }
-//
-//      if (difference.x &gt; -1.0 &amp;&amp; difference.x &lt; 0.0 &amp;&amp; difference.y &gt; 0.0) {
-//         this.enumFacing = EnumFacing.NORTH;
-//         xz[0] = difference.x * -1.0;
-//         xz[1] = 0.0;
-//      }
-//
-//      if (difference.y &lt; 0.0 &amp;&amp; difference.y &gt; -1.0 &amp;&amp; difference.x &gt; 0.0) {
-//         this.enumFacing = EnumFacing.WEST;
-//         xz[0] = 0.0;
-//         xz[1] = difference.y * -1.0;
-//         this.enumFacing = EnumFacing.WEST;
-//      }
-//
-//      if (difference.x &gt;= 0.0 &amp;&amp; difference.y &lt; -1.0) {
-//         xz[1] = 1.0;
-//      }
-//
-//      if (difference.y &gt;= 0.0 &amp; difference.x &lt; -1.0) {
-//         xz[0] = 1.0;
-//      }
-//
-//      if (difference.x &gt;= 0.0 &amp;&amp; difference.y &gt; 0.0) {
-//      }
-//
-//      if (difference.y &lt;= -1.0 &amp;&amp; difference.x &lt; -1.0) {
-//         xz[0] = 1.0;
-//         xz[1] = 1.0;
-//      }
-//
-//      return xz;
-//   }
-//
-//   private EnumFacing getPlaceSide() {
-//      BlockPos playerPos = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 0.5, mc.thePlayer.posZ);
-//      if (playerPos.equalsBlockPos(this.blockPos)) {
-//         System.out.println("Error");
-//      }
-//
-//      if (playerPos.add(0, 1, 0).equalsBlockPos(this.blockPos)) {
-//         return EnumFacing.UP;
-//      } else if (playerPos.add(0, -1, 0).equalsBlockPos(this.blockPos)) {
-//         return EnumFacing.DOWN;
-//      } else if (playerPos.add(1, 0, 0).equalsBlockPos(this.blockPos)) {
-//         return EnumFacing.WEST;
-//      } else if (playerPos.add(-1, 0, 0).equalsBlockPos(this.blockPos)) {
-//         return EnumFacing.EAST;
-//      } else if (playerPos.add(0, 0, 1).equalsBlockPos(this.blockPos)) {
-//         return EnumFacing.NORTH;
-//      } else if (playerPos.add(0, 0, -1).equalsBlockPos(this.blockPos)) {
-//         return EnumFacing.SOUTH;
-//      } else if (playerPos.add(1, 0, 1).equalsBlockPos(this.blockPos)) {
-//         return EnumFacing.WEST;
-//      } else if (playerPos.add(-1, 0, 1).equalsBlockPos(this.blockPos)) {
-//         return EnumFacing.EAST;
-//      } else if (playerPos.add(-1, 0, 1).equalsBlockPos(this.blockPos)) {
-//         return EnumFacing.NORTH;
-//      } else {
-//         return playerPos.add(-1, 0, -1).equalsBlockPos(this.blockPos) ? EnumFacing.SOUTH : null;
-//      }
-//   }
-//
-//   @EventTarget
-//   public void onEventClick(EventClick eventClick) {
-//      eventClick.setCanceled(true);
-//      if (this.block == null) {
-//         this.block = mc.thePlayer.inventory.getCurrentItem();
-//      }
-//
-//      if (this.blockPos != null &amp;&amp; mc.currentScreen == null) {
-//         ItemStack lastItem = mc.thePlayer.inventory.getCurrentItem();
-//         ItemStack itemstack = mc.thePlayer.inventory.getCurrentItem();
-//         if (!this.silentMode.getSelected().equals("None")) {
-//            for(int i = 36; i &lt; mc.thePlayer.inventoryContainer.inventorySlots.size(); ++i) {
-//               ItemStack itemStack = mc.thePlayer.inventoryContainer.getSlot(i).getStack();
-//               if (itemStack != null
-//                  &amp;&amp; itemStack.getItem() instanceof ItemBlock
-//                  &amp;&amp; itemStack.stackSize &gt; 0
-//                  &amp;&amp; Augustus.getInstance().getBlockUtil().isValidStack(itemStack)) {
-//                  this.block = itemStack;
-//                  this.slotID = i - 36;
-//                  break;
-//               }
-//            }
-//
-//            if (this.silentMode.getSelected().equals("Spoof") &amp;&amp; this.lastSlotID != this.slotID) {
-//            }
-//
-//            itemstack = mc.thePlayer.inventoryContainer.getSlot(this.slotID + 36).getStack();
-//         } else {
-//            this.slotID = mc.thePlayer.inventory.currentItem;
-//            this.lastSlotID = mc.thePlayer.inventory.currentItem;
-//         }
-//
-//         String var24 = this.mode.getSelected();
-//         switch(var24) {
-//            case "Basic":
-//               double x = mc.thePlayer.posX;
-//               double z = mc.thePlayer.posZ;
-//               double add1 = 1.05;
-//               double add2 = 0.05;
-//               this.xyz = new double[]{mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ};
-//               double maX = (double)this.blockPos.getX() + add1;
-//               double miX = (double)this.blockPos.getX() - add2;
-//               double maZ = (double)this.blockPos.getZ() + add1;
-//               double miZ = (double)this.blockPos.getZ() - add2;
-//               if (x &gt; maX || x &lt; miX || z &gt; maZ || z &lt; miZ) {
-//                  if (this.silentMode.getSelected().equals("Switch")) {
-//                     mc.thePlayer.inventory.setCurrentItem(this.block.getItem(), 0, false, false);
-//                  }
-//
-//                  EnumFacing e = this.getPlaceSide();
-//                  if (e != null) {
-//                     double[] ex = this.getAdvancedDiagonalExpandXZ(this.blockPos);
-//                     if (mc.playerController
-//                        .onPlayerRightClick(
-//                           mc.thePlayer,
-//                           mc.theWorld,
-//                           itemstack,
-//                           this.blockPos,
-//                           e,
-//                           new Vec3((double)this.blockPos.getX() + ex[0], (double)this.blockPos.getY() - 0.5234234, (double)this.blockPos.getZ() + ex[1])
-//                        )) {
-//                        mc.thePlayer.swingItem();
-//                     }
-//                  }
-//
-//                  if (itemstack != null &amp;&amp; itemstack.stackSize == 0) {
-//                     mc.thePlayer.inventory.mainInventory[this.slotID] = null;
-//                  }
-//               }
-//               break;
-//            default:
-//               MovingObjectPosition blockOver = mc.objectMouseOver;
-//               if (blockOver != null) {
-//                  BlockPos blockpos = blockOver.getBlockPos();
-//                  if (blockOver.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK
-//                     &amp;&amp; mc.theWorld.getBlockState(blockpos).getBlock().getMaterial() != Material.air) {
-//                     if (itemstack != null &amp;&amp; !(itemstack.getItem() instanceof ItemBlock)) {
-//                        return;
-//                     }
-//
-//                     this.hitpoints.add(new double[]{blockOver.hitVec.xCoord, blockOver.hitVec.yCoord, blockOver.hitVec.zCoord});
-//                     if (mc.thePlayer.posY &lt; (double)blockpos.getY() + 1.5) {
-//                        if (blockOver.sideHit != EnumFacing.UP &amp;&amp; blockOver.sideHit != EnumFacing.DOWN) {
-//                           if (this.silentMode.getSelected().equals("Switch")) {
-//                              mc.thePlayer.inventory.setCurrentItem(this.block.getItem(), 0, false, false);
-//                           }
-//
-//                           if (mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, itemstack, blockpos, blockOver.sideHit, blockOver.hitVec)) {
-//                              mc.thePlayer.swingItem();
-//                           }
-//
-//                           if (itemstack != null &amp;&amp; itemstack.stackSize == 0) {
-//                              mc.thePlayer.inventory.mainInventory[this.slotID] = null;
-//                           }
-//
-//                           mc.sendClickBlockToController(mc.currentScreen == null &amp;&amp; mc.gameSettings.keyBindAttack.isKeyDown() &amp;&amp; mc.inGameHasFocus);
-//                        }
-//                     } else if (blockOver.sideHit != EnumFacing.DOWN
-//                        &amp;&amp; blockOver.getBlockPos().equalsBlockPos(this.blockPos)
-//                        &amp;&amp; mc.gameSettings.keyBindJump.isKeyDown()) {
-//                        if (this.silentMode.getSelected().equals("Switch")) {
-//                           mc.thePlayer.inventory.setCurrentItem(this.block.getItem(), 0, false, false);
-//                        }
-//
-//                        if (mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, itemstack, blockpos, blockOver.sideHit, blockOver.hitVec)) {
-//                           mc.thePlayer.swingItem();
-//                        }
-//
-//                        if (itemstack != null &amp;&amp; itemstack.stackSize == 0) {
-//                           mc.thePlayer.inventory.mainInventory[this.slotID] = null;
-//                        }
-//
-//                        mc.sendClickBlockToController(mc.currentScreen == null &amp;&amp; mc.gameSettings.keyBindAttack.isKeyDown() &amp;&amp; mc.inGameHasFocus);
-//                     }
-//                  }
-//               }
-//         }
-//
-//         if (lastItem != null &amp;&amp; this.silentMode.getSelected().equals("Switch")) {
-//            mc.thePlayer.inventory.setCurrentItem(lastItem.getItem(), 0, false, false);
-//         }
-//
-//         this.lastSlotID = this.slotID;
-//      }
-//   }
-//
-//   @EventTarget
-//   public void onEventSilent(EventSilent eventSilent) {
-//      eventSilent.setSlotID(this.slotID);
-//   }
-//
-//   @EventTarget
-//   public void onEventSilentMove(EventSilentMove eventSilentMove) {
-//      if (this.moveFix.getBoolean()) {
-//         eventSilentMove.setSilent(true);
-//      }
-//
-//      if (this.mode.getSelected().equals("Legit") &amp;&amp; this.adStrafe.getBoolean()) {
-//         BlockPos b = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 0.5, mc.thePlayer.posZ);
-//         if (mc.theWorld.getBlockState(b).getBlock().getMaterial() == Material.air
-//            &amp;&amp; mc.currentScreen == null
-//            &amp;&amp; !Keyboard.isKeyDown(mc.gameSettings.keyBindJump.getKeyCodeDefault())
-//            &amp;&amp; this.buildForward()
-//            &amp;&amp; mc.thePlayer.movementInput.moveForward != 0.0F) {
-//            if (mc.thePlayer.getHorizontalFacing(this.rots[0]) == EnumFacing.EAST) {
-//               if ((double)b.getZ() + 0.5 &gt; mc.thePlayer.posZ) {
-//                  mc.thePlayer.movementInput.moveStrafe = 1.0F;
-//               } else {
-//                  mc.thePlayer.movementInput.moveStrafe = -1.0F;
-//               }
-//            } else if (mc.thePlayer.getHorizontalFacing(this.rots[0]) == EnumFacing.WEST) {
-//               if ((double)b.getZ() + 0.5 &lt; mc.thePlayer.posZ) {
-//                  mc.thePlayer.movementInput.moveStrafe = 1.0F;
-//               } else {
-//                  mc.thePlayer.movementInput.moveStrafe = -1.0F;
-//               }
-//            } else if (mc.thePlayer.getHorizontalFacing(this.rots[0]) == EnumFacing.SOUTH) {
-//               if ((double)b.getX() + 0.5 &lt; mc.thePlayer.posX) {
-//                  mc.thePlayer.movementInput.moveStrafe = 1.0F;
-//               } else {
-//                  mc.thePlayer.movementInput.moveStrafe = -1.0F;
-//               }
-//            } else if ((double)b.getX() + 0.5 &gt; mc.thePlayer.posX) {
-//               mc.thePlayer.movementInput.moveStrafe = 1.0F;
-//            } else {
-//               mc.thePlayer.movementInput.moveStrafe = -1.0F;
-//            }
-//
-//            this.adTimeHelper.reset();
-//         }
-//      }
-//   }
-//
-//   @EventTarget
-//   public void onEventMove(EventMove eventMove) {
-//      if (!this.moveFix.getBoolean()) {
-//         eventMove.setYaw(Augustus.getInstance().getYawPitchHelper().realYaw);
-//      }
-//   }
-//
-//   @EventTarget
-//   public void onEventJump(EventJump eventJump) {
-//      if (!this.moveFix.getBoolean()) {
-//         eventJump.setYaw(Augustus.getInstance().getYawPitchHelper().realYaw);
-//      }
-//   }
-//
-//   private void setRotation() {
-//      if (mc.currentScreen == null) {
-//         mc.thePlayer.rotationYaw = this.rots[0];
-//         mc.thePlayer.rotationPitch = this.rots[1];
-//         mc.thePlayer.prevRotationYaw = this.lastRots[0];
-//         mc.thePlayer.prevRotationPitch = this.lastRots[1];
-//      }
-//   }
-//
-//   private boolean buildForward() {
-//      float realYaw = MathHelper.wrapAngleTo180_float(Augustus.getInstance().getYawPitchHelper().realYaw);
-//      if ((double)realYaw &gt; 77.5 &amp;&amp; (double)realYaw &lt; 102.5) {
-//         return true;
-//      } else if (!((double)realYaw &gt; 167.5) &amp;&amp; !(realYaw &lt; -167.0F)) {
-//         if ((double)realYaw &lt; -77.5 &amp;&amp; (double)realYaw &gt; -102.5) {
-//            return true;
-//         } else {
-//            return (double)realYaw &gt; -12.5 &amp;&amp; (double)realYaw &lt; 12.5;
-//         }
-//      } else {
-//         return true;
-//      }
-//   }
-//
-//   private BlockPos getAimBlockPos() {
-//      BlockPos playerPos = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1.0, mc.thePlayer.posZ);
-//      if ((mc.gameSettings.keyBindJump.isKeyDown() || !mc.thePlayer.onGround)
-//         &amp;&amp; mc.thePlayer.moveForward == 0.0F
-//         &amp;&amp; mc.thePlayer.moveStrafing == 0.0F
-//         &amp;&amp; this.isOkBlock(playerPos.add(0, -1, 0))) {
-//         return playerPos.add(0, -1, 0);
-//      } else {
-//         BlockPos blockPos = null;
-//         ArrayList&lt;BlockPos&gt; bp = this.getBlockPos();
-//         ArrayList&lt;BlockPos&gt; blockPositions = new ArrayList&lt;&gt;();
-//         if (bp.size() &gt; 0) {
-//            for(int i = 0; i &lt; Math.min(bp.size(), 18); ++i) {
-//               blockPositions.add(bp.get(i));
-//            }
-//
-//            blockPositions.sort(Comparator.comparingDouble(this::getDistanceToBlockPos));
-//            if (blockPositions.size() &gt; 0) {
-//               blockPos = blockPositions.get(0);
-//            }
-//         }
-//
-//         return blockPos;
-//      }
-//   }
-//
-//   private ArrayList&lt;BlockPos&gt; getBlockPos() {
-//      BlockPos playerPos = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1.0, mc.thePlayer.posZ);
-//      ArrayList&lt;BlockPos&gt; blockPoses = new ArrayList&lt;&gt;();
-//
-//      for(int x = playerPos.getX() - 2; x &lt;= playerPos.getX() + 2; ++x) {
-//         for(int y = playerPos.getY() - 1; y &lt;= playerPos.getY(); ++y) {
-//            for(int z = playerPos.getZ() - 2; z &lt;= playerPos.getZ() + 2; ++z) {
-//               if (this.isOkBlock(new BlockPos(x, y, z))) {
-//                  blockPoses.add(new BlockPos(x, y, z));
-//               }
-//            }
-//         }
-//      }
-//
-//      if (!blockPoses.isEmpty()) {
-//         blockPoses.sort(
-//            Comparator.comparingDouble(
-//               blockPos -&gt; mc.thePlayer.getDistance((double)blockPos.getX() + 0.5, (double)blockPos.getY() + 0.5, (double)blockPos.getZ() + 0.5)
-//            )
-//         );
-//      }
-//
-//      return blockPoses;
-//   }
-//
-//   private double getDistanceToBlockPos(BlockPos blockPos) {
-//      double distance = 1337.0;
-//
-//      for(float x = (float)blockPos.getX(); x &lt;= (float)(blockPos.getX() + 1); x = (float)((double)x + 0.2)) {
-//         for(float y = (float)blockPos.getY(); y &lt;= (float)(blockPos.getY() + 1); y = (float)((double)y + 0.2)) {
-//            for(float z = (float)blockPos.getZ(); z &lt;= (float)(blockPos.getZ() + 1); z = (float)((double)z + 0.2)) {
-//               double d0 = mc.thePlayer.getDistance((double)x, (double)y, (double)z);
-//               if (d0 &lt; distance) {
-//                  distance = d0;
-//               }
-//            }
-//         }
-//      }
-//
-//      return distance;
-//   }
-//
-//   private boolean isOkBlock(BlockPos blockPos) {
-//      Block block = mc.theWorld.getBlockState(blockPos).getBlock();
-//      return !(block instanceof BlockLiquid) &amp;&amp; !(block instanceof BlockAir) &amp;&amp; !(block instanceof BlockChest) &amp;&amp; !(block instanceof BlockFurnace);
-//   }
-//
-//   private void restRotation() {
-//      this.rots[0] = Augustus.getInstance().getYawPitchHelper().realYaw;
-//      this.rots[1] = Augustus.getInstance().getYawPitchHelper().realPitch;
-//      this.lastRots[0] = Augustus.getInstance().getYawPitchHelper().realLastYaw;
-//      this.lastRots[1] = Augustus.getInstance().getYawPitchHelper().realLastPitch;
-//   }
-//
-//   @EventTarget
-//   public void onEventRender3D(EventRender3D eventRender3D) {
-//      if (this.esp.getBoolean()) {
-//         GL11.glEnable(3042);
-//         GL11.glBlendFunc(770, 771);
-//         GL11.glEnable(2848);
-//         GL11.glDisable(2929);
-//         GL11.glDisable(3553);
-//         GlStateManager.disableCull();
-//         GL11.glDepthMask(false);
-//         float red = 0.16470589F;
-//         float green = 0.5686275F;
-//         float blue = 0.96862745F;
-//         float lineWidth = 0.0F;
-//         if (this.blockPos != null) {
-//            if (mc.thePlayer.getDistance((double)this.blockPos.getX(), (double)this.blockPos.getY(), (double)this.blockPos.getZ()) &gt; 1.0) {
-//               double d0 = 1.0 - mc.thePlayer.getDistance((double)this.blockPos.getX(), (double)this.blockPos.getY(), (double)this.blockPos.getZ()) / 20.0;
-//               if (d0 &lt; 0.3) {
-//                  d0 = 0.3;
-//               }
-//
-//               lineWidth = (float)((double)lineWidth * d0);
-//            }
-//
-//            RenderUtil.drawBlockESP(this.blockPos, red, green, blue, 0.39215687F, 1.0F, lineWidth);
-//         }
-//
-//         GL11.glColor4f(1.0F, 1.0F, 1.0F, 1.0F);
-//         GL11.glDepthMask(true);
-//         GlStateManager.enableCull();
-//         GL11.glEnable(3553);
-//         GL11.glEnable(2929);
-//         GL11.glDisable(3042);
-//         GL11.glBlendFunc(770, 771);
-//         GL11.glDisable(2848);
-//      }
-//   }
-//
-//   public int getSlotID() {
-//      return this.slotID;
-//   }
-//}
+
+
+// NOTE (AI): The NCP mode is a pure C04 ladder: when the client-side bounding box rose more than 0.6 blocks (the vanilla step limit), it sends C04 y+0.42 false then y+0.75 false, and drops timerSpeed to 0.4 for two ticks. The server accepts the 1.0-block step because the client reports the intermediate positions, and the timer slowdown hides the resulting speed spike from horizontal checks. Vanilla mode just raises the local stepHeight, which works on servers that do not simulate stepping server-side. This is the same offset pair (0.42/0.75) used by NCP-speed and bhop modules, which is why the module disables itself while the client's Speed module is toggled.
 </code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> ClimbSlabEvent for the packet ladder; UpdateEvent for stepHeight and timer restore.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The server accepts the ladder because each reported position is within one tick's plausible delta; the timer slowdown hides the effective vertical speed. Checks that simulate stepping independently (Matrix, Vulcan) flag the 1.0-block rise regardless of the ladder.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware's Step is the same packet ladder lineage. Rise 5.99 sends C04 at d plus random/2000. Rise 6.x splits NCPStep (d plus random/2000), NewNCPStep, MatrixStep (exact float ladder 0.41999998688698, 0.7531999805212, 1.00133597911215, 1.42133596599913, 1.75453595963335, 2.0026719582243), VulcanStep (single +0.5) and WatchdogStep (packet rewrite). Sigma sends first/second/off C04 ladders plus a C06 look variant.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiVoid</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Speed / Bhop</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.1.30, Rise 6.2.4, Sigma 4.11, Spicy)</span>
 </div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
+<p class="impl-pattern">Move faster than vanilla sprint by manipulating jump arcs, timer speed and the movement packets the client emits.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Spicy's Bhop Hypixel mode sets noClip, jumps on a 0.00004 ground check, and runs 26.5 tps plus random jitter in air so the vanilla C03 emission carries an accelerated trajectory. Test 3 mode drives EventMove directly: motionY 0.41999998688697815 on ground, speed seeded at forward*2.1500000953674316 and decayed by speed/165 per air tick, plus a random 1.0E-5..9.9E-4 Y jitter on ground packets. An S08 setback counter auto-disables after 3 lagbacks in 5 seconds.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy — info/spicyclient/modules/movement/Bhop.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/movement/Bhop.java =====
+package info.spicyclient.modules.movement;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Random;
+
+import org.apache.commons.lang3.RandomUtils;
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.SpicyClient;
+import info.spicyclient.chatCommands.Command;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventMotion;
+import info.spicyclient.events.listeners.EventMove;
+import info.spicyclient.events.listeners.EventOnLadder;
+import info.spicyclient.events.listeners.EventPacket;
+import info.spicyclient.events.listeners.EventSendPacket;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.notifications.Color;
+import info.spicyclient.notifications.NotificationManager;
+import info.spicyclient.notifications.Type;
+import info.spicyclient.settings.BooleanSetting;
+import info.spicyclient.settings.ModeSetting;
+import info.spicyclient.settings.NumberSetting;
+import info.spicyclient.settings.SettingChangeEvent;
+import info.spicyclient.util.MovementUtils;
+import info.spicyclient.util.Timer;
+import net.minecraft.client.Minecraft;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.EnumPacketDirection;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C02PacketUseEntity.Action;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C03PacketPlayer.C04PacketPlayerPosition;
+import net.minecraft.network.play.client.C03PacketPlayer.C06PacketPlayerPosLook;
+import net.minecraft.network.play.client.C13PacketPlayerAbilities;
+import net.minecraft.network.play.client.C14PacketTabComplete;
+import net.minecraft.network.play.client.C15PacketClientSettings;
+import net.minecraft.network.play.client.C16PacketClientStatus;
+import net.minecraft.network.play.client.C16PacketClientStatus.EnumState;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
+import net.minecraft.network.play.client.C18PacketSpectate;
+import net.minecraft.network.play.client.C19PacketResourcePackStatus;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.status.client.C00PacketServerQuery;
+import net.minecraft.potion.Potion;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.MathHelper;
+import optifine.MathUtils;
+
+public class Bhop extends Module {
+	
+	public ModeSetting mode = new ModeSetting("Mode", "Vanilla", "Vanilla", "PvpLands", "Hypixel", "Test", "Test 2", "Test 3");
+	
+	public NumberSetting hypixelSpeed = new NumberSetting("Speed", 0.01, 0.0001, 0.03, 0.0001);
+	
+	private static double lastY;
+	private static float rotate = 180;
+	
+	private static int lagbackCheck = 0;
+	private static long lastLagback = System.currentTimeMillis();
+	
+	private transient boolean toggle = true;
+	
+	public Bhop() {
+		super("Bhop", Keyboard.KEY_NONE, Category.MOVEMENT);
+		resetSettings();
+	}
+	
+	@Override
+	public void resetSettings() {
+		this.settings.clear();
+		this.addSettings(mode, hypixelSpeed);
+	}
+	
+	@Override
+	public void onSettingChange(SettingChangeEvent e) {
+		if (e.setting.getSetting() == mode) {
+			
+			if (mode.is("Hypixel") || mode.getMode() == "Hypixel") {
+				
+				if (!this.settings.contains(hypixelSpeed)) {
+					this.settings.add(hypixelSpeed);
+				}
+				reorderSettings();
+				
+			}else {
+				
+				if (this.settings.contains(hypixelSpeed)) {
+					this.settings.remove(hypixelSpeed);
+				}
+				reorderSettings();
+				
+			}
+			
+		}
+	}
+	
+	public void onEnable() {
+		this.speed = 0.0D;
+		if (SpicyClient.config.fly.isEnabled()) {
+			toggle();
+			NotificationManager.getNotificationManager().createNotification("Don't use bhop while fly is enabled!", "", true, 5000, Type.WARNING, Color.RED);
+		}
+		
+		lastY = mc.thePlayer.posY;
+	}
+	
+	public void onDisable() {
+		mc.timer.ticksPerSecond = 20f;
+		this.mc.timer.timerSpeed = 1.00f;
+		status = 0;
+	}
+	
+	private int status = 0;
+	private boolean boosted = false;
+	
+    private double speed;
+    private double lastDist;
+    public static int stage;
+    
+    private transient Timer timer = new Timer();
+    
+	public void onEvent(Event e) {
+		
+		if (e instanceof EventPacket) {
+			
+			if (e.isPre()) {
+				
+				EventPacket packetEvent = (EventPacket) e;
+				
+				if (packetEvent.packet instanceof S08PacketPlayerPosLook) {
+					
+					if (lagbackCheck &gt;= 3) {
+						
+						lagbackCheck = 0;
+						lastLagback = System.currentTimeMillis() - (5*1000);
+						this.toggle();
+						NotificationManager.getNotificationManager().createNotification(this.name + " has been disabled to prevent flags", "", true, 1000, Type.WARNING, Color.RED);
+						
+					}else {
+						
+						lastLagback = System.currentTimeMillis();
+						lagbackCheck++;
+						
+					}
+					
+				}
+				
+			}
+			
+		}
+		
+		if (e instanceof EventUpdate) {
+			
+			if (e.isPre()) {
+				
+				if (lastLagback + (5*1000) &lt; System.currentTimeMillis()) {
+					
+					lagbackCheck = 0;
+					lastLagback = System.currentTimeMillis() + (10*1000);
+					
+				}
+				
+			}
+			
+		}
+		
+		if (e instanceof EventUpdate) {
+			if (e.isPre()) {
+				this.additionalInformation = mode.getMode();
+				
+				if (mode.getMode().equalsIgnoreCase("Vanilla") &amp;&amp; mc.gameSettings.keyBindForward.pressed) {
+					if (mc.thePlayer.onGround) {
+						mc.gameSettings.keyBindJump.pressed = false;
+						mc.thePlayer.jump();
+						mc.thePlayer.setSprinting(true);
+					}
+				}
+			}
+		}
+		
+		if (e instanceof EventMotion) {
+			
+			if (e.isBeforePost()) {
+				
+				EventMotion event = (EventMotion) e;
+				
+				if (mode.getMode().equalsIgnoreCase("Pvplands") &amp;&amp; !mc.thePlayer.isInWater()) {
+					
+					if (mc.thePlayer.onGround &amp;&amp; mc.gameSettings.keyBindForward.pressed) {
+						mc.thePlayer.setSprinting(true);
+						mc.gameSettings.keyBindJump.pressed = false;
+			            mc.thePlayer.jump();
+			            mc.thePlayer.jump();
+			            mc.thePlayer.setSprinting(true);
+			            //mc.thePlayer.motionY = 0.1f;
+					}
+					else if (mc.gameSettings.keyBindForward.pressed) {
+			            float f = mc.thePlayer.rotationYaw * 0.017453292F;
+			            mc.thePlayer.motionX -= (double)(MathHelper.sin(f) * 0.035F);
+			            mc.thePlayer.motionZ += (double)(MathHelper.cos(f) * 0.035F);
+					}
+					
+				}
+				else if (mode.getMode().equalsIgnoreCase("Pvplands") &amp;&amp; mc.thePlayer.isInWater()) {
+					if (mc.thePlayer.onGround) {
+						mc.gameSettings.keyBindJump.pressed = false;
+						mc.thePlayer.jump();
+						mc.thePlayer.setSprinting(true);
+					}
+				}
+				else if (mode.is("Hypixel") &amp;&amp; (mc.gameSettings.keyBindForward.pressed || mc.gameSettings.keyBindBack.pressed || mc.gameSettings.keyBindLeft.pressed || mc.gameSettings.keyBindRight.pressed) &amp;&amp; (!SpicyClient.config.blockFly.isEnabled() || (SpicyClient.config.killaura.isEnabled() &amp;&amp; SpicyClient.config.killaura.target != null) || true)) {
+					
+					mc.gameSettings.keyBindJump.pressed = false;
+					
+					if (!mc.thePlayer.isInWater()) {
+						
+						mc.thePlayer.noClip = true;
+						
+						if (MovementUtils.isOnGround(0.00004)) {
+							
+							//MovementUtils.setMotion((float) Math.sqrt(mc.thePlayer.motionX * mc.thePlayer.motionX + mc.thePlayer.motionZ * mc.thePlayer.motionZ) + ((float)hypixelSpeed.getValue() * 15));
+							mc.thePlayer.jump();
+							
+							e.setCanceled(true);
+							
+						}
+						
+						if (MovementUtils.isOnGround(1)) {
+							mc.timer.ticksPerSecond = 20;
+						}else if (mc.thePlayer.fallDistance &lt; 1.5) {
+							mc.timer.ticksPerSecond = 26.5f + new Random().nextFloat();
+						}
+						
+						mc.thePlayer.setSprinting(true);
+						//MovementUtils.strafe((float) Math.sqrt(mc.thePlayer.motionX * mc.thePlayer.motionX + mc.thePlayer.motionZ * mc.thePlayer.motionZ) + 0.01f);
+						MovementUtils.setMotion((float) Math.sqrt(mc.thePlayer.motionX * mc.thePlayer.motionX + mc.thePlayer.motionZ * mc.thePlayer.motionZ) + ((float)hypixelSpeed.getValue()));
+						
+					}else {
+						
+					}
+					
+				}
+				else if (mode.is("Hypixel") &amp;&amp; (!!SpicyClient.config.blockFly.isEnabled() || (SpicyClient.config.killaura.isEnabled() &amp;&amp; SpicyClient.config.killaura.target != null))) {
+					
+					mc.timer.ticksPerSecond = 20;
+					
+				}
+				else if (mode.is("Test") &amp;&amp; (mc.gameSettings.keyBindForward.pressed || mc.gameSettings.keyBindBack.pressed || mc.gameSettings.keyBindLeft.pressed || mc.gameSettings.keyBindRight.pressed)) {
+					
+					mc.gameSettings.keyBindJump.pressed = false;
+					
+					if (!mc.thePlayer.isInWater()) {
+						
+						mc.thePlayer.noClip = true;
+						
+						if (!MovementUtils.isOnGround(1)) {
+							
+							mc.thePlayer.motionY = -0.01 + (new Random().nextDouble() / 100);
+							//e.setCanceled(true);
+							
+						}
+						else if (MovementUtils.isOnGround(0.000000000004)) {
+							mc.thePlayer.jump();
+						}
+						
+						mc.thePlayer.setSprinting(true);
+						//MovementUtils.strafe((float) Math.sqrt(mc.thePlayer.motionX * mc.thePlayer.motionX + mc.thePlayer.motionZ * mc.thePlayer.motionZ) + 0.01f);
+						MovementUtils.setMotion((float) Math.sqrt(mc.thePlayer.motionX * mc.thePlayer.motionX + mc.thePlayer.motionZ * mc.thePlayer.motionZ) + ((float)hypixelSpeed.getValue()));
+						
+					}else {
+						
+					}
+					
+				}
+				else if (mode.is("Test 3")) {
+					
+					if ((!SpicyClient.config.blockFly.isEnabled() || (SpicyClient.config.killaura.isEnabled() &amp;&amp; SpicyClient.config.killaura.target != null))) {
+						
+						if (MovementUtils.isOnGround(1)) {
+							mc.timer.ticksPerSecond = 20;
+						}else if (mc.thePlayer.fallDistance &lt; 3) {
+							mc.timer.ticksPerSecond = 26.5f + new Random().nextFloat();
+						}
+						
+					}else {
+						
+						mc.timer.ticksPerSecond = 20;
+						
+					}
+					
+				}
+				
+			}
+			
+		}
+		
+		if (e instanceof EventMotion &amp;&amp; mc.thePlayer.onGround &amp;&amp; mode.is("Test 3")) {
+            ((EventMotion)e).setY(((EventMotion)e).getY() + (double)RandomUtils.nextFloat(1.0E-5F, 9.9E-4F));
+        }
+
+        if (e instanceof EventMove &amp;&amp; MovementUtils.isMoving() &amp;&amp; !mc.thePlayer.isInWater() &amp;&amp; e.isBeforePre() &amp;&amp; mode.is("Test 3") &amp;&amp; (!SpicyClient.config.blockFly.isEnabled() || (SpicyClient.config.killaura.isEnabled() &amp;&amp; SpicyClient.config.killaura.target != null))) {
+        	forward =  0.2873D;
+            if (mc.thePlayer.onGround) {
+                ((EventMove)e).setY(mc.thePlayer.motionY = 0.41999998688697815D);
+                this.speed = forward * 2.1500000953674316D;
+                this.lastDistanceReset = true;
+            } else if (!this.lastDistanceReset &amp;&amp; !mc.thePlayer.isCollidedHorizontally) {
+                //this.speed -= this.speed / 159.0D;
+            	this.speed -= this.speed / 165.0D;
+            } else {
+                this.speed -= 0.66D * (this.speed - forward);
+                this.lastDistanceReset = false;
+            }
+
+            MovementUtils.setMotion(Math.max(this.speed, forward));
+            ((EventMove)e).setSpeed(Math.max(this.speed, speed));
+        }
+		
+	}
+	
+	public static transient float Speed = 0;
+	public static transient boolean lastDistanceReset = false;
+	
+	public static double roundToPlace(double value, int places) {
+		if (places &lt; 0) {
+			throw new IllegalArgumentException();
+		} else {
+			BigDecimal bd = new BigDecimal(value);
+			bd = bd.setScale(places, RoundingMode.HALF_UP);
+			return bd.doubleValue();
+		}
+	}
+    double forward;
+    double strafe;
 }
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
+
+
+// NOTE (AI): Bhop is Spicy's speed module and it manipulates C03 only indirectly: the Hypixel mode sets the player noClip, jumps on a 0.00004 ground check, and runs the client at 26.5 tps plus a random jitter while airborne, so the movement packets the vanilla emitter sends carry a faster-than-normal trajectory. Test 3 mode is the packet-level variant: on EventMove it sets motionY to 0.41999998688697815, seeds speed at forward*2.1500000953674316 and decays it by speed/165 per air tick, and adds a random 1.0E-5..9.9E-4 Y jitter to every on-ground packet so the server sees a noisy ground contact. The S08PacketPlayerPosLook handler counts setbacks and hard-disables the module after 3 lagbacks in 5 seconds, an explicit anti-flag fail-safe.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventMove and EventMotion for physics; EventPacket on S08 for the lagback counter.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The 0.42 jump plus speed decay is the classic NCP bhop signature; the timer manipulation (26.5 tps) trips timer checks unless keepalive and transaction packets are delayed to match. The S08 auto-disable is an explicit flag-avoidance mechanism: the module quits before the anti-cheat can accumulate a ban.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99's Speed has NCP/LowHop-style modes that send C04 ground packets at specific moments. Rise 6.x ships FuncraftSpeed and InteractSpeed, which send C04 with onGround true on interact. Sigma's Bhop sends C04(x, -10, z, true) as a void trick, with PremiumBhopAddon extending it.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler</span>
+<span class="impl-module-clients">(Memeware 7.3, Rise 5.99, Rise 6.1.30, Rise 6.2.4, Sigma 4.11, Spicy, Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Break anti-cheat position timing by cancelling, rewriting or re-injecting C03 packets, usually paired with keepalive and transaction manipulation.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Sigma's Hypixel mode arms a watchdog flag by sending C04 (x, y+0.16, z, true) and (x, y+0.07, z, true) through sendPacketNoEvent, then cancels every C03 in the outgoing pre phase until an S08PacketPlayerPosLook disarms it. ViperMC mode injects ten C04 packets alternating +-0.2 Y every 3 seconds. The keepalive and transaction branches (Erisium re-sends the last S00 key every 1500ms, SagePvP/ColdNetwork cancel accepted C0F with id 0) keep the frozen connection alive.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/other/Disabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/other/Disabler.java =====
+package info.sigmaclient.module.impl.other;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+
+import info.sigmaclient.Client;
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.event.impl.EventUpdate;
+import info.sigmaclient.management.MoveUtils;
+import info.sigmaclient.management.notifications.Notifications;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.module.data.Options;
+import info.sigmaclient.module.data.Setting;
+import info.sigmaclient.module.impl.movement.Phase;
+import info.sigmaclient.util.Timer;
+import info.sigmaclient.util.misc.ChatUtil;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemBook;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.Packet;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
+import net.minecraft.network.play.server.S00PacketKeepAlive;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+
+
+public class Disabler extends Module {
+    String MODE = "MODE";
+    boolean faithful = false, watchdog = false, erisium = false;
+    Timer timer = new Timer();
+    int lastKey;
+    String mode;
+
+    public Disabler(ModuleData data) {
+        super(data);
+        settings.put(MODE, new Setting&lt;&gt;(MODE, new Options("Mode", "Hypixel", new String[]{"Hypixel", "Faithful", "Erisium", "SagePvP", "ColdNetwork"}), "Disabler method."));
+    }
+
+    @Override
+    public void onEnable() {
+        if (mc.theWorld == null)
+            return;
+        erisium = false;
+        timer.reset();
+        mode = ((Options) settings.get(MODE).getValue()).getSelected();
+        if (mode.equalsIgnoreCase("ViperMC")) {
+            if (!MoveUtils.isOnGround(0.0001)) {
+                this.toggle();
+                Notifications.getManager().post("Disabler", "Try again on ground !", Notifications.Type.WARNING);
+            }
+        }
+        if (mode.equalsIgnoreCase("Hypixel")) {
+            if (MoveUtils.isOnGround(0.001) &amp;&amp; mc.thePlayer.isCollidedVertically) {
+                double x = mc.thePlayer.posX;
+                double y = mc.thePlayer.posY;
+                double z = mc.thePlayer.posZ;
+                mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.16, z, true));
+                mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.07, z, true));
+                watchdog = true;
+                Notifications.getManager().post("Disabler", "Wait 5s.", Notifications.Type.INFO);
+            } else {
+                watchdog = false;
+            }
+        } else if (mode.equalsIgnoreCase("Faithful")) {
+            Notifications.getManager().post("Disabler", "Relog to disable Area 51.", Notifications.Type.INFO);
+        }
+    }
+
+    @Override
+    @RegisterEvent(events = {EventUpdate.class, EventPacket.class})
+    public void onEvent(Event event) {
+        if (mode == null) {
+            mode = ((Options) settings.get(MODE).getValue()).getSelected();
+        }
+        if (!mode.equalsIgnoreCase(((Options) settings.get(MODE).getValue()).getSelected())) {
+
+            mode = ((Options) settings.get(MODE).getValue()).getSelected();
+            if (mode.equalsIgnoreCase("Faithful")) {
+                Notifications.getManager().post("Disabler", "Relog to disable Area 51.", Notifications.Type.INFO);
+            }
+        }
+        this.setSuffix(mode);
+        if (event instanceof EventUpdate) {
+            EventUpdate em = (EventUpdate) event;
+            if (em.isPre()) {
+                if (mc.thePlayer.ticksExisted &lt;= 1) {
+                    erisium = false;
+                }
+                if (mode.equalsIgnoreCase("ViperMC")) {
+                    if (timer.delay(3000)) {
+                        em.setY(mc.thePlayer.posY + 0.4);
+                        return;
+                    }
+                    for (int i = 0; i &lt; 10; ++i) {
+                        boolean i2 = i &gt; 2 &amp;&amp; i &lt; 8;
+                        double x = i2 ? 0.2 : -0.2D;
+                        C03PacketPlayer.C04PacketPlayerPosition packet = new C03PacketPlayer.C04PacketPlayerPosition(
+                                mc.thePlayer.posX, mc.thePlayer.posY + x, mc.thePlayer.posZ, true);
+                        mc.thePlayer.sendQueue.addToSendQueue(packet);
+                    }
+                }
+                if (mode.equalsIgnoreCase("Hypixel"))
+                    if (!watchdog) {
+                        if (MoveUtils.isOnGround(0.001) &amp;&amp; mc.thePlayer.isCollidedVertically) {
+                            double x = mc.thePlayer.posX;
+                            double y = mc.thePlayer.posY;
+                            double z = mc.thePlayer.posZ;
+                            mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y, z, true));
+                            mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.16, z, true));
+                            mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.07, z, true));
+                            watchdog = true;
+                            Notifications.getManager().post("Disabler", "Please wait 5s.", Notifications.Type.INFO);
+                        }
+                    } else {
+                        mc.thePlayer.motionX = 0;
+                        mc.thePlayer.motionY = 0;
+                        mc.thePlayer.motionZ = 0;
+                        mc.thePlayer.jumpMovementFactor = 0;
+                        mc.thePlayer.noClip = true;
+                        mc.thePlayer.onGround = false;
+                    }
+                if (mode.equalsIgnoreCase("Erisium")) {
+                    if (erisium &amp;&amp; timer.delay(1500)) {
+                        erisium = !erisium;
+                        mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C00PacketKeepAlive(lastKey));
+                    }
+                }
+
+            }
+        } else if (event instanceof EventPacket) {
+            EventPacket ep = (EventPacket) event;
+            Packet p = ep.getPacket();
+            if (ep.isPre()) {
+                if (p instanceof C03PacketPlayer) {
+                    if (mode.equalsIgnoreCase("Hypixel") &amp;&amp; watchdog) {
+                        ep.setCancelled(true);
+                    }
+                }
+                if (p instanceof S08PacketPlayerPosLook) {
+                    S08PacketPlayerPosLook pac = (S08PacketPlayerPosLook) ep.getPacket();
+                    pac.yaw = mc.thePlayer.rotationYaw;
+                    pac.pitch = mc.thePlayer.rotationPitch;
+                    if (watchdog &amp;&amp; mode.equalsIgnoreCase("Hypixel")) {
+                        Notifications.getManager().post("Disabler", "You can do what you want for 5s !", Notifications.Type.INFO);
+                        this.toggle();
+                    }
+                }
+                if (p instanceof S00PacketKeepAlive) {
+                    S00PacketKeepAlive packet = (S00PacketKeepAlive) p;
+                    int KEY = packet.func_149134_c();
+                    if (mode.equalsIgnoreCase("Erisium")) {
+                        timer.reset();
+                        erisium = true;
+                        lastKey = KEY;
+                    }
+                }
+                if (p instanceof C00PacketKeepAlive) {
+                    C00PacketKeepAlive packet = (C00PacketKeepAlive) p;
+                    if (mode.equalsIgnoreCase("Faithful") || mode.equalsIgnoreCase("Erisium") || mode.equalsIgnoreCase("SagePvP") || mode.equalsIgnoreCase("ColdNetwork")) {
+                        ep.setCancelled(true);
+                    }
+                }
+                if (p instanceof C0FPacketConfirmTransaction) {
+                    C0FPacketConfirmTransaction packet = (C0FPacketConfirmTransaction) p;
+                    int id = packet.getId();
+                    boolean accepted = packet.isAccepted();
+                    int uid = packet.getUid();
+                    if (id == 0 &amp;&amp; accepted)
+                        if (mode.equalsIgnoreCase("SagePvP") || mode.equalsIgnoreCase("ColdNetwork")) {
+                            ep.setCancelled(true);
+                        }
+
+                }
+            }
+        }
+    }
 }
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
+
+
+// NOTE (AI): The Hypixel mode is the C03 centerpiece: while armed (watchdog flag), every C03PacketPlayer is cancelled in the outgoing pre phase, freezing the server-side player, and the module waits for an S08PacketPlayerPosLook to disarm. Before arming, it sends C04 (x, y+0.16, z, true) and (x, y+0.07, z, true) through sendPacketNoEvent, the ground-truth pair that trips Hypixel's watchdog jump flag so the watchdog window opens. ViperMC mode instead injects ten C04 packets alternating +0.2/-0.2 Y per 3 seconds and bumps the UpdateEvent Y by 0.4. The keepalive and transaction branches (Erisium re-sends the last S00 key every 1500ms; SagePvP/ColdNetwork cancel accepted C0F with id 0) are the timing half that keeps the freeze from being detected as a dead connection.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket outgoing pre for C03 cancel and C04 injection; EventUpdate for the arming sequence.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The +0.16/+0.07 pair is the Hypixel watchdog jump-flag trigger, a ground-truth pattern the server accepts as a jump; the resulting 5 second free-move window is bounded by the watchdog itself. Cancelling C03 while armed freezes the server-side player, which is the point, and the S08 disarm prevents the freeze from persisting.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware's Disabler has Mineplex Combat (C00 key corruption), Transaction, Latest Verus, PvPTemple, OmegaCraft, Timer, AACv1.9.10, Sloth, Ghostly, Watchdog and Faithful Movement modes. Rise 5.99's Disabler rewrites C06 into C04 and re-injects position packets. Rise 6.x ships ConvertMovingPackets, DynamicPVP, Ghostly, Lunar, NoRules, RiseBalance, Teleport, UniversoCraft and Verus2 disablers, most of which convert C03 subclasses or re-send position. Spicy has Disabler and Hypixel5SecDisabler (C04 +0.21/+0.11 pattern). Tenacity has DisablerModule and AdvancedDisablerModule with C06 to C04 conversion.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Regen</span>
-<span class="impl-module-clients">(Gugustus, Mint B1, Koks v1, Tenacity 6.0, Sigma 4.11, Vestige 3.0, November 0.2, Lycoris 2.0, Jigsaw 0.26)</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Every client intercepts C03 at the outgoing packet event (PacketOutEvent, PacketSendEvent, EventSendPacket) and matches instanceof C03PacketPlayer, which also catches the C04/C05/C06 subclasses. Movement engines hook UpdateEvent or PreMotionEvent to alter position, ground and rotation before the vanilla emitter builds the packet; Rise 6.x additionally routes through TeleportEvent for S08 responses.</div>
+<div class="impl-clients">Vanilla emission differs per client: Memeware and Nekoware patch EntityPlayerSP.onUpdateWalkingPlayer to fire a custom UpdateEvent that carries setY/setGround, Sigma and Spicy do the same with their motion events, while Rise 5.99 and Tenacity rewrite the emitter to consume their own event objects. Send paths diverge the same way: sendQueue.addToSendQueue (Memeware, Nekoware, Sigma, Spicy, Tenacity), PacketUtil.sendPacket and sendPacketWithoutEvent (Rise 5.99), PacketUtil.send and sendNoEvent (Rise 6.x). Bus-bypassing sends (sendPacketSilent, sendPacketNoEvent, sendPacketWithoutEvent, sendNoEvent) are universal and used whenever a module must not re-trigger its own packet listener.</div>
 </div>
-<p class="impl-pattern">The most heavily-modded packet. Flight cancels S08 and sends spoofed C06. Speed modifies C04 with onGround=true at precise offsets. NoFall sets onGround=true. Blink buffers all C03 packets and releases them at once. Criticals sends micro-offset C04 before attacks. Damage sends C04 with large Y offset for self-damage. Step injects staged C04 packets for block stepping.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// NoFall — set ground
-if (event.getPacket() instanceof C03PacketPlayer) {
-  ((C03PacketPlayer)event.getPacket()).setOnGround(true);
-}
-// Blink — buffer + release
-if (event.getPacket() instanceof C03PacketPlayer) { packets.add(event.getPacket()); event.setCancelled(true); }
-// onDisable: packets.forEach(p -&gt; sendPacketNoEvent(p));
-// Flight packet mode — cancel S08, send spoofed C06
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// Speed — ground spoof
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.42, z, true));
-// Criticals — offset
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y + 0.0625, z, false));
-mc.thePlayer.sendQueue.addToSendQueue(new C04PacketPlayerPosition(x, y, z, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket (C03/C04/C05/C06) + EventReceivePacket (S08)</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
+<a class="related-chip" href="../C00PacketKeepAlive/">C00PacketKeepAlive</a>
+<a class="related-chip" href="../C0FPacketConfirmTransaction/">C0FPacketConfirmTransaction</a>
+<a class="related-chip" href="../C02PacketUseEntity/">C02PacketUseEntity</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S39PacketPlayerAbilities (0x39): Server updates the player's capabilities (flying, invulnerable, creative, fly speed, walk speed).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Flight, GodMode, CreativeFly">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="CreativeFlight, Debugger, PingSpoofComponent (packet holding)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S39PacketPlayerAbilities — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S39PacketPlayerAbilities — Minecraft 1.8.9 Packet Reference","description":"The authoritative capability sync packet: flags byte plus fly and walk speeds, mirrored by a single-flag serverbound C13. Three Rise 6.x surface areas in the corpus: CreativeFlight rewrites the received S39 to claim flying, Debugger prints its fields for protocol inspection, and PingSpoofComponent t","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -73,26 +73,637 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">This is the SERVER→CLIENT version. The server sends this when the player's abilities change. The CLIENT→SERVER version is C13PacketPlayerAbilities (which only carries the isFlying flag).</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>Server-to-client capability sync: one flags byte (0x01 invulnerable, 0x02 flying, 0x04 allowFlying, 0x08 creative), then fly speed and walk speed floats. The server pushes it on join, on every capabilities change, and as part of the login burst alongside S01, S37 and S38. Its serverbound mirror C13PacketPlayerAbilities carries only the isFlying flag, so S39 is the only place the client learns the full authoritative set.</p>
+<h4>Vanilla handling</h4>
+<p>handlePlayerAbilities copies all four flags and both speeds into thePlayer.capabilities, and the movement code then obeys them: fly speed scales creative flight, walk speed scales ground speed. Server side, processPlayerAbilities (C13) flips only isFlying and only when allowFlying is true, so the server stays authoritative and re-broadcasts the corrected state via S39 whenever it disagrees with the client. The client handlers are behaviorally identical across all 8 corpus clients.</p>
+<h4>Why clients touch it</h4>
+<p>Three Rise 6.x surface areas. CreativeFlight, a mode of the Flight module, rewrites the received packet in place: wrapper.setFlying(mc.thePlayer.capabilities.isFlying) so the server's flying flag can never desync the client while the mode force-flies the player at timer speed 3. Debugger carries an Abilities toggle that prints fly speed, allowFlying and isFlying to chat for protocol inspection. PingSpoofComponent classifies S39 as a teleport-class packet, so when a spoof window is active, held S39 packets flush together with S08 teleports and S09 held-item changes rather than being held with regular traffic.</p>
+<h4>Exploit surface</h4>
+<p>The packet is clientbound, so the server cannot see mutations; the risk is desync rather than detection. CreativeFlight's rewrite makes local capabilities authoritative and hides the server's corrections, viable only while the server does not re-send S39 faster than the module rewrites it. The packet also constrains packet-holding systems: because S39 arrives on gamemode and flight changes, holding it across an S08 teleport would leave the client's flag state and position inconsistent, which is why the component groups the three packet classes.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityPlayerMP re-sends S39 whenever the capabilities setter path detects a change, and ServerConfigurationManager sends it once on join. C13 processing is the only serverbound input and it gates flying on allowFlying; the server's S39 responses are the corrective loop that keeps the client honest about permission.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>One flags byte then two raw 32-bit IEEE floats with no quantization: 0.05 default fly speed, 0.1 default walk speed. Bit 0x02 is current flying, 0x04 is permission to fly; creative players get both set, survival players neither unless a plugin grants flight. The same byte layout is reused by C13, which zeroes the unused fields.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats infer flight from movement and C13, not from S39, but the packet is a synchronization oracle for them: a client that never confirms flying while the S39 stream says flying is on is not mirroring state, and the movement that follows is what actually flags. CreativeFlight's rewrite exists to keep that mirror consistent. Holding components treat S39 as teleport-adjacent because a held S39 crossing a held S08 desyncs flags and position, a failure mode that correlates with timer and fly flags.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Flight</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<p class="impl-pattern">The authoritative capability sync packet: flags byte plus fly and walk speeds, mirrored by a single-flag serverbound C13. Three Rise 6.x surface areas in the corpus: CreativeFlight rewrites the received S39 to claim flying, Debugger prints its fields for protocol inspection, and PingSpoofComponent treats it as teleport-class traffic so held S39 flushes with S08.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">CreativeFlight</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Detect ability changes. Flight checks allowFlying. GodMode tracks invulnerable.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Force creative-style flight on survival servers by keeping the server's flying flag in sync with client-forced capabilities.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A mode of the Flight module. On enable it sets capabilities.isFlying and jumps; on pre-motion it force-flies with timer speed 3 and motion scaling. In the receive handler, every S39PacketPlayerAbilities is rewritten in place: wrapper.setFlying(mc.thePlayer.capabilities.isFlying), so the server's corrections can never desync the local flying state. PreUpdateEvent arms PingSpoofComponent.spoof(300000, ...) to hold all stateful traffic while the mode runs.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/movement/flight/CreativeFlight.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/movement/flight/CreativeFlight.java =====
+package com.alan.clients.module.impl.movement.flight;
+
+import com.alan.clients.component.impl.player.PingSpoofComponent;
+import com.alan.clients.component.impl.player.RotationComponent;
+import com.alan.clients.component.impl.player.rotationcomponent.MovementFix;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.*;
+import com.alan.clients.event.impl.other.MoveEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.render.Render2DEvent;
+import com.alan.clients.event.impl.render.Render3DEvent;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.util.vector.Vector2f;
+import com.alan.clients.value.Mode;
+import net.minecraft.entity.Entity;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S39PacketPlayerAbilities;
+import net.minecraft.util.MathHelper;
+
+public class CreativeFlight extends Mode&lt;Flight&gt; {
+
+    public CreativeFlight(String name, Flight parent) {
+        super(name, parent);
+    }
+     double lastPosX = Double.NaN;
+     double lastPosY = Double.NaN;
+     double lastPosZ = Double.NaN;
+    private double serverPosX, serverPosY, serverPosZ;
+    private double lastServerPosX, lastServerPosY, lastServerPosZ;
+    private float serverYaw, serverPitch;
+    private double cameraOffsetX = 0;
+    private double cameraOffsetY = 0;
+    private double cameraOffsetZ = 0;
+    private float cameraYawOffset = 0;
+    private float cameraPitchOffset = 0;
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+if(mc.thePlayer.onGround){
+
+    mc.thePlayer.jump();
+}
+
+      //  mc.thePlayer.cameraYaw = 0;
+      //  mc.thePlayer.cameraPitch = 0;
+   //     mc.gameSettings.keyBindJump.setPressed(true);
+
+       //     mc.gameSettings.keyBindForward.setPressed(true);
+        RotationComponent.setSmoothed(false);
+        RotationComponent.setRotations(new Vector2f(mc.thePlayer.rotationYaw + 45, mc.thePlayer.rotationPitch), 10, MovementFix.NORMAL);
+
+
+      //  MoveUtil.preventDiagonalSpeed();
+    //  lastPosX = mc.thePlayer.lastTickPosX;
+    //   lastPosY = mc.thePlayer.lastTickPosY;
+   //    lastPosZ = mc.thePlayer.lastTickPosZ;
+   //     mc.thePlayer.setPosition(lastPosX, lastPosY, lastPosZ);
+      //  mc.timer.timerSpeed = 1f;
+        mc.timer.timerSpeed = 3f;
+        if(mc.thePlayer.offGroundTicks &gt;=6){
+
+            mc.thePlayer.capabilities.allowFlying = true;
+mc.thePlayer.motionZ *= 9.5;
+            mc.thePlayer.motionX *= 9.5;
+            final double yaw = Math.toRadians(mc.thePlayer.rotationYaw);
+            final double x = Math.sin(yaw) * 9;
+            final double z = Math.cos(yaw) * 9;
+         //   event.setPosX(event.getPosX() - x);
+        //    event.setPosZ(event.getPosZ() + z);
+
+mc.thePlayer.motionY = 0;
+
+        }
+
+
+
+
+      //  mc.thePlayer.setPosition(mc.thePlayer.lastTickPosX, mc.thePlayer.lastTickPosY, mc.thePlayer.lastTickPosZ);
+
+
+    };
+
+    @EventLink
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+        mc.timer.timerSpeed = 0f;
+        if(mc.thePlayer.offGroundTicks&gt;= 5){
+
+            mc.thePlayer.motionY = .005;
+        }
+
+
+        //MoveUtil.strafe(9);
+     //   mc.thePlayer.setPosition(lastPosX, lastPosY, lastPosZ);
+    };
+
+    @EventLink
+    public final Listener&lt;PostStrafeEvent&gt; onPostStrafe = event -&gt; {
+
+
+        //MoveUtil.strafe(9);
+    //    mc.thePlayer.setPosition(lastPosX, lastPosY, lastPosZ);
+    };
+
+    @EventLink
+    public final Listener&lt;PostMotionEvent&gt; postMotionEventListener = event -&gt; {
+
+
+        //MoveUtil.strafe(9);
+      //  mc.thePlayer.setPosition(lastPosX, lastPosY, lastPosZ);
+    };
+
+    @EventLink
+    public final Listener&lt;Render2DEvent&gt; event = event -&gt; {
+        if(Math.hypot(serverPosX - lastServerPosX,serverPosZ - lastServerPosZ)&gt;.4){
+            mc.fontRendererObj.drawWithShadow("Teleported: "+ Math.round((Math.hypot(serverPosX - lastServerPosX,serverPosZ - lastServerPosZ))), (double) mc.scaledResolution.getScaledWidth() / 2.2, (double) mc.scaledResolution.getScaledHeight() / 2 + 20, -1);
+            // ChatUtil.display("good");
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PreUpdateEvent&gt; PreUpdateEvent = event -&gt; {
+        PingSpoofComponent.spoof(300000, true, false, false, false, false);
+
+
+        //MoveUtil.strafe(9);
+
+    };
+
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (p instanceof C0FPacketConfirmTransaction || p instanceof C00PacketKeepAlive){
+
+        }
+
+
+        if (p instanceof S39PacketPlayerAbilities) {
+            final S39PacketPlayerAbilities wrapper = (S39PacketPlayerAbilities) p;
+            wrapper.setFlying(mc.thePlayer.capabilities.isFlying);
+        }
+
+        if (p instanceof S08PacketPlayerPosLook) {
+            S08PacketPlayerPosLook posLookPacket = (S08PacketPlayerPosLook) p;
+
+            // Update the player's position and rotation to match the server's data
+            lastServerPosX = serverPosX;
+            lastServerPosY = serverPosY;
+            lastServerPosZ = serverPosZ;
+
+            serverPosX = posLookPacket.getX();
+            serverPosY = posLookPacket.getY();
+            serverPosZ = posLookPacket.getZ();
+
+            lastPosX =   posLookPacket.getX();
+            lastPosZ  =    posLookPacket.getZ();
+            lastPosY = posLookPacket.getY();
+
+         //   mc.thePlayer.setPosition(lastPosX, lastPosY, lastPosZ);
+            // Update the camera rotation
+         //   event.setCancelled();
+
+            // Optionally, reset motion to prevent client-side movement
+         //   mc.thePlayer.motionX = 0;
+         //   mc.thePlayer.motionY = 0;
+        //    mc.thePlayer.motionZ = 0;
+
+
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;Render3DEvent&gt; onRender3D = event -&gt; {
+        // Save the original render view entity
+        double partialTicks = mc.timer.renderPartialTicks;
+      //  mc.timer.timerSpeed = 10f;
+        // Interpolate between the last and current server positions
+        double interpolatedPosX = lastServerPosX + (serverPosX - lastServerPosX) * partialTicks;
+        double interpolatedPosY = lastServerPosY + (serverPosY - lastServerPosY) * partialTicks;
+        double interpolatedPosZ = lastServerPosZ + (serverPosZ - lastServerPosZ) * partialTicks;
+
+
+        if(mc.thePlayer.offGroundTicks &gt;=5) {
+            // Set the render view entity's position to the interpolated position
+            Entity renderViewEntity = mc.getRenderViewEntity();
+            renderViewEntity.posX = interpolatedPosX;
+            renderViewEntity.posY = interpolatedPosY;
+            renderViewEntity.posZ = interpolatedPosZ;
+
+            // Also update the previous positions to prevent any rendering jitter
+            renderViewEntity.prevPosX = interpolatedPosX;
+            renderViewEntity.prevPosY = interpolatedPosY;
+            renderViewEntity.prevPosZ = interpolatedPosZ;
+        }
+
+        // Update the rotation
+      //  renderViewEntity.rotationYaw = serverYaw;
+      //  renderViewEntity.rotationPitch = serverPitch;
+    };
+
+
+    @Override
+    public void onEnable() {
+        cameraOffsetX = 0;
+        cameraOffsetY = 0;
+        cameraOffsetZ = 0;
+        cameraYawOffset = 0;
+        cameraPitchOffset = 0;
+
+        lastPosX = mc.thePlayer.lastReportedPosX;
+        lastPosY = mc.thePlayer.lastReportedPosY;
+        lastPosZ = mc.thePlayer.lastReportedPosZ;
+        PingSpoofComponent.dispatch();
+        if (mc.thePlayer.onGround) {
+            mc.thePlayer.jump();
+        }
+        mc.thePlayer.capabilities.isFlying = true;
+
+    }
+
+    @Override
+    public void onDisable() {
+        mc.thePlayer.capabilities.isFlying = false;
+       // mc.gameSettings.keyBindForward.setPressed(false);
+      //  mc.gameSettings.keyBindJump.setPressed(false);
+     //  mc.gameSettings.keyBindForward.setPressed(false);
+      //  mc.thePlayer.motionX *= 9;
+      //  mc.thePlayer.motionZ *= 9;
+        cameraOffsetX = 0;
+        cameraOffsetY = 0;
+        cameraOffsetZ = 0;
+        cameraYawOffset = 0;
+        cameraPitchOffset = 0;
+
+        PingSpoofComponent.dispatch();
+
+      //  lastPosX = mc.thePlayer.posX;
+     //   lastPosY = mc.thePlayer.posY;
+      //  lastPosZ = mc.thePlayer.posZ;
+        mc.thePlayer.capabilities.allowFlying = mc.playerController.getCurrentGameType().isCreative();
+
+    }
+
+    @EventLink
+    private final Listener&lt;MoveEvent&gt; moveEventListener = event -&gt; {
+        if (mc.thePlayer.offGroundTicks &gt;= 6) {
+
+        }
+    };
+
+}
+// NOTE (AI): The S39 rewrite keeps the server's flying flag in sync with the client's forced capabilities while the mode flies at timer speed 3. Note the pairing with PingSpoofComponent.spoof(300000, ...) in PreUpdateEvent: all stateful traffic is held for 300 seconds, and S39 is part of the teleports tuple so it flushes together with S08. The packet is mutated in place on the receive event, which the component system then cancels and queues.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (mutation), PreUpdateEvent (spoof arming), PreMotionEvent (movement).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The mutation is invisible to the server, but the movement it enables (timer 3, 9.5x motion scaling) is a textbook fly flag on any serious anti-cheat; the S39 rewrite only prevents the flag-state desync that would compound the detection.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 carries the same mode with an identical S39 branch (wrapper.setFlying(mc.thePlayer.capabilities.isFlying)); the 6.2.4 build adds the Render3D interpolation scaffolding.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">GodMode</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Debugger</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Detect ability changes. Flight checks allowFlying. GodMode tracks invulnerable.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Developer tool that prints protocol traffic to chat, including a dedicated Abilities readout for S39.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The receive handler branches by packet class: S32 transactions, S00 keepalives, S08 teleports, S12 velocity, S27 explosions and S39 abilities each print their fields. The S39 branch logs fly speed, allowFlying and isFlying via the MCP accessors. The send side only fires while Client.DEVELOPMENT_SWITCH is set, but the receive side is live in release builds.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 — com/alan/clients/module/impl/other/Debugger.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/module/impl/other/Debugger.java =====
+package com.alan.clients.module.impl.other;
+
+import com.alan.clients.Client;
+import com.alan.clients.component.impl.player.BlinkComponent;
+import com.alan.clients.component.impl.render.ESPComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.event.impl.render.Render2DEvent;
+import com.alan.clients.module.Module;
+import com.alan.clients.module.api.Category;
+import com.alan.clients.module.api.ModuleInfo;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.interfaces.ThreadAccess;
+import com.alan.clients.util.math.MathUtil;
+import com.alan.clients.util.render.RenderUtil;
+import com.alan.clients.util.vector.Vector2d;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.DragValue;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.EnumChatFormatting;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.awt.*;
+import java.lang.reflect.Field;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+
+import static com.alan.clients.layer.Layers.*;
+
+@ModuleInfo(aliases = {"module.other.debugger.name"}, category = Category.PLAYER, description = "module.other.debugger.description")
+public final class Debugger extends Module implements ThreadAccess {
+
+    private final BooleanValue transaction = new BooleanValue("Transactions", this, true);
+    private final BooleanValue keepAlive = new BooleanValue("Keep Alive", this, true);
+    private final BooleanValue teleport = new BooleanValue("Teleport", this, true);
+    private final BooleanValue velocity = new BooleanValue("Velocity", this, true);
+    private final BooleanValue abilities = new BooleanValue("Abilities", this, true);
+    private final BooleanValue displayAll = new BooleanValue("Display All", this, true);
+    private final BooleanValue blacklist = new BooleanValue("Blacklist", this, true, () -&gt; !displayAll.getValue());
+    private final BooleanValue time = new BooleanValue("Time Since Move", this, true, () -&gt; !displayAll.getValue());
+    private final BooleanValue devPanel = new BooleanValue("Dev Panel", this, false);
+    private final BooleanValue eventCalls = new BooleanValue("Event Calls", this, false);
+
+    private final DragValue position = new DragValue("", this, new Vector2d(200, 200), true);
+
+    private final DateTimeFormatter date = DateTimeFormatter.ofPattern("MM/dd/yyyy");
+    private final ArrayList&lt;String&gt; blacklisted = new ArrayList&lt;&gt;();
+
+    public static HashMap&lt;String, Integer&gt; calls = new HashMap&lt;&gt;();
+    private long threadLag;
+    private boolean measuring;
+    private StopWatch stopWatch = new StopWatch();
+
+    @Override
+    public void onEnable() {
+        blacklisted.clear();
+    }
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        if (!Client.DEVELOPMENT_SWITCH) return;
+
+        final Packet&lt;?&gt; packet = event.getPacket();
+        if (packet instanceof C03PacketPlayer &amp;&amp; teleport.getValue()) {
+
+            stopWatch.reset();
+        }
+
+        if (displayAll.getValue()) {
+            String name = packet.getClass().getSimpleName();
+
+            if (blacklist.getValue()) {
+                if (!blacklisted.contains(name)) {
+                    ChatUtil.display(EnumChatFormatting.BLACK + " BlackListed Packet " + EnumChatFormatting.RESET + " (ID: %s)", name);
+                    blacklisted.add(name);
+                }
+            } else if (!blacklisted.contains(name)) {
+                ChatUtil.display(EnumChatFormatting.GOLD + " Packet " + EnumChatFormatting.RESET + " (ID: %s)", name);
+
+                for (Field field : packet.getClass().getDeclaredFields()) {
+                    field.setAccessible(true);
+
+                    try {
+                        ChatUtil.display(EnumChatFormatting.YELLOW + " %s:" + EnumChatFormatting.GRAY + " %s", field.getName(), field.get(packet));
+                    } catch (IllegalAccessException e) {
+                        e.printStackTrace();
+                    }
+                }
+
+                if (time.getValue()) ChatUtil.display(EnumChatFormatting.YELLOW + " %s:" + EnumChatFormatting.GRAY + " %s", "time since movement", stopWatch.getElapsedTime());
+
+                ChatUtil.display("");
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (transaction.getValue() &amp;&amp; packet instanceof S32PacketConfirmTransaction) {
+            final S32PacketConfirmTransaction transaction = ((S32PacketConfirmTransaction) packet);
+
+            ChatUtil.display(EnumChatFormatting.RED + " Transaction " + EnumChatFormatting.RESET + " (ID: %s)   (WindowID: %s)", transaction.actionNumber, transaction.windowId);
+        } else if (keepAlive.getValue() &amp;&amp; packet instanceof S00PacketKeepAlive) {
+            final S00PacketKeepAlive wrapper = ((S00PacketKeepAlive) packet);
+
+            ChatUtil.display(EnumChatFormatting.GREEN + " Keep Alive " + EnumChatFormatting.RESET + " (ID: %s)", wrapper.func_149134_c());
+        } else if (teleport.getValue() &amp;&amp; packet instanceof S08PacketPlayerPosLook) {
+            final S08PacketPlayerPosLook wrapper = ((S08PacketPlayerPosLook) packet);
+
+            ChatUtil.display(EnumChatFormatting.BLUE + " Server Teleport " + EnumChatFormatting.RESET + " (Position: %s)",
+                    MathUtil.round(wrapper.x, 3) + " " +
+                            MathUtil.round(wrapper.y, 3) + " " +
+                            MathUtil.round(wrapper.z, 3));
+        } else if (velocity.getValue() &amp;&amp; packet instanceof S12PacketEntityVelocity) {
+            final S12PacketEntityVelocity wrapper = ((S12PacketEntityVelocity) packet);
+
+            if (wrapper.getEntityID() == mc.thePlayer.getEntityId()) {
+                ChatUtil.display(EnumChatFormatting.LIGHT_PURPLE + " Velocity " + EnumChatFormatting.RESET + " (DeltaX: %s) (DeltaY: %s)  (DeltaZ: %s) ",
+                        wrapper.motionX / 8000D, wrapper.motionY / 8000D, wrapper.motionZ / 8000D);
+            }
+        } else if (velocity.getValue() &amp;&amp; packet instanceof S27PacketExplosion) {
+            S27PacketExplosion explosion = ((S27PacketExplosion) packet);
+            ChatUtil.display(EnumChatFormatting.LIGHT_PURPLE + " Explosion (Velocity) " + EnumChatFormatting.RESET + " (DeltaX: %s) (DeltaY: %s)  (DeltaZ: %s) ",
+                    explosion.func_149149_c(), explosion.func_149144_d(), explosion.func_149147_e());
+        } else if (abilities.getValue() &amp;&amp; packet instanceof S39PacketPlayerAbilities) {
+            S39PacketPlayerAbilities abilitiesp = ((S39PacketPlayerAbilities) packet);
+            ChatUtil.display(EnumChatFormatting.YELLOW + " Abilities " + abilitiesp.getFlySpeed() + " " + abilitiesp.isAllowFlying() + " " + abilitiesp.isFlying());
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;Render2DEvent&gt; onRender2D = event -&gt; {
+        if (devPanel.getValue()) {
+            double padding = 10;
+            position.scale = new Vector2d(180, 207);
+
+            getLayer(REGULAR, 1).add(() -&gt; RenderUtil.roundedRectangle(position.position.x, position.position.y, position.scale.x, position.scale.y, getTheme().getRound(), getTheme().getBackgroundShade()));
+            getLayer(BLUR).add(() -&gt; RenderUtil.roundedRectangle(position.position.x, position.position.y, position.scale.x, position.scale.y, getTheme().getRound(), Color.BLACK));
+            getLayer(BLOOM).add(() -&gt; RenderUtil.roundedRectangle(position.position.x, position.position.y, position.scale.x, position.scale.y, getTheme().getRound(), getTheme().getDropShadow()));
+
+            getLayer(REGULAR, 1).add(() -&gt; {
+                mc.fontRendererObj.drawWithShadow(Client.NAME + " " + Client.VERSION + " INDEV " + date.format(LocalDateTime.now()), position.position.x + padding, position.position.y + padding, new Color(255, 255, 0).getRGB());
+                mc.fontRendererObj.drawWithShadow("FPS: " + Minecraft.getDebugFPS() + " [target " + mc.getLimitFramerate() + "]", position.position.x + padding, position.position.y + padding * 2, new Color(255, 255, 0).getRGB());
+
+                mc.fontRendererObj.draw("Debugger", position.position.x + padding, position.position.y + padding * 4, getTheme().getFirstColor().hashCode());
+
+                if (Client.DEVELOPMENT_SWITCH) {
+                    mc.fontRendererObj.draw("Blink: " + BlinkComponent.blinking, position.position.x + padding, position.position.y + padding * 6, Color.WHITE.hashCode());
+                } else {
+                    mc.fontRendererObj.draw("Hidden due to not in dev mode", position.position.x + padding, position.position.y + padding * 5, Color.WHITE.hashCode());
+                    mc.fontRendererObj.draw("Hidden due to not in dev mode", position.position.x + padding, position.position.y + padding * 6, Color.WHITE.hashCode());
+                }
+
+//                mc.fontRendererObj.drawString("Bot Amount: " + Client.INSTANCE.getBotManager().size(), position.position.x + padding, position.position.y + padding * 7, Color.WHITE.hashCode());
+                mc.fontRendererObj.draw("ESPs Amount: " + ESPComponent.esps.size(), position.position.x + padding, position.position.y + padding * 8, Color.WHITE.hashCode());
+
+                mc.fontRendererObj.draw("Performance", position.position.x + padding, position.position.y + padding * 9, getTheme().getFirstColor().hashCode());
+                mc.fontRendererObj.draw("ThreadLag: " + threadLag, position.position.x + padding, position.position.y + padding * 16, Color.WHITE.hashCode());
+
+                mc.fontRendererObj.draw("Other", position.position.x + padding, position.position.y + padding * 18, getTheme().getFirstColor().hashCode());
+                mc.fontRendererObj.draw("Timer: " + mc.timer.timerSpeed, position.position.x + padding, position.position.y + padding * 19, Color.WHITE.hashCode());
+            });
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (measuring) return;
+
+        long systemTime = System.currentTimeMillis();
+        measuring = true;
+
+        boolean run = mc.thePlayer.ticksExisted % 100 == 0 &amp;&amp; eventCalls.getValue();
+        threadPool.execute(() -&gt; {
+            threadLag = System.currentTimeMillis() - systemTime;
+            measuring = false;
+
+            if (run) {
+                ChatUtil.display("Displaying Calls: ");
+
+                for (String name : calls.keySet()) {
+                    ChatUtil.display(name + ": " + calls.get(name));
+                }
+
+                calls.clear();
+            }
+        });
+    };
+}
+// NOTE (AI): The Abilities branch is a pure read: it prints fly speed, allowFlying and isFlying. The send-side dump is gated on Client.DEVELOPMENT_SWITCH, but the receive branch is live regardless, which is why S39 debugging works in release builds. This is the canonical example of reading S39 fields through the MCP accessors.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent; PacketSendEvent gated on the development switch.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None; the module only reads packets and prints text. It is a diagnostic tool, included here because it is the only corpus code that consumes S39 purely for inspection.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.2.4 ships the same module under Client-release2/Client/src/main/java with an identical S39 branch.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">CreativeFly</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoofComponent (packet holding)</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Detect ability changes. Flight checks allowFlying. GodMode tracks invulnerable.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Hold and replay latency-sensitive packets; S39 is classified as teleport-class so it flushes together with S08 rather than with regular traffic.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The component owns five class tuples (regular, velocity, teleports, players, blink, movement) plus per-tuple enable flags set by spoof(). While enabled, matching packets are cancelled on send or receive and queued as TimedPacket entries; on PostMotion, entries older than the spoof amount are replayed via PacketUtil.queue. S39PacketPlayerAbilities sits in the teleports tuple with S08PacketPlayerPosLook and S09PacketHeldItemChange.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 — com/alan/clients/component/impl/player/PingSpoofComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/component/impl/player/PingSpoofComponent.java =====
+package com.alan.clients.component.impl.player;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.CancellableEvent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PostMotionEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.util.packet.PacketUtil;
+import net.minecraft.client.gui.GuiDownloadTerrain;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.Tuple;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+public final class PingSpoofComponent extends Component {
+    public static ConcurrentLinkedQueue&lt;PacketUtil.TimedPacket&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+    static StopWatch enabledTimer = new StopWatch();
+    public static boolean enabled;
+    static long amount;
+    static Tuple&lt;Class[], Boolean&gt; regular = new Tuple&lt;&gt;(new Class[]{C0FPacketConfirmTransaction.class, C00PacketKeepAlive.class, S1CPacketEntityMetadata.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; velocity = new Tuple&lt;&gt;(new Class[]{S12PacketEntityVelocity.class, S27PacketExplosion.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; teleports = new Tuple&lt;&gt;(new Class[]{S08PacketPlayerPosLook.class, S39PacketPlayerAbilities.class, S09PacketHeldItemChange.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; players = new Tuple&lt;&gt;(new Class[]{S13PacketDestroyEntities.class, S14PacketEntity.class, S14PacketEntity.S16PacketEntityLook.class, S14PacketEntity.S15PacketEntityRelMove.class, S14PacketEntity.S17PacketEntityLookMove.class, S18PacketEntityTeleport.class, S20PacketEntityProperties.class, S19PacketEntityHeadLook.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; blink = new Tuple&lt;&gt;(new Class[]{C02PacketUseEntity.class, C0DPacketCloseWindow.class, C0EPacketClickWindow.class, C0CPacketInput.class, C0BPacketEntityAction.class, C08PacketPlayerBlockPlacement.class, C07PacketPlayerDigging.class, C09PacketHeldItemChange.class, C13PacketPlayerAbilities.class, C15PacketClientSettings.class, C16PacketClientStatus.class, C17PacketCustomPayload.class, C18PacketSpectate.class, C19PacketResourcePackStatus.class, C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class, C0APacketAnimation.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; movement = new Tuple&lt;&gt;(new Class[]{C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class}, false);
+
+    public static Tuple&lt;Class[], Boolean&gt;[] types = new Tuple[]{regular, velocity, teleports, players, blink, movement};
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; send = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; receive = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    public CancellableEvent onPacket(Packet&lt;?&gt; packet, CancellableEvent event) {
+        if (!event.isCancelled() &amp;&amp; enabled &amp;&amp; Arrays.stream(types).anyMatch(tuple -&gt; tuple.getSecond() &amp;&amp; Arrays.stream(tuple.getFirst()).anyMatch(regularpacket -&gt; regularpacket == packet.getClass()))) {
+            event.setCancelled();
+            packets.add(new PacketUtil.TimedPacket(packet));
+        }
+
+        return event;
+    }
+
+    public static void dispatch() {
+        if (!packets.isEmpty()) {
+            // Stops the packets from being called twice
+            boolean enabled = PingSpoofComponent.enabled;
+            PingSpoofComponent.enabled = false;
+            packets.forEach(timedPacket -&gt; PacketUtil.queue(timedPacket.getPacket()));
+            PingSpoofComponent.enabled = enabled;
+            packets.clear();
+        }
+    }
+
+    public static void disable() {
+        enabled = false;
+        enabledTimer.setMillis(enabledTimer.millis - 999999999);
+    }
+
+    @EventLink
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; dispatch();
+
+    @EventLink
+    public final Listener&lt;PostMotionEvent&gt; onPostMotion = event -&gt; {
+        if (!(enabled = !enabledTimer.finished(100) &amp;&amp; !(mc.currentScreen instanceof GuiDownloadTerrain))) {
+            dispatch();
+        } else {
+            // Stops the packets from being called twice
+            enabled = false;
+
+            packets.forEach(packet -&gt; {
+                if (packet.getTime() + amount &lt; System.currentTimeMillis()) {
+                    PacketUtil.queue(packet.getPacket());
+                    packets.remove(packet);
+                }
+            });
+
+            enabled = true;
+        }
+    };
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players) {
+        spoof(amount, regular, velocity, teleports, players, false);
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink, boolean movement) {
+        enabledTimer.reset();
+
+        PingSpoofComponent.regular.setSecond(regular);
+        PingSpoofComponent.velocity.setSecond(velocity);
+        PingSpoofComponent.teleports.setSecond(teleports);
+        PingSpoofComponent.players.setSecond(players);
+        PingSpoofComponent.blink.setSecond(blink);
+        PingSpoofComponent.movement.setSecond(movement);
+        PingSpoofComponent.amount = amount;
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink) {
+        spoof(amount, regular, velocity, teleports, players, blink, false);
+    }
+
+    public static void blink() {
+        spoof(9999999, true, false, false, false, true);
+    }
+}
+// NOTE (AI): S39 sits in the teleports tuple with S08PacketPlayerPosLook and S09PacketHeldItemChange: while a spoof window is active these classes are cancelled and queued, then flushed together via dispatch(). Grouping matters because holding an S39 across an S08 would desync flag state from position. The component is the shared engine behind PingSpoof, CreativeFlight and the blink modes.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, PacketSendEvent, PostMotionEvent, WorldChangeEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Holding S39 is not itself detectable, but the desync it prevents is: a held S39 crossing a held S08 would leave flag state and position inconsistent, a correlation anti-cheats can use. The teleport grouping exists to keep that ordering intact.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.2.4 ships the identical component under Client-release2/Client/src/main/java; both versions are driven by the same spoof() and blink() entry points.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent is the common surface; CreativeFlight mutates the packet object on the event, Debugger reads it, PingSpoofComponent cancels and queues it.</div>
+<div class="impl-clients">Rise 6.x uses the component system for holding; the 6.1.30 and 6.2.4 trees are functionally identical. The other six clients carry only the vanilla handler and have no S39 modules.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C13PacketPlayerAbilities/">C13PacketPlayerAbilities</a>
+<a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
+<a class="related-chip" href="../S38PacketPlayerListItem/">S38PacketPlayerListItem</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

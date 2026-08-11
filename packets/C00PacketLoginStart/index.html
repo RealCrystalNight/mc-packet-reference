@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C00PacketLoginStart (0x00): Starts the login process by sending the player's GameProfile (username) to the server.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="LOGIN">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="NameSpoof, CrackedBypass">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="BlinkComponent, Blink / Fly / BackupFly (login allowlist)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C00PacketLoginStart — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"LOGIN Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C00PacketLoginStart — Minecraft 1.8.9 Packet Reference","description":"The login opener: username-only GameProfile sent right after the handshake. No module in the 8 clients spoofs or cancels it; BlinkComponent (Rise 6.x) and Spicy's Blink/Fly/BackupFly merely exempt it from packet buffering so the handshake survives while they hold everything else.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"LOGIN Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -69,26 +69,229 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerLoginServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Sent immediately after C00Handshake (with state=LOGIN). The GameProfile has a username but the UUID is null — the server fills in the UUID from Mojang's auth servers and returns it in S02PacketLoginSuccess. This is the first step of the login handshake after the initial HANDSHAKING state.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C00PacketLoginStart is the first packet of the LOGIN state, sent immediately after C00Handshake with nextState=2. It carries a GameProfile whose username is the only meaningful field; the UUID is null at this stage and the server fills it in from the session service. The vanilla client fires it from three places: GuiConnecting on connect, Minecraft.java's direct networkmanager path, and RealmsConnect for realm joins. The server answers with S01PacketEncryptionRequest on online-mode servers or S02PacketLoginSuccess on offline-mode servers. Everything after this packet is gated on the server's decision in processLoginStart.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerLoginServer.processLoginStart validates the currentLoginState is HELLO via Validate.validState, stores the profile, then branches on server.isServerInOnlineMode() and whether the channel is local. Online mode moves to KEY state and sends S01PacketEncryptionRequest; offline mode jumps straight to READY_TO_ACCEPT. The username arrives as a VarInt-length-prefixed UTF-8 string; the client enforces the 16-character limit at the login screen, and the packet itself does no re-validation beyond reading the string.</p>
+<h4>Why clients touch it</h4>
+<p>Two families in the 8 clients reference this packet, and neither spoofs the name. Rise 6.1.30 and 6.2.4 BlinkComponent list C00PacketLoginStart in a five-class exemption set that is returned untouched by the blink buffer. Spicy Blink, Fly and BackupFly use an identical three-way guard (C00PacketKeepAlive, C00Handshake, C00PacketLoginStart) in their EventSendPacket handlers so the handshake always flows while the module cancels everything else. No name-spoof module exists in this corpus: the old Gugustus NameSpoof pattern is absent from all 8 clients, which instead treat the packet as untouchable plumbing.</p>
+<h4>Exploit surface</h4>
+<p>The packet is sent before encryption, so the username is visible to any MITM during login, and on offline-mode servers the name is trust-on-first-use: impersonation is a server configuration weakness, not a packet bug. Client-side abuse is limited to cancellation, which stalls the login at HELLO until the server's connection timeout fires. The only real engineering concern for module authors is accidental swallowing: a blink module that buffers C00PacketLoginStart breaks every future join, which is exactly why both Rise's component and Spicy's modules hard-code the exemption.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>NetHandlerLoginServer.processLoginStart: Validate.validState(HELLO), store loginGameProfile, then either send S01PacketEncryptionRequest and move to KEY (online mode, non-local channel) or move straight to READY_TO_ACCEPT (offline mode or local channel). No username validation beyond the wire read; the server trusts the client's login-screen limit of 16 chars.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Sent in LOGIN state only, id 0x00. Single String field: VarInt length + UTF-8 bytes. UUID in the GameProfile is null until the server resolves it via the session service. State must be LOGIN after the C00Handshake; a C00PacketLoginStart in any other state is a protocol violation that the server's Validate check rejects.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>No anti-cheat parses this packet: it carries no position, timing, or interaction data and the player entity does not exist yet. Serverside plugins and proxies (auth plugins, BungeeCord) consume the name for pre-auth bookkeeping, but nothing in the 8 clients interacts with that. The packet is a non-surface for flagging, which is why modules only need to avoid breaking it.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NameSpoof</span>
-<span class="impl-module-clients">(Gugustus)</span>
+<p class="impl-pattern">The login opener: username-only GameProfile sent right after the handshake. No module in the 8 clients spoofs or cancels it; BlinkComponent (Rise 6.x) and Spicy's Blink/Fly/BackupFly merely exempt it from packet buffering so the handshake survives while they hold everything else.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BlinkComponent</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Intercept login start to spoof username before authentication.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof C00PacketLoginStart) {
-  ((C00PacketLoginStart) event.getPacket()).gameProfile.name = "SpoofedName";
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<p class="impl-pattern">Exempt C00PacketLoginStart (and the other four pre-play serverbound packets) from blink buffering so the login handshake always reaches the server while blink is active.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PacketSendEvent listener at VERY_LOW priority returns without cancelling when the packet is C00Handshake, C00PacketLoginStart, C00PacketServerQuery, C01PacketPing or C01PacketEncryptionResponse. Any other packet is parked in the static queue and cancelled, unless it matches the per-module setExempt list. The queue flushes via PacketUtil.sendNoEvent when a C03PacketPlayer arrives, the player dies, or the world changes.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BlinkComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BlinkComponent.java =====
+package com.alan.clients.component.impl.player;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.other.ServerJoinEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.util.packet.PacketUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.handshake.client.C00Handshake;
+import net.minecraft.network.login.client.C00PacketLoginStart;
+import net.minecraft.network.login.client.C01PacketEncryptionResponse;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.status.client.C00PacketServerQuery;
+import net.minecraft.network.status.client.C01PacketPing;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+public final class BlinkComponent extends Component {
+
+    public static final ConcurrentLinkedQueue&lt;Packet&lt;?&gt;&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+    public static boolean blinking, dispatch;
+    public static ArrayList&lt;Class&lt;?&gt;&gt; exemptedPackets = new ArrayList&lt;&gt;();
+    public static StopWatch exemptionWatch = new StopWatch();
+
+    public static void setExempt(Class&lt;?&gt;... packets) {
+        exemptedPackets = new ArrayList&lt;&gt;(Arrays.asList(packets));
+        exemptionWatch.reset();
+    }
+
+    @EventLink(value = Priorities.VERY_LOW)
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        if (mc.thePlayer == null) {
+            packets.clear();
+            exemptedPackets.clear();
+            return;
+        }
+
+        if (mc.thePlayer.isDead || mc.isSingleplayer() || !mc.getNetHandler().doneLoadingTerrain) {
+            packets.forEach(PacketUtil::sendNoEvent);
+            packets.clear();
+            blinking = false;
+            exemptedPackets.clear();
+            return;
+        }
+
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof C00Handshake || packet instanceof C00PacketLoginStart ||
+                packet instanceof C00PacketServerQuery || packet instanceof C01PacketPing ||
+                packet instanceof C01PacketEncryptionResponse) {
+            return;
+        }
+
+        if (blinking &amp;&amp; !dispatch) {
+            if (exemptionWatch.finished(100)) {
+                exemptionWatch.reset();
+                exemptedPackets.clear();
+            }
+
+//            PingSpoofComponent.spoofing = false;
+
+            if (!event.isCancelled() &amp;&amp; exemptedPackets.stream().noneMatch(packetClass -&gt;
+                    packetClass == packet.getClass())) {
+                packets.add(packet);
+                event.setCancelled();
+            }
+        } else if (packet instanceof C03PacketPlayer) {
+            packets.forEach(PacketUtil::sendNoEvent);
+            packets.clear();
+            dispatch = false;
+        }
+    };
+
+    public static void dispatch() {
+        dispatch = true;
+    }
+
+    @EventLink(value = Priorities.VERY_LOW)
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; {
+        packets.clear();
+        BlinkComponent.blinking = false;
+    };
+
+    @EventLink(value = Priorities.VERY_LOW)
+    public final Listener&lt;ServerJoinEvent&gt; onServerJoin = event -&gt; {
+        packets.clear();
+        BlinkComponent.blinking = false;
+    };
+
+}
+
+
+// NOTE (AI): The exemption list covers every serverbound packet that exists before the PLAY state, so blink can never swallow the login or status flow. Everything else is parked in the static queue and flushed through sendNoEvent, which bypasses the event bus entirely, when a C03PacketPlayer arrives or the player dies. The exemptionWatch window lets modules temporarily whitelist specific packet classes for 100ms.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None: the packet is returned untouched, so wire behavior is identical to vanilla. The exemption exists purely to prevent self-inflicted login stalls, not to evade anything.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 ships the byte-identical file at com/alan/clients/component/impl/player/BlinkComponent.java; both versions use the same five-class instanceof list and the same 100ms exemption window.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Blink / Fly / BackupFly (login allowlist)</span>
+<span class="impl-module-clients">(Spicy)</span>
+</div>
+<p class="impl-pattern">Keep the handshake alive while the module cancels and buffers all other serverbound packets, so blink and Hypixel-mode fly cannot kill the login sequence.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">EventSendPacket pre handler returns early when the packet is C00PacketKeepAlive, C00Handshake or C00PacketLoginStart. Every other packet is added to a static ArrayList and cancelled. Blink flushes the queue through mc.getNetHandler().addToSendQueue on disable; Fly's Hypixel mode applies the same guard before rewriting C03PacketPlayer fields and parking packets in its own buffer.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy — info/spicyclient/modules/player/Blink.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/player/Blink.java =====
+package info.spicyclient.modules.player;
+
+import java.util.ArrayList;
+
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.chatCommands.Command;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventSendPacket;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.notifications.Color;
+import info.spicyclient.notifications.NotificationManager;
+import info.spicyclient.notifications.Type;
+import net.minecraft.network.NetworkManager;
+import net.minecraft.network.Packet;
+import net.minecraft.network.handshake.client.C00Handshake;
+import net.minecraft.network.login.client.C00PacketLoginStart;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+
+public class Blink extends Module {
+	
+	public static ArrayList&lt;Packet&gt; packets = new ArrayList&lt;Packet&gt;();
+	
+	public Blink() {
+		super("Blink", Keyboard.KEY_NONE, Category.PLAYER);
+	}
+	
+	public void onEnable() {
+		packets.clear();
+		
+		if (mc.isSingleplayer()) {
+			NotificationManager.getNotificationManager().createNotification("Don't use blink in singleplayer!", "", true, 5000, Type.WARNING, Color.RED);
+			this.toggle();
+		}
+		
+	}
+	
+	public void onDisable() {
+		
+		for (Packet p : packets) {
+			
+			if (mc.isSingleplayer()) {
+				
+			}else {
+				mc.getNetHandler().addToSendQueue(p);
+			}
+			
+		}
+		packets.clear();
+		
+	}
+	
+	public void onEvent(Event e) {
+		
+		if (e instanceof EventSendPacket) {
+			
+			if (e.isPre()) {
+				
+				if (((EventSendPacket)e).packet instanceof C00PacketKeepAlive || ((EventSendPacket)e).packet instanceof C00Handshake || ((EventSendPacket)e).packet instanceof C00PacketLoginStart) {
+					return;
+				}
+				
+				EventSendPacket sendPacket = (EventSendPacket) e;
+				packets.add(sendPacket.packet);
+				sendPacket.setCanceled(true);
+				
+			}
+			
+		}
+		
+	}
+	
+}
+
+
+// NOTE (AI): The allowlist guard runs before the cancel branch, so keepalive, handshake and login packets are returned untouched while everything else is buffered and cancelled. The queue flushes through addToSendQueue on disable, which re-enters the normal send path (and therefore the event bus) rather than bypassing it like Rise's sendNoEvent.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
 <div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>No anti-cheat relevance: the guard only prevents the module from breaking its own connection. The interesting detail is that the exemption is identical across three modules, which suggests a shared template in Spicy's codebase.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Fly.java repeats the same three-way instanceof guard at lines 398, 818 and 1032 in its Hypixel mode, and BackupFly.java at lines 356 and 725; both additionally rewrite C03PacketPlayer on-ground/moving flags after the guard.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">CrackedBypass</span>
-<span class="impl-module-clients">(Gugustus)</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent / EventSendPacket on all clients; Rise 6.x routes through its component system with @EventLink listeners.</div>
+<div class="impl-clients">Rise uses a central BlinkComponent with an explicit class allowlist and sendNoEvent flushing. Spicy implements the guard inline in each module's EventSendPacket handler with instanceof casts on the raw Packet.</div>
 </div>
-<p class="impl-pattern">Intercept login start to spoof username before authentication.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof C00PacketLoginStart) {
-  ((C00PacketLoginStart) event.getPacket()).gameProfile.name = "SpoofedName";
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C00Handshake/">C00Handshake</a>
+<a class="related-chip" href="../S01PacketEncryptionRequest/">S01PacketEncryptionRequest</a>
+<a class="related-chip" href="../S02PacketLoginSuccess/">S02PacketLoginSuccess</a>
+<a class="related-chip" href="../S00PacketDisconnect/">S00PacketDisconnect</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

@@ -41,40 +41,64 @@
   "handler": "INetHandlerPlayClient",
   "notes": "Reason 0: bed can't be set (respawn). Reason 1/2: rain toggle. Reason 3: gamemode change (value=0-3). Reason 4: credits. Reason 5: demo. Reason 6: arrow hitting entity. Reason 7/8: fade values. Reason 9: elder guardian effect.",
   "implementation": {
+    "writeup": [
+      {
+        "h": "Role in the protocol",
+        "p": "A two-field state toggle: an unsigned byte reason and a float value. It is the server's mechanism for global client state that has no dedicated packet: rain start/stop and strength, gamemode changes, the end-game credits screen, the demo screen and its help messages, arrow-hit feedback, and the elder guardian mob-appearance effect. EntityPlayerMP sends reason 4 on end-game and reason 3 with the new GameType ID on gamemode change; WorldServer and ServerConfigurationManager drive reasons 1, 2, 7 and 8 for weather."
+      },
+      {
+        "h": "Vanilla handling",
+        "p": "NetHandlerPlayClient.handleChangeGameState switches on the reason. Reason 1 sets raining true, 2 sets raining false, 3 calls playerController.setGameType(GameType.getByID(value)), 4 opens GuiWinGame, 5 routes the demo screen (value 0) or demo help messages (101/102/103), 6 plays the successful-hit sound, 7 sets rain strength, 8 sets thunder strength, 10 spawns the mob-appearance particle and guardian curse sound. Reasons with a MESSAGE_NAMES entry also push a translated chat line."
+      },
+      {
+        "h": "Why clients touch it",
+        "p": "Two Rise 6.x handlers, both defensive. Ambience, a render module, cancels reasons 1 and 2 whenever the user has forced a custom weather mode, so server rain toggles cannot override the client's chosen sky. DemoCheck, a security feature, drops reason 5 with value 0, which is the demo-mode screen: a malicious or griefing server can lock a player into the demo overlay, and the check removes that lever. No client in the corpus uses this packet for AutoGG-style game-end detection; reason 4 is ignored everywhere."
+      },
+      {
+        "h": "Exploit surface",
+        "p": "The demo screen (reason 5, value 0) is the abuse vector: it swaps the HUD and movement handling to demo mode, which hostile servers use to grief players. Rain reasons are a nuisance vector on weather-cycling servers, which is exactly why Ambience filters them. Reason 3 gamemode changes are server-authoritative and no client in the corpus fights them; overriding setGameType client-side desyncs the player controller and is a known crash/flag source, which is why it is absent."
+      }
+    ],
+    "overview": "The catch-all state toggle: rain, gamemode, credits, demo, arrow feedback, guardian effect. The 8 clients use it only defensively: Rise 6.x Ambience filters rain toggles under forced weather, and Rise 6.x DemoCheck kills the demo-screen lockout. No game-end (credits) detection exists in this corpus.",
+    "server_handling": "Server senders: WorldServer.updateWeather sends reason 7/8 (strengths) per dimension and reason 1/2 (rain stop/start) globally; ServerConfigurationManager sends reason 1 plus 7/8 on player join; EntityPlayerMP sends 4 on end-game and 3 with GameType.getID on gamemode change; EntityArrow sends 6 to the shooter on a successful hit; EntityGuardian sends 10 on the elder guardian effect; DemoWorldManager sends 5 with 0/101/102/103. The client handler applies each reason directly to client world state, with no validation of value ranges.",
+    "protocol_notes": "Encoding: unsigned byte reason, float value. The value is only meaningful for reasons 3 (gamemode id), 5 (demo sub-state), 7 and 8 (weather strengths). Reasons 0, 4, 6, 9, 10 carry value 0.0F. MESSAGE_NAMES maps reasons 1, 3, 4, 5 to chat translations, so some reasons produce both a state change and a chat line. Reason 9 is defined but unused in 1.8.9; reason 10 is the elder guardian variant.",
+    "anticheat_landscape": "No anti-cheat measures this packet. Gamemode changes are server-authoritative and instant, so client-side gamemode spoofing is a desync crash rather than a cheat. The defensive angle is server trust: DemoCheck exists because a hostile server can emit reason 5 to disable normal gameplay, and Ambience exists because weather packets fight user-selected ambience. Both are filters on server-controlled state, not evasions.",
     "modules": [
       {
-        "name": "AutoGG",
+        "name": "Ambience (weather override)",
         "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
+          "Rise 6.2.4",
+          "Rise 6.1.30"
         ],
-        "purpose": "Detect game state changes. NoRain cancels rain start (reason=1/2). AutoGG detects game end (reason=4=credits).",
-        "how_it_works": "",
-        "detailed_code": "// NoRain\nif (event.getPacket() instanceof S2BPacketChangeGameState) {\n  S2BPacketChangeGameState s2b = (S2BPacketChangeGameState) event.getPacket();\n  if (s2b.getGameState() == 1 || s2b.getGameState() == 2) event.setCancelled(true);\n}",
-        "vanilla_hook": "EventReceivePacket"
+        "purpose": "Force a chosen weather and stop server rain toggles from overriding it.",
+        "how_it_works": "When the Weather mode is not Unchanged, the PacketReceiveEvent handler cancels every S2B whose reason is 1 or 2 (begin/end rain). A PreMotionEvent branch re-applies the forced state every 20 ticks via WorldInfo setters, and onDisable resets rain strength and weather flags to defaults.",
+        "detailed_code": "// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/render/Ambience.java =====\npackage com.alan.clients.module.impl.render;\n\nimport com.alan.clients.event.Listener;\nimport com.alan.clients.event.annotations.EventLink;\nimport com.alan.clients.event.impl.motion.PreMotionEvent;\nimport com.alan.clients.event.impl.packet.PacketReceiveEvent;\nimport com.alan.clients.event.impl.render.Render3DEvent;\nimport com.alan.clients.module.Module;\nimport com.alan.clients.module.api.Category;\nimport com.alan.clients.module.api.ModuleInfo;\nimport com.alan.clients.value.impl.ColorValue;\nimport com.alan.clients.value.impl.ModeValue;\nimport com.alan.clients.value.impl.NumberValue;\nimport com.alan.clients.value.impl.SubMode;\nimport lombok.Getter;\nimport net.minecraft.network.play.server.S03PacketTimeUpdate;\nimport net.minecraft.network.play.server.S2BPacketChangeGameState;\nimport net.minecraft.util.BlockPos;\nimport net.minecraft.world.biome.BiomeGenBase;\n\nimport java.awt.*;\n\n@Getter\n@ModuleInfo(aliases = {\"module.render.ambience.name\"}, description = \"module.render.ambience.description\", category = Category.RENDER)\npublic final class Ambience extends Module {\n\n    private final NumberValue time = new NumberValue(\"Time\", this, 0, 0, 22999, 1);\n    private final NumberValue speed = new NumberValue(\"Time Speed\", this, 0, 0, 20, 1);\n\n    private final ModeValue weather = new ModeValue(\"Weather\", this) {{\n        add(new SubMode(\"Unchanged\"));\n        add(new SubMode(\"Clear\"));\n        add(new SubMode(\"Rain\"));\n        add(new SubMode(\"Heavy Snow\"));\n        add(new SubMode(\"Light Snow\"));\n        add(new SubMode(\"Nether Particles\"));\n        setDefault(\"Unchanged\");\n    }};\n\n    public final ColorValue snowColor = new ColorValue(\"Snow Color\", this, Color.WHITE,\n            () -> !weather.getValue().getName().equals(\"Heavy Snow\") && !weather.getValue().getName().equals(\"Light Snow\"));\n\n    @Override\n    public void onDisable() {\n        mc.theWorld.setRainStrength(0);\n        mc.theWorld.getWorldInfo().setCleanWeatherTime(Integer.MAX_VALUE);\n        mc.theWorld.getWorldInfo().setRainTime(0);\n        mc.theWorld.getWorldInfo().setThunderTime(0);\n        mc.theWorld.getWorldInfo().setRaining(false);\n        mc.theWorld.getWorldInfo().setThundering(false);\n    }\n\n    @EventLink\n    public final Listener<Render3DEvent> onRender3D = event -> {\n        mc.theWorld.setWorldTime((time.getValue().intValue() + (System.currentTimeMillis() * speed.getValue().intValue())));\n    };\n\n    @EventLink\n    public final Listener<PreMotionEvent> onPreMotionEvent = event -> {\n        if (mc.thePlayer.ticksExisted % 20 == 0) {\n\n            switch (this.weather.getValue().getName()) {\n                case \"Clear\": {\n                    mc.theWorld.setRainStrength(0);\n                    mc.theWorld.getWorldInfo().setCleanWeatherTime(Integer.MAX_VALUE);\n                    mc.theWorld.getWorldInfo().setRainTime(0);\n                    mc.theWorld.getWorldInfo().setThunderTime(0);\n                    mc.theWorld.getWorldInfo().setRaining(false);\n                    mc.theWorld.getWorldInfo().setThundering(false);\n                    break;\n                }\n                case \"Nether Particles\":\n                case \"Light Snow\":\n                case \"Heavy Snow\":\n                case \"Rain\": {\n                    mc.theWorld.setRainStrength(1);\n                    mc.theWorld.getWorldInfo().setCleanWeatherTime(0);\n                    mc.theWorld.getWorldInfo().setRainTime(Integer.MAX_VALUE);\n                    mc.theWorld.getWorldInfo().setThunderTime(Integer.MAX_VALUE);\n                    mc.theWorld.getWorldInfo().setRaining(true);\n                    mc.theWorld.getWorldInfo().setThundering(false);\n                }\n            }\n        }\n    };\n\n    @EventLink\n    public final Listener<PacketReceiveEvent> onPacketReceiveEvent = event -> {\n        if (event.getPacket() instanceof S03PacketTimeUpdate) {\n            event.setCancelled();\n        } else if (event.getPacket() instanceof S2BPacketChangeGameState && !this.weather.getValue().getName().equals(\"Unchanged\")) {\n            S2BPacketChangeGameState s2b = (S2BPacketChangeGameState) event.getPacket();\n\n            if (s2b.getGameState() == 1 || s2b.getGameState() == 2) {\n                event.setCancelled();\n            }\n        }\n    };\n\n    public float getFloatTemperature(BlockPos blockPos, BiomeGenBase biomeGenBase) {\n        if (this.isEnabled()) {\n            switch (this.weather.getValue().getName()) {\n                case \"Nether Particles\":\n                case \"Light Snow\":\n                case \"Heavy Snow\":\n                    return 0.1F;\n                case \"Rain\":\n                    return 0.2F;\n            }\n        }\n\n        return biomeGenBase.getFloatTemperature(blockPos);\n    }\n\n    public boolean skipRainParticles() {\n        final String name = this.weather.getValue().getName();\n        return this.isEnabled() && name.equals(\"Light Snow\") || name.equals(\"Heavy Snow\") || name.equals(\"Nether Particles\");\n    }\n}\n\n// NOTE (AI): The S2B branch (lines ~90-96) only filters reasons 1 and 2. Time updates are filtered separately via S03PacketTimeUpdate, and the forced weather is re-asserted on a 20-tick cadence to survive server-side refreshes.",
+        "code_source": "Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/render/Ambience.java",
+        "vanilla_hook": "PacketReceiveEvent, PreMotionEvent, Render3DEvent.",
+        "anti_cheat_notes": "Client-only state, invisible to the server. The 20-tick re-assertion matters because the server re-sends rain state on join and on weather ticks; without it the forced weather would flicker.",
+        "variations": "Identical file in Rise 6.1.30 under com/alan/clients/module/impl/render/."
       },
       {
-        "name": "NoRain",
+        "name": "DemoCheck (security)",
         "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
+          "Rise 6.2.4",
+          "Rise 6.1.30"
         ],
-        "purpose": "Detect game state changes. NoRain cancels rain start (reason=1/2). AutoGG detects game end (reason=4=credits).",
-        "how_it_works": "",
-        "detailed_code": "// NoRain\nif (event.getPacket() instanceof S2BPacketChangeGameState) {\n  S2BPacketChangeGameState s2b = (S2BPacketChangeGameState) event.getPacket();\n  if (s2b.getGameState() == 1 || s2b.getGameState() == 2) event.setCancelled(true);\n}",
-        "vanilla_hook": "EventReceivePacket"
-      },
-      {
-        "name": "AntiDemo",
-        "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
-        ],
-        "purpose": "Detect game state changes. NoRain cancels rain start (reason=1/2). AutoGG detects game end (reason=4=credits).",
-        "how_it_works": "",
-        "detailed_code": "// NoRain\nif (event.getPacket() instanceof S2BPacketChangeGameState) {\n  S2BPacketChangeGameState s2b = (S2BPacketChangeGameState) event.getPacket();\n  if (s2b.getGameState() == 1 || s2b.getGameState() == 2) event.setCancelled(true);\n}",
-        "vanilla_hook": "EventReceivePacket"
+        "purpose": "Drop the demo-mode packet so a server cannot lock the client into the demo screen.",
+        "how_it_works": "A SecurityFeature on the packet receive chain. It drops any S2B where reason is 5 and value is 0, which is exactly the packet DemoWorldManager sends to open GuiScreenDemo. The demo help messages (values 101-103) are not blocked, only the screen-opening state.",
+        "detailed_code": "// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/security/impl/DemoCheck.java =====\npackage com.alan.clients.security.impl;\n\nimport com.alan.clients.security.SecurityFeature;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.play.server.S2BPacketChangeGameState;\n\npublic final class DemoCheck extends SecurityFeature {\n\n    public DemoCheck() {\n        super(\"Demo Check\", \"Server attempted to prevent gameplay with a demo screen\");\n    }\n\n    @Override\n    public boolean handle(final Packet<?> packet) {\n        if (packet instanceof S2BPacketChangeGameState) {\n            final S2BPacketChangeGameState wrapper = ((S2BPacketChangeGameState) packet);\n\n            return wrapper.getGameState() == 5 && wrapper.func_149137_d() == 0;\n        }\n\n        return false;\n    }\n}\n\n// NOTE (AI): Precise filter: reason 5 with value 0.0F. The value check is what distinguishes the lockout screen from the harmless demo help messages.",
+        "code_source": "Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/security/impl/DemoCheck.java",
+        "vanilla_hook": "Security pipeline handle(Packet).",
+        "anti_cheat_notes": "Server-trust defense, not anti-cheat. Only relevant on servers that abuse the demo state; on legit demo servers it changes nothing user-visible except skipping the overlay.",
+        "variations": "Identical file in Rise 6.1.30. No other client in the corpus filters demo state."
       }
+    ],
+    "general_hooks": "Rise 6.x uses PacketReceiveEvent for module-level filtering (Ambience) and the security handle(Packet) chain for feature-level filtering (DemoCheck).",
+    "client_variations": "Both Rise 6.x versions ship identical Ambience and DemoCheck files. Rise 5.99 has no S2B module reference at all; Memeware, Nekoware, Sigma, Spicy and Tenacity only touch the packet in vanilla NetHandlerPlayClient code.",
+    "related": [
+      "S03PacketTimeUpdate",
+      "S2APacketParticles",
+      "S01PacketJoinGame"
     ]
   }
 }

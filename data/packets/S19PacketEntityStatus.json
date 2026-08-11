@@ -41,34 +41,50 @@
   "handler": "INetHandlerPlayClient",
   "notes": "Status codes: 2=hurt, 3=death, 6=taming, 7=tamed, 8=shaking, 9=hearts, 10=wolfSmoke, 11=accept, 12=witherSpawn, 15=redstoneTorches, 16=ironGolem, 17=sheepEat, 18=trueGod, 19=endermanScream, 20=zombieVillagerCure, 21=guardianElder, 22=petWolf, 23=zombieVillagerReplacing, 24=arrowCount, 25=particles, 26=thorns, 27=snowParticles, 28=shulkerTeleport, 29=ironGolemGiveRose.",
   "implementation": {
+    "writeup": [
+      {
+        "h": "Role in the protocol",
+        "p": "S19PacketEntityStatus carries a single opcode byte for one entity: the client-bound event channel for hurt (2), death (3), wolf taming, hearts, wither spawn and a dozen more codes. The server broadcasts it through WorldServer.setEntityState, which routes to the entity tracker (corpus line 880), and EntityPlayerMP sends code 9 to the player itself (line 893). For a cheat client the only actionable signal is the hurt/death transition of the local player, which is why the sole module consumer is a velocity module."
+      },
+      {
+        "h": "Vanilla handling",
+        "p": "NetHandlerPlayClient.handleEntityStatus (Memeware 7.3 bundle, line 897) special-cases opcode 21 (guardian sound) and otherwise forwards the code to entity.handleHealthUpdate, which plays the hurt/death sounds, wolf effects, totem-like particles and so on. The handler is a pure dispatch table: no state is stored, no position is involved."
+      },
+      {
+        "h": "Why clients touch it",
+        "p": "The corpus has exactly one module consumer: Rise 6.x GrimVelocity, in both 6.1.30 and 6.2.4, which uses opcode 2 (hurt) on the local player as the precondition for cancelling the following S12 velocity. Rise's NetworkAPI whitelists the packet for scripts in both versions. Memeware, Nekoware, Sigma, Spicy and Tenacity reference it only through the vanilla handler. The thinness is structural: the packet has no position or rotation data, so movement, render and combat modules have nothing to consume; only the hurt-to-knockback contract matters."
+      },
+      {
+        "h": "Exploit surface",
+        "p": "The S19(2) then S12 pairing is the knockback contract: the server announces damage, then the velocity that results from it. Cancelling S12 after seeing the hurt status is the classic velocity bypass, and GrimVelocity hardens it by sending a C07 dig packet at the player's own position on the next PreUpdate, so the server observes a legitimate block interaction on the damaged tick instead of a missing motion change. Anticheats that detect velocity cancel measure the absent motionY after a confirmed hurt status; the dig packet is the counter because it gives the server an acceptable action to attach the tick to."
+      }
+    ],
+    "overview": "The status opcode channel is nearly invisible to the 8 clients: one module, GrimVelocity in Rise 6.x, uses opcode 2 as the trigger for a velocity bypass, and the script API whitelists it. Everything else in the corpus is the vanilla dispatch handler.",
+    "server_handling": "Clientbound only. WorldServer.setEntityState broadcasts the opcode through the entity tracker to every tracking player; EntityPlayerMP sends code 9 (the eating effect) to the player directly. The client dispatch is entity.handleHealthUpdate with a special case for 21. There is no per-player state kept on either side; the packet is a one-shot event.",
+    "protocol_notes": "VarInt entityId plus one unsigned byte opcode. The opcode set is defined by Entity.handleHealthUpdate: 2 = hurt, 3 = death, 6 = taming, 7 = tamed, 8 = wolf shaking, 9 = eating, 10 = wolf smoke, 11 = accept, 12 = wither spawn, 15 = redstone torches, 16 = iron golem, 17 = sheep eating, 19 = enderman scream, 20 = zombie villager cure, 21 = guardian elder, 22 = pet wolf, 24 = arrow count, 26 = thorns, 27 = snow particles, 28 = shulker teleport, 29 = iron golem rose. The opcode for the local player arrives on the same connection as the S12 that follows.",
+    "anticheat_landscape": "Velocity detection is the only anticheat interaction: the hurt status confirms damage, and the subsequent S12 must produce the expected motion change. Cancelling S12 without a substitute is the classic flag; GrimVelocity's substitute is the C07 dig at the player's own position, which the server processes as a normal block interaction. Server anticheats cannot see the client's S19 handling at all, so the entire exploit surface is the S12 side of the pairing.",
     "modules": [
       {
-        "name": "ESP",
+        "name": "GrimVelocity",
         "found_in": [
-          "Tenacity 6.0"
+          "Rise 6.1.30",
+          "Rise 6.2.4"
         ],
-        "purpose": "Detect entity status changes (2=damage, 3=death, 9=eating) for visual effects.",
-        "how_it_works": "",
-        "vanilla_hook": "EventReceivePacket"
-      },
-      {
-        "name": "DamageIndicator",
-        "found_in": [
-          "Tenacity 6.0"
-        ],
-        "purpose": "Detect entity status changes (2=damage, 3=death, 9=eating) for visual effects.",
-        "how_it_works": "",
-        "vanilla_hook": "EventReceivePacket"
-      },
-      {
-        "name": "KillAura",
-        "found_in": [
-          "Tenacity 6.0"
-        ],
-        "purpose": "Detect entity status changes (2=damage, 3=death, 9=eating) for visual effects.",
-        "how_it_works": "",
-        "vanilla_hook": "EventReceivePacket"
+        "purpose": "Grim-targeted velocity bypass: cancel the knockback S12 after confirming the hurt status, then emit a benign C07 dig so the damaged tick still carries a legitimate server action.",
+        "how_it_works": "A VERY_LOW priority PacketReceiveEvent handler checks S19PacketEntityStatus first: when the entity is the local player and the opcode is 2, it sets realVelocity. The next S12PacketEntityVelocity for the local player is then cancelled, realVelocity clears and velocity is set. On the following PreUpdateEvent, if velocity is set, it sends C07PacketPlayerDigging (START_DESTROY_BLOCK while looking at a block and swinging, otherwise STOP_DESTROY_BLOCK) at the player's own position and clears the flag.",
+        "detailed_code": "// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/GrimVelocity.java =====\npackage com.alan.clients.module.impl.combat.velocity;\n\nimport com.alan.clients.event.Listener;\nimport com.alan.clients.event.Priorities;\nimport com.alan.clients.event.annotations.EventLink;\nimport com.alan.clients.event.impl.motion.PreUpdateEvent;\nimport com.alan.clients.event.impl.packet.PacketReceiveEvent;\nimport com.alan.clients.module.impl.combat.Velocity;\nimport com.alan.clients.util.packet.PacketUtil;\nimport com.alan.clients.value.Mode;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.play.client.C07PacketPlayerDigging;\nimport net.minecraft.network.play.server.S12PacketEntityVelocity;\nimport net.minecraft.network.play.server.S19PacketEntityStatus;\nimport net.minecraft.util.BlockPos;\nimport net.minecraft.util.EnumFacing;\nimport net.minecraft.util.MovingObjectPosition;\n\npublic final class GrimVelocity extends Mode<Velocity> {\n\n    public GrimVelocity(String name, Velocity parent) {\n        super(name, parent);\n    }\n\n    private boolean realVelocity, velocity;\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<PreUpdateEvent> onPreUpdate = event -> {\n        if (velocity) {\n            PacketUtil.send(new C07PacketPlayerDigging((mc.objectMouseOver != null && mc.thePlayer.isSwingInProgress && mc.objectMouseOver.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK ? C07PacketPlayerDigging.Action.START_DESTROY_BLOCK : C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK),\n                    new BlockPos(mc.thePlayer), EnumFacing.UP));\n\n            velocity = false;\n        }\n    };\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<PacketReceiveEvent> onReceiveLow = event -> {\n        final Packet<?> packet = event.getPacket();\n        if (event.isCancelled()) return;\n\n        if(packet instanceof S19PacketEntityStatus) {\n            final S19PacketEntityStatus wrapper = (S19PacketEntityStatus) event.getPacket();\n\n            if(wrapper.getEntity(mc.theWorld) != mc.thePlayer || wrapper.getOpCode() != 2) {\n                return;\n            }\n\n            realVelocity = true;\n        }\n\n        if (packet instanceof S12PacketEntityVelocity && realVelocity) {\n            final S12PacketEntityVelocity wrapper = (S12PacketEntityVelocity) packet;\n\n            if (wrapper.getEntityID() == mc.thePlayer.getEntityId()) {\n                event.setCancelled();\n\n                realVelocity = false;\n                velocity = true;\n            }\n        }\n    };\n}\n\n// NOTE (AI): S19PacketEntityStatus opcode 2 (hurt) on the player is the precondition for the velocity\n// NOTE (AI): cancel: the next S12 for self is dropped and a C07PacketPlayerDigging is sent at the\n// NOTE (AI): player's own position on the following PreUpdate, giving the server a legitimate\n// NOTE (AI): block-interaction action to attach the tick to instead of a missing knockback.\n",
+        "code_source": "Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/GrimVelocity.java",
+        "vanilla_hook": "PacketReceiveEvent (VERY_LOW), PreUpdateEvent.",
+        "anti_cheat_notes": "The hurt-status gate prevents cancelling velocities that never arrived. The C07 dig at the player's own feet is a no-op block action that still registers server-side, giving the anticheat a legitimate interaction instead of a bare missing knockback.",
+        "variations": "Identical in Rise 6.1.30 and 6.2.4 (same package com/alan/clients/module/impl/combat/velocity)."
       }
+    ],
+    "general_hooks": "PacketReceiveEvent in Rise 6.x; no other hook exists in the corpus.",
+    "client_variations": "Only Rise 6.x touches the packet outside vanilla. The 6.1.30 and 6.2.4 GrimVelocity files are identical apart from the corpus path prefix.",
+    "related": [
+      "S12PacketEntityVelocity",
+      "S06PacketUpdateHealth",
+      "S08PacketPlayerPosLook"
     ]
   }
 }

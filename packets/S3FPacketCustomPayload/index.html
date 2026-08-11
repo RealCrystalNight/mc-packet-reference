@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S3FPacketCustomPayload (0x3F): Sends a plugin channel message from server to client. Used for mod/plugin communication.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="BrandDetector, ServerCrasher, AntiCheatDetector">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="PacketDebugger, NetworkAPI (script API)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S3FPacketCustomPayload — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S3FPacketCustomPayload — Minecraft 1.8.9 Packet Reference","description":"The clientbound plugin channel. Rise 5.99's PacketDebugger logs every channel name to chat for anti-cheat fingerprinting, and the MC|Brand channel is the standard server-identity read. Rise 6.x only registers the class in its script API.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -72,47 +72,264 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Common channels: "MC|Brand" (server brand), "MC|AdvCmd" (command block update), "MC|TrList" (villager trades), "MC|RPack" (resource pack).</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>The clientbound plugin message. A channel name string (20-char cap) plus a raw PacketBuffer payload capped at 1048576 bytes. Vanilla channels include MC|Brand (server brand, sent once at join), MC|TrList (villager trades), MC|BOpen (book opening), and MC|AdvCmd (command block updates). handleCustomPayload dispatches by channel name; unknown channels are ignored. This is the standard bus for server-to-client mod and plugin communication.</p>
+<h4>Vanilla handling</h4>
+<p>handleCustomPayload branches on the channel: MC|TrList decodes the merchant recipe list into the open GuiMerchant, MC|Brand stores the brand string on the player, MC|BOpen opens the written-book GUI. The buffer is released in a finally block. Channel length is capped at 20 and the payload at 1MB, with an IOException on overflow.</p>
+<h4>Why clients touch it</h4>
+<p>Rise 5.99 PacketDebugger logs the channel name of every S3FPacketCustomPayload to chat via Rise.addChatMessage, as part of anti-cheat fingerprinting: the module also times keepalives and transactions. Reading MC|Brand is the standard server-identity read: brand strings identify Paper, Purpur, BungeeCord, and plugin stacks before a bypass picks a mode. Rise 6.x registers the class in the script API. The dedicated BrandDetector modules of the wider ecosystem (Flux, Lycoris) sit outside this corpus, so PacketDebugger is the only real consumer here.</p>
+<h4>Exploit surface</h4>
+<p>Purely observational. The payload is server-controlled; a malicious server can send oversized or malformed payloads, but the 1MB cap and try/finally release keep the vanilla path safe. Clients read the channel and payload for fingerprinting, and nothing is sent back, so servers cannot detect the read. The detection value is the brand string itself, which identifies the server stack before a disabler selects a mode.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>ServerConfigurationManager sends MC|Brand once per join with the server mod name. EntityPlayerMP sends MC|TrList when a player opens a merchant and MC|BOpen when opening a written book. The channel table is per-connection; the vanilla client only receives S3F and never echoes it. The wire payload length is the remaining readable bytes, capped at 1MB.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>readPacketData reads the channel (20-char cap), then takes the remaining readable bytes as the payload buffer, rejecting anything over 1048576 bytes with an IOException. writePacketData writes the channel then the raw buffer bytes. The payload is channel-specific; parsers must know the channel before reading fields from the buffer.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Passive surface. The brand and channel names fingerprint the server stack; anti-cheats that send their own channels (version checks, telemetry) leak their presence through this packet. Clients never echo S3F, so the read is undetectable server-side. No anti-cheat in the corpus flags the packet itself.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BrandDetector</span>
-<span class="impl-module-clients">(Flux B39.11 (Brand detection), Lycoris 1.0 (Brand detection))</span>
+<p class="impl-pattern">The clientbound plugin channel. Rise 5.99's PacketDebugger logs every channel name to chat for anti-cheat fingerprinting, and the MC|Brand channel is the standard server-identity read. Rise 6.x only registers the class in its script API.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PacketDebugger</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Read server brand from "MC|Brand" channel. Detect anti-cheat plugins from custom payloads.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S3FPacketCustomPayload) {
-  S3FPacketCustomPayload s3f = (S3FPacketCustomPayload) event.getPacket();
-  if (s3f.getChannelName().equals("MC|Brand")) {
-    String brand = s3f.getBufferData().readStringFromBuffer(32767);
-    // detect server type
-  }
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Fingerprint the server's anti-cheat and network behavior by logging plugin channels and packet timing to chat.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">onPacketSend logs C0FPacketConfirmTransaction window id and uid with inter-arrival milliseconds, C00PacketKeepAlive key with inter-arrival milliseconds, and S3FPacketCustomPayload channel name via Rise.addChatMessage. The S3F branch catches clientbound payloads as they pass through the event.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/PacketDebugger.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/PacketDebugger.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.other;
+
+import dev.rise.Rise;
+import dev.rise.event.impl.packet.PacketSendEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.server.S3FPacketCustomPayload;
+
+@ModuleInfo(name = "PacketDebugger", description = "Debugger for detecting anticheats", category = Category.OTHER)
+public final class PacketDebugger extends Module {
+    private long lastKeepAlive;
+    private long lastTransaction;
+
+    @Override
+    public void onPacketSend(PacketSendEvent event) {
+
+        Packet p = event.getPacket();
+
+        if (p instanceof C0FPacketConfirmTransaction) {
+            long lastPacket = System.currentTimeMillis() - lastTransaction;
+            Rise.addChatMessage("Transaction: " + ((C0FPacketConfirmTransaction) event.getPacket()).getWindowId()
+                    + " " + ((C0FPacketConfirmTransaction) event.getPacket()).getUid() + " " + lastPacket + "ms");
+            this.lastTransaction = System.currentTimeMillis();
+        } else if (p instanceof C00PacketKeepAlive) {
+            long lastPacket = System.currentTimeMillis() - lastKeepAlive;
+            Rise.addChatMessage("KeepAlive: " + ((C00PacketKeepAlive) event.getPacket()).getKey() + " " + lastPacket + "ms");
+            this.lastKeepAlive = System.currentTimeMillis();
+        } else if (p instanceof S3FPacketCustomPayload) {
+            Rise.addChatMessage("Payload: " + ((S3FPacketCustomPayload) event.getPacket()).getChannelName());
+        }
+
+    }
+}
+// NOTE (AI): The S3FPacketCustomPayload branch on lines 37-38 prints the channel name to chat. The module's primary output is keepalive and transaction timing, which reveals how the server handles the two packets that ping-spoof and disabler modes rely on.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Logging only, no mutation, nothing flaggable. The timing output doubles as a manual check of server keepalive/transaction behavior.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus. Rise 6.x drops the module and exposes the class through the script API instead.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ServerCrasher</span>
-<span class="impl-module-clients">(Flux B39.11 (Brand detection), Lycoris 1.0 (Brand detection))</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NetworkAPI (script API)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Read server brand from "MC|Brand" channel. Detect anti-cheat plugins from custom payloads.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S3FPacketCustomPayload) {
-  S3FPacketCustomPayload s3f = (S3FPacketCustomPayload) event.getPacket();
-  if (s3f.getChannelName().equals("MC|Brand")) {
-    String brand = s3f.getBufferData().readStringFromBuffer(32767);
-    // detect server type
-  }
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Expose the packet class to Rise's JavaScript scripting API.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">S3FPacketCustomPayload is listed in the clientbound Class array of NetworkAPI.java (line 106).</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 — com/alan/clients/script/api/NetworkAPI.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/script/api/NetworkAPI.java =====
+package com.alan.clients.script.api;
+
+import com.alan.clients.util.chat.ChatUtil;
+import lombok.SneakyThrows;
+import net.minecraft.network.EnumPacketDirection;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.INetHandlerPlayClient;
+import net.minecraft.network.play.INetHandlerPlayServer;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+
+import javax.script.ScriptException;
+import java.util.Arrays;
+
+public class NetworkAPI extends API {
+
+    public final static Class&lt;Packet&lt;INetHandlerPlayServer&gt;&gt;[] serverbound = new Class[]{
+            C00PacketKeepAlive.class,
+            C01PacketChatMessage.class,
+            C02PacketUseEntity.class,
+            C03PacketPlayer.class,
+            C03PacketPlayer.C04PacketPlayerPosition.class,
+            C03PacketPlayer.C05PacketPlayerLook.class,
+            C03PacketPlayer.C06PacketPlayerPosLook.class,
+            C07PacketPlayerDigging.class,
+            C08PacketPlayerBlockPlacement.class,
+            C09PacketHeldItemChange.class,
+            C0APacketAnimation.class,
+            C0BPacketEntityAction.class,
+            C0CPacketInput.class,
+            C0DPacketCloseWindow.class,
+            C0EPacketClickWindow.class,
+            C0FPacketConfirmTransaction.class,
+            C10PacketCreativeInventoryAction.class,
+            C11PacketEnchantItem.class,
+            C12PacketUpdateSign.class,
+            C13PacketPlayerAbilities.class,
+            C14PacketTabComplete.class,
+            C15PacketClientSettings.class,
+            C16PacketClientStatus.class,
+            C17PacketCustomPayload.class,
+            C18PacketSpectate.class,
+            C19PacketResourcePackStatus.class,
+    };
+    public final static Class&lt;Packet&lt;INetHandlerPlayClient&gt;&gt;[] clientbound = new Class[]{
+            S00PacketKeepAlive.class,
+            S01PacketJoinGame.class,
+            S02PacketChat.class,
+            S03PacketTimeUpdate.class,
+            S04PacketEntityEquipment.class,
+            S05PacketSpawnPosition.class,
+            S06PacketUpdateHealth.class,
+            S07PacketRespawn.class,
+            S08PacketPlayerPosLook.class,
+            S09PacketHeldItemChange.class,
+            S0APacketUseBed.class,
+            S0BPacketAnimation.class,
+            S0CPacketSpawnPlayer.class,
+            S0DPacketCollectItem.class,
+            S0EPacketSpawnObject.class,
+            S0FPacketSpawnMob.class,
+            S10PacketSpawnPainting.class,
+            S11PacketSpawnExperienceOrb.class,
+            S12PacketEntityVelocity.class,
+            S13PacketDestroyEntities.class,
+            S14PacketEntity.class,
+            S18PacketEntityTeleport.class,
+            S19PacketEntityHeadLook.class,
+            S19PacketEntityStatus.class,
+            S1BPacketEntityAttach.class,
+            S1CPacketEntityMetadata.class,
+            S1DPacketEntityEffect.class,
+            S1EPacketRemoveEntityEffect.class,
+            S1FPacketSetExperience.class,
+            S20PacketEntityProperties.class,
+            S21PacketChunkData.class,
+            S22PacketMultiBlockChange.class,
+            S23PacketBlockChange.class,
+            S24PacketBlockAction.class,
+            S25PacketBlockBreakAnim.class,
+            S26PacketMapChunkBulk.class,
+            S27PacketExplosion.class,
+            S28PacketEffect.class,
+            S29PacketSoundEffect.class,
+            S2APacketParticles.class,
+            S2BPacketChangeGameState.class,
+            S2CPacketSpawnGlobalEntity.class,
+            S2DPacketOpenWindow.class,
+            S2EPacketCloseWindow.class,
+            S2FPacketSetSlot.class,
+            S30PacketWindowItems.class,
+            S31PacketWindowProperty.class,
+            S32PacketConfirmTransaction.class,
+            S33PacketUpdateSign.class,
+            S34PacketMaps.class,
+            S35PacketUpdateTileEntity.class,
+            S36PacketSignEditorOpen.class,
+            S37PacketStatistics.class,
+            S38PacketPlayerListItem.class,
+            S39PacketPlayerAbilities.class,
+            S3APacketTabComplete.class,
+            S3BPacketScoreboardObjective.class,
+            S3CPacketUpdateScore.class,
+            S3DPacketDisplayScoreboard.class,
+            S3EPacketTeams.class,
+            S3FPacketCustomPayload.class,
+            S40PacketDisconnect.class,
+            S41PacketServerDifficulty.class,
+            S42PacketCombatEvent.class,
+            S43PacketCamera.class,
+            S44PacketWorldBorder.class,
+            S45PacketTitle.class,
+            S46PacketSetCompressionLevel.class,
+            S47PacketPlayerListHeaderFooter.class,
+            S48PacketResourcePackSend.class,
+            S49PacketUpdateEntityNBT.class
+    };
+
+    @SneakyThrows
+    private static Packet&lt;?&gt; instantiatePacket(final EnumPacketDirection direction, final int id, final Object... params) {
+        Packet&lt;?&gt; packet = null;
+        try {
+            if (direction == EnumPacketDirection.CLIENTBOUND) {
+                packet = (Packet&lt;?&gt;) Arrays.stream(clientbound[id].getConstructors()).filter(x -&gt; x.getParameterCount() == params.length).findFirst().get().newInstance(params);
+            } else if (direction == EnumPacketDirection.SERVERBOUND) {
+                packet = (Packet&lt;?&gt;) Arrays.stream(serverbound[id].getConstructors()).filter(x -&gt; x.getParameterCount() == params.length).findFirst().get().newInstance(params);
+            }
+        } catch (Exception ex) {
+            ChatUtil.display("Failed to instantiate packet!");
+            throw new ScriptException(ex);
+        }
+        return packet;
+    }
+
+    public void sendPacket(final int id, final Object... params) {
+        final Packet&lt;?&gt; packet = instantiatePacket(EnumPacketDirection.SERVERBOUND, id, params);
+        MC.getNetHandler().addToSendQueue(packet);
+    }
+
+    public void receivePacket(final int id, final Object... params) {
+        final Packet&lt;?&gt; packet = instantiatePacket(EnumPacketDirection.CLIENTBOUND, id, params);
+        MC.getNetHandler().addToReceiveQueue(packet);
+    }
+
+    public boolean isSingleplayer() {
+        return MC.isSingleplayer();
+    }
+
+    public boolean isMultiplayer() {
+        return !MC.isSingleplayer() &amp;&amp; MC.getCurrentServerData() != null;
+    }
+
+    public String getServerIP() {
+        return MC.getCurrentServerData() != null
+                ? MC.getCurrentServerData().serverIP
+                : null;
+    }
+
+    public String getServerName() {
+        return MC.getCurrentServerData() != null
+                ? MC.getCurrentServerData().serverName
+                : null;
+    }
+
+    public String getServerMOTD() {
+        return MC.getCurrentServerData() != null
+                ? MC.getCurrentServerData().serverMOTD
+                : null;
+    }
+}
+// NOTE (AI): The clientbound array lists S3FPacketCustomPayload at line 106. Identical file ships in Rise 6.2.4 under Client-release2/Client/src/main/java.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> None directly.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None. Registry only.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> 6.2.4 ships the byte-identical file with the Client-release2 path prefix.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiCheatDetector</span>
-<span class="impl-module-clients">(Flux B39.11 (Brand detection), Lycoris 1.0 (Brand detection))</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Rise 5.99: PacketSendEvent. Rise 6.x: script API table.</div>
+<div class="impl-clients">Rise 5.99 logs the packet through its event bus; Rise 6.x exposes the class to scripts. No client in the corpus cancels or forges S3F.</div>
 </div>
-<p class="impl-pattern">Read server brand from "MC|Brand" channel. Detect anti-cheat plugins from custom payloads.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S3FPacketCustomPayload) {
-  S3FPacketCustomPayload s3f = (S3FPacketCustomPayload) event.getPacket();
-  if (s3f.getChannelName().equals("MC|Brand")) {
-    String brand = s3f.getBufferData().readStringFromBuffer(32767);
-    // detect server type
-  }
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C17PacketCustomPayload/">C17PacketCustomPayload</a>
+<a class="related-chip" href="../S02PacketChat/">S02PacketChat</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

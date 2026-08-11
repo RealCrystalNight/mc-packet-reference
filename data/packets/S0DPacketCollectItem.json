@@ -40,21 +40,51 @@
   ],
   "handler": "INetHandlerPlayClient",
   "implementation": {
-    "modules": [
+    "writeup": [
       {
-        "name": "ItemESP",
-        "found_in": [],
-        "purpose": "Track item pickups. ItemESP uses for visual effects.",
-        "how_it_works": "",
-        "vanilla_hook": "EventReceivePacket"
+        "h": "Role in the protocol",
+        "p": "S0D plays the item pickup animation: a VarInt item-entity id and a VarInt collector-entity id. The server emits it from EntityLivingBase.onCollideWithPlayer, which sends up to three tracking broadcasts per pickup depending on the item-count branch. The client spawns the collect particles, plays the sound and removes the item entity. It is a pure presentation packet."
       },
       {
-        "name": "ItemStealer",
-        "found_in": [],
-        "purpose": "Track item pickups. ItemESP uses for visual effects.",
-        "how_it_works": "",
-        "vanilla_hook": "EventReceivePacket"
+        "h": "Vanilla handling",
+        "p": "NetHandlerPlayClient.handleCollectItem removes the item entity by id, spawns the pickup particles and plays the collect sound. Nothing on the client validates the collector id; the animation is cosmetic. The server side is equally dumb: three sendToAllTrackingEntity calls in onCollideWithPlayer with no rate limiting."
+      },
+      {
+        "h": "Why clients touch it",
+        "p": "Almost nobody. The single functional hit is Rise 6.x AdaptiveRefreshRateComponent, which uses S0D as a cheap game-activity signal: an item pickup forces the HUD cache dirty for 5 ticks so the adaptive refresh rate does not sleep through pickups. Everything else in the corpus is vanilla. The ItemESP and ItemStealer families that one might expect to care about pickups do not hook S0D in these clients: they track item entities directly on the entity list."
+      },
+      {
+        "h": "Exploit surface",
+        "p": "None. S0D carries two entity ids and drives only particles and a despawn. There is no state, no timing heuristic and no anti-cheat that measures pickups, so modules have nothing to cancel, spoof or time. The honest assessment is that S0D is the least interesting packet in this range: its only corpus use is a HUD perf component treating it as an activity tick."
       }
+    ],
+    "overview": "The pickup animation packet: item entity id plus collector id, driving particles, sound and a despawn. Module interest is essentially zero: the only functional use in the whole corpus is Rise's AdaptiveRefreshRateComponent, which treats S0D as a game-activity signal to keep the HUD refresh awake.",
+    "server_handling": "EntityLivingBase.onCollideWithPlayer sends S0D through the entity tracker in three branches covering the pickup conditions, each a sendToAllTrackingEntity with the item entity id and the collector's own id. No server-side rate limit or validation exists.",
+    "protocol_notes": "Two VarInts: collected item entity id first, collector player id second (the vanilla constructor takes (collectedItemEntityId, entityId)). Clientbound in PLAY state. The collector id is not required to be the local player, which is why the packet also animates other players' pickups.",
+    "anticheat_landscape": "Nothing to flag. No anti-cheat measures item pickups, and the packet carries no position or timing data. The only ecosystem interaction is visual: a client that suppresses S0D would still receive the items in inventory, so even packet-cancelling modules would gain nothing.",
+    "modules": [
+      {
+        "name": "AdaptiveRefreshRateComponent",
+        "found_in": [
+          "Rise 6.2.4",
+          "Rise 6.1.30"
+        ],
+        "purpose": "Keep the HUD refresh awake around pickups: an S0D forces the HUD cache dirty for 5 ticks so the adaptive refresh does not sleep through game activity.",
+        "how_it_works": "On PacketReceiveEvent, S0D sets disabledFor = 5, which disables the adaptive refresh for that many ticks in PreMotionEvent; S02 chat, S30 window items and S2F slot updates drive the same dirty path. The component runs at component level in the HUD module tree.",
+        "detailed_code": "// ===== FILE: Rise 6.1.30 — com/alan/clients/component/impl/hud/AdaptiveRefreshRateComponent.java =====\npackage com.alan.clients.component.impl.hud;\n\nimport com.alan.clients.component.Component;\nimport com.alan.clients.event.Listener;\nimport com.alan.clients.event.annotations.EventLink;\nimport com.alan.clients.event.impl.motion.PreMotionEvent;\nimport com.alan.clients.event.impl.packet.PacketReceiveEvent;\nimport com.alan.clients.event.impl.render.Render2DEvent;\nimport com.alan.clients.ui.ingame.GuiIngameCache;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.play.server.S02PacketChat;\nimport net.minecraft.network.play.server.S0DPacketCollectItem;\nimport net.minecraft.network.play.server.S2FPacketSetSlot;\nimport net.minecraft.network.play.server.S30PacketWindowItems;\nimport rip.vantage.commons.util.time.StopWatch;\n\npublic class AdaptiveRefreshRateComponent extends Component {\n\n    private boolean playerList, debugInfo;\n    private boolean setDirty;\n    private int disabledFor;\n    private float health;\n    public final StopWatch stopWatch = new StopWatch();\n\n    @EventLink\n    public final Listener<PreMotionEvent> onPreMotionEvent = event -> {\n        if (mc.thePlayer.ticksExisted % 100 == 0 || setDirty ||\n                mc.gameSettings.keyBindPlayerList.isKeyDown() != playerList || mc.gameSettings.showDebugInfo != debugInfo ||\n                mc.thePlayer.ticksExisted <= 10 || disabledFor > 0) {\n            GuiIngameCache.dirty = true;\n            playerList = mc.gameSettings.keyBindPlayerList.isKeyDown();\n            debugInfo = mc.gameSettings.showDebugInfo;\n            setDirty = false;\n        }\n\n        if (health != mc.thePlayer.getHealth()) {\n            disabledFor = 3;\n            health = mc.thePlayer.getHealth();\n        }\n\n        disabledFor--;\n    };\n\n    @EventLink\n    public final Listener<Render2DEvent> onRender2D = event -> {\n        if (mc.currentScreen != null) {\n            setDirty = true;\n            GuiIngameCache.dirty = true;\n        }\n    };\n\n    @EventLink\n    public final Listener<PacketReceiveEvent> onPacketReceiveEvent = event -> {\n        Packet packet = event.getPacket();\n\n        if (packet instanceof S02PacketChat || packet instanceof S30PacketWindowItems || packet instanceof S2FPacketSetSlot) {\n            stopWatch.reset();\n            setDirty = true;\n        }\n\n        if (packet instanceof S0DPacketCollectItem) {\n            disabledFor = 5;\n        }\n    };\n}\n// NOTE (AI): A HUD performance component, not a cheat module. S0D is used as a cheap game-activity signal: when an item is collected, the HUD cache is forced dirty for 5 ticks so the adaptive refresh does not sleep through pickups. Chat, window items, slot updates and health changes drive the same dirty path. This is the only functional use of S0D in the entire 8-client corpus; every other reference is vanilla.",
+        "code_source": "Rise 6.1.30 - com/alan/clients/component/impl/hud/AdaptiveRefreshRateComponent.java",
+        "vanilla_hook": "PacketReceiveEvent (S0D), PreMotionEvent (tick accounting), Render2DEvent.",
+        "anti_cheat_notes": "None: the component mutates only the local HUD cache and never touches the packet or the wire.",
+        "variations": "Identical in 6.1.30 and 6.2.4; no other client in the corpus references S0D in non-vanilla code."
+      }
+    ],
+    "general_hooks": "PacketReceiveEvent only, and only in Rise 6.x; the component model is the sole consumer.",
+    "client_variations": "Rise 6.1.30 and 6.2.4 share the component; Memeware, Nekoware, Sigma, Spicy and Tenacity have no non-vanilla S0D code at all.",
+    "related": [
+      "S0CPacketSpawnPlayer",
+      "S2FPacketSetSlot",
+      "S30PacketWindowItems",
+      "S0BPacketAnimation"
     ]
   }
 }

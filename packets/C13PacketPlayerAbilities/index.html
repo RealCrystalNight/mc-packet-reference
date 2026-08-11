@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C13PacketPlayerAbilities (0x13): Player toggles flying state. Only sent for the flying flag change — the server controls all other ability flags via S39P">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Flight, CreativeFly">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Disabler (abilities spoof), AbilitiesDisabler, Nuker, Fly / LongJump / BackupFly (ability spoof)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C13PacketPlayerAbilities — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C13PacketPlayerAbilities — Minecraft 1.8.9 Packet Reference","description":"The ability-flag packet. The server keeps exactly one bit (isFlying, ANDed against server-side allowFlying); the 8 clients abuse it as a safe desync probe in disablers and as a client-side flight declaration in movement modules.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -76,22 +76,554 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">The client only sends this when the flying state changes (pressing space twice in creative mode). The server ignores all flags except isFlying for non-creative players. Even if you set allowFlying=true, the server won't let you fly unless it sent S39 with allowFlying=true first.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C13 announces ability state changes: a 4-bit flag byte (invulnerable, flying, allowFlying, creative) plus fly and walk speed floats. Vanilla sends it only when the flying flag flips, from EntityPlayerSP.sendPlayerAbilities. Despite the full struct, the 1.8.9 server reads exactly one bit: it writes isFlying into the player's capabilities and discards everything else.</p>
+<h4>Vanilla handling</h4>
+<p>processPlayerAbilities is a single line: capabilities.isFlying = packetIn.isFlying() &amp;&amp; capabilities.allowFlying. The server's own allowFlying flag, set exclusively via S39PacketPlayerAbilities, ANDs out any client claim of flight, which is the core reason ability spoofing is a dead end against vanilla. The float fields are not stored at all in 1.8.9, so a forged flySpeed or walkSpeed never reaches server math.</p>
+<h4>Why clients touch it</h4>
+<p>The 8 clients show four families. (1) Disabler modes: Memeware Watchdog sends C13 with NaN flySpeed on Hypixel, Rise 5.99's hypixelSlime and c13 modes send allowFlying/isFlying true, Spicy's Disabler sends creative flags. (2) Rise 6.x AbilitiesDisabler spams C13 every 5 ticks. (3) Flight movement: Spicy LongJump, Fly and BackupFly forge full PlayerCapabilities with random flySpeed. (4) Utility: Rise 6.x Nuker syncs the flying flag before teleport-nuking, and the script PacketAPI exposes sendAbilities.</p>
+<h4>Exploit surface</h4>
+<p>Because the server ANDs against its own allowFlying, the packet is the safest spoof in the protocol: a forged isFlying claim is dropped silently on any non-creative player, which is why disablers spam it freely. The NaN flySpeed in Memeware targets proxy and anti-cheat parsers that copy the float before the handler drops it. The real signal anti-cheats measure is not C13 but the motion that follows: clients that declare flying then move at fly speed without S39 authorization flag on movement checks, not on the packet itself.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processPlayerAbilities writes capabilities.isFlying = packetIn.isFlying() &amp;&amp; capabilities.allowFlying and nothing else. The invulnerable, allowFlying, creativeMode, flySpeed and walkSpeed fields are parsed from the wire and discarded. S39PacketPlayerAbilities is the only way the server-side allowFlying changes.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Flag byte (0x01 invulnerable, 0x02 flying, 0x04 allowFlying, 0x08 creative) + two floats. Vanilla clients emit it on double-tap-space in creative; modules emit it on ticks, strafe events or module enable. The wire format accepts any float, including NaN and values far outside the 0..1 range.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats treat C13 as a weak signal because vanilla discards most of it. NCP and Verus correlate declared flying with actual vertical motion; a client that spams isFlying=true but moves like a walker is suspicious, and one that moves like a flier without S39 authorization flags on motion. The NaN flySpeed trick only works against layers that deserialize the float before the vanilla handler.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Flight</span>
-<span class="impl-module-clients">(Gugustus, Tenacity 6.0)</span>
+<p class="impl-pattern">The ability-flag packet. The server keeps exactly one bit (isFlying, ANDed against server-side allowFlying); the 8 clients abuse it as a safe desync probe in disablers and as a client-side flight declaration in movement modules.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler (abilities spoof)</span>
+<span class="impl-module-clients">(Memeware 7.3, Rise 5.99, Spicy)</span>
 </div>
-<p class="impl-pattern">Toggle flying state. Client sends isFlying=true to tell server player started flying.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>mc.thePlayer.sendQueue.addToSendQueue(new C13PacketPlayerAbilities());</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Send forged C13 payloads as part of anti-cheat disabler mode suites, usually alongside C0F and C00 manipulation.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Memeware's Watchdog mode sends C13 with isFlying=true and NaN flySpeed every 30 ticks on Hypixel. Rise 5.99's hypixelSlime mode sends isFlying=true when the server allows flying; its c13 mode sends a bare C13 with allowFlying and flying set. Spicy's Disabler sends creative-flag capabilities from its own mode logic.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/exploit/Disabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/exploit/Disabler.java =====
+package me.memewaredevs.client.module.exploit;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.event.events.PacketInEvent;
+import me.memewaredevs.client.event.events.PacketOutEvent;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+import me.memewaredevs.client.util.ChatUtil;
+import me.memewaredevs.client.util.misc.Timer;
+import me.memewaredevs.client.util.packet.PacketUtil;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S2APacketParticles;
+import org.apache.commons.lang3.RandomUtils;
+
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.function.Consumer;
+
+public class Disabler extends Module {
+
+    private static final int VERUS_DISABLE_AUTOBAN_CHANNEL = 65536;
+    private static final short VERUS_DISABLE_AUTOBAN_UID = 32767;
+    private final Queue&lt;Packet&gt; packetQueue = new ConcurrentLinkedQueue();
+    private final Timer timer = new Timer();
+    private final Timer timer1 = new Timer();
+
+    public Disabler(final String name, final int key, final Module.Category category) {
+        super(name, key, category);
+        this.addModes("Mineplex Combat", "Transaction", "Latest Verus", "PvPTemple", "OmegaCraft", "Timer", "AACv1.9.10", "Sloth", "Ghostly", "Watchdog", "Faithful Movement");
+    }
+
+    @Override
+    public void onDisable() {
+        packetQueue.clear();
+    }
+
+    @Override
+    public void onEnable() {
+        timer.reset();
+    }
+
+    @Handler
+    public Consumer&lt;PacketInEvent&gt; packetInEventConsumer = (event) -&gt; {
+        if (isMode("Sloth")) {
+            if (event.getPacket() instanceof S08PacketPlayerPosLook) {
+                S08PacketPlayerPosLook playerPosLook = (S08PacketPlayerPosLook) event.getPacket();
+                /**
+                 * Works alongside with the spigot exploit.
+                 * Exploit PlayerData bug (Player data gets set to null if the previous event is cancelled, and y difference &lt;= 1.0E-4)
+                 */
+                playerPosLook.y += 1.0E-4;
+            }
+        }
+    };
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer = (event) -&gt; {
+        if (isMode("Latest Verus")) {
+            if (timer.delay(490L)) {
+                if (!packetQueue.isEmpty()) {
+                    PacketUtil.sendPacketSilent(packetQueue.poll());
+                }
+                timer.reset();
+            }
+        }
+
+        if (isMode("OmegaCraft")) {
+            PacketUtil.sendPacketSilent(new C0FPacketConfirmTransaction(VERUS_DISABLE_AUTOBAN_CHANNEL, VERUS_DISABLE_AUTOBAN_UID, true));
+        }
+
+        if (isMode("PvPTemple")) { // Added by Auth
+            event.setGround(false);
+            event.setY(event.getY() + 0.42);
+            event.setYaw(0);
+            event.setPitch(0);
+        }
+
+        if (isMode("Watchdog")) {
+            if (timer.delay(15000L)) {
+                if (!packetQueue.isEmpty()) {
+                    PacketUtil.sendPacketSilent(packetQueue.poll());
+                }
+                timer.reset();
+            }
+        }
+
+    };
+
+    @Handler
+    public Consumer&lt;PacketInEvent&gt; eventConsumer0 = (event) -&gt; {
+        if (event.getPacket() instanceof S2APacketParticles) {
+            event.cancel();
+        }
+    };
+
+    @Handler
+    public Consumer&lt;PacketOutEvent&gt; eventConsumer1 = (event) -&gt; {
+
+        if (isMode("Mineplex Combat"))
+            if (event.getPacket() instanceof C00PacketKeepAlive) {
+                C00PacketKeepAlive packetKeepAlive = (C00PacketKeepAlive) event.getPacket();
+                packetKeepAlive.key -= RandomUtils.nextInt(3, 128);
+            }
+
+        if (isMode("OmegaCraft"))
+            if (event.getPacket() instanceof C0FPacketConfirmTransaction)
+                event.cancel();
+
+        if (isMode("Latest Verus")) {
+            if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
+                C0FPacketConfirmTransaction c0fPacketConfirmTransaction = (C0FPacketConfirmTransaction) event.getPacket();
+                packetQueue.add(c0fPacketConfirmTransaction);
+                event.cancel();
+            }
+
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
+                if (mc.thePlayer.ticksExisted % 33 == 0) {
+                    c03.y = -0.911;
+                    c03.onGround = false;
+                    c03.field_149480_h = false;
+                }
+            }
+
+            if (mc.thePlayer != null &amp;&amp; mc.thePlayer.ticksExisted &lt;= 7) {
+                timer.reset();
+                packetQueue.clear();
+            }
+        }
+
+        if (isMode("Timer") &amp;&amp; event.getPacket() instanceof C03PacketPlayer) {
+            if (mc.thePlayer.ticksExisted % 3 != 0) {
+                event.cancel();
+            }
+        }
+        if (isMode("AACv1.9.10")) {
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                PacketUtil.sendPacketSilent(new C0CPacketInput());
+                C03PacketPlayer packetPlayer = (C03PacketPlayer) event.getPacket();
+                /**
+                 * Resets all checks VL due to a bug in critical hit check
+                 */
+                packetPlayer.y += 7.0E-9D;
+            }
+        }
+
+        if (isMode("Sloth")) {
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                C03PacketPlayer packetPlayer = (C03PacketPlayer) event.getPacket();
+                if (!timer.delay(1000L)) {
+                    for (int i = 0; i &lt; 10; ++i) {
+                        double y = i &gt; 2 &amp;&amp; i &lt; 8 ? 11 : 120;
+                        PacketUtil.sendPacketSilent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY - y, mc.thePlayer.posZ, true));
+                    }
+                } else {
+                    //set to default jump value so viper can stop fucking value patching it
+                    packetPlayer.y += 0.42F;
+                }
+            }
+        }
+        if (isMode("Faithful Movement")) {
+            if (mc.thePlayer != null &amp;&amp; event.getPacket() instanceof C00PacketKeepAlive) {
+                C00PacketKeepAlive packetKeepAlive = (C00PacketKeepAlive) event.getPacket();
+                packetKeepAlive.key -= 31;
+            }
+        }
+
+
+        if (isMode("Ghostly")) { // Ghostly Disabler added by Auth
+            if (event.getPacket() instanceof C03PacketPlayer)
+                PacketUtil.sendPacketSilent(new C0CPacketInput());
+            if (event.getPacket() instanceof C0FPacketConfirmTransaction)
+                event.cancel();
+        }
+        if (isMode("Watchdog")) {
+//            PacketUtil.sendPacketSilent(new C0EPacketClickWindow());
+            if (mc.getCurrentServerData().serverIP.contains("hypixel.net")) {
+                if (mc.thePlayer.ticksExisted % 30 == 0) {
+                    PlayerCapabilities pc = new PlayerCapabilities();
+                    pc.isFlying = true;
+                    pc.setFlySpeed(Float.NaN);
+                    PacketUtil.sendPacketSilent(new C13PacketPlayerAbilities(pc));
+                }
+                System.out.println(event.getPacket());
+                if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
+                    event.setPacket(new C0FPacketConfirmTransaction(Integer.MIN_VALUE, Short.MAX_VALUE, true));
+                }
+            } else {
+                ChatUtil.printChat("You must be on Hypixel to use Watchdog Disabler!");
+                this.toggle();
+            }
+        }
+    };
+}
+// NOTE (AI): The C13 hit is in the Watchdog mode: on Hypixel, every 30 ticks the module builds a fresh PlayerCapabilities with isFlying=true and flySpeed set to Float.NaN and sends it via sendPacketSilent. The server's processPlayerAbilities only writes capabilities.isFlying = packetIn.isFlying() &amp;&amp; capabilities.allowFlying, so the NaN flySpeed never reaches the server-side capabilities; the mode is aimed at the proxy/anti-cheat layer that parses the packet before the handler. The same mode corrupts C0F transaction keys with Integer.MIN_VALUE/Short.MAX_VALUE.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketOutEvent (Memeware), PacketSendEvent (Rise 5.99), module-specific events (Spicy).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Low risk against vanilla because the handler ANDs the bit away; the NaN float is the only payload that can poison a parsing layer. Motion checks remain the actual flag surface.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 uses PacketUtil.sendPacket/sendPacketWithoutEvent; Spicy uses sendPacketNoEvent on the network manager; Memeware uses sendPacketSilent.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">CreativeFly</span>
-<span class="impl-module-clients">(Gugustus, Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AbilitiesDisabler</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Toggle flying state. Client sends isFlying=true to tell server player started flying.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>mc.thePlayer.sendQueue.addToSendQueue(new C13PacketPlayerAbilities());</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Spam C13 with a fresh isFlying=true capabilities object to desynchronize anti-cheat ability tracking.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On StrafeEvent, every 5 ticks, builds a PlayerCapabilities (isFlying=true, allowFlying left false) and sends it through PacketUtil.send. Gated on the parent Disabler's deprecated setting.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/AbilitiesDisabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/AbilitiesDisabler.java =====
+package com.alan.clients.module.impl.exploit.disabler;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.StrafeEvent;
+import com.alan.clients.module.impl.exploit.Disabler;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.value.Mode;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.play.client.C13PacketPlayerAbilities;
+
+public class AbilitiesDisabler extends Mode&lt;Disabler&gt; {
+    public AbilitiesDisabler(String name, Disabler parent) {
+        super(name, parent);
+    }
+
+    @EventLink
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+        if (!getParent().deprecated.getValue()) {
+            return;
+        }
+
+        if (mc.thePlayer.ticksExisted % 5 == 0) {
+            final PlayerCapabilities playerCapabilities = new PlayerCapabilities();
+            playerCapabilities.isFlying = true;
+            PacketUtil.send(new C13PacketPlayerAbilities(playerCapabilities));
+        }
+    };
+}
+// NOTE (AI): AbilitiesDisabler is a Mode of the Rise 6.x Disabler. Every 5 ticks on StrafeEvent it sends a C13 with a fresh PlayerCapabilities whose isFlying is true. The default constructor of PlayerCapabilities leaves allowFlying false, so the vanilla handler ANDs the flying bit out; the spam is aimed at anti-cheat layers that fingerprint the packet stream rather than the server state. It only runs while the parent Disabler's deprecated setting is enabled.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> StrafeEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The default-constructed capabilities leave allowFlying false, so vanilla drops the flying bit; the spam targets packet-level fingerprinting only.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Byte-identical AbilitiesDisabler exists in Rise 6.1.30.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Nuker</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
+<p class="impl-pattern">Sync the server-side flying flag before teleport-nuking so airborne path movement is not treated as un-authorized flight.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">In Teleport mode, when the player can fly but is not flagged flying, the module mutates the shared capabilities and sends C13 with isFlying=true via sendNoEvent, then path-teleports with C04 packets.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/other/Nuker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/other/Nuker.java =====
+package com.alan.clients.module.impl.other;
+
+import com.alan.clients.component.impl.player.GUIDetectionComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.Module;
+import com.alan.clients.module.api.Category;
+import com.alan.clients.module.api.ModuleInfo;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.pathfinding.unlegit.MainPathFinder;
+import com.alan.clients.util.pathfinding.unlegit.Vec3;
+import com.alan.clients.util.rotation.RotationUtil;
+import com.alan.clients.util.vector.Vector2f;
+import com.alan.clients.util.vector.Vector3d;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.ModeValue;
+import com.alan.clients.value.impl.NumberValue;
+import com.alan.clients.value.impl.SubMode;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockAir;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C13PacketPlayerAbilities;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.Collections;
+import java.util.List;
+
+@ModuleInfo(aliases = {"module.other.nuker.name"}, description = "module.other.nuker.description", category = Category.PLAYER)
+public final class Nuker extends Module {
+
+    private final ModeValue mode = new ModeValue("Mode", this)
+            .add(new SubMode("Nearby"))
+            .add(new SubMode("Teleport"))
+            .setDefault("Nearby");
+
+    private final NumberValue delay = new NumberValue("Delay", this, 150, 0, 5000, 50);
+    private final NumberValue range = new NumberValue("Range", this, 4, 1, 6, 0.5);
+    private final BooleanValue rotations = new BooleanValue("Rotations", this, false);
+    private final BooleanValue scatter = new BooleanValue("Scatter", this, false);
+    private final BooleanValue swing = new BooleanValue("Swing", this, false);
+
+    private final StopWatch stopWatch = new StopWatch();
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (GUIDetectionComponent.inGUI()) return;
+
+        final double range = this.range.getValue().doubleValue();
+
+        switch (mode.getValue().getName()) {
+            case "Nearby":
+                if (stopWatch.finished(delay.getValue().longValue())) {
+                    new Thread(() -&gt; nuke(range, event.getPosX(), event.getPosY(), event.getPosZ())).start();
+                    stopWatch.reset();
+                }
+                break;
+
+            case "Teleport":
+                if (mc.gameSettings.keyBindUseItem.isKeyDown() &amp;&amp; stopWatch.finished(delay.getValue().longValue())) {
+                    final BlockPos target = mc.thePlayer.rayTrace(999, 1).getBlockPos();
+
+                    if (mc.theWorld.getBlockState(target).getBlock() instanceof BlockAir) {
+                        return;
+                    }
+
+                    if (mc.thePlayer.capabilities.allowFlying &amp;&amp; !mc.thePlayer.capabilities.isFlying) {
+                        final PlayerCapabilities capabilities = mc.thePlayer.capabilities;
+                        capabilities.isFlying = true;
+                        PacketUtil.sendNoEvent(new C13PacketPlayerAbilities(capabilities));
+                    }
+
+                    new Thread(() -&gt; {
+                        final List&lt;Vec3&gt; path = MainPathFinder.computePath(new Vec3(event.getPosX(), event.getPosY(), event.getPosZ()), new Vec3(target.getX(), target.getY(), target.getZ()), false);
+
+                        if (path == null) {
+                            return;
+                        }
+
+                        for (final Vec3 vec : path) {
+                            PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(vec.getX(), vec.getY(), vec.getZ(), false));
+                        }
+
+                        nuke(range, target.getX(), target.getY(), target.getZ());
+                        Collections.reverse(path);
+
+                        for (final Vec3 vec : path) {
+                            PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(vec.getX(), vec.getY(), vec.getZ(), false));
+                        }
+                    }).start();
+
+                    stopWatch.reset();
+                }
+                break;
+        }
+
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (p instanceof S02PacketChat) {
+            final S02PacketChat wrapper = (S02PacketChat) p;
+
+            if (!wrapper.isChat() &amp;&amp; wrapper.getChatComponent().getUnformattedText().equals("You can't build outside the plot!")) {
+                event.setCancelled();
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; {
+        this.toggle();
+    };
+
+    private void nuke(final double range, final double x, final double y, final double z) {
+        for (double posX = -range; posX &lt; range; posX++) {
+            for (double posY = range; posY &gt; -range; posY--) {
+                for (double posZ = -range; posZ &lt; range; posZ++) {
+                    if (scatter.getValue() &amp;&amp; !((mc.thePlayer.ticksExisted % 2 == 0 ? posX : posZ) % 2 == 0)) {
+                        continue;
+                    }
+
+                    final BlockPos blockPos = new BlockPos(x + posX, y + posY, z + posZ);
+                    final Block block = mc.theWorld.getBlockState(blockPos).getBlock();
+
+                    if (block instanceof BlockAir) {
+                        continue;
+                    }
+
+                    if (rotations.getValue()) {
+                        final Vector2f rotations = RotationUtil.calculate(new Vector3d(blockPos.getX(), blockPos.getY(), blockPos.getZ()));
+                        PacketUtil.sendNoEvent(new C03PacketPlayer.C05PacketPlayerLook(rotations.x, rotations.y, false));
+                    }
+                    PacketUtil.sendNoEvent(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, EnumFacing.UP));
+
+                    if (swing.getValue()) {
+                        mc.thePlayer.swingItem();
+                    }
+                }
+            }
+        }
+
+//        final BlockPos blockPos = new BlockPos(x, y, z);
+//        final Block block = mc.theWorld.getBlockState(blockPos).getBlock();
+//
+//        if (block instanceof BlockAir) {
+//            return;
+//        }
+//
+//        if (rotations.getValue()) {
+//            final Vector2f rotations = RotationUtil.calculate(new Vector3d(blockPos.getX(), blockPos.getY(), blockPos.getZ()));
+//            PacketUtil.sendNoEvent(new C03PacketPlayer.C05PacketPlayerLook(rotations.x, rotations.y, false));
+//        }
+//        PacketUtil.sendNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
+//        PacketUtil.sendNoEvent(new C08PacketPlayerBlockPlacement(blockPos, EnumFacing.UP.getIndex(), mc.thePlayer.getHeldItem(), 255, 255, 255));
+//        PacketUtil.sendNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
+//
+//        if (swing.getValue()) {
+//            mc.thePlayer.swingItem();
+//        }
+    }
+}
+// NOTE (AI): The C13 hit is in the Teleport mode: before path-teleporting to the targeted block, the module checks the client-side capabilities and, if allowFlying is true but isFlying is false, mutates the shared capabilities object and sends C13 with isFlying=true. This synchronizes the server-side flying flag so the airborne C04 teleport path does not trigger fly kick or movement checks while the nuker walks the computed path.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreMotionEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Only meaningful when the server already granted allowFlying (creative or S39); otherwise the bit is ANDed out and the C04 teleports carry the flag risk.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Same code in Rise 6.1.30.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Fly / LongJump / BackupFly (ability spoof)</span>
+<span class="impl-module-clients">(Spicy)</span>
+</div>
+<p class="impl-pattern">Declare flight abilities client-side and mirror the declaration to the server as part of Hypixel-targeted flight modules.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">LongJump's onEnable forges PlayerCapabilities with isFlying, allowFlying, isCreativeMode and a random flySpeed 0.1..9.0 and sends via sendPacketNoEvent. Fly and BackupFly repeat the same construct at fixed points in their damage-fly sequences.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy — info/spicyclient/modules/movement/LongJump.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/movement/LongJump.java =====
+package info.spicyclient.modules.movement;
+
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.SpicyClient;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventMotion;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.modules.Module.Category;
+import info.spicyclient.util.MovementUtils;
+import info.spicyclient.util.Timer;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.play.client.C13PacketPlayerAbilities;
+import net.minecraft.util.MathHelper;
+
+public class LongJump extends Module {
+	
+	public LongJump() {
+		super("Long Jump", Keyboard.KEY_NONE, Category.MOVEMENT);
+	}
+
+	
+	public void onEnable() {
+		
+        PlayerCapabilities playerCapabilities = new PlayerCapabilities();
+        playerCapabilities.isFlying = true;
+        playerCapabilities.allowFlying = true;
+        playerCapabilities.setFlySpeed((float) ((Math.random() * (9.0 - 0.1)) + 0.1));
+        playerCapabilities.isCreativeMode = true;
+        mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C13PacketPlayerAbilities(playerCapabilities));
+        
+	}
+	
+	public void onDisable() {
+		
+	}
+	
+	public static boolean jumped = false;
+	public static Timer timer = new Timer();
+	
+	
+	public void onEvent(Event e) {
+		
+		if (e instanceof EventUpdate &amp;&amp; e.isPre()) {
+			this.additionalInformation = "Hypixel";
+		}
+		
+		if (e instanceof EventMotion) {
+			
+			if (e.isPost()) {
+				
+				if (jumped &amp;&amp; mc.thePlayer.onGround) {
+					this.toggle();
+					jumped = false;
+					return;
+				}
+				
+				mc.gameSettings.keyBindJump.pressed = false;
+
+                if (MovementUtils.isOnGround(0.000001)) {
+                	
+                	MovementUtils.strafe((float) Math.sqrt(mc.thePlayer.motionX * mc.thePlayer.motionX + mc.thePlayer.motionZ * mc.thePlayer.motionZ) + 1.25f);
+                    mc.thePlayer.jump();
+                    e.setCanceled(true);
+                    jumped = true;
+
+                }
+
+                mc.thePlayer.setSprinting(true);
+				
+			}
+			
+		}
+		
+	}
+	
+	
+}
+// NOTE (AI): LongJump's onEnable forges a PlayerCapabilities with isFlying, allowFlying, isCreativeMode and a random flySpeed between 0.1 and 9.0, then sends it via sendPacketNoEvent. The vanilla server ignores allowFlying, creativeMode and flySpeed from C13 and only ANDs the isFlying bit against its own allowFlying, so this is a client-side state declaration for the movement code, with the packet doubling as a desync probe against servers that do read abilities.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> onEnable, EventMotion/EventUpdate handlers.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The server ignores the forged allowFlying, so these modules still rely on the damage-fly trick for actual flight; C13 is a state declaration that keeps the client's own capabilities and the packet stream consistent.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Spicy Fly.java and BackupFly.java duplicate the same PlayerCapabilities construction with the random flySpeed and creative flag; Spicy Disabler sends it twice when Fly is enabled.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">StrafeEvent (Rise 6.x), PacketOutEvent/PacketSendEvent (disablers), onEnable (Spicy movement), PreMotionEvent (Rise 6.x Nuker).</div>
+<div class="impl-clients">Spicy routes through mc.getNetHandler().getNetworkManager().sendPacketNoEvent; Memeware through PacketUtil.sendPacketSilent; Rise 5.99 through PacketUtil.sendPacketWithoutEvent; Rise 6.x through PacketUtil.send/sendNoEvent.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S39PacketPlayerAbilities/">S39PacketPlayerAbilities</a>
+<a class="related-chip" href="../C03PacketPlayer/">C03PacketPlayer</a>
+<a class="related-chip" href="../C0BPacketEntityAction/">C0BPacketEntityAction</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

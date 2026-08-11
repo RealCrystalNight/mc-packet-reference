@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S11PacketSpawnExperienceOrb (0x11): Spawns an experience orb entity with position and XP value.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="XPBottler, AutoCollect">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="AntiExploit">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S11PacketSpawnExperienceOrb — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S11PacketSpawnExperienceOrb — Minecraft 1.8.9 Packet Reference","description":"Spawns experience orbs, one of the most frequent and least stateful clientbound packets. Only one corpus hit: Tenacity 6.0 AntiExploit rate-limits S11 as a crash-exploit guard. No XP tracker exists in the 8 clients because farming modules iterate EntityXPOrb instances in the world list instead of ho","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -74,18 +74,176 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayClient.handleSpawnExperienceOrb()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>Spawns experience orbs: entity id, fixed-point position (x32) and a short XP value. The server splits orb value at 2000 when an XP source drops, so a large experience drop produces several S11 packets instead of one huge orb. EntityTrackerEntry.getPacket emits it for EntityXPOrb. The packet is frequent on farming servers and essentially free of state: no rotation, no velocity, no metadata.</p>
+<h4>Vanilla handling</h4>
+<p>handleSpawnExperienceOrb creates an EntityXPOrb, sets its position and assigns the xpValue. The client's XP bar is driven by pickup events and S06 health/xp updates, not by this packet, so S11 has no visible effect beyond the floating orb entity. Server side, orb value splitting happens at drop time, so the value in the packet is already the split value.</p>
+<h4>Why clients touch it</h4>
+<p>Exactly one module in the corpus references S11: Tenacity 6.0 AntiExploit, which rate-limits orb spawns as a crash-exploit guard (two S11 packets within 1 ms increments a violation counter that cancels the second packet). No AutoFarm or XP-tracker module exists in the 8 clients: XP collection modules iterate EntityXPOrb instances in the world entity list rather than hooking spawn packets, mirroring how ESP treats every other spawn packet.</p>
+<h4>Exploit surface</h4>
+<p>The orb-flood: a hostile server or proxy streaming S11 at high rate creates hundreds of EntityXPOrb instances per second, each with its own render state, which is the classic XP-lag crash vector. Tenacity's 1 ms rate gate is the canonical mitigation. The xpValue short is unsigned server-side; values above 32767 wrap negative client-side, which makes the orb render but breaks pickup logic. Nothing here is flaggable by anti-cheats because the packet is clientbound and server-authored.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityTrackerEntry.getPacket returns new S11PacketSpawnExperienceOrb((EntityXPOrb) trackedEntity) for tracked XP orbs, snapshotting the orb's value. The server splits any XP drop exceeding 2000 into multiple orbs before they are tracked, so each S11 carries a value at or below the split cap. The client handler creates the orb and assigns the value with no validation.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>VarInt entity id, three x32 position ints, then a short XP value. No rotations, velocity or metadata fields. Because the value is a signed short, values in the 32768-65535 range arrive negative; the vanilla client does not guard against it. The packet is emitted in bursts when an XP source is destroyed, which is what makes it a flood-exploit vector.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats ignore S11 entirely: it is clientbound, cosmetic and cannot be influenced by the player. The relevant defense is client-side (Tenacity's rate gate) and server-side (spawn rate caps on XP sources). No bypass trade-off exists for this packet.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">XPBottler</span>
+<p class="impl-pattern">Spawns experience orbs, one of the most frequent and least stateful clientbound packets. Only one corpus hit: Tenacity 6.0 AntiExploit rate-limits S11 as a crash-exploit guard. No XP tracker exists in the 8 clients because farming modules iterate EntityXPOrb instances in the world list instead of hooking spawn packets.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiExploit</span>
+<span class="impl-module-clients">(Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">Detect XP orbs for auto-collect.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Rate-limit XP orb spawns and other clientbound floods so a hostile server cannot lag or crash the client.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PacketReceiveEvent handler tracks the timestamp of the last S11. If a new one arrives within 1 ms, invalidExperience increments and the packet is cancelled on the second violation with a chat warning; a gap longer than 1 ms resets the counter. The same handler sanitizes resource pack URIs, S43 camera teleports, S2A particle floods, S27 explosion strength and S18 teleport coordinates.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/module/impl/misc/AntiExploit.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/misc/AntiExploit.java =====
+package dev.tenacity.module.impl.misc;
+
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.packet.PacketReceiveEvent;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.ModuleCategory;
+import dev.tenacity.util.misc.ChatUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C19PacketResourcePackStatus;
+import net.minecraft.network.play.server.*;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+
+public class AntiExploit extends Module {
+
+
+
+    private long lastExplosion = 0, lastExperience = 0;
+    private int invalidExperience = 0;
+   final int PACKET_THRESHOLD = 100;
+    final long CHECK_INTERVAL = 1000;
+    int packetCount = 0;
+
+    public AntiExploit() {
+        super("AntiExploit", "Prevents server exploits", ModuleCategory.MISC);
+    }
+
+    private final IEventListener&lt;PacketReceiveEvent&gt; onReceivePacket = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+        handlePacketCount();
+        if(packet instanceof S48PacketResourcePackSend) {
+            S48PacketResourcePackSend resourcePack = (S48PacketResourcePackSend) packet;
+
+            try {
+                URI uri = new URI(resourcePack.getURL());
+                String scheme = uri.getScheme();
+
+                boolean isLevelProtocol = scheme.equalsIgnoreCase("level");
+                boolean isHttpProtocol = scheme.equalsIgnoreCase("http");
+                boolean isHttpsProtocol = scheme.equalsIgnoreCase("https");
+
+                if(!isHttpProtocol &amp;&amp; !isHttpsProtocol &amp;&amp; !isLevelProtocol) {
+                    ChatUtil.print("§cBlocked Exploit: Resource Pack");
+                    event.cancel();
+                } else if(isLevelProtocol &amp;&amp; (resourcePack.getURL().contains("..") || !((S48PacketResourcePackSend) packet).getURL().endsWith("/resources.zip"))) {
+                    ChatUtil.print("§cBlocked Exploit: File Access");
+                    event.cancel();
+                    mc.getNetHandler().addToSendQueue(new C19PacketResourcePackStatus(((S48PacketResourcePackSend) packet).getHash(), C19PacketResourcePackStatus.Action.FAILED_DOWNLOAD));
+                }
+            } catch (URISyntaxException exception) {
+                ChatUtil.print("§cBlocked Exploit: Resource Pack");
+                event.cancel();
+                mc.getNetHandler().addToSendQueue(new C19PacketResourcePackStatus(((S48PacketResourcePackSend) packet).getHash(), C19PacketResourcePackStatus.Action.FAILED_DOWNLOAD));
+            }
+        } else if(packet instanceof S43PacketCamera &amp;&amp; !mc.thePlayer.isSpectator()) {
+            ChatUtil.print("§cBlocked Exploit: Crash");
+            event.cancel();
+        } else if(packet instanceof S2APacketParticles) {
+            S2APacketParticles particles = (S2APacketParticles) packet;
+            if(Math.abs(particles.getParticleSpeed()) &gt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Particles");
+                event.cancel();
+            } else if(((S2APacketParticles) packet).getParticleCount() &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            }
+        } else if(packet instanceof S27PacketExplosion) {
+            S27PacketExplosion explosion = (S27PacketExplosion) packet;
+
+            if(Math.abs(explosion.getStrength()) &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            } else if(System.currentTimeMillis() - lastExplosion &lt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            } else if(packet instanceof S2APacketParticles) {
+            S2APacketParticles particles = (S2APacketParticles) packet;
+
+            if(Math.abs(particles.getParticleSpeed()) &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Particles");
+                event.cancel();
+            } else if(particles.getParticleCount() &gt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            }
+        }
+
+            lastExplosion = System.currentTimeMillis();
+        } else if(packet instanceof S18PacketEntityTeleport) {
+            S18PacketEntityTeleport teleport = (S18PacketEntityTeleport) packet;
+
+            double packetX = Math.abs(teleport.getX());
+            double packetY = Math.abs(teleport.getY());
+            double packetZ = Math.abs(teleport.getZ());
+
+            if(packetX &gt; 30000000 || packetY &gt; 30000000 || packetZ &gt; 30000000) {
+                ChatUtil.print("§cBlocked Exploit: Teleport");
+                event.cancel();
+            }
+        } else if(packet instanceof S11PacketSpawnExperienceOrb) {
+            if(System.currentTimeMillis() - lastExperience &lt;= 1) {
+                invalidExperience++;
+
+                if(invalidExperience &gt;= 2) {
+                    ChatUtil.print("§cBlocked Exploit: Crash");
+                    event.cancel();
+                }
+            } else {
+                invalidExperience = 0;
+            }
+            lastExperience = System.currentTimeMillis();
+        }
+
+    };
+
+    private void triggerKick() {
+        ChatUtil.print("§cAbnormal packet activity detected. Kicking player...");
+    }
+        private void handlePacketCount() {
+            long currentTime = System.currentTimeMillis();
+
+            long lastPacketCheckTime = 0;
+            if (currentTime - lastPacketCheckTime &gt; CHECK_INTERVAL) {
+                packetCount = 0;
+                lastPacketCheckTime = currentTime;
+            }
+            packetCount++;
+            if (packetCount &gt; PACKET_THRESHOLD) {
+                triggerKick();
+                packetCount = 0;
+        }
+
+    }
+
+}
+// NOTE (AI): The S11 branch is a crash-exploit guard: two XP orb spawn packets inside 1 ms increment invalidExperience, and the second violation cancels the packet and prints a chat warning. The module is a general clientbound sanitizer covering resource pack URI validation, camera teleport abuse, particle and explosion floods, and giant teleport coordinates, with S11 as one of the flood classes.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (Tenacity's IEventListener bus).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Client-side exploit hardening, not an anti-cheat bypass: cancelling S11 removes orbs from the renderer, which a server can observe as missing orb pickups only if it tracks them, which vanilla does not.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other client in the corpus touches S11. Tenacity's own PacketRate/anti-flood logic is folded into this single module.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoCollect</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent is the only hook surface in the corpus, used by Tenacity 6.0 AntiExploit.</div>
+<div class="impl-clients">All clients except Tenacity 6.0 reference S11 only through bundled vanilla code; Rise additionally lists it in NetworkAPI's script packet registry.</div>
 </div>
-<p class="impl-pattern">Detect XP orbs for auto-collect.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S0EPacketSpawnObject/">S0EPacketSpawnObject</a>
+<a class="related-chip" href="../S13PacketDestroyEntities/">S13PacketDestroyEntities</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

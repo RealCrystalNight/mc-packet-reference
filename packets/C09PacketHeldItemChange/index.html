@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C09PacketHeldItemChange (0x09): Player changes their selected hotbar slot.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Scaffold, AutoTool, InventoryManager, AutoPot, NoSlow, AutoGApple">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Scaffold (silent switch), NewNewBreaker (AutoTool), AutoSoup / AutoPot (slot routing)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C09PacketHeldItemChange — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C09PacketHeldItemChange — Minecraft 1.8.9 Packet Reference","description":"The slot-switch packet that silent everything depends on. Scaffold switches to blocks invisibly, breakers grab the best tool, and consumable modules hop to the potion slot and back. The server trusts the int, so the entire game is keeping the visible slot in sync with the action slot.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -68,331 +68,837 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayServer.processHeldItemChange()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C09 carries one int: the hotbar slot index the client is switching to. The server's processHeldItemChange validates 0 &lt;= slot &lt; 9 and sets the player's currentItem, which changes the server-side held item used for reach, damage, block breaking and what other players see. It is the cheapest stateful packet in the play state: no position, no timestamp, so clients can spam it freely, which is exactly why silent-switch modules rely on it.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayServer.processHeldItemChange: if the slot is within the hotbar, set inventory.currentItem and mark the player active; otherwise log a warning. The client-side vanilla path is EntityPlayerSP/PlayerControllerMP updating the slot when the user scrolls. Because the server trusts the packet entirely, any module that sends C09 with a different slot than the visible one desynchronizes the server's view of the held item.</p>
+<h4>Why clients touch it</h4>
+<p>Three families across the 8 clients. (1) Silent switching: Scaffold (Tenacity ScaffoldModule, Rise 5.99 Scaffold, Sigma Scaffold) sends C09 to the block slot while the visible hotbar stays put, and cancels incoming C09 echoes. (2) Tool/weapon automation: Rise 6.2.4 NewNewBreaker switches to the best tool before breaking, KillAura (Rise 6.2.4/6.1.30) swaps weapons for 1.9+ style switching. (3) Consumable routing: AutoPotion/AutoSoup/AutoGap/AutoHead/AutoEat (Memeware, Rise 5.99, Sigma) switch to the food/potion slot, use the item, then switch back.</p>
+<h4>Exploit surface</h4>
+<p>The packet is unthrottled, so modules can switch slots 20 times per tick. The detectability comes from the server comparing the packet slot to the client's own S09PacketHeldItemChange echoes and to attack/place packets: an aura that attacks with a sword while C09 says a block is held gets flagged by rotation+slot correlation checks. Silent switch modules therefore cancel the visible slot change or re-send it after the action.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processHeldItemChange validates the slot range and sets inventory.currentItem. There is no rate limit and no validation against the client's last known slot. The side effect is that the server-side held item drives entity equipment broadcasts (S04PacketEntityEquipment) and the player's attack/place behavior.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Single VarInt slot field. Sent in PLAY state only. Vanilla sends it on scroll wheel input; modules send it via PacketUtil.sendPacket, addToSendQueue, or addToSendQueueNoEvent (Tenacity). Silent-switch modules cancel the packet when it matches the player's real current slot so the visible hotbar never moves.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats correlate C09 with C02/C08/C07: switching to a sword then attacking with reach is normal, but attacking while the C09 stream says a block is held trips slot-consistency checks on Verus and newer NCP. The fix in clients is to send C09 to the weapon slot before the attack and back after, or to cancel the switch entirely and spoof the attack slot.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Gugustus, Vestige 3.0, November 0.2, Jigsaw 0.26)</span>
+<p class="impl-pattern">The slot-switch packet that silent everything depends on. Scaffold switches to blocks invisibly, breakers grab the best tool, and consumable modules hop to the potion slot and back. The server trusts the int, so the entire game is keeping the visible slot in sync with the action slot.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold (silent switch)</span>
+<span class="impl-module-clients">(Tenacity 6.0, Rise 5.99, Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Silent slot switching. Scaffold switches to block slot silently. AutoTool switches to best tool. AutoPot switches to potion slot. Always paired with a switch back to original slot.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>//package dev.tenacity.module.impl.funny;
-//
-//import dev.tenacity.event.IEventListener;
-//import dev.tenacity.event.impl.packet.PacketSendEvent;
-//import dev.tenacity.event.impl.player.BlockPlaceableEvent;
-//import dev.tenacity.event.impl.player.MotionEvent;
-//import dev.tenacity.module.Module;
-//import dev.tenacity.module.ModuleCategory;
-//import dev.tenacity.setting.impl.BooleanSetting;
-//import dev.tenacity.setting.impl.ModeSetting;
-//import dev.tenacity.setting.impl.NumberSetting;
-//import dev.tenacity.util.misc.ChatUtil;
-//import dev.tenacity.util.misc.RaycastUtil;
-//import dev.tenacity.util.misc.TimerUtil;
-//import dev.tenacity.util.player.InventoryUtil;
-//import dev.tenacity.util.player.MovementUtil;
-//import dev.tenacity.util.player.RotationUtil;
-//import net.minecraft.block.BlockAir;
-//import net.minecraft.block.material.Material;
-//import net.minecraft.network.play.client.C09PacketHeldItemChange;
-//import net.minecraft.network.play.client.C0APacketAnimation;
-//import net.minecraft.util.BlockPos;
-//import net.minecraft.util.EnumFacing;
-//import net.minecraft.util.MovingObjectPosition;
-//import net.minecraft.util.Vec3;
-//import org.apache.velocity.runtime.log.NullLogChute;
-//import org.lwjgl.input.Keyboard;
-//import org.lwjgl.util.vector.Vector2f;
-//
-//public final class realwatchdogfullstrafeandautoblockand8bpsscaffoldModule extends Module {
-//
-//    private final BooleanSetting sprint = new BooleanSetting("Sprint", true),
-//            swing = new BooleanSetting("Swing", true),
-//            rotate = new BooleanSetting("Rotate", true),
-//            tower = new BooleanSetting("Tower", true);
-//
-//    private final NumberSetting searchRange = new NumberSetting("Sell range", 3, 1, 6, 1),
-//            bruteForceRayCastIntensity = new NumberSetting("aggressive humping intensity", 5, 1, 10, 1);
-//
-//    private final ModeSetting switchItemMode = new ModeSetting("Switch Item Mode", "Dog pee", "Dog Piss Sever"),
-//            swingMode = new ModeSetting("Swing Mode", "Dog pee", "Dog piss server"),
-//            rotationMode = new ModeSetting("Rotation Mode", "Watchdog", "WatchCat"),
-//            towerMode = new ModeSetting("Tower Mode", "Watchdog", "realwatchdogfullstrafeandautoblockand8bpsscaffoldModule");
-//
-//    private BlockCache blockCache, lastBlockCache;
-//    private int startSlot, slot, lastSlot;
-//    private final TimerUtil timerUtil = new TimerUtil();
-//
-//    private float yaw, pitch;
-//
-//    public realwatchdogfullstrafeandautoblockand8bpsscaffoldModule() {
-//        super("realwatchdogfullstrafeandautoblockand8bpsscaffoldModule", "realwatchdogfullstrafeandautoblockand8bpsscaffoldModule", ModuleCategory.FUNNY);
-//        swingMode.addParent(swing, BooleanSetting::isEnabled);
-//        rotationMode.addParent(rotate, BooleanSetting::isEnabled);
-//        towerMode.addParent(tower, BooleanSetting::isEnabled);
-//        bruteForceRayCastIntensity.addParent(rotationMode, rotation -&gt; rotationMode.isMode("aggressive humping intensity"));
-//        initializeSettings(sprint, searchRange, rotate, rotationMode, bruteForceRayCastIntensity, switchItemMode, swing, swingMode, tower, towerMode);
-//    }
-//
-//    private final IEventListener&lt;BlockPlaceableEvent&gt; onBlockPlaceableEvent = event -&gt; {
-//        placeBlock();
-//    };
-//
-//    private final IEventListener&lt;MotionEvent&gt; onMotionEvent = event -&gt; {
-//        slot = InventoryUtil.getBlockSlot();
-//
-//        if(sprint.isEnabled())
-//            mc.gameSettings.keyBindSprint.pressed = true;
-//        else {
-//            mc.gameSettings.keyBindSprint.pressed = false;
-//            mc.thePlayer.setSprinting(false);
-//        }
-//
-//        if(slot != -1) {
-//            if(switchItemMode.isMode("Client") &amp;&amp; mc.thePlayer.inventory.currentItem != slot)
-//                mc.thePlayer.inventory.currentItem = slot;
-//            if(switchItemMode.isMode("Server") &amp;&amp; lastSlot != slot) {
-//                mc.getNetHandler().addToSendQueueNoEvent(new C09PacketHeldItemChange(slot));
-//                lastSlot = slot;
-//            }
-//        }
-//
-//        if(event.isPre()) {
-//            blockCache = getBlockCache();
-//            if(blockCache != null)
-//                lastBlockCache = blockCache;
-//
-//            final float sensitivityMultiplier = RotationUtil.getSensitivityMultiplier();
-//            final float fixedYaw = yaw - yaw % sensitivityMultiplier;
-//            final float fixedPitch = pitch - pitch % sensitivityMultiplier;
-//
-//            event.setYaw(fixedYaw);
-//            event.setPitch(fixedPitch);
-//
-//            // Have to do this or else watchdog will delete your blocks
-//            if(mc.thePlayer.onGround) {
-//                mc.thePlayer.motionX *= 0.91f;
-//                mc.thePlayer.motionZ *= 0.91f;
-//            }
-//
-//            if(tower.isEnabled() &amp;&amp; mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; blockCache != null) {
-//                switch (towerMode.getCurrentMode()) {
-//                    case "Watchdog":
-//                        mc.thePlayer.motionY = 0.02f;
-//                        break;
-//                    case "realwatchdogfullstrafeandautoblockand8bpsscaffoldModule":
-//                        mc.thePlayer.motionY = 1f;
-//                        break;
-//                }
-//            }
-//        }
-//
-//    };
-//    @Override
-//    public void onEnable() {
-//        if (mc.thePlayer != null) {
-//            startSlot = mc.thePlayer.inventory.currentItem;
-//        } else {
-//            return;
-//        }
-//
-//        slot = lastSlot = -1;
-//        blockCache = lastBlockCache = null;
-//
-//        yaw = MovementUtil.getMoveYaw() + 180;
-//        pitch = 80;
-//        super.onEnable();
-//    }
-//
-//    @Override
-//    public void onDisable() {
-//        if(mc.thePlayer.inventory.currentItem != startSlot || lastSlot != startSlot) {
-//            if(switchItemMode.isMode("Client"))
-//                mc.thePlayer.inventory.currentItem = startSlot;
-//            else
-//                mc.getNetHandler().addToSendQueueNoEvent(new C09PacketHeldItemChange(startSlot));
-//        }
-//        super.onDisable();
-//    }
-//
-//    private void placeBlock() {
-//        if(blockCache == null || lastBlockCache == null || slot == -1) return;
-//
-//        if(mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, mc.thePlayer.inventory.getStackInSlot(slot),
-//                lastBlockCache.getBlockPos(), lastBlockCache.getEnumFacing(), getHitVec())) {
-//
-//            if(rotate.isEnabled())
-//                updateRotations();
-//
-//            if(swing.isEnabled()) {
-//                if(swingMode.isMode("Client"))
-//                    mc.thePlayer.swingItem();
-//                else
-//                    mc.getNetHandler().addToSendQueue(new C0APacketAnimation());
-//            }
-//
-//        }
-//        blockCache = null;
-//    }
-//
-//    private void updateRotations() {
-//        switch(rotationMode.getCurrentMode()) {
-//            case "Enum":
-//                this.yaw = (float) lastBlockCache.getEnumFacing().angleFromEnumFacing() - 180;
-//                this.pitch = 77;
-//                break;
-//            case "Brute Force RayCast":
-//                for (float yaw = MovementUtil.getMoveYaw() - 180; yaw &lt; MovementUtil.getMoveYaw() + 180; yaw += bruteForceRayCastIntensity.getCurrentValue()) {
-//                    for (float pitch = 90; pitch &gt; -90; pitch -= bruteForceRayCastIntensity.getCurrentValue()) {
-//                        final MovingObjectPosition cursor = RaycastUtil.getMouseOver(new Vector2f(yaw, pitch), searchRange.getCurrentValue());
-//                        if (cursor != null &amp;&amp; cursor.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK) {
-//                            BlockPos pos = cursor.getBlockPos();
-//                            if (pos.getX() == lastBlockCache.getBlockPos().getX() &amp;&amp; pos.getY() == lastBlockCache.getBlockPos().getY() &amp;&amp; pos.getZ() == lastBlockCache.getBlockPos().getZ()) {
-//                                this.yaw = yaw;
-//                                this.pitch = pitch;
-//                                break;
-//                            }
-//                        }
-//                    }
-//                }
-//                break;
-//        }
-//    }
-//
-//    private Vec3 getHitVec() {
-//        double x = lastBlockCache.getBlockPos().getX() + 0.5,
-//                y = lastBlockCache.getBlockPos().getY() + 0.5,
-//                z = lastBlockCache.getBlockPos().getZ() + 0.5;
-//
-//        if(lastBlockCache.getEnumFacing() != EnumFacing.UP &amp;&amp; lastBlockCache.getEnumFacing() != EnumFacing.DOWN) {
-//            y += 0.5;
-//        } else {
-//            x += 0.3;
-//            z += 0.3;
-//        }
-//
-//        if(lastBlockCache.getEnumFacing() == EnumFacing.SOUTH || lastBlockCache.getEnumFacing() == EnumFacing.NORTH)
-//            x += 0.15;
-//        if(lastBlockCache.getEnumFacing() == EnumFacing.EAST || lastBlockCache.getEnumFacing() == EnumFacing.WEST)
-//            z += 0.15;
-//
-//        return new Vec3(x, y, z);
-//    }
-//
-//    private BlockCache getBlockCache() {
-//        final BlockPos belowBlockPos = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1, mc.thePlayer.posZ);
-//        if (mc.theWorld.getBlockState(belowBlockPos).getBlock() instanceof BlockAir) {
-//            for (int x = 0; x &lt; searchRange.getCurrentValue(); x++) {
-//                for (int z = 0; z &lt; searchRange.getCurrentValue(); z++) {
-//                    for (int i = 1; i &gt; -3; i -= 2) {
-//                        final BlockPos blockPos = belowBlockPos.add(x * i, 0, z * i);
-//                        if (mc.theWorld.getBlockState(blockPos).getBlock() instanceof BlockAir) {
-//                            for (final EnumFacing direction : EnumFacing.values()) {
-//                                final BlockPos block = blockPos.offset(direction);
-//                                final Material material = mc.theWorld.getBlockState(block).getBlock().getMaterial();
-//                                if (material.isSolid() &amp;&amp; !material.isLiquid())
-//                                    return new BlockCache(block, direction.getOpposite());
-//                            }
-//                        }
-//                    }
-//                }
-//            }
-//        }
-//        return null;
-//    }
-//
-//    public static final class BlockCache {
-//
-//        private final BlockPos blockPos;
-//        private final EnumFacing enumFacing;
-//
-//        public BlockCache(final BlockPos blockPos, final EnumFacing enumFacing) {
-//            this.blockPos = blockPos;
-//            this.enumFacing = enumFacing;
-//        }
-//
-//        public BlockPos getBlockPos() {
-//            return blockPos;
-//        }
-//
-//        public EnumFacing getEnumFacing() {
-//            return enumFacing;
-//        }
-//    }
-//
-//}
+<p class="impl-pattern">Switch the server-side held item to the block slot without moving the visible hotbar.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Tenacity ScaffoldModule sends C09 to the target slot via addToSendQueueNoEvent (line ~80), cancels incoming C09 packets that would reveal the switch (line ~150), and restores the original slot with a second C09 (line ~183). Rise 5.99 Scaffold sends C09 only when the computed block slot differs from the player's current slot, and cancels all C09 on the send event.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/module/impl/player/ScaffoldModule.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/player/ScaffoldModule.java =====
+package dev.tenacity.module.impl.player;
+
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.packet.PacketSendEvent;
+import dev.tenacity.event.impl.player.BlockPlaceableEvent;
+import dev.tenacity.event.impl.player.MotionEvent;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.ModuleCategory;
+import dev.tenacity.setting.impl.BooleanSetting;
+import dev.tenacity.setting.impl.ModeSetting;
+import dev.tenacity.setting.impl.NumberSetting;
+import dev.tenacity.util.misc.ChatUtil;
+import dev.tenacity.util.misc.MathUtil;
+import dev.tenacity.util.misc.RaycastUtil;
+import dev.tenacity.util.misc.TimerUtil;
+import dev.tenacity.util.player.InventoryUtil;
+import dev.tenacity.util.player.MovementUtil;
+import dev.tenacity.util.player.RotationUtil;
+import net.minecraft.block.BlockAir;
+import net.minecraft.block.material.Material;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C09PacketHeldItemChange;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.MovingObjectPosition;
+import net.minecraft.util.Vec3;
+import org.lwjgl.input.Keyboard;
+import org.lwjgl.util.vector.Vector2f;
+
+public final class ScaffoldModule extends Module {
+
+    private final BooleanSetting sprint = new BooleanSetting("Sprint", true),
+            swing = new BooleanSetting("Swing", true),
+            rotate = new BooleanSetting("Rotate", true),
+            tower = new BooleanSetting("Tower", true);
+
+    private final NumberSetting searchRange = new NumberSetting("Search Range", 3, 1, 6, 1),
+            bruteForceRayCastIntensity = new NumberSetting("Brute Force Intensity", 5, 1, 10, 1);
+
+    private final ModeSetting switchItemMode = new ModeSetting("Switch Item Mode", "Client", "Server"),
+            swingMode = new ModeSetting("Swing Mode", "Client", "Server"),
+            rotationMode = new ModeSetting("Rotation Mode", "Enum", "Brute Force RayCast"),
+            towerMode = new ModeSetting("Tower Mode", "Vanilla", "BlocksMC", "Verus", "Vulcan");
+
+    private BlockCache blockCache, lastBlockCache;
+    private int startSlot, slot, lastSlot;
+    private final TimerUtil timerUtil = new TimerUtil();
+
+    private float yaw, pitch;
+
+    public ScaffoldModule() {
+        super("Scaffold", "Automatically bridges for you", ModuleCategory.PLAYER);
+        swingMode.addParent(swing, BooleanSetting::isEnabled);
+        rotationMode.addParent(rotate, BooleanSetting::isEnabled);
+        towerMode.addParent(tower, BooleanSetting::isEnabled);
+        bruteForceRayCastIntensity.addParent(rotationMode, rotation -&gt; rotationMode.isMode("Brute Force RayCast"));
+        initializeSettings(sprint, searchRange, rotate, rotationMode, bruteForceRayCastIntensity, switchItemMode, swing, swingMode, tower, towerMode);
+    }
+
+    private final IEventListener&lt;BlockPlaceableEvent&gt; onBlockPlaceableEvent = event -&gt; {
+        placeBlock();
+    };
+
+    private final IEventListener&lt;MotionEvent&gt; onMotionEvent = event -&gt; {
+        slot = InventoryUtil.getBlockSlot();
+
+        if(sprint.isEnabled())
+            mc.gameSettings.keyBindSprint.pressed = true;
+        else {
+            mc.gameSettings.keyBindSprint.pressed = false;
+            mc.thePlayer.setSprinting(false);
+        }
+
+        if(slot != -1) {
+            if(switchItemMode.isMode("Client") &amp;&amp; mc.thePlayer.inventory.currentItem != slot)
+                mc.thePlayer.inventory.currentItem = slot;
+            if(switchItemMode.isMode("Server") &amp;&amp; lastSlot != slot) {
+                mc.getNetHandler().addToSendQueueNoEvent(new C09PacketHeldItemChange(slot));
+                lastSlot = slot;
+            }
+        }
+
+        if(event.isPre()) {
+            blockCache = getBlockCache();
+            if(blockCache != null)
+                lastBlockCache = blockCache;
+
+            final float sensitivityMultiplier = RotationUtil.getSensitivityMultiplier();
+            final float fixedYaw = yaw - yaw % sensitivityMultiplier;
+            final float fixedPitch = pitch - pitch % sensitivityMultiplier;
+
+            event.setYaw(fixedYaw);
+            event.setPitch(fixedPitch);
+
+            // Have to do this or else watchdog will delete your blocks
+            if(mc.thePlayer.onGround) {
+                mc.thePlayer.motionX *= 0.91f;
+                mc.thePlayer.motionZ *= 0.91f;
+            }
+
+            if(tower.isEnabled() &amp;&amp; mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; blockCache != null) {
+                switch (towerMode.getCurrentMode()) {
+                    case "Vanilla":
+                        mc.thePlayer.motionY = 0.42f;
+                        break;
+                }
+                switch (towerMode.getCurrentMode()) {
+                    case "BlocksMC":
+                        if (Keyboard.isKeyDown(Keyboard.KEY_SPACE)) {
+                            mc.thePlayer.motionY = 0.42f;
+                        }
+                        if (Keyboard.isKeyDown(Keyboard.KEY_W) || Keyboard.isKeyDown(Keyboard.KEY_A) || Keyboard.isKeyDown(Keyboard.KEY_D) || Keyboard.isKeyDown(Keyboard.KEY_S)) {
+                            mc.thePlayer.motionY = 0.15f;
+                        }
+                        switch (towerMode.getCurrentMode()) {
+                            case "Verus":
+                                if (Keyboard.isKeyDown(Keyboard.KEY_SPACE)) {
+                                    mc.thePlayer.motionY = MathUtil.getRandomInRange(0.4, 0.5);
+                                    if (mc.thePlayer.serverSprintState) {
+                                        mc.getNetHandler().addToSendQueueNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                                        mc.thePlayer.serverSprintState = false;
+                                    } else {
+                                        mc.getNetHandler().addToSendQueueNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SPRINTING));
+                                        mc.thePlayer.serverSprintState = false;
+                                    }
+                                    if (timerUtil.hasTimeElapsed(4000, true)) {
+                                        ChatUtil.error("Warning, towering further may result in a silent flag, please proceed with caution");
+                                    }
+                                }
+                        }
+                        switch (towerMode.getCurrentMode()) {
+                            case "Vulcan":
+                                if (Keyboard.isKeyDown(Keyboard.KEY_SPACE)) {
+                                    mc.thePlayer.motionY = 0.2f;
+                                    if (timerUtil.hasTimeElapsed(4000, true)) {
+                                        ChatUtil.error("Warning, towering further may result in a silent flag, please proceed with caution");
+                                    }
+                                }
+
+                        }
+                }
+            }
+
+        }
+    };
+
+    private final IEventListener&lt;PacketSendEvent&gt; onPacketSendEvent = event -&gt; {
+        if(event.getPacket() instanceof C09PacketHeldItemChange) {
+            final C09PacketHeldItemChange c09 = (C09PacketHeldItemChange) event.getPacket();
+            if(switchItemMode.isMode("Server")) {
+                startSlot = c09.getSlotId();
+                event.cancel();
+            }
+        }
+    };
+
+    @Override
+    public void onEnable() {
+        if (mc == null || mc.thePlayer == null) {
+            return;
+        }
+        if (mc.thePlayer.inventory == null) {
+            return;
+        }
+
+        startSlot = mc.thePlayer.inventory.currentItem;
+        slot = lastSlot = -1;
+        blockCache = lastBlockCache = null;
+
+        yaw = MovementUtil.getMoveYaw() + 180;
+        pitch = 80;
+        super.onEnable();
+    }
+
+    @Override
+    public void onDisable() {
+        if(mc.thePlayer.inventory.currentItem != startSlot || lastSlot != startSlot) {
+            if(switchItemMode.isMode("Client"))
+                mc.thePlayer.inventory.currentItem = startSlot;
+            else
+                mc.getNetHandler().addToSendQueueNoEvent(new C09PacketHeldItemChange(startSlot));
+        }
+        super.onDisable();
+    }
+
+    private void placeBlock() {
+        if(blockCache == null || lastBlockCache == null || slot == -1) return;
+
+        if(mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, mc.thePlayer.inventory.getStackInSlot(slot),
+                lastBlockCache.getBlockPos(), lastBlockCache.getEnumFacing(), getHitVec())) {
+
+            if(rotate.isEnabled())
+                updateRotations();
+
+            if(swing.isEnabled()) {
+                if(swingMode.isMode("Client"))
+                    mc.thePlayer.swingItem();
+                else
+                    mc.getNetHandler().addToSendQueue(new C0APacketAnimation());
+            }
+
+        }
+        blockCache = null;
+    }
+
+    private void updateRotations() {
+        switch(rotationMode.getCurrentMode()) {
+            case "Enum":
+                this.yaw = (float) lastBlockCache.getEnumFacing().angleFromEnumFacing() - 180;
+                this.pitch = 77;
+                break;
+            case "Brute Force RayCast":
+                for (float yaw = MovementUtil.getMoveYaw() - 180; yaw &lt; MovementUtil.getMoveYaw() + 180; yaw += bruteForceRayCastIntensity.getCurrentValue()) {
+                    for (float pitch = 90; pitch &gt; -90; pitch -= bruteForceRayCastIntensity.getCurrentValue()) {
+                        final MovingObjectPosition cursor = RaycastUtil.getMouseOver(new Vector2f(yaw, pitch), searchRange.getCurrentValue());
+                        if (cursor != null &amp;&amp; cursor.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK) {
+                            BlockPos pos = cursor.getBlockPos();
+                            if (pos.getX() == lastBlockCache.getBlockPos().getX() &amp;&amp; pos.getY() == lastBlockCache.getBlockPos().getY() &amp;&amp; pos.getZ() == lastBlockCache.getBlockPos().getZ()) {
+                                this.yaw = yaw;
+                                this.pitch = pitch;
+                                break;
+                            }
+                        }
+                    }
+                }
+                break;
+        }
+    }
+
+    private Vec3 getHitVec() {
+        double x = lastBlockCache.getBlockPos().getX() + 0.5,
+                y = lastBlockCache.getBlockPos().getY() + 0.5,
+                z = lastBlockCache.getBlockPos().getZ() + 0.5;
+
+        if(lastBlockCache.getEnumFacing() != EnumFacing.UP &amp;&amp; lastBlockCache.getEnumFacing() != EnumFacing.DOWN) {
+            y += 0.5;
+        } else {
+            x += 0.3;
+            z += 0.3;
+        }
+
+        if(lastBlockCache.getEnumFacing() == EnumFacing.SOUTH || lastBlockCache.getEnumFacing() == EnumFacing.NORTH)
+            x += 0.15;
+        if(lastBlockCache.getEnumFacing() == EnumFacing.EAST || lastBlockCache.getEnumFacing() == EnumFacing.WEST)
+            z += 0.15;
+
+        return new Vec3(x, y, z);
+    }
+
+    private BlockCache getBlockCache() {
+        final BlockPos belowBlockPos = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1, mc.thePlayer.posZ);
+        if (mc.theWorld.getBlockState(belowBlockPos).getBlock() instanceof BlockAir) {
+            for (int x = 0; x &lt; searchRange.getCurrentValue(); x++) {
+                for (int z = 0; z &lt; searchRange.getCurrentValue(); z++) {
+                    for (int i = 1; i &gt; -3; i -= 2) {
+                        final BlockPos blockPos = belowBlockPos.add(x * i, 0, z * i);
+                        if (mc.theWorld.getBlockState(blockPos).getBlock() instanceof BlockAir) {
+                            for (final EnumFacing direction : EnumFacing.values()) {
+                                final BlockPos block = blockPos.offset(direction);
+                                final Material material = mc.theWorld.getBlockState(block).getBlock().getMaterial();
+                                if (material.isSolid() &amp;&amp; !material.isLiquid())
+                                    return new BlockCache(block, direction.getOpposite());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    public static final class BlockCache {
+
+        private final BlockPos blockPos;
+        private final EnumFacing enumFacing;
+
+        public BlockCache(final BlockPos blockPos, final EnumFacing enumFacing) {
+            this.blockPos = blockPos;
+            this.enumFacing = enumFacing;
+        }
+
+        public BlockPos getBlockPos() {
+            return blockPos;
+        }
+
+        public EnumFacing getEnumFacing() {
+            return enumFacing;
+        }
+    }
+
+}
+
+// NOTE (AI): Tenacity 6.0 ScaffoldModule: complete file. Silent C09 switch (line ~80), cancellation of C09 echoes (lines ~150-151), restore-to-start-slot (line ~183), plus C0B sprint toggling around placement (lines ~122-125).
 </code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> MotionEvent for placement + switch; PacketSendEvent to cancel C09 echoes.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The visible-hotbar cancellation makes the server see a different slot than spectators; servers that mirror S09 back detect the mismatch. Block placement with a silently-switched slot is otherwise indistinguishable from a scroll.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 Scaffold.java sends C09 through PacketUtil.sendPacketWithoutEvent and cancels all C09 in onPacketSend; Sigma 4.11 Scaffold.java includes its own switch logic. Rise 6.2.4/6.1.30 Scaffold do not construct C09 directly (Slot component + custom packets).</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoTool</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Gugustus, Vestige 3.0, November 0.2, Jigsaw 0.26)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NewNewBreaker (AutoTool)</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Silent slot switching. Scaffold switches to block slot silently. AutoTool switches to best tool. AutoPot switches to potion slot. Always paired with a switch back to original slot.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Silent switch to block slot
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(blockSlot));
-// ... place block ...
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(originalSlot));
-// Cancel real slot changes during scaffold
-if (event.getPacket() instanceof C09PacketHeldItemChange) event.setCancelled(true);
-// NoSlow — send current slot to bypass slowdown
-mc.thePlayer.sendQueue.addToSendQueueSilent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Break blocks (including through walls) while automatically switching to the best tool via C09.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Finds the target block with a raycast or surroundings scan, computes the best tool slot with SlotUtil, sends C09 to that slot, digs with C07, then switches back to the original slot. On attack events it also swaps to the weapon slot. The breaker mode determines target selection (Through Walls / Surroundings).</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/player/NewNewBreaker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/player/NewNewBreaker.java =====
+package com.alan.clients.module.impl.player;
+
+import com.alan.clients.component.impl.player.RotationComponent;
+import com.alan.clients.component.impl.player.Slot;
+import com.alan.clients.component.impl.player.rotationcomponent.MovementFix;
+import com.alan.clients.component.impl.render.NotificationComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreUpdateEvent;
+import com.alan.clients.event.impl.other.AttackEvent;
+import com.alan.clients.event.impl.other.TeleportEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.render.Render2DEvent;
+import com.alan.clients.event.impl.render.Render3DEvent;
+import com.alan.clients.module.Module;
+import com.alan.clients.module.api.Category;
+import com.alan.clients.module.api.ModuleInfo;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.PlayerUtil;
+import com.alan.clients.util.player.SlotUtil;
+import com.alan.clients.util.render.RenderUtil;
+import com.alan.clients.util.rotation.RotationUtil;
+import com.alan.clients.util.vector.Vector2f;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.ModeValue;
+import com.alan.clients.value.impl.NumberValue;
+import com.alan.clients.value.impl.SubMode;
+import lombok.Getter;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockAir;
+import net.minecraft.block.BlockBed;
+import net.minecraft.client.entity.EntityPlayerSP;
+import net.minecraft.client.gui.ScaledResolution;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C09PacketHeldItemChange;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.MovingObjectPosition;
+import net.minecraft.util.Vec3;
+import org.lwjgl.opengl.GL11;
+
+import java.awt.*;
+import java.util.ArrayList;
+
+@ModuleInfo(aliases = {"module.player.breaker.name"}, description = "module.player.breaker.description", category = Category.PLAYER)
+public class NewNewBreaker extends Module {
+    public final ModeValue mode = new ModeValue("Mode", this)
+            .add(new SubMode("Through Walls"))
+            .add(new SubMode("Surroundings"))
+            .setDefault("Through Walls");
+    private final NumberValue Range = new NumberValue("Range", this, 4, 1, 5, 0.1);
+
+    public final BooleanValue rotate = new BooleanValue("Rotate", this, true);
+    public final BooleanValue movementCorrection = new BooleanValue("Movement Correction", this, false);
+    public final BooleanValue whitelistFriendlyBed = new BooleanValue("Whitelist Friendly Bed", this, false);
+
+    public final BooleanValue hitCheck = new BooleanValue("Aura Check", this, false);
+    private final NumberValue fastBreakNormal = new NumberValue("FastBreak", this, 0, 0, 1, 0.1);
+    private final NumberValue fastBreakBed = new NumberValue("FastBreak bed", this, 0, 0, 1, 0.1);
+    private final NumberValue airMultipalyer = new NumberValue("Air Multiplier", this, 1, 0, 3, 0.1);
+
+    private float hardness;
+    private float damagetoblock;
+
+    private int attackTicks;
+    private boolean notify = true;
+    private int usedItem, delay, rotateTime;
+    private Vec3 teleport;
+
+    private BlockPos coordsBed;
+    private BlockPos blockToBreak;
+
+    @Getter
+    boolean breaking = false;
+    @Override
+    public void onDisable() {
+        mc.playerController.curBlockDamageMP = 0;
+    }
+    @Override
+    public void onEnable() {
+        hardness = 0;
+        damagetoblock = 0;
+    }
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; {
+        notify = true;
+    };
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;TeleportEvent&gt; onTeleport = event -&gt; {
+        if (mc.thePlayer.getDistance(event.getPosX(), event.getPosY(), event.getPosZ()) &gt; 30) {
+            if (notify) {
+                notify = false;
+                NotificationComponent.post("Breaker","Whitelisted bed");
+            }
+            teleport = new Vec3(event.getPosX(), event.getPosY(), event.getPosZ());
+        }
+    };
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;PreUpdateEvent&gt; onPreUpdate = event -&gt; {
+        Module scaffold = getModule(Scaffold.class);
+        if (scaffold == null || scaffold.isEnabled()) {
+            return;
+        }
+        EntityPlayerSP player = mc.thePlayer;
+        attackTicks++;
+        delay--;
+        if (delay &gt; 0 || (whitelistFriendlyBed.getValue() &amp;&amp; teleport != null &amp;&amp; player.getDistanceSq(teleport.xCoord, teleport.yCoord, teleport.zCoord) &lt; 1500)) {
+            return;
+        }
+
+        boolean foundbed = false;
+        int bedX = 0;
+        int bedY = 0;
+        int bedZ = 0;
+        for (int x = -Range.getValue().intValue()+1; x &lt;= Range.getValue().intValue()+1; x++) {
+            for (int y = -Range.getValue().intValue()+1; y &lt;= Range.getValue().intValue()+1; y++) {
+                for (int z = -Range.getValue().intValue()+1; z &lt;= Range.getValue().intValue()+1; z++) {
+                    Block block = PlayerUtil.blockRelativeToPlayer(x, y, z);
+                    if (block instanceof BlockBed) {
+                        foundbed = true;
+                        bedX = x;
+                        bedY = y;
+                        bedZ = z;
+                        BlockPos blockPos = new BlockPos(player.posX + x, player.posY + y, player.posZ + z);
+                        if (damagetoblock &lt;= 0) {
+                            if (coordsBed != null) {
+                                if (blockPos.distanceSq(mc.thePlayer.getPosition()) &lt; coordsBed.distanceSq(mc.thePlayer.getPosition())) {
+                                    coordsBed = blockPos;
+                                }
+                            } else {
+                                coordsBed = blockPos;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ArrayList&lt;BlockPos&gt; nearblocks = new ArrayList&lt;&gt;();
+
+        if (foundbed) {
+            breaking = true;
+            int airblocks = 0;
+            nearblocks.add(new BlockPos(bedX + 1, bedY, bedZ));
+            nearblocks.add(new BlockPos(bedX - 1, bedY, bedZ));
+            nearblocks.add(new BlockPos(bedX, bedY, bedZ + 1));
+            nearblocks.add(new BlockPos(bedX, bedY, bedZ - 1));
+            nearblocks.add(new BlockPos(bedX, bedY + 1, bedZ));
+
+            for (int i = 0; i &lt; nearblocks.size(); i++) {
+                BlockPos blockPos = nearblocks.get(i);
+                Block block = PlayerUtil.blockRelativeToPlayer(blockPos.getX(), blockPos.getY(), blockPos.getZ());
+                if (block instanceof BlockBed) {
+                    nearblocks.remove(i);
+                    nearblocks.add(new BlockPos(blockPos.getX() + 1, blockPos.getY(), blockPos.getZ()));
+                    nearblocks.add(new BlockPos(blockPos.getX() - 1, blockPos.getY(), blockPos.getZ()));
+                    nearblocks.add(new BlockPos(blockPos.getX(), blockPos.getY(), blockPos.getZ() + 1));
+                    nearblocks.add(new BlockPos(blockPos.getX(), blockPos.getY(), blockPos.getZ() - 1));
+                    nearblocks.add(new BlockPos(blockPos.getX(), blockPos.getY() + 1, blockPos.getZ()));
+                    break;
+                }
+            }
+            for (int i = 0; i &lt; nearblocks.size(); i++) {
+                BlockPos blockPos = nearblocks.get(i);
+                Block block = PlayerUtil.blockRelativeToPlayer(blockPos.getX(), blockPos.getY(), blockPos.getZ());
+                if (block instanceof BlockAir) {
+                    airblocks++;
+                }
+            }
+            if (airblocks &gt; 0 || !this.mode.getValue().getName().equals("Surroundings")) {
+                blockToBreak = coordsBed;
+            } else {
+                float minHardness = 99999999;
+
+                for (BlockPos blockPos : nearblocks) {
+                    Block block = PlayerUtil.blockRelativeToPlayer(blockPos.getX(), blockPos.getY(), blockPos.getZ());
+                    if (block.getBlockHardness() &lt; minHardness &amp;&amp; !(block instanceof BlockBed)) {
+                        minHardness = block.getBlockHardness();
+                        if (damagetoblock &lt;= 0) {
+                            blockToBreak = new BlockPos(player.posX + blockPos.getX(), player.posY + blockPos.getY(), player.posZ + blockPos.getZ());
+                        }
+                    }
+                }
+                for (int i = 0; i &lt; nearblocks.size(); i++) {
+                    BlockPos blockPos = nearblocks.get(i);
+                    Block block = PlayerUtil.blockRelativeToPlayer(blockPos.getX(), blockPos.getY(), blockPos.getZ());
+                    if (minHardness == block.getBlockHardness() &amp;&amp; blockPos.add(player.getPosition()).distance(player.getPosition()) &lt; blockToBreak.distance(player.getPosition())) {
+                        if (damagetoblock &lt;= 0) {
+                            blockToBreak = new BlockPos(player.posX + blockPos.getX(), player.posY + blockPos.getY(), player.posZ + blockPos.getZ());
+                        }
+                    }
+                }
+            }
+            if (blockToBreak.distance(player.getPosition()) &lt;= Range.getValue().floatValue()) {
+                if (rotate.getValue()) {
+                    rotate(blockToBreak);
+                }
+//                player.swingItem();
+                int slot = SlotUtil.findTool(blockToBreak);
+//                final BlockDamageEvent bdEvent = new BlockDamageEvent(this.mc.thePlayer, this.mc.thePlayer.worldObj, blockToBreak);
+//                Client.INSTANCE.getEventBus().handle(bdEvent);
+                if (slot != -1) PacketUtil.send(new C09PacketHeldItemChange(slot));
+                if (slot != -1) hardness = SlotUtil.getPlayerRelativeBlockHardness(player, mc.theWorld, blockToBreak, slot);
+                else hardness = SlotUtil.getPlayerRelativeBlockHardness(player, mc.theWorld, blockToBreak, getComponent(Slot.class).getItemIndex());
+                if (!mc.thePlayer.onGround) hardness *= airMultipalyer.getValue().floatValue();
+
+                if (damagetoblock == 0) {
+                    PacketUtil.send(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockToBreak, EnumFacing.DOWN));
+                }
+                mc.thePlayer.swingItem();
+                damagetoblock += hardness;
+                mc.theWorld.sendBlockBreakProgress(player.getEntityId(), blockToBreak, (int) (damagetoblock * 10 - 1));
+                if (damagetoblock &gt;= (PlayerUtil.blockRelativeToPlayer(blockToBreak.getX(), blockToBreak.getY(), blockToBreak.getZ()) instanceof BlockBed ? 1-fastBreakBed.getValue().floatValue() : 1-fastBreakNormal.getValue().floatValue())) {
+                    damagetoblock = 0;
+
+                    PacketUtil.send(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, blockToBreak, EnumFacing.DOWN));
+                    mc.playerController.onPlayerDestroyBlock(blockToBreak, EnumFacing.UP);
+                }
+                if (slot != -1) PacketUtil.send(new C09PacketHeldItemChange(getComponent(Slot.class).getItemIndex()));
+
+//                final BlockDamageEvent bdEvent = new BlockDamageEvent(this.mc.thePlayer, this.mc.thePlayer.worldObj, blockToBreak);
+//                Client.INSTANCE.getEventBus().handle(bdEvent);
+//                float xd = SlotUtil.getPlayerRelativeBlockHardness(mc.thePlayer, mc.theWorld, blockToBreak, getComponent(SlotComponent.class).getItemIndex());
+//                usedItem = getComponent(SlotComponent.class).getItemIndex();
+//                if (!mc.thePlayer.onGround) xd *= airMultipalyer.getValue().floatValue();
+//                mc.playerController.curBlockDamageMP += xd;
+//                mc.theWorld.sendBlockBreakProgress(mc.thePlayer.getEntityId(), blockToBreak, (int) (mc.playerController.curBlockDamageMP * 10 - 1));
+//
+//                if (mc.playerController.curBlockDamageMP &gt;= 1) {
+//                    mc.thePlayer.swingItem();
+//                    PacketUtil.send(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, blockToBreak, EnumFacing.DOWN));
+//                    mc.playerController.onPlayerDestroyBlock(blockToBreak, EnumFacing.DOWN);
+//                    mc.playerController.curBlockDamageMP = 0;
+//                }
+            }
+        } else {
+            if (breaking) {
+                damagetoblock = 0;
+            }
+            breaking = false;
+        }
+
+        mc.playerController.curBlockDamageMP = damagetoblock;
+    };
+
+    @EventLink
+    public final Listener&lt;AttackEvent&gt; onAttackEvent = event -&gt; {
+        if(whitelistFriendlyBed.getValue() ){
+            attackTicks = 0;
+        } else if (attackTicks &lt; 10) {
+            attackTicks++;
+        }
+
+        if (attackTicks &lt; 10) {
+            breaking = true;
+        } else {
+            breaking = false;
+        }
+
+    };
+
+    @EventLink
+    public final Listener&lt;Render2DEvent&gt; onRender2D = event -&gt; {
+        if (breaking) {
+            final ScaledResolution scaledResolution = event.getScaledResolution();
+            final double y = scaledResolution.getScaledHeight() * 0.80;
+
+            RenderUtil.drawRoundedGradientRect((scaledResolution.getScaledWidth() - (mc.playerController.curBlockDamageMP * 100)) / 2, y, mc.playerController.curBlockDamageMP * 100, 10, 4,
+                    getTheme().getFirstColor(), getTheme().getSecondColor(), true);
+            RenderUtil.color(Color.WHITE);
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;Render3DEvent&gt; onRender3D = event -&gt; {
+        if (breaking) {
+            try {
+                double x1 = blockToBreak.getX() - mc.getRenderManager().renderPosX;
+                double y1 = blockToBreak.getY() - mc.getRenderManager().renderPosY;
+                double z1 = blockToBreak.getZ() - mc.getRenderManager().renderPosZ;
+
+                double x2 = x1 + 1.0;
+                double y2 = y1 + 1.0;
+                double z2 = z1 + 1.0;
+
+                renderBoundingBox(x1, y1, z1, x2, y2, z2);
+
+            } catch (NullPointerException e) {
+
+            }
+        }
+    };
+    private void renderBoundingBox(double x1, double y1, double z1, double x2, double y2, double z2) {
+        GL11.glPushMatrix();
+        GL11.glDisable(GL11.GL_TEXTURE_2D);
+        GL11.glEnable(GL11.GL_LINE_SMOOTH);
+        GL11.glLineWidth(2.0f);
+        GL11.glBegin(GL11.GL_LINES);
+        if (coordsBed == blockToBreak) {
+            GL11.glColor3f(255, 0, 0);
+        } else {
+            GL11.glColor3f(255, 255, 255);
+        }
+
+        GL11.glVertex3d(x1, y1, z1);
+        GL11.glVertex3d(x2, y1, z1);
+
+        GL11.glVertex3d(x2, y1, z1);
+        GL11.glVertex3d(x2, y2, z1);
+
+        GL11.glVertex3d(x2, y2, z1);
+        GL11.glVertex3d(x1, y2, z1);
+
+        GL11.glVertex3d(x1, y2, z1);
+        GL11.glVertex3d(x1, y1, z1);
+
+        GL11.glVertex3d(x1, y1, z1);
+        GL11.glVertex3d(x1, y1, z2);
+
+        GL11.glVertex3d(x2, y1, z1);
+        GL11.glVertex3d(x2, y1, z2);
+
+        GL11.glVertex3d(x2, y2, z1);
+        GL11.glVertex3d(x2, y2, z2);
+
+        GL11.glVertex3d(x1, y2, z1);
+        GL11.glVertex3d(x1, y2, z2);
+
+        GL11.glVertex3d(x1, y1, z2);
+        GL11.glVertex3d(x2, y1, z2);
+
+        GL11.glVertex3d(x2, y1, z2);
+        GL11.glVertex3d(x2, y2, z2);
+
+        GL11.glVertex3d(x2, y2, z2);
+        GL11.glVertex3d(x1, y2, z2);
+
+        GL11.glVertex3d(x1, y2, z2);
+        GL11.glVertex3d(x1, y1, z2);
+
+        GL11.glEnd();
+
+        GL11.glEnable(GL11.GL_TEXTURE_2D);
+        GL11.glDisable(GL11.GL_LINE_SMOOTH);
+        GL11.glPopMatrix();
+    }
+    public void rotate(BlockPos block) {
+        if (!this.rotate.getValue()) return;
+        final Vector2f rotations = RotationUtil.calculate(block);
+        RotationComponent.setRotations(rotations, 10, movementCorrection.getValue() ? MovementFix.NORMAL : MovementFix.OFF);
+        mc.objectMouseOver.setBlockPos(block);
+        mc.objectMouseOver.sideHit = EnumFacing.UP;
+        mc.objectMouseOver.hitVec = new Vec3(Math.random(), 1, Math.random());
+        mc.objectMouseOver.typeOfHit = MovingObjectPosition.MovingObjectType.BLOCK;
+    }
+}
+
+// NOTE (AI): Rise 6.2.4 NewNewBreaker: complete file. C09 tool switch at line ~203 (to best tool) and line ~220 (back to the item index), C07 digging, rotation and movement correction. Demonstrates the component-based Slot API of Rise 6.x.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreUpdateEvent for digging; AttackEvent for weapon switch; PacketUtil.send for C09.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Rapid tool switching followed by instant block break is the classic nuker signature; Watchdog checks break speed vs tool tier. The module is primarily aimed at bed/obsidian breaking on HCF servers where fast break is expected.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 ships the same module. KillAura in Rise 6.2.4/6.1.30 also sends C09 pairs (lines ~897-921, ~1018-1019) for weapon switching during attacks.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InventoryManager</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Gugustus, Vestige 3.0, November 0.2, Jigsaw 0.26)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoSoup / AutoPot (slot routing)</span>
+<span class="impl-module-clients">(Memeware 7.3, Rise 5.99, Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Silent slot switching. Scaffold switches to block slot silently. AutoTool switches to best tool. AutoPot switches to potion slot. Always paired with a switch back to original slot.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Silent switch to block slot
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(blockSlot));
-// ... place block ...
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(originalSlot));
-// Cancel real slot changes during scaffold
-if (event.getPacket() instanceof C09PacketHeldItemChange) event.setCancelled(true);
-// NoSlow — send current slot to bypass slowdown
-mc.thePlayer.sendQueue.addToSendQueueSilent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Switch to the soup/potion slot, consume, and return to the combat slot, all with C09.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On low health, find a soup/potion in the hotbar or inventory, send C09 to that slot, send the C08 use packet, then send C09 back to the original slot. Memeware AutoSoup also sends C07 RELEASE_USE_ITEM and calls stopUsingItem to end the eat state cleanly so the server does not keep the player stuck eating.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/combat/AutoSoup.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/combat/AutoSoup.java =====
+
+package me.memewaredevs.client.module.combat;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.util.misc.Timer;
+import net.minecraft.init.Items;
+import net.minecraft.item.ItemSoup;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C09PacketHeldItemChange;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+
+import java.util.function.Consumer;
+
+public class AutoSoup extends Module {
+    private final Timer time = new Timer();
+
+    public AutoSoup() {
+        super("Auto Soup", 0, Module.Category.COMBAT);
+    }
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; update = e -&gt; {
+        if (mc.thePlayer.getHealth() &lt; mc.thePlayer.getMaxHealth() - 10.0f &amp;&amp; time.delay(50.0f)) {
+            if (hotbarHasSoups()) {
+                useSoup();
+            } else {
+                getSoupFromInventory();
+                time.reset();
+            }
+        }
+    };
+
+    private boolean hotbarHasSoups() {
+        for (int index = 36; index &lt; 45; ++index) {
+            final ItemStack itemStack = mc.thePlayer.inventoryContainer.getSlot(index).getStack();
+            if (itemStack == null || !(itemStack.getItem() instanceof ItemSoup)) {
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private void getSoupFromInventory() {
+        int index;
+        ItemStack itemStack;
+        int item = -1;
+        boolean found = false;
+        for (index = 36; index &gt;= 9; --index) {
+            itemStack = mc.thePlayer.inventoryContainer.getSlot(index).getStack();
+            if (itemStack == null || !(itemStack.getItem() instanceof ItemSoup)) {
+                continue;
+            }
+            item = index;
+            found = true;
+            break;
+        }
+        if (found) {
+            for (index = 0; index &lt; 45; ++index) {
+                itemStack = mc.thePlayer.inventoryContainer.getSlot(index).getStack();
+                if (itemStack == null) {
+                    continue;
+                }
+                if (itemStack.getItem() != Items.bowl || index &lt; 36 || index &gt; 44) {
+                    break;
+                }
+                mc.playerController.windowClick(0, index, 0, 0, mc.thePlayer);
+                mc.playerController.windowClick(0, -999, 0, 0, mc.thePlayer);
+                break;
+            }
+            mc.playerController.windowClick(0, item, 0, 1, mc.thePlayer);
+        }
+    }
+
+    private void useSoup() {
+        int index;
+        ItemStack itemStack;
+        int item = -1;
+        boolean found = false;
+        for (index = 36; index &lt; 45; ++index) {
+            itemStack = mc.thePlayer.inventoryContainer.getSlot(index).getStack();
+            if (itemStack == null || !(itemStack.getItem() instanceof ItemSoup)) {
+                continue;
+            }
+            item = index;
+            found = true;
+            break;
+        }
+        if (found) {
+            for (index = 0; index &lt; 45; ++index) {
+                itemStack = mc.thePlayer.inventoryContainer.getSlot(index).getStack();
+                if (itemStack == null || itemStack.getItem() != Items.bowl || index &lt; 36 || index &gt; 44) {
+                    continue;
+                }
+                mc.playerController.windowClick(0, index, 0, 0, mc.thePlayer);
+                mc.playerController.windowClick(0, -999, 0, 0, mc.thePlayer);
+            }
+            final int slot = mc.thePlayer.inventory.currentItem;
+            mc.thePlayer.inventory.currentItem = item - 36;
+            mc.playerController.updateController();
+            mc.thePlayer.sendQueue
+                    .addToSendQueue(new C08PacketPlayerBlockPlacement(mc.thePlayer.inventory.getCurrentItem()));
+            mc.thePlayer.sendQueue
+                    .addToSendQueue(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));
+            mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(
+                    C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+            mc.thePlayer.stopUsingItem();
+            mc.thePlayer.inventory.currentItem = slot;
+        }
+    }
+}
+
+// NOTE (AI): Memeware 7.3 AutoSoup: complete file. C09 to the soup slot, C08 to eat (line ~107), C09 back to the original slot (line ~109), C07 release + stopUsingItem to close the use state.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent; direct sendQueue.addToSendQueue for C09/C08/C07.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Soup servers expect rapid eating, so the switch-eat-switch pattern is usually under the radar there; on vanilla combat servers the instant eat is flagged by consumption-timer checks.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware AutoPotion mirrors it for splash potions; Rise 5.99 AutoPot/AutoSoup/AutoGap/AutoHead send C09 via PacketUtil; Sigma AutoPot/AutoSoup/AutoGApple/AutoEat do the same on their event bus.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoPot</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Gugustus, Vestige 3.0, November 0.2, Jigsaw 0.26)</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">MotionEvent/UpdateEvent for the switch decision; PacketSendEvent in silent-switch modules to cancel C09 echoes; sendQueue/PacketUtil for the actual send.</div>
+<div class="impl-clients">Tenacity uses addToSendQueueNoEvent to bypass its own event bus. Rise 5.99 uses PacketUtil.sendPacketWithoutEvent. Memeware/Sigma push raw packets to the send queue. Rise 6.x routes through PacketUtil.send and the Slot component, and its PingSpoofComponent parks C09 in the blink packet class list.</div>
 </div>
-<p class="impl-pattern">Silent slot switching. Scaffold switches to block slot silently. AutoTool switches to best tool. AutoPot switches to potion slot. Always paired with a switch back to original slot.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Silent switch to block slot
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(blockSlot));
-// ... place block ...
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(originalSlot));
-// Cancel real slot changes during scaffold
-if (event.getPacket() instanceof C09PacketHeldItemChange) event.setCancelled(true);
-// NoSlow — send current slot to bypass slowdown
-mc.thePlayer.sendQueue.addToSendQueueSilent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoSlow</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Gugustus, Vestige 3.0, November 0.2, Jigsaw 0.26)</span>
-</div>
-<p class="impl-pattern">Silent slot switching. Scaffold switches to block slot silently. AutoTool switches to best tool. AutoPot switches to potion slot. Always paired with a switch back to original slot.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Silent switch to block slot
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(blockSlot));
-// ... place block ...
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(originalSlot));
-// Cancel real slot changes during scaffold
-if (event.getPacket() instanceof C09PacketHeldItemChange) event.setCancelled(true);
-// NoSlow — send current slot to bypass slowdown
-mc.thePlayer.sendQueue.addToSendQueueSilent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoGApple</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Gugustus, Vestige 3.0, November 0.2, Jigsaw 0.26)</span>
-</div>
-<p class="impl-pattern">Silent slot switching. Scaffold switches to block slot silently. AutoTool switches to best tool. AutoPot switches to potion slot. Always paired with a switch back to original slot.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Silent switch to block slot
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(blockSlot));
-// ... place block ...
-mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(originalSlot));
-// Cancel real slot changes during scaffold
-if (event.getPacket() instanceof C09PacketHeldItemChange) event.setCancelled(true);
-// NoSlow — send current slot to bypass slowdown
-mc.thePlayer.sendQueue.addToSendQueueSilent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S09PacketHeldItemChange/">S09PacketHeldItemChange</a>
+<a class="related-chip" href="../S2FPacketSetSlot/">S2FPacketSetSlot</a>
+<a class="related-chip" href="../C08PacketPlayerBlockPlacement/">C08PacketPlayerBlockPlacement</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

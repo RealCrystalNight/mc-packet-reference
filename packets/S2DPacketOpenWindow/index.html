@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S2DPacketOpenWindow (0x2D): Opens an inventory GUI window (chest, crafting table, furnace, enchantment table, etc.) with window ID, type, title, and">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ChestStealer, InvManager, AutoArmor">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="WorldGuardRegen (window suppress), GodMode (window desync)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S2DPacketOpenWindow — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S2DPacketOpenWindow — Minecraft 1.8.9 Packet Reference","description":"The window-open packet, and the desync hinge for two Rise 6.x combat modules: WorldGuardRegen suppresses it during regen bursts, GodMode cancels it permanently to keep the server-client container state split. No chest-stealing or shop-detection module exists in the corpus; the windowId echo contract","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -77,38 +77,211 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Inventory types: minecraft:chest, crafting_table, furnace, dispenser, enchanting_table, brewing_stand, villager, beacon, anvil, hopper, dropper, EntityHorse. RektSky B5 ChestStealer intercepts this packet for silent chest handling — it cancels the vanilla open, stores the window data, and manages the chest entirely via packet-level manipulation.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>Opens an inventory window on the client. The server assigns a windowId (incrementing per player, wrapping at 256), picks a GUI type string, sends the title as a chat component, the slot count, and for EntityHorse windows the horse's entityId. The client switches on the type string: minecraft:container becomes a chest GUI, minecraft:villager a trade GUI, EntityHorse a horse inventory, anything else a LocalBlockIntercommunication GUI. The windowId must then be echoed back on every C0E click and C0D close.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleOpenWindow matches the type string and calls the matching display method (displayGUIChest, displayVillagerTradeGui, displayGUIHorse, displayGui), then stamps the windowId onto the player's openContainer. The horse branch looks up the entity by id and silently does nothing if the entity is missing. Server-side, EntityPlayerMP.displayGUIChest and openGui build the packet with the player's currentWindowId, which increments on every open.</p>
+<h4>Why clients touch it</h4>
+<p>Two Rise 6.x modules, both cancelling the packet for combat-adjacent reasons. WorldGuardRegen suppresses S2D while its regen burst is active (ticks &lt;= 1) so a server-initiated window cannot interrupt the position-desync regen sequence. GodMode cancels every S2D unconditionally, which keeps the server's window state desynced from the client as part of the godmode attack-desync. The context's ChestStealer/AutoArmor/ServerCrasher open-window usage does not exist in this corpus; the 8 clients contain no inventory-stealing S2D consumer.</p>
+<h4>Exploit surface</h4>
+<p>The windowId protocol is a state machine: the client must mirror every S2D with an open container and echo the id in later clicks. Cancelling S2D (Rise 6.x) leaves the server believing a window is open while the client never shows it, which is exactly the desync GodMode and WorldGuardRegen exploit. Server-side open-window spam (ServerCrasher style) is a client DoS: each S2D forces a GUI construction, and rapid-fire opens desync the container state. The EntityHorse branch's entity lookup is also a soft spot: a stale id silently drops the window.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityPlayerMP.displayGUIChest/openGui increments currentWindowId, opens the container server-side, and sends S2D with the id, GUI type, display name, and slot count (plus entityId for horses). The client must echo the windowId in C0E clicks and C0D closes or the server container stays open with stale state. Vanilla performs no validation that the client actually opened the window, which is the desync window both Rise 6.x modules rely on.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Encoding: unsigned byte windowId, String guiId (minecraft:container, minecraft:villager, EntityHorse, or a block interaction id), IChatComponent title, unsigned byte slotCount, then int entityId only when guiId is EntityHorse. windowId wraps at 256 and the client stamps it on openContainer.windowId. The type string is the discriminator; there is no numeric window-type enum on the wire in 1.8.9.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats track window state through the C0E/C0D echo trail, not through S2D itself. The Rise 6.x cancels create a server-side phantom container: the server keeps sending window updates (S2F, S30) to a window the client never opened, which is detectable if an anti-cheat correlates window items with click packets. The trade-off is why WorldGuardRegen only cancels during the short regen burst (ticks &lt;= 1) while GodMode accepts the permanent desync.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ChestStealer</span>
-<span class="impl-module-clients">(Gugustus, Tenacity 6.0)</span>
+<p class="impl-pattern">The window-open packet, and the desync hinge for two Rise 6.x combat modules: WorldGuardRegen suppresses it during regen bursts, GodMode cancels it permanently to keep the server-client container state split. No chest-stealing or shop-detection module exists in the corpus; the windowId echo contract is what makes cancellation useful.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WorldGuardRegen (window suppress)</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Detect window opening (chest, crafting table, etc.). ChestStealer triggers on GuiChest open.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S2DPacketOpenWindow) {
-  S2DPacketOpenWindow s2d = (S2DPacketOpenWindow) event.getPacket();
-  if (s2d.getGuiId().equals("minecraft:chest")) chestStealer.enable();
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Prevent a server-initiated window from interrupting the regen position-desync sequence.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A Regen mode. Its PreMotionEvent handler drops the player y by 0.05 and holds yaw/pitch while health is below the threshold; the PacketSendEvent handler wraps attacks in a C04-teleport/attack/C04-return sandwich. The PacketReceiveEvent handler cancels any S2D while ticks <= 1, i.e. during the active regen burst, so the server cannot open a container mid-sequence and break the state machine.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/regen/WorldGuardRegen.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/regen/WorldGuardRegen.java =====
+package com.alan.clients.module.impl.combat.regen;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.input.MoveInputEvent;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.motion.StrafeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.impl.combat.Regen;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.NumberValue;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.server.S2DPacketOpenWindow;
+
+public final class WorldGuardRegen extends Mode&lt;Regen&gt; {
+
+    private final NumberValue health = new NumberValue("Minimum Health", this, 15, 1, 20, 1);
+
+    private int ticks;
+
+    private float yaw;
+    private float pitch;
+
+    public WorldGuardRegen(String name, Regen parent) {
+        super(name, parent);
+    }
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (mc.thePlayer.onGround &amp;&amp; mc.thePlayer.getHealth() &lt; this.health.getValue().floatValue()) {
+            if (ticks &lt;= 1) {
+                event.setPosY(event.getPosY() - 0.05);
+                event.setYaw(yaw);
+                event.setPitch(pitch);
+                ticks++;
+            }
+        } else {
+            yaw = event.getYaw();
+            pitch = event.getPitch();
+            ticks = 0;
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (p instanceof C02PacketUseEntity &amp;&amp; mc.thePlayer.onGround &amp;&amp; mc.thePlayer.getHealth() &lt; this.health.getValue().floatValue() &amp;&amp; ticks &lt;= 1) {
+            final C02PacketUseEntity wrapper = (C02PacketUseEntity) p;
+
+            if (wrapper.getAction().equals(C02PacketUseEntity.Action.ATTACK)) {
+                event.setCancelled();
+
+                PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, true));
+                PacketUtil.sendNoEvent(wrapper);
+                PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY - 0.05, mc.thePlayer.posZ, false));
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        if (event.getPacket() instanceof S2DPacketOpenWindow &amp;&amp; ticks &lt;= 1) {
+            event.setCancelled();
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+        if (mc.thePlayer.onGround &amp;&amp; mc.thePlayer.getHealth() &lt; this.health.getValue().floatValue() &amp;&amp; ticks &lt;= 1) {
+            event.setSpeed(0);
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;MoveInputEvent&gt; onMove = event -&gt; {
+        if (mc.thePlayer.onGround &amp;&amp; mc.thePlayer.getHealth() &lt; this.health.getValue().floatValue() &amp;&amp; ticks &lt;= 1) {
+            event.setJump(false);
+        }
+    };
+}
+
+// NOTE (AI): The S2D cancel (lines ~67-69) is gated on ticks &lt;= 1, the same guard as the position drop and attack sandwich, so the window suppression only lasts for the regen burst.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreMotionEvent, PacketSendEvent, PacketReceiveEvent, StrafeEvent, MoveInputEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The cancel is brief and purposeful: a phantom window for one or two ticks is below most anti-cheat window-state checks, which expect C0D echoes after a delay. Long cancels would desync window items.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical file in Rise 6.1.30 under com/alan/clients/module/impl/combat/regen/.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InvManager</span>
-<span class="impl-module-clients">(Gugustus, Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">GodMode (window desync)</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Detect window opening (chest, crafting table, etc.). ChestStealer triggers on GuiChest open.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S2DPacketOpenWindow) {
-  S2DPacketOpenWindow s2d = (S2DPacketOpenWindow) event.getPacket();
-  if (s2d.getGuiId().equals("minecraft:chest")) chestStealer.enable();
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Cancel every open-window packet so the server's container state permanently diverges from the client's.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Cancels all S2D in PacketReceiveEvent. Combined with the module's core trick (drop y by 0.05 every pre-motion, wrap attacks in a position sandwich via PacketUtil.sendNoEvent), the server keeps an open phantom container while the client stays in normal movement. onEnable snapshots yaw/pitch for the desync frames.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/GodMode.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/GodMode.java =====
+package com.alan.clients.module.impl.exploit;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.input.MoveInputEvent;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.motion.StrafeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.Module;
+import com.alan.clients.module.api.Category;
+import com.alan.clients.module.api.ModuleInfo;
+import com.alan.clients.util.packet.PacketUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.server.S2DPacketOpenWindow;
+
+@ModuleInfo(aliases = {"module.combat.godmode.name"}, description = "module.exploit.godmode.description", category = Category.EXPLOIT)
+public class GodMode extends Module {
+
+    private float yaw;
+    private float pitch;
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        event.setPosY(event.getPosY() - 0.05);
+        event.setYaw(yaw);
+        event.setPitch(pitch);
+    };
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (p instanceof C02PacketUseEntity) {
+            final C02PacketUseEntity wrapper = (C02PacketUseEntity) p;
+
+            if (wrapper.getAction().equals(C02PacketUseEntity.Action.ATTACK)) {
+                event.setCancelled();
+
+                PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, true));
+                PacketUtil.sendNoEvent(wrapper);
+                PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY - 0.05, mc.thePlayer.posZ, false));
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        if (event.getPacket() instanceof S2DPacketOpenWindow) {
+            event.setCancelled();
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+        event.setSpeed(0);
+    };
+
+    @EventLink
+    public final Listener&lt;MoveInputEvent&gt; onMove = event -&gt; {
+        event.setJump(false);
+    };
+
+    @Override
+    public void onEnable() {
+        yaw = mc.thePlayer.rotationYaw;
+        pitch = mc.thePlayer.rotationPitch;
+    }
+}
+
+// NOTE (AI): The S2D cancel (lines ~51-53) is unconditional, unlike WorldGuardRegen's tick-gated version. The y-drop and attack sandwich above it are the actual godmode mechanism; the window cancel keeps the server-side state desynced.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreMotionEvent, PacketSendEvent, PacketReceiveEvent, StrafeEvent, MoveInputEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>High detection risk by design: permanent window desync plus position desync is a classic godmode signature. Modern anti-cheats correlate C0E/C0D history with window ids and flag clicks against windows the client never opened.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical file in Rise 6.1.30. Rise 5.99 has no S2D reference in any module.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoArmor</span>
-<span class="impl-module-clients">(Gugustus, Tenacity 6.0)</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Both Rise 6.x modules filter S2D on PacketReceiveEvent; the surrounding exploit logic lives in PreMotionEvent and PacketSendEvent.</div>
+<div class="impl-clients">Rise 6.1.30 and 6.2.4 ship identical GodMode and WorldGuardRegen files. Memeware, Nekoware, Sigma, Spicy and Tenacity reference S2D only in vanilla sources. No client uses S2D for chest stealing or shop detection.</div>
 </div>
-<p class="impl-pattern">Detect window opening (chest, crafting table, etc.). ChestStealer triggers on GuiChest open.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S2DPacketOpenWindow) {
-  S2DPacketOpenWindow s2d = (S2DPacketOpenWindow) event.getPacket();
-  if (s2d.getGuiId().equals("minecraft:chest")) chestStealer.enable();
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S2EPacketCloseWindow/">S2EPacketCloseWindow</a>
+<a class="related-chip" href="../S2FPacketSetSlot/">S2FPacketSetSlot</a>
+<a class="related-chip" href="../S30PacketWindowItems/">S30PacketWindowItems</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

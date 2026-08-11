@@ -1,0 +1,48 @@
+{
+  "writeup": [
+    {
+      "h": "Role in the protocol",
+      "p": "C00PacketServerQuery is the STATUS-state request that opens the server-list ping exchange. It is a completely empty packet, just the 0x00 id. OldServerPinger sends it immediately after C00Handshake with nextState=1, and the server answers with S00PacketServerInfo carrying the JSON status blob (MOTD, version, player counts, favicon). RealmsServerStatusPinger uses the same packet for the realms screen. The exchange exists entirely outside gameplay: it runs while the server list is displayed and no world or player entity exists."
+    },
+    {
+      "h": "Vanilla handling",
+      "p": "NetHandlerStatusServer.processServerQuery is a one-liner: it responds with S00PacketServerInfo(server.getServerStatusResponse()), and the status object is generated on demand by the dedicated server. There is no rate limiting, no state machine, and no validation beyond the handler dispatch. OldServerPinger sends the query on a fresh NetworkManager whose direction is already pinned to the STATUS state by the handshake, so any packet other than S00PacketServerInfo or S01PacketPong on the reply side closes the connection as a protocol error."
+    },
+    {
+      "h": "Why clients touch it",
+      "p": "Only Rise 6.1.30 and 6.2.4 BlinkComponent reference this packet, and only to exempt it from blink buffering, exactly like C00PacketLoginStart. No exploit module in the 8 clients sends or mutates it. The status query is invisible to gameplay-oriented modules because their event buses are wired to play-state packets and their logic assumes a loaded world. Spicy's Bhop.java carries a C00PacketServerQuery import with no usage anywhere in the file, a dead import that does not count as a module hit."
+    },
+    {
+      "h": "Exploit surface",
+      "p": "The abusive use of this packet is server scanning: flood C00PacketServerQuery over many connections to enumerate hosts or measure their response latency. None of the 8 clients ships such a scanner, and the STATUS state is not even reachable from module code in most of them because the event system only fires packet events after world join. The practical consequence is that this packet is a non-surface in the corpus: the only code touching it is the defensive exemption in BlinkComponent."
+    }
+  ],
+  "overview": "The empty STATUS-state opener for the server-list ping. No module in the 8 clients sends or mutates it; the only corpus hit is BlinkComponent's exemption list, which keeps the packet flowing while blink buffers everything else. Spicy Bhop's import is dead code.",
+  "server_handling": "NetHandlerStatusServer.processServerQuery responds immediately with S00PacketServerInfo(this.server.getServerStatusResponse()). No rate limit, no state validation, no per-player tracking: the status is generated fresh for every query and the connection is expected to be closed by the client pinger afterwards.",
+  "protocol_notes": "STATUS state only, id 0x00, zero payload bytes. Must follow a C00Handshake with nextState=1. The server replies S00PacketServerInfo; the client pinger then sends C01PacketPing and waits for S01PacketPong before closing. RealmsServerStatusPinger sends the same query on realm connections. Sending it in any other state fails protocol validation at the handler dispatch.",
+  "anticheat_landscape": "No anti-cheat measures this packet: there is no player, no world, and no timing value the server folds into anything persistent. Status queries are a reflection/scanning surface for server owners (they reveal MOTD and player counts to anyone), but that is a server exposure, not a client module concern. The 8 clients contain no scanner, so the packet never appears in their gameplay traffic.",
+  "modules": [
+    {
+      "name": "BlinkComponent",
+      "found_in": [
+        "Rise 6.1.30",
+        "Rise 6.2.4"
+      ],
+      "purpose": "Exempt C00PacketServerQuery from blink buffering so the server-list ping still completes while the blink queue is armed.",
+      "how_it_works": "The PacketSendEvent listener returns early for a hard-coded list of pre-play packets that includes C00PacketServerQuery alongside C00Handshake, C00PacketLoginStart, C01PacketPing and C01PacketEncryptionResponse. The packet is never parked in the blink queue, so OldServerPinger's query reaches the wire even when blinking is on.",
+      "detailed_code": "// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BlinkComponent.java =====\npackage com.alan.clients.component.impl.player;\n\nimport com.alan.clients.component.Component;\nimport com.alan.clients.event.Listener;\nimport com.alan.clients.event.Priorities;\nimport com.alan.clients.event.annotations.EventLink;\nimport com.alan.clients.event.impl.other.ServerJoinEvent;\nimport com.alan.clients.event.impl.other.WorldChangeEvent;\nimport com.alan.clients.event.impl.packet.PacketSendEvent;\nimport com.alan.clients.util.packet.PacketUtil;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.handshake.client.C00Handshake;\nimport net.minecraft.network.login.client.C00PacketLoginStart;\nimport net.minecraft.network.login.client.C01PacketEncryptionResponse;\nimport net.minecraft.network.play.client.C03PacketPlayer;\nimport net.minecraft.network.status.client.C00PacketServerQuery;\nimport net.minecraft.network.status.client.C01PacketPing;\nimport rip.vantage.commons.util.time.StopWatch;\n\nimport java.util.ArrayList;\nimport java.util.Arrays;\nimport java.util.concurrent.ConcurrentLinkedQueue;\n\npublic final class BlinkComponent extends Component {\n\n    public static final ConcurrentLinkedQueue<Packet<?>> packets = new ConcurrentLinkedQueue<>();\n    public static boolean blinking, dispatch;\n    public static ArrayList<Class<?>> exemptedPackets = new ArrayList<>();\n    public static StopWatch exemptionWatch = new StopWatch();\n\n    public static void setExempt(Class<?>... packets) {\n        exemptedPackets = new ArrayList<>(Arrays.asList(packets));\n        exemptionWatch.reset();\n    }\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<PacketSendEvent> onPacketSend = event -> {\n        if (mc.thePlayer == null) {\n            packets.clear();\n            exemptedPackets.clear();\n            return;\n        }\n\n        if (mc.thePlayer.isDead || mc.isSingleplayer() || !mc.getNetHandler().doneLoadingTerrain) {\n            packets.forEach(PacketUtil::sendNoEvent);\n            packets.clear();\n            blinking = false;\n            exemptedPackets.clear();\n            return;\n        }\n\n        final Packet<?> packet = event.getPacket();\n\n        if (packet instanceof C00Handshake || packet instanceof C00PacketLoginStart ||\n                packet instanceof C00PacketServerQuery || packet instanceof C01PacketPing ||\n                packet instanceof C01PacketEncryptionResponse) {\n            return;\n        }\n\n        if (blinking && !dispatch) {\n            if (exemptionWatch.finished(100)) {\n                exemptionWatch.reset();\n                exemptedPackets.clear();\n            }\n\n//            PingSpoofComponent.spoofing = false;\n\n            if (!event.isCancelled() && exemptedPackets.stream().noneMatch(packetClass ->\n                    packetClass == packet.getClass())) {\n                packets.add(packet);\n                event.setCancelled();\n            }\n        } else if (packet instanceof C03PacketPlayer) {\n            packets.forEach(PacketUtil::sendNoEvent);\n            packets.clear();\n            dispatch = false;\n        }\n    };\n\n    public static void dispatch() {\n        dispatch = true;\n    }\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<WorldChangeEvent> onWorldChange = event -> {\n        packets.clear();\n        BlinkComponent.blinking = false;\n    };\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<ServerJoinEvent> onServerJoin = event -> {\n        packets.clear();\n        BlinkComponent.blinking = false;\n    };\n\n}\n\n\n// NOTE (AI): The same five-class exemption covers the whole STATUS/LOGIN handshake, so blink is invisible before world join. Because blink is a PLAY-state exploit, the exemption is defensive: without it, a user toggling blink on the server list would silently break the pinger's query and the server row would hang.",
+      "code_source": "Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BlinkComponent.java",
+      "vanilla_hook": "PacketSendEvent",
+      "anti_cheat_notes": "None: the packet is passed through unmodified. The only observable effect is that the server list still works while blink is enabled.",
+      "variations": "Rise 6.1.30 is byte-identical. No other client in the corpus touches this packet with real code; Spicy's Bhop.java has an unused import only."
+    }
+  ],
+  "general_hooks": "PacketSendEvent in Rise 6.x BlinkComponent; no other client wires the STATUS state into its event bus.",
+  "client_variations": "Classic clients (Memeware, Nekoware, Sigma, Spicy, Tenacity) never reference this packet outside the bundled vanilla OldServerPinger, so their event systems do not even see STATUS-state packets.",
+  "related": [
+    "C00Handshake",
+    "S00PacketServerInfo",
+    "C01PacketPing",
+    "S01PacketPong"
+  ]
+}

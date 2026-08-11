@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C00PacketKeepAlive (0x00): Response to S00PacketKeepAlive. The client echoes back the server's keep-alive ID.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="PingSpoof, Disabler, Timer">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="PingSpoof, Disabler, Fly (timer reset), Blink / AntiVoid">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C00PacketKeepAlive — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C00PacketKeepAlive — Minecraft 1.8.9 Packet Reference","description":"The timing backbone of the play state: server sends S00 with a key, client echoes it, server folds round-trip into a ping EMA. Ping spoofers delay the echo, disablers cancel or corrupt the key, and a surprising number of movement modules (Fly, Bhop, Blink) cancel it as collateral when they need to s","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -69,316 +69,496 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">If the client doesn't respond within ~30 seconds, the server will disconnect them.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>Keepalive is the protocol's liveness and latency probe. The server sends S00PacketKeepAlive with a monotonically increasing key (server tick-based), the client must echo it back as C00PacketKeepAlive with the same key. NetHandlerPlayServer.processKeepAlive compares the echoed key to the stored field_147378_h and folds the round-trip time into the player's ping EMA: ping = (ping * 3 + delta) / 4. It is the only packet in the play state whose sole purpose is timing, which makes it the backbone of ping spoofing, disconnect-detection, and timer-based disabler modes.</p>
+<h4>Vanilla handling</h4>
+<p>Client side, NetHandlerPlayClient.handleKeepAlive immediately echoes: <code>this.addToSendQueue(new C00PacketKeepAlive(packetIn.func_149134_c()));</code>. Server side, processKeepAlive is a pure timing check: if the key matches, it recomputes ping; otherwise it silently ignores. Note there is no per-connection timeout in vanilla 1.8.9 server code for a missing keepalive response; timeouts are enforced by the network layer (read timeout) or by anti-cheat plugins. This asymmetry is exactly what ping-spoof modules exploit.</p>
+<h4>Why clients touch it</h4>
+<p>The 8 clients show three distinct families. (1) Ping spoofers (Rise 5.99 PingSpoof, Rise 6.x PingSpoofComponent, Sigma 4.11 PingSpoof, Spicy PingSpoof) buffer the packet and release it late. (2) Disablers (Memeware 7.3 Disabler, Sigma 4.11 Disabler, Rise 6.x KeepAliveDisabler/DynamicPVPDisabler/LunarDisabler/Verus2Disabler, Spicy Disabler, Tenacity 6.0 AdvancedDisablerModule) cancel or mutate the key to break server-side timing heuristics on specific anti-cheats. (3) Movement modules that need to reset the server-side timer or cancel all stateful packets (Nekoware v1 Fly, Spicy Bhop/BackupFly/Fly, Rise 5.99 Fly/LongJump/Speed, Sigma Blink, Spicy Blink, Rise BlinkAntiVoid/WatchdogAntiVoid).</p>
+<h4>Exploit surface</h4>
+<p>Delaying the echo inflates the server's measured ping. Mutating the key (Memeware's Mineplex Combat mode subtracts a random 3..127 from the key) makes the server's key comparison fail, so the ping EMA is never updated, freezing the displayed ping and confusing plugins that use keepalive gaps to estimate lag or detect timer. Cancelling keepalive outright is the crude version: safe only while the server has no keepalive timeout, which is why disabler modes pair the cancel with periodic re-sends (Sigma's Erisium mode re-sends lastKey every 1500 ms).</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>NetHandlerPlayServer.processKeepAlive (line ~1015 in the bundled 1.8.9 sources): if packetIn.getKey() == field_147378_h, ping = (ping * 3 + (now - lastPingTime)) / 4. No response to a wrong or missing key: the packet is simply ignored. The client handler echoes unconditionally. Because wrong keys are silently dropped, mutating the key is undetectable from the packet stream alone: the server just never updates ping.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Serverbound C00 and clientbound S00 share the same int key field (writeVarIntToBuffer / readVarIntFromBuffer in 1.8.9 MCP; the key is a plain int). S00 is sent roughly every second of play time (server tick counter). C00 must be sent on the same connection before the next S00 for the ping EMA to converge. In practice modules intercept C00 in PacketSendEvent and S00 in PacketReceiveEvent.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>NCP and AAC track keepalive timing to distinguish real latency from timer abuse; a frozen or wildly inflated ping is a classic timer/fly flag. Verus-era servers (the Rise 6.x Verus2Disabler, Memeware's 'Latest Verus' mode) correlate keepalive gaps with transaction (C0F) gaps, so disablers buffer C00 and C0F together and flush them together after a fixed delay. The risk trade-off: pure delay is stealthy but does nothing against servers that timeout dead connections; cancellation is strong but requires knowing the server has no keepalive timeout.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
+<p class="impl-pattern">The timing backbone of the play state: server sends S00 with a key, client echoes it, server folds round-trip into a ping EMA. Ping spoofers delay the echo, disablers cancel or corrupt the key, and a surprising number of movement modules (Fly, Bhop, Blink) cancel it as collateral when they need to stop all stateful traffic.</p>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoof</span>
-<span class="impl-module-clients">(Astro 2.2.1, Tenacity 5.1, Sigma 3.9, Lycoris 2.0, November 0.2, Memeware 7.3, Jigsaw 0.24)</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.1.30, Rise 6.2.4, Sigma 4.11, Spicy)</span>
 </div>
-<p class="impl-pattern">Delay/cancel/replace keepalive to spoof ping or bypass anti-cheat timing checks.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// PingSpoof — delay response
-if (event.getPacket() instanceof S00PacketKeepAlive) {
-  event.setCancelled();
-  keepAliveQueue.add(new C00PacketKeepAlive(s00.func_149134_c() + offset));
+<p class="impl-pattern">Inflate the player's measured ping by delaying keepalive (and transaction) echoes.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Intercept S00 on receive; on the send side, cancel C00 (and usually C0F) and park it in a map keyed by release timestamp; on each pre-motion tick, flush entries whose delay has elapsed via sendPacket (bypassing the event bus).</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/PingSpoof.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/PingSpoof.java =====
+package dev.rise.module.impl.other;
+
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.other.WorldChangedEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.event.impl.packet.PacketSendEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.math.TimeUtil;
+import dev.rise.util.player.PacketUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+
+import java.util.Iterator;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@ModuleInfo(name = "PingSpoof", description = "Makes your ping higher for the server", category = Category.OTHER)
+public final class PingSpoof extends Module {
+
+    private final NumberSetting delay = new NumberSetting("Delay", this, 1000, 10, 30000, 1);
+
+    private final ConcurrentHashMap&lt;Packet&lt;?&gt;, Long&gt; packets = new ConcurrentHashMap&lt;&gt;();
+
+    private final TimeUtil timer = new TimeUtil();
+
+    @Override
+    protected void onDisable() {
+        packets.clear();
+    }
+
+    @Override
+    public void onWorldChanged(final WorldChangedEvent event) {
+        if (mc.isSingleplayer()) return;
+
+        packets.clear();
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        if (mc.isSingleplayer())
+            return;
+
+        for (final Iterator&lt;Map.Entry&lt;Packet&lt;?&gt;, Long&gt;&gt; iterator = packets.entrySet().iterator(); iterator.hasNext(); ) {
+            final Map.Entry&lt;Packet&lt;?&gt;, Long&gt; entry = iterator.next();
+
+            if (entry.getValue() &lt; System.currentTimeMillis()) {
+                PacketUtil.sendPacket(entry.getKey());
+                iterator.remove();
+            }
+        }
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        if (mc.isSingleplayer())
+            return;
+
+        if (event.getPacket() instanceof S08PacketPlayerPosLook) {
+            timer.reset();
+        }
+    }
+
+    @Override
+    public void onPacketSend(final PacketSendEvent event) {
+        if (mc.isSingleplayer())
+            return;
+
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (p instanceof C0FPacketConfirmTransaction || p instanceof C00PacketKeepAlive) {
+            packets.put(p, (long) (System.currentTimeMillis() + delay.getValue()));
+            event.setCancelled(true);
+        }
+    }
 }
-// Disabler — cancel
-if (event.getPacket() instanceof C00PacketKeepAlive) event.setCancelled(true);
-// Disabler — spoof key
-C00PacketKeepAlive c00 = (C00PacketKeepAlive) event.getPacket();
-c00.key -= RandomUtils.nextInt(3, 128);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
+// NOTE (AI): The entire PingSpoof module: buffers C0F and C00 in a ConcurrentHashMap
+// keyed by release time, cancels them on PacketSendEvent, and flushes via
+// PacketUtil.sendPacket (event-bus bypass) on each PreMotion tick.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent (cancel + park), PreMotionEvent (flush), PacketReceiveEvent (S08 resets the timer).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Pure delay is low-risk: the server only sees late echoes. Pairing C0F with C00 keeps transaction order consistent, which matters because modern anti-cheats correlate the two gaps.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Sigma 4.11 and Spicy implement the same buffer-and-release pattern on their own event buses. Rise 6.x moves this into PingSpoofComponent used by both 6.1.30 and 6.2.4.</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler</span>
-<span class="impl-module-clients">(Astro 2.2.1, Tenacity 5.1, Sigma 3.9, Lycoris 2.0, November 0.2, Memeware 7.3, Jigsaw 0.24)</span>
+<span class="impl-module-clients">(Memeware 7.3, Sigma 4.11, Rise 6.1.30, Rise 6.2.4, Spicy, Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">Delay/cancel/replace keepalive to spoof ping or bypass anti-cheat timing checks.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>package dev.tenacity.module.impl.exploit;
+<p class="impl-pattern">Break anti-cheat timing heuristics that use keepalive as a latency reference.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Mode-dependent: cancel the echo entirely, corrupt the key so the server silently drops it, or re-send a stale key on a timer. Memeware's Mineplex Combat mode corrupts; Sigma's Faithful/Erisium/SagePvP/ColdNetwork modes cancel and Erisium re-sends lastKey every 1500 ms; Rise 6.x splits this into KeepAliveDisabler, DynamicPVPDisabler, LunarDisabler and Verus2Disabler, each tuned to a server family.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/exploit/Disabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/exploit/Disabler.java =====
+package me.memewaredevs.client.module.exploit;
 
-import dev.tenacity.Tenacity;
-import dev.tenacity.event.impl.game.WorldEvent;
-import dev.tenacity.event.impl.network.PacketReceiveEvent;
-import dev.tenacity.event.impl.network.PacketSendEvent;
-import dev.tenacity.event.impl.player.MotionEvent;
-import dev.tenacity.module.Category;
-import dev.tenacity.module.Module;
-import dev.tenacity.module.impl.movement.Speed;
-import dev.tenacity.module.settings.impl.BooleanSetting;
-import dev.tenacity.module.settings.impl.MultipleBoolSetting;
-import dev.tenacity.module.settings.impl.NumberSetting;
-import dev.tenacity.ui.mainmenu.CustomMainMenu;
-import dev.tenacity.utils.misc.MathUtils;
-import dev.tenacity.utils.player.ChatUtil;
-import dev.tenacity.utils.player.MovementUtils;
-import dev.tenacity.utils.player.RotationUtils;
-import dev.tenacity.utils.server.PacketUtils;
-import dev.tenacity.utils.server.ServerUtils;
-import dev.tenacity.utils.time.TimerUtil;
-import net.minecraft.client.entity.EntityPlayerSP;
-import net.minecraft.client.gui.inventory.GuiInventory;
-import net.minecraft.client.multiplayer.GuiConnecting;
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.event.events.PacketInEvent;
+import me.memewaredevs.client.event.events.PacketOutEvent;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+import me.memewaredevs.client.util.ChatUtil;
+import me.memewaredevs.client.util.misc.Timer;
+import me.memewaredevs.client.util.packet.PacketUtil;
 import net.minecraft.entity.player.PlayerCapabilities;
 import net.minecraft.network.Packet;
 import net.minecraft.network.play.client.*;
-import net.minecraft.network.play.server.S07PacketRespawn;
 import net.minecraft.network.play.server.S08PacketPlayerPosLook;
-import net.minecraft.potion.Potion;
-import net.minecraft.util.AxisAlignedBB;
-import net.minecraft.util.ChatComponentText;
+import net.minecraft.network.play.server.S2APacketParticles;
+import org.apache.commons.lang3.RandomUtils;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.stream.Collectors;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.function.Consumer;
 
-public final class Disabler extends Module {
+public class Disabler extends Module {
 
-    private final MultipleBoolSetting disablers = new MultipleBoolSetting("Disablers",
-            new BooleanSetting("Watchdog Strafe", false),
-            new BooleanSetting("Watchdog Timer", false),
-            new BooleanSetting("MMC", false),
-            new BooleanSetting("C06-&gt;C04", false),
-            new BooleanSetting("C04-&gt;C06", false),
-            new BooleanSetting("Hover", false),
-            new BooleanSetting("Spoof Ground", false),
-            new BooleanSetting("C0B Cancel", false),
-            new BooleanSetting("C0C Spam", false),
-            new BooleanSetting("Verus", false),
-            new BooleanSetting("Omni Sprint", false),
-            new BooleanSetting("Void TP", false),
-            new BooleanSetting("Silent S08", false));
+    private static final int VERUS_DISABLE_AUTOBAN_CHANNEL = 65536;
+    private static final short VERUS_DISABLE_AUTOBAN_UID = 32767;
+    private final Queue&lt;Packet&gt; packetQueue = new ConcurrentLinkedQueue();
+    private final Timer timer = new Timer();
+    private final Timer timer1 = new Timer();
 
-    private final NumberSetting hoverHeight = new NumberSetting("Hover Height", 0.1, 5, 0.01, 0.01);
-
-    private final BooleanSetting onGround = new BooleanSetting("On Ground", true);
-
-    private final NumberSetting TPDelay = new NumberSetting("TP Delay", 20, 100, 5, 1);
-
-    private final TimerUtil timer = new TimerUtil(), joinTimer = new TimerUtil();
-
-    private boolean synced;
-
-    private final CopyOnWriteArrayList&lt;Packet&gt; watchdogPlayerPackets = new CopyOnWriteArrayList&lt;&gt;(), watchdogC0FC00Packets = new CopyOnWriteArrayList&lt;&gt;(), watchdogInvPackets = new CopyOnWriteArrayList&lt;&gt;();
-
-    private final CopyOnWriteArrayList&lt;Packet&gt; packets = new CopyOnWriteArrayList&lt;&gt;();
-
-    private double s08Y;
-
-    public static boolean spiking;
-    public static final TimerUtil spikeTimer = new TimerUtil();
-
-    private int airTicks;
-
-    public Disabler() {
-        super("Disabler", Category.EXPLOIT, "Disables some anticheats");
-        TPDelay.addParent(disablers, voidTPDisabler -&gt; voidTPDisabler.getSetting("Void TP").isEnabled());
-        hoverHeight.addParent(disablers, hoverDisabler -&gt; hoverDisabler.getSetting("Hover").isEnabled());
-        onGround.addParent(disablers, spoofGroundDisabler -&gt; spoofGroundDisabler.getSetting("Spoof Ground").isEnabled());
-        this.addSettings(disablers, TPDelay, onGround, hoverHeight);
+    public Disabler(final String name, final int key, final Module.Category category) {
+        super(name, key, category);
+        this.addModes("Mineplex Combat", "Transaction", "Latest Verus", "PvPTemple", "OmegaCraft", "Timer", "AACv1.9.10", "Sloth", "Ghostly", "Watchdog", "Faithful Movement");
     }
 
     @Override
-    public void onMotionEvent(MotionEvent event) {
-        final List&lt;BooleanSetting&gt; enabledBooleanSettings = disablers.getBoolSettings().stream().filter(BooleanSetting::isEnabled).collect(Collectors.toList());
-
-
-        if(enabledBooleanSettings.size() == 1) {
-            setSuffix(enabledBooleanSettings.get(0).name);
-        } else if(enabledBooleanSettings.size() &gt; 1) {
-            setSuffix(enabledBooleanSettings.size() + " Enabled");
-        } else {
-            setSuffix("None");
-        }
-
-        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
-            if(booleanSetting.isEnabled()) {
-                switch(booleanSetting.name) {
-                    case "MMC":
-                        if (timer.hasTimeElapsed(MathUtils.getRandomInRange(1000, 1500), true)) {
-                            packets.forEach(PacketUtils::sendPacketNoEvent);
-                            packets.clear();
-                        }
-                        break;
-                    case "Watchdog Timer":
-                        if(spikeTimer.hasTimeElapsed(700, true)) {
-                            timer.reset();
-                        }
-                        break;
-                    case "C0C Spam":
-                        PacketUtils.sendPacketNoEvent(new C0CPacketInput());
-                        break;
-                }
-            }
-        }
+    public void onDisable() {
+        packetQueue.clear();
     }
 
     @Override
-    public void onPacketSendEvent(PacketSendEvent event) {
-        if(mc.thePlayer == null) return;
-        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
-            if(booleanSetting.isEnabled()) {
-                switch(booleanSetting.name) {
-                    case "Watchdog Strafe":
-                        if(ServerUtils.isOnHypixel()) {
-                            if(event.getPacket() instanceof C03PacketPlayer &amp;&amp; !mc.thePlayer.isPotionActive(Potion.jump)) {
-                                final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                                if(Tenacity.INSTANCE.getModuleCollection().getModule(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.fallDistance &lt; 1)
-                                    c03.setOnGround(true);
-
-                                if(Tenacity.INSTANCE.getModuleCollection().getModule(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.ticksExisted % 4 != 0 &amp;&amp; mc.thePlayer.fallDistance &lt; 1) {
-                                    event.cancel();
-                                    watchdogPlayerPackets.add(event.getPacket());
-                                } else if (!watchdogPlayerPackets.isEmpty()) {
-                                    watchdogPlayerPackets.forEach(PacketUtils::sendPacketNoEvent);
-                                    watchdogPlayerPackets.clear();
-                                }
-                            }
-                        }
-                        break;
-                    case "Watchdog Timer":
-                        if(ServerUtils.isOnHypixel()) {
-                            if(event.getPacket() instanceof C03PacketPlayer) {
-                                final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                                if(!c03.isMoving() &amp;&amp; !c03.getRotating()) {
-                                    event.cancel();
-                                    break;
-                                }
-                            }
-                            if(!timer.hasTimeElapsed(350)) {
-                                if(event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) {
-                                    event.cancel();
-                                    watchdogC0FC00Packets.add(event.getPacket());
-                                }
-                            } else if(!watchdogC0FC00Packets.isEmpty()) {
-                                watchdogC0FC00Packets.forEach(PacketUtils::sendPacketNoEvent);
-                                watchdogC0FC00Packets.clear();
-                            }
-                        }
-                        break;
-                    case "Void TP":
-                        if(event.getPacket() instanceof C03PacketPlayer) {
-                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                            if(mc.thePlayer.ticksExisted % TPDelay.getValue() == 0) {
-                                c03.setY(c03.getPositionY() - 1000);
-                            }
-                        }
-                        break;
-                    case "MMC":
-                        if (event.getPacket() instanceof C0BPacketEntityAction) {
-                            final C0BPacketEntityAction c0b = (C0BPacketEntityAction) event.getPacket();
-                            if (c0b.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
-                                if (EntityPlayerSP.serverSprintState) {
-                                    PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
-                                    EntityPlayerSP.serverSprintState = false;
-                                }
-                            }
-                            event.cancel();
-                        }
-
-                        if (event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) {
-                            event.cancel();
-                            packets.add(event.getPacket());
-                        }
-                        break;
-                    case "C06-&gt;C04":
-                        if (event.getPacket() instanceof C03PacketPlayer.C06PacketPlayerPosLook) {
-                            final C03PacketPlayer.C06PacketPlayerPosLook c06 = (C03PacketPlayer.C06PacketPlayerPosLook) event.getPacket();
-                            event.setPacket(new C03PacketPlayer.C04PacketPlayerPosition(c06.getPositionX(), c06.getPositionY(), c06.getPositionZ(), c06.isOnGround()));
-                        }
-                        break;
-                    case "C04-&gt;C06":
-                        if (event.getPacket() instanceof C03PacketPlayer.C04PacketPlayerPosition) {
-                            final C03PacketPlayer.C04PacketPlayerPosition c04 = (C03PacketPlayer.C04PacketPlayerPosition) event.getPacket();
-                            event.setPacket(new C03PacketPlayer.C06PacketPlayerPosLook(c04.getPositionX(), c04.getPositionY(), c04.getPositionZ(), mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch, c04.isOnGround()));
-                        }
-                        break;
-                    case "Hover":
-                        if (event.getPacket() instanceof C03PacketPlayer) {
-                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                            c03.setY(mc.thePlayer.posY + hoverHeight.getValue());
-                        }
-                        break;
-                    case "Spoof Ground":
-                        if (event.getPacket() instanceof C03PacketPlayer) {
-                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                            c03.setOnGround(onGround.isEnabled());
-                        }
-                        break;
-                    case "C0B Cancel":
-                        if (event.getPacket() instanceof C0BPacketEntityAction) event.cancel();
-                        break;
-                    case "Verus":
-                        if(event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) event.cancel();
-                        break;
-                    case "Omni Sprint":
-                        if (event.getPacket() instanceof C0BPacketEntityAction) {
-                            final C0BPacketEntityAction c0b = (C0BPacketEntityAction) event.getPacket();
-                            if (c0b.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
-                                if (EntityPlayerSP.serverSprintState) {
-                                    PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
-                                    EntityPlayerSP.serverSprintState = false;
-                                }
-                            }
-                            event.cancel();
-                        }
-                        break;
-                }
-            }
-        }
-    }
-
-    @Override
-    public void onPacketReceiveEvent(PacketReceiveEvent event) {
-        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
-            if (booleanSetting.isEnabled()) {
-                switch (booleanSetting.name) {
-                    case "Silent S08":
-                        if(event.getPacket() instanceof S08PacketPlayerPosLook) {
-                            final S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-                            event.cancel();
-                            PacketUtils.sendPacketNoEvent(new C03PacketPlayer.C06PacketPlayerPosLook(s08.getX(), s08.getY(), s08.getZ(), s08.getYaw(), s08.getPitch(), false));
-                        }
-                        break;
-                }
-            }
-        }
-    }
-
-    private boolean isBlockUnder() {
-        if (mc.thePlayer.posY &lt; 0) return false;
-        for (int offset = 0; offset &lt; (int) mc.thePlayer.posY + 2; offset += 2) {
-            AxisAlignedBB bb = mc.thePlayer.getEntityBoundingBox().offset(0, -offset, 0);
-            if (!mc.theWorld.getCollidingBoundingBoxes(mc.thePlayer, bb).isEmpty()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    @Override
-    public void onWorldEvent(WorldEvent event) {
-        watchdogC0FC00Packets.clear();
+    public void onEnable() {
         timer.reset();
     }
-}
 
-</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Timer</span>
-<span class="impl-module-clients">(Astro 2.2.1, Tenacity 5.1, Sigma 3.9, Lycoris 2.0, November 0.2, Memeware 7.3, Jigsaw 0.24)</span>
-</div>
-<p class="impl-pattern">Delay/cancel/replace keepalive to spoof ping or bypass anti-cheat timing checks.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// PingSpoof — delay response
-if (event.getPacket() instanceof S00PacketKeepAlive) {
-  event.setCancelled();
-  keepAliveQueue.add(new C00PacketKeepAlive(s00.func_149134_c() + offset));
+    @Handler
+    public Consumer&lt;PacketInEvent&gt; packetInEventConsumer = (event) -&gt; {
+        if (isMode("Sloth")) {
+            if (event.getPacket() instanceof S08PacketPlayerPosLook) {
+                S08PacketPlayerPosLook playerPosLook = (S08PacketPlayerPosLook) event.getPacket();
+                /**
+                 * Works alongside with the spigot exploit.
+                 * Exploit PlayerData bug (Player data gets set to null if the previous event is cancelled, and y difference &lt;= 1.0E-4)
+                 */
+                playerPosLook.y += 1.0E-4;
+            }
+        }
+    };
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer = (event) -&gt; {
+        if (isMode("Latest Verus")) {
+            if (timer.delay(490L)) {
+                if (!packetQueue.isEmpty()) {
+                    PacketUtil.sendPacketSilent(packetQueue.poll());
+                }
+                timer.reset();
+            }
+        }
+
+        if (isMode("OmegaCraft")) {
+            PacketUtil.sendPacketSilent(new C0FPacketConfirmTransaction(VERUS_DISABLE_AUTOBAN_CHANNEL, VERUS_DISABLE_AUTOBAN_UID, true));
+        }
+
+        if (isMode("PvPTemple")) { // Added by Auth
+            event.setGround(false);
+            event.setY(event.getY() + 0.42);
+            event.setYaw(0);
+            event.setPitch(0);
+        }
+
+        if (isMode("Watchdog")) {
+            if (timer.delay(15000L)) {
+                if (!packetQueue.isEmpty()) {
+                    PacketUtil.sendPacketSilent(packetQueue.poll());
+                }
+                timer.reset();
+            }
+        }
+
+    };
+
+    @Handler
+    public Consumer&lt;PacketInEvent&gt; eventConsumer0 = (event) -&gt; {
+        if (event.getPacket() instanceof S2APacketParticles) {
+            event.cancel();
+        }
+    };
+
+    @Handler
+    public Consumer&lt;PacketOutEvent&gt; eventConsumer1 = (event) -&gt; {
+
+        if (isMode("Mineplex Combat"))
+            if (event.getPacket() instanceof C00PacketKeepAlive) {
+                C00PacketKeepAlive packetKeepAlive = (C00PacketKeepAlive) event.getPacket();
+                packetKeepAlive.key -= RandomUtils.nextInt(3, 128);
+            }
+
+        if (isMode("OmegaCraft"))
+            if (event.getPacket() instanceof C0FPacketConfirmTransaction)
+                event.cancel();
+
+        if (isMode("Latest Verus")) {
+            if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
+                C0FPacketConfirmTransaction c0fPacketConfirmTransaction = (C0FPacketConfirmTransaction) event.getPacket();
+                packetQueue.add(c0fPacketConfirmTransaction);
+                event.cancel();
+            }
+
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
+                if (mc.thePlayer.ticksExisted % 33 == 0) {
+                    c03.y = -0.911;
+                    c03.onGround = false;
+                    c03.field_149480_h = false;
+                }
+            }
+
+            if (mc.thePlayer != null &amp;&amp; mc.thePlayer.ticksExisted &lt;= 7) {
+                timer.reset();
+                packetQueue.clear();
+            }
+        }
+
+        if (isMode("Timer") &amp;&amp; event.getPacket() instanceof C03PacketPlayer) {
+            if (mc.thePlayer.ticksExisted % 3 != 0) {
+                event.cancel();
+            }
+        }
+        if (isMode("AACv1.9.10")) {
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                PacketUtil.sendPacketSilent(new C0CPacketInput());
+                C03PacketPlayer packetPlayer = (C03PacketPlayer) event.getPacket();
+                /**
+                 * Resets all checks VL due to a bug in critical hit check
+                 */
+                packetPlayer.y += 7.0E-9D;
+            }
+        }
+
+        if (isMode("Sloth")) {
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                C03PacketPlayer packetPlayer = (C03PacketPlayer) event.getPacket();
+                if (!timer.delay(1000L)) {
+                    for (int i = 0; i &lt; 10; ++i) {
+                        double y = i &gt; 2 &amp;&amp; i &lt; 8 ? 11 : 120;
+                        PacketUtil.sendPacketSilent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY - y, mc.thePlayer.posZ, true));
+                    }
+                } else {
+                    //set to default jump value so viper can stop fucking value patching it
+                    packetPlayer.y += 0.42F;
+                }
+            }
+        }
+        if (isMode("Faithful Movement")) {
+            if (mc.thePlayer != null &amp;&amp; event.getPacket() instanceof C00PacketKeepAlive) {
+                C00PacketKeepAlive packetKeepAlive = (C00PacketKeepAlive) event.getPacket();
+                packetKeepAlive.key -= 31;
+            }
+        }
+
+
+        if (isMode("Ghostly")) { // Ghostly Disabler added by Auth
+            if (event.getPacket() instanceof C03PacketPlayer)
+                PacketUtil.sendPacketSilent(new C0CPacketInput());
+            if (event.getPacket() instanceof C0FPacketConfirmTransaction)
+                event.cancel();
+        }
+        if (isMode("Watchdog")) {
+//            PacketUtil.sendPacketSilent(new C0EPacketClickWindow());
+            if (mc.getCurrentServerData().serverIP.contains("hypixel.net")) {
+                if (mc.thePlayer.ticksExisted % 30 == 0) {
+                    PlayerCapabilities pc = new PlayerCapabilities();
+                    pc.isFlying = true;
+                    pc.setFlySpeed(Float.NaN);
+                    PacketUtil.sendPacketSilent(new C13PacketPlayerAbilities(pc));
+                }
+                System.out.println(event.getPacket());
+                if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
+                    event.setPacket(new C0FPacketConfirmTransaction(Integer.MIN_VALUE, Short.MAX_VALUE, true));
+                }
+            } else {
+                ChatUtil.printChat("You must be on Hypixel to use Watchdog Disabler!");
+                this.toggle();
+            }
+        }
+    };
 }
-// Disabler — cancel
-if (event.getPacket() instanceof C00PacketKeepAlive) event.setCancelled(true);
-// Disabler — spoof key
-C00PacketKeepAlive c00 = (C00PacketKeepAlive) event.getPacket();
-c00.key -= RandomUtils.nextInt(3, 128);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
+// NOTE (AI): Keepalive handling is in eventConsumer1, Mineplex Combat mode: the key is
+// mutated by a random 3..127 offset so NetHandlerPlayServer's key comparison
+// fails and the ping EMA is never updated. The Watchdog mode instead queues
+// packets and flushes them every 15s to look like a laggy connection.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketOutEvent (cancel or mutate the live packet object).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Key corruption is stealthier than cancellation because the server's response is identical to a dropped packet: ping just stops updating. The random 3..127 offset keeps the mutation from looking like a fixed-value spoof.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Sigma 4.11 (Faithful/Erisium/SagePvP/ColdNetwork modes), Tenacity 6.0 AdvancedDisablerModule, and the Rise 6.x per-server disabler suite (KeepAliveDisabler, DynamicPVPDisabler, LunarDisabler, Verus2Disabler).</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Fly (timer reset)</span>
+<span class="impl-module-clients">(Nekoware v1 private, Rise 5.99, Spicy)</span>
 </div>
+<p class="impl-pattern">Cancel keepalive as collateral when a movement exploit needs to stop all stateful serverbound traffic.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Movement modules that spoof position or use damage tricks cancel every packet the server treats as stateful (C0F, C00) and reset their own timer. Nekoware v1's Fly cancels C0FPacketConfirmTransaction and C00PacketKeepAlive together; the point is not ping spoofing but keeping the server's view of the player frozen while the client replays position packets.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Nekoware v1 private — me/nekoWare/client/module/movement/Fly.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Nekoware v1 private — me/nekoWare/client/module/movement/Fly.java =====
+package me.nekoWare.client.module.movement;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.nekoWare.client.event.events.EventCollide;
+import me.nekoWare.client.event.events.MovementEvent;
+import me.nekoWare.client.event.events.PacketOutEvent;
+import me.nekoWare.client.event.events.UpdateEvent;
+import me.nekoWare.client.module.Module;
+import me.nekoWare.client.util.blocks.misc.BlockUtil;
+import me.nekoWare.client.util.misc.Timer;
+import me.nekoWare.client.util.movement.MovementUtils;
+import me.nekoWare.client.util.packet.PacketUtil;
+import net.minecraft.init.Blocks;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C09PacketHeldItemChange;
+import net.minecraft.network.play.client.C0CPacketInput;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C18PacketSpectate;
+import net.minecraft.util.AxisAlignedBB;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.MovementInput;
+import org.apache.commons.lang3.RandomUtils;
+
+import java.util.function.Consumer;
+
+public class Fly extends Module {
+
+    private Timer timer = new Timer();
+
+    private double y;
+
+    public Fly() {
+        super("Fly", 34, Module.Category.MOVEMENT);
+        this.addDouble("Speed", 2.5, 0.1, 5.0);
+        this.addModes("Vanilla", "Damage", "Verus");
+        this.addBoolean("Anti-Kick", false);
+    }
+
+    @Handler
+    public Consumer&lt;MovementEvent&gt; eventConsumer0 = event -&gt; {
+
+    };
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer1 = (event) -&gt; {
+
+        if (isMode("Vanilla")) {
+            mc.timer.timerSpeed = 1f;
+            if (event.isPre()) {
+                float speed = getDouble("Speed").floatValue();
+                MovementInput movementInput = mc.thePlayer.movementInput;
+                mc.thePlayer.motionY = movementInput.isJumping() ? speed * 0.5F
+                        : movementInput.isSneaking() ? -speed * 0.5F
+                        : 0.0F;
+                MovementUtils.setMoveSpeed(speed);
+                if (getBool("Anti-Kick") &amp;&amp; timer.delay(700.0f)) {
+                    MovementUtils.fallPacket();
+                    MovementUtils.ascendPacket();
+                    timer.reset();
+                }
+            }
+        }
+        
+        if (isMode("Damage")) {
+        	
+        	
+            mc.timer.timerSpeed = 1f;
+			if (event.isPre()) {
+				mc.thePlayer.sendQueue.addToSendQueue(new C0CPacketInput());
+				mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer(true));
+				mc.thePlayer.onGround = false;
+				float speed = getDouble("Speed").floatValue();
+				MovementInput movementInput = mc.thePlayer.movementInput;
+				mc.thePlayer.motionY = movementInput.isJumping() ? speed * 0.5F
+						: movementInput.isSneaking() ? -speed * 0.5F : 0.0F;
+				MovementUtils.setMoveSpeed(speed);
+			}
+        }
+        
+        if (isMode("Verus")) {
+        	
+
+        	mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1.5, mc.thePlayer.posZ), 1, new ItemStack(Blocks.stone.getItem(mc.theWorld, new BlockPos(-1, -1, -1))), 0, 0.94f, 0));
+            MovementUtils.setMoveSpeed(0.36);
+            mc.timer.timerSpeed = 1f;
+
+
+
+            if (y &gt;= 11) {
+                y = 0;
+            }
+
+            y++;
+
+    mc.thePlayer.motionY = 0f;
+        }
+    };
+
+    @Handler
+    public Consumer&lt;PacketOutEvent&gt; eventConsumer11 = (event) -&gt; {
+        if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
+            event.cancel();
+
+            timer.reset();
+        }
+        
+        if (event.getPacket() instanceof C00PacketKeepAlive) {
+            event.cancel();
+
+            timer.reset();
+        }
+    };
+
+    @Override
+    public void onEnable() {
+if(this.isMode("Damage")) {
+    	mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX,
+				mc.thePlayer.posY + 3.05, mc.thePlayer.posZ, false));
+		mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX,
+				mc.thePlayer.posY, mc.thePlayer.posZ, false));
+		mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX,
+				mc.thePlayer.posY + 0.41999998688697815, mc.thePlayer.posZ, true));
+		mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY + 0.5, mc.thePlayer.posZ);
+		}
+    }
+
+    @Override
+    public void onDisable() {
+
+    	MovementUtils.setMoveSpeed(0);
+    	
+    }
+}
+// NOTE (AI): eventConsumer11 cancels C0F and C00 together and resets the module timer.
+// This is a movement-exploit pattern: keepalive is collateral damage, not the
+// target; the server-side player view stays frozen while position packets
+// are replayed for the damage/fly trick.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketOutEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Blunt but effective on servers without keepalive timeouts. The visible side effect is a frozen ping on the tab list, which staff can notice.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Spicy's BackupFly, Bhop, Fly, AutoLog and Blink all reference C00PacketKeepAlive with the same cancel pattern; Rise 5.99's Fly, LongJump, Speed, Freecam and BlinkAntiVoid touch it via their own packet handlers.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Blink / AntiVoid</span>
+<span class="impl-module-clients">(Sigma 4.11, Rise 6.1.30, Rise 6.2.4, Spicy)</span>
+</div>
+<p class="impl-pattern">Buffer-and-release: keepalive is one of the packet types held while the client 'blinks' (stays frozen server-side).</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Blink cancels all serverbound packets including C00 while enabled, then releases them in order on disable. AntiVoid variants (Rise 6.x BlinkAntiVoid, WatchdogAntiVoid) do the same but release early if the player would fall into the void. The keepalive is included so the server keeps receiving a steady stream when the blink window is short.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/player/Blink.java; Spicy — modules/movement/Blink.java</span></p>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent / custom packet event.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Long blink windows flag on every serious anti-cheat; the keepalive handling here is incidental, not the point of the module.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.x implements it as BlinkComponent used by Blink, BlinkAntiVoid and WatchdogAntiVoid in both 6.1.30 and 6.2.4.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent (serverbound C00) and PacketReceiveEvent (clientbound S00) on every client; Rise 6.x uses its component system (PingSpoofComponent, KeepAliveDisabler).</div>
+<div class="impl-clients">Classic clients (Memeware, Nekoware, Sigma, Spicy) mutate or cancel the packet object inside the event. Rise 5.99 and 6.x replace the packet on the event (event.setPacket) or flush via PacketUtil.sendPacket, which bypasses the event bus entirely.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S00PacketKeepAlive/">S00PacketKeepAlive</a>
+<a class="related-chip" href="../C0FPacketConfirmTransaction/">C0FPacketConfirmTransaction</a>
+<a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

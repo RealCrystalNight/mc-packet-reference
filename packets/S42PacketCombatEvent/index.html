@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S42PacketCombatEvent (0x42): Server sends combat-related events: enter combat, end combat, entity dead with death message.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="AutoGG, KillAura, DeathDetector">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S42PacketCombatEvent — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S42PacketCombatEvent — Minecraft 1.8.9 Packet Reference","description":"Combat tag transitions from the server's CombatTracker. ENTER_COMBAT and END_COMBAT are the only variants the vanilla server constructs; ENTITY_DIED exists on the wire but is dead code in vanilla 1.8.9, which is why none of the 8 clients hooks it. Client-side the handler only feeds Twitch streaming ","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -76,44 +76,27 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayClient.handleCombatEvent()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>Combat tracker state machine. The server announces combat tag transitions through ENTER_COMBAT and END_COMBAT, with a third variant ENTITY_DIED defined for death broadcasts. EntityPlayerMP sends ENTER_COMBAT from func_152111_bt when combat starts and END_COMBAT from func_152112_bu when it ends; END_COMBAT carries the fight duration in ticks and the tracked entity's ID. Only the clientbound direction exists: the client never acknowledges combat state.</p>
+<h4>Vanilla handling</h4>
+<p>The client handler func_175098_a resolves the tracked entity by ID and feeds Twitch streaming metadata: END_COMBAT becomes a MetadataCombat with a negative timestamp derived from the duration (1000 * duration / 20), and ENTITY_DIED becomes a MetadataPlayerDeath carrying the victim, the killer entity and the death message. Nothing in the handler touches the death screen, the health bar or the tab list; those are driven by the client's own entity state.</p>
+<h4>Why clients touch it</h4>
+<p>No module in the 8 clients references S42. This is the natural home for death-event hooks (AutoGG, kill counting, KillAura target cleanup), yet the corpus shows none: AutoGG modules in these clients key off S02PacketChat death-message patterns instead, and KillAura cleanup keys off S13PacketDestroyEntities. The structural reason is that the vanilla server never sends ENTITY_DIED: EntityPlayerMP.onDeath broadcasts the death message through ServerConfigurationManager chat (becoming S02PacketChat on the client), and only ENTER_COMBAT and END_COMBAT are ever constructed. The ENTITY_DIED branch of the client handler is dead code in vanilla 1.8.9.</p>
+<h4>Exploit surface</h4>
+<p>readPacketData dispatches on a VarInt enum; an out-of-range value deserializes to null (readEnumValue returns null past the last ordinal) and the handler's event comparisons then NPE. The death message is read as a length-prefixed UTF-8 string capped at 32767 bytes, not a chat component, so no JSON component parsing happens here. END_COMBAT writes the tracked entity ID as a plain 4-byte int while ENTITY_DIED writes the killer as a VarInt and the victim as an int: the mixed widths are a known 1.8 protocol quirk.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityPlayerMP.func_152111_bt and func_152112_bu wrap the combat tag transitions and send the packet with the current CombatTracker; END_COMBAT fills the duration from CombatTracker.func_180134_f and the tracked entity ID from func_94550_c. Player deaths do not produce this packet: onDeath routes the death message through ServerConfigurationManager chat broadcast, so the ENTITY_DIED variant is only reachable from plugin or modded servers that construct it directly.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Event enum is a VarInt (readEnumValue). END_COMBAT: duration VarInt plus tracked entity ID as a full int. ENTITY_DIED: killer entity ID as VarInt, victim as int, then a String (not IChatComponent, despite the metadata table) capped at 32767 bytes. ENTER_COMBAT carries no payload. readEnumValue returns null for out-of-range values, which reaches the handler as a null eventType.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats do not use S42 for validation: it is clientbound, and combat tag state is tracked server-side from attack packets (C02) and damage events. Server plugins that expose combat tags rely on ENTER_COMBAT and END_COMBAT, not on client acknowledgements, so there is nothing to spoof or cancel from the client.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoGG</span>
-<span class="impl-module-clients">(Tenacity 6.0, Sigma 3.9)</span>
+<p class="impl-pattern">Combat tag transitions from the server's CombatTracker. ENTER_COMBAT and END_COMBAT are the only variants the vanilla server constructs; ENTITY_DIED exists on the wire but is dead code in vanilla 1.8.9, which is why none of the 8 clients hooks it. Client-side the handler only feeds Twitch streaming metadata.</p>
 </div>
-<p class="impl-pattern">Detect player death (ENTITY_DIED event) for AutoGG and kill aura target cleanup.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S42PacketCombatEvent) {
-  S42PacketCombatEvent s42 = (S42PacketCombatEvent) event.getPacket();
-  if (s42.eventType == S42PacketCombatEvent.Event.ENTITY_DIED &amp;&amp; s42.playerId == mc.thePlayer.getEntityId()) {
-    mc.thePlayer.sendChatMessage("gg");
-  }
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KillAura</span>
-<span class="impl-module-clients">(Tenacity 6.0, Sigma 3.9)</span>
-</div>
-<p class="impl-pattern">Detect player death (ENTITY_DIED event) for AutoGG and kill aura target cleanup.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S42PacketCombatEvent) {
-  S42PacketCombatEvent s42 = (S42PacketCombatEvent) event.getPacket();
-  if (s42.eventType == S42PacketCombatEvent.Event.ENTITY_DIED &amp;&amp; s42.playerId == mc.thePlayer.getEntityId()) {
-    mc.thePlayer.sendChatMessage("gg");
-  }
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">DeathDetector</span>
-<span class="impl-module-clients">(Tenacity 6.0, Sigma 3.9)</span>
-</div>
-<p class="impl-pattern">Detect player death (ENTITY_DIED event) for AutoGG and kill aura target cleanup.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S42PacketCombatEvent) {
-  S42PacketCombatEvent s42 = (S42PacketCombatEvent) event.getPacket();
-  if (s42.eventType == S42PacketCombatEvent.Event.ENTITY_DIED &amp;&amp; s42.playerId == mc.thePlayer.getEntityId()) {
-    mc.thePlayer.sendChatMessage("gg");
-  }
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S02PacketChat/">S02PacketChat</a>
+<a class="related-chip" href="../S13PacketDestroyEntities/">S13PacketDestroyEntities</a>
+<a class="related-chip" href="../C02PacketUseEntity/">C02PacketUseEntity</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

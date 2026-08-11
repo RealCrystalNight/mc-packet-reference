@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S08PacketPlayerPosLook (0x08): Forces the player to a specific position and rotation. The client must respond with a C04/05/06.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Flight, Speed, NoRotate, Freecam, Disabler, NoClip, Blink, FlagDetector, Backtrack">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Flight / Fly, Speed, Disabler, NoRotate, Phase / Blink, AntiVoid">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S08PacketPlayerPosLook — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S08PacketPlayerPosLook — Minecraft 1.8.9 Packet Reference","description":"The server's authoritative position correction: doubles plus floats plus a relative-flag bitmask, answered by a mandatory C06 confirm. The most-modded clientbound packet in the corpus: Flight cancels it, Speed treats it as a flag, NoRotate strips rotation, Phase counts it, AntiVoid uses it to time i","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -79,982 +79,949 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">The client must send a movement confirm (C04/C05/C06) back. The Y coordinate in this packet is the head Y, not feet Y.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S08 is the server's authoritative position and rotation correction: three doubles, two floats and a byte bitmask of relative flags (0x01 X, 0x02 Y, 0x04 Z, 0x08 Y_ROT, 0x10 X_ROT). It fires on join, dimension change, /tp-style teleports and anti-cheat lag-backs, and the client must answer with a C06PacketPlayerPosLook confirm or the server keeps its own position and re-sends. It is the most-intercepted clientbound packet in the corpus: every movement exploit family reads it, and several non-movement modules use it as a state signal (spawned, flagged, respawned).</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handlePlayerPosLook (Memeware copy, line 601) checks PacketThreadUtil, adds each absolute field to the current value when the matching relative flag is set, calls setPosition, then immediately replies C06PacketPlayerPosLook using the bounding-box minY as the feet position. The motion zeroing lines are commented out in the Memeware and Nekoware copies, a decompile artifact of the 1.5.2-era base. The first S08 flips doneLoadingTerrain, which is the spawned signal Memeware's Stealer waits for to clear its chest state.</p>
+<h4>Why clients touch it</h4>
+<p>Five families. Flight modes cancel S08 to avoid being snapped back and re-send a confirm that matches the spoofed position (Rise MineLandFlight, CreativeFlight; Sigma Fly; Spicy Fly and BackupFly; Tenacity FlightModule). Speed modules treat S08 as a flag and auto-disable or cancel per-mode (Memeware and Nekoware Flag Check, Rise 5.99 Speed Zonecraft and Vulcan2). Rotation strippers rewrite yaw and pitch before the vanilla handler runs (Rise 5.99 NoRot and Freelook, Sigma NoRotate). Phase and Blink count or suppress teleports (Rise VulcanPhase, Sigma Phase and Blink, Spicy Phase). AntiVoid and Disabler suites use S08 as a timing trigger (Spicy AntiVoid, Rise VerusCustomDisabler and WatchdogDisabler, Sigma Disabler, Tenacity DisablerModule, Memeware Disabler Sloth mode). Sigma AntiVelocity even rewrites S08 rotations in AACFlag mode while hurtResistantTime is active.</p>
+<h4>Exploit surface</h4>
+<p>The anti-cheat's blunt instrument is the rubberband: any server-side position desync ends in an S08. Clients fight it three ways: cancel the packet and re-send a spoofed C06 (keeps the client position, desyncs the server), accept the position but strip rotations (NoRotate), or ignore S08 only while a module state machine is armed (VulcanPhase counts teleports and then stands down after four). Rise 6.x TeleportCheck sits on the same packet to detect teleport exploits aimed at its own users. Every anti-cheat measures the C06 echo: the confirm must match the teleported coordinates, which is why cancel-and-spoof is only viable when the module replays the exact S08 position and why repeated cancels read as teleport-spam flags.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>NetHandlerPlayServer.setPlayerLocation (Spicy and Tenacity copies, line 448) computes the absolute target, adds the relative offsets when flags are set, zeroes the player's motion and sends S08. processPlayer validates incoming C0x movement against the last sent position and re-sends S08 when the client drifts beyond tolerance, which is the rubberband. Vanilla 1.8.9 has no teleport-id counter, so the server trusts the next C06-style confirm and re-sends S08 only when subsequent movement disagrees; that gap is exactly what cancel-and-confirm spoofing exploits.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Wire order: x, y, z doubles, yaw, pitch floats, then one flags byte read via readUnsignedByte. Flagged fields are deltas added to the current client value, so the server can nudge a player with a partial teleport; the join S08 is absolute (empty flag set). The client replies with C06PacketPlayerPosLook (absolute position, bounding-box minY, current rotations, onGround flag) regardless of which fields were relative. Because the reply uses the client's post-processing position, any module that mutates the packet before the handler runs changes what the server records.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>S08 is where lag-back lands: speed, phase, ground and fly checks all terminate in one. Cancelling S08 without echoing the position forces the server into a re-send loop that is itself visible as teleport spam. The stealthy pattern is to accept the position and neutralize the effect: NoRotate rewrites rotation so the confirm matches while aim stays client-side, and disablers re-arm PingSpoofComponent immediately after S08 (Rise VerusCustomDisabler sets disable = -20 on every teleport and only spoofs once the position history is clean). Hypixel-era flight modes cancel S08 only until the server velocity-confirms the fall, then let the teleport through to avoid a permanent desync flag.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Flight</span>
-<span class="impl-module-clients">(Mint B1, Gugustus, Tenacity 6.0, Sigma 4.11, Vestige 3.0, Astro 2.2.1, Flux B39.11)</span>
+<p class="impl-pattern">The server's authoritative position correction: doubles plus floats plus a relative-flag bitmask, answered by a mandatory C06 confirm. The most-modded clientbound packet in the corpus: Flight cancels it, Speed treats it as a flag, NoRotate strips rotation, Phase counts it, AntiVoid uses it to time its rescue, and the disabler suites use it to re-arm ping-spoof and blink state.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Flight / Fly</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">Second most-modded clientbound packet. Flight cancels S08 and sends spoofed C06 to maintain position. Speed cancels to prevent rubberbanding. Freecam cancels to keep camera free. NoRotate strips rotation. NoClip sends confirm + position back then cancels. FlagDetector auto-disables modules on S08 (lag-back detection). Backtrack buffers S08 for delayed processing to extend reach.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Flight — cancel S08 + spoof position
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// FlagDetector — auto-disable
-if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; speedModule.isEnabled()) speedModule.toggle();
-// NoRotate — strip yaw/pitch
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  s08.yaw = mc.thePlayer.rotationYaw;
-  s08.pitch = mc.thePlayer.rotationPitch;
-}
-// Freecam — cancel
-if (event.getPacket() instanceof S08PacketPlayerPosLook) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Speed</span>
-<span class="impl-module-clients">(Mint B1, Gugustus, Tenacity 6.0, Sigma 4.11, Vestige 3.0, Astro 2.2.1, Flux B39.11)</span>
-</div>
-<p class="impl-pattern">Second most-modded clientbound packet. Flight cancels S08 and sends spoofed C06 to maintain position. Speed cancels to prevent rubberbanding. Freecam cancels to keep camera free. NoRotate strips rotation. NoClip sends confirm + position back then cancels. FlagDetector auto-disables modules on S08 (lag-back detection). Backtrack buffers S08 for delayed processing to extend reach.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Flight — cancel S08 + spoof position
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// FlagDetector — auto-disable
-if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; speedModule.isEnabled()) speedModule.toggle();
-// NoRotate — strip yaw/pitch
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  s08.yaw = mc.thePlayer.rotationYaw;
-  s08.pitch = mc.thePlayer.rotationPitch;
-}
-// Freecam — cancel
-if (event.getPacket() instanceof S08PacketPlayerPosLook) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoRotate</span>
-<span class="impl-module-clients">(Mint B1, Gugustus, Tenacity 6.0, Sigma 4.11, Vestige 3.0, Astro 2.2.1, Flux B39.11)</span>
-</div>
-<p class="impl-pattern">Second most-modded clientbound packet. Flight cancels S08 and sends spoofed C06 to maintain position. Speed cancels to prevent rubberbanding. Freecam cancels to keep camera free. NoRotate strips rotation. NoClip sends confirm + position back then cancels. FlagDetector auto-disables modules on S08 (lag-back detection). Backtrack buffers S08 for delayed processing to extend reach.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Flight — cancel S08 + spoof position
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// FlagDetector — auto-disable
-if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; speedModule.isEnabled()) speedModule.toggle();
-// NoRotate — strip yaw/pitch
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  s08.yaw = mc.thePlayer.rotationYaw;
-  s08.pitch = mc.thePlayer.rotationPitch;
-}
-// Freecam — cancel
-if (event.getPacket() instanceof S08PacketPlayerPosLook) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Freecam</span>
-<span class="impl-module-clients">(Mint B1, Gugustus, Tenacity 6.0, Sigma 4.11, Vestige 3.0, Astro 2.2.1, Flux B39.11)</span>
-</div>
-<p class="impl-pattern">Second most-modded clientbound packet. Flight cancels S08 and sends spoofed C06 to maintain position. Speed cancels to prevent rubberbanding. Freecam cancels to keep camera free. NoRotate strips rotation. NoClip sends confirm + position back then cancels. FlagDetector auto-disables modules on S08 (lag-back detection). Backtrack buffers S08 for delayed processing to extend reach.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Flight — cancel S08 + spoof position
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// FlagDetector — auto-disable
-if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; speedModule.isEnabled()) speedModule.toggle();
-// NoRotate — strip yaw/pitch
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  s08.yaw = mc.thePlayer.rotationYaw;
-  s08.pitch = mc.thePlayer.rotationPitch;
-}
-// Freecam — cancel
-if (event.getPacket() instanceof S08PacketPlayerPosLook) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler</span>
-<span class="impl-module-clients">(Mint B1, Gugustus, Tenacity 6.0, Sigma 4.11, Vestige 3.0, Astro 2.2.1, Flux B39.11)</span>
-</div>
-<p class="impl-pattern">Second most-modded clientbound packet. Flight cancels S08 and sends spoofed C06 to maintain position. Speed cancels to prevent rubberbanding. Freecam cancels to keep camera free. NoRotate strips rotation. NoClip sends confirm + position back then cancels. FlagDetector auto-disables modules on S08 (lag-back detection). Backtrack buffers S08 for delayed processing to extend reach.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>package epsilon.modules.exploit;
+<p class="impl-pattern">Keep a spoofed airborne position by cancelling S08 teleports until the server confirms the fall, then accept the snap-back and slow the game clock.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketReceiveEvent, cancel S08 while the module has not been teleport-confirmed; keep broadcasting C03 packets and pin the client position to the launch point. The confirm is the S12 velocity packet: once motionY passes a threshold, teleported flips true, S08 is let through and timerSpeed drops to 0.3.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 - com/alan/clients/module/impl/movement/flight/MineLandFlight.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/module/impl/movement/flight/MineLandFlight.java =====
+package com.alan.clients.module.impl.movement.flight;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Queue;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.stream.Collectors;
-
-import org.apache.commons.lang3.RandomUtils;
-import org.lwjgl.input.Keyboard;
-
-import epsilon.Epsilon;
-import epsilon.events.Event;
-import epsilon.events.listeners.EventMotion;
-import epsilon.events.listeners.EventUpdate;
-import epsilon.events.listeners.packet.EventReceivePacket;
-import epsilon.events.listeners.packet.EventSendPacket;
-import epsilon.modules.Module;
-import epsilon.modules.ModuleManager;
-import epsilon.modules.movement.Fly;
-import epsilon.settings.setting.BooleanSetting;
-import epsilon.settings.setting.ModeSetting;
-import epsilon.settings.setting.NumberSetting;
-import epsilon.util.MoveUtil;
-import epsilon.util.Timer;
-import net.minecraft.network.play.client.C00PacketKeepAlive;
-import net.minecraft.network.play.client.C01PacketChatMessage;
-import net.minecraft.network.play.client.C02PacketUseEntity;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.value.Mode;
+import net.minecraft.network.Packet;
 import net.minecraft.network.play.client.C03PacketPlayer;
-import net.minecraft.network.play.client.C03PacketPlayer.C04PacketPlayerPosition;
-import net.minecraft.network.play.client.C03PacketPlayer.C05PacketPlayerLook;
-import net.minecraft.network.play.client.C03PacketPlayer.C06PacketPlayerPosLook;
-import net.minecraft.network.play.client.C07PacketPlayerDigging;
-import net.minecraft.network.play.client.C0BPacketEntityAction;
-import net.minecraft.network.play.client.C0CPacketInput;
-import net.minecraft.network.play.client.C0DPacketCloseWindow;
-import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
-import net.minecraft.network.play.client.C10PacketCreativeInventoryAction;
-import net.minecraft.network.play.client.C11PacketEnchantItem;
-import net.minecraft.network.play.client.C12PacketUpdateSign;
-import net.minecraft.network.play.client.C13PacketPlayerAbilities;
-import net.minecraft.network.play.client.C15PacketClientSettings;
-import net.minecraft.network.play.client.C16PacketClientStatus;
-import net.minecraft.network.play.client.C18PacketSpectate;
 import net.minecraft.network.play.server.S08PacketPlayerPosLook;
 import net.minecraft.network.play.server.S12PacketEntityVelocity;
-import net.minecraft.util.BlockPos;
-import net.minecraft.util.EnumFacing;
-import net.minecraft.network.play.client.C17PacketCustomPayload;
-import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.util.MathHelper;
+
+public class MineLandFlight extends Mode&lt;Flight&gt; {
+
+    private double serverPosX, serverPosY, serverPosZ;
+    private boolean teleported;
+
+    public MineLandFlight(String name, Flight parent) {
+        super(name, parent);
+    }
+
+    @Override
+    public void onEnable() {
+        serverPosX = mc.thePlayer.posX;
+        serverPosY = mc.thePlayer.posY;
+        serverPosZ = mc.thePlayer.posZ;
+        teleported = false;
+    }
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (!teleported) {
+
+            final double yaw = MoveUtil.direction();
+            final double speed = 6;
+
+            if (mc.thePlayer.ticksExisted % 3 == 0) {
+                PacketUtil.send(new C03PacketPlayer(mc.thePlayer.onGround));
+                mc.thePlayer.setPosition(serverPosX, serverPosY, serverPosZ);
+            }
+
+            event.setPosY(event.getPosY() - 1.1 + (mc.thePlayer.ticksExisted % 3 == 0 ? 0.42f : 0));
+            event.setPosX(event.getPosX() + MathHelper.sin((float) yaw) * speed);
+            event.setPosZ(event.getPosZ() - MathHelper.cos((float) yaw) * speed);
+
+        } else {
+            mc.timer.timerSpeed = 0.3f;
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof S08PacketPlayerPosLook &amp;&amp; !teleported) {
+            event.setCancelled();
+        } else if (packet instanceof S12PacketEntityVelocity) {
+            final S12PacketEntityVelocity wrapper = (S12PacketEntityVelocity) packet;
+
+            if (wrapper.getEntityID() == mc.thePlayer.getEntityId() &amp;&amp; wrapper.motionY / 8000D &gt; 0.5) {
+                teleported = true;
+            }
+        }
+    };
+}
+// NOTE (AI): Mode of the Rise 6.x Flight module tuned for the MineLand server family. The S08 handler cancels every teleport while teleported is false, so the spoofed position stream from PreMotion (posY dropped 1.1, 6 blocks per tick forward) is never snapped back. The teleport is only accepted once the server confirms the fall through an S12 velocity packet with motionY / 8000D &gt; 0.5, after which timerSpeed drops to 0.3. This cancel-then-accept pattern is the canonical S08 ground-spoof: cancel rubberbands while airborne, let the teleport through the moment the server has committed to the new position. The C03 broadcast every 3 ticks with setPosition back to serverPos pins the server-side bounding box at the launch point.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (S08, S12).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancelling rubberbands is the classic flight flag; the MineLand pattern defuses it by accepting the teleport the moment the server's own velocity check confirms the fall, so the client is never in a permanently-desynced state.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 Fly marks a setback on S08 in Hypixel and Hycraft modes; Rise 6.2.4 CreativeFlight tracks S08 into serverPos fields to replay the teleport through its own position buffer; Sigma Fly and Spicy Fly and BackupFly cancel S08 in Hypixel mode only; Tenacity FlightModule (Mineland Fling mode) cancels S08 until the S12 confirm and then sets timer speed to 1.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Speed</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99)</span>
+</div>
+<p class="impl-pattern">Treat S08 as a lag-back flag and disable the module, or cancel the teleport per server mode so the speed boost survives.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Memeware and Nekoware hook PacketInEvent: if the packet is S08 and the Flag Check setting is on, print a chat message and toggle the module off. Rise 5.99 Speed runs per-mode handlers: Zonecraft cancels S08 and re-sends C04, Vulcan2 cancels teleports inside 10 blocks, Hypixel2 cancels once, Minemenclub Hop resets its balance counter.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 - me/memewaredevs/client/module/movement/Speed.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/movement/Speed.java =====
+/*
+ * Decompiled with CFR 0.145.
+ *
+ * Could not load the following classes:
+ *  org.apache.commons.lang3.RandomUtils
+ */
+package me.memewaredevs.client.module.movement;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.event.events.MovementEvent;
+import me.memewaredevs.client.event.events.PacketInEvent;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+import me.memewaredevs.client.util.ChatUtil;
+import me.memewaredevs.client.util.CubeUtil;
+import me.memewaredevs.client.util.blocks.misc.BlockUtil;
+import me.memewaredevs.client.util.movement.DynamicFriction;
+import me.memewaredevs.client.util.movement.MovementUtils;
+import me.memewaredevs.client.util.packet.PacketUtil;
 import net.minecraft.network.play.client.C09PacketHeldItemChange;
-import net.minecraft.network.play.client.C0APacketAnimation;
-import net.minecraft.block.BlockAir;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.entity.EntityPlayerSP;
-import net.minecraft.client.gui.inventory.GuiChest;
-import net.minecraft.client.gui.inventory.GuiInventory;
-import net.minecraft.client.network.NetHandlerPlayClient;
-import net.minecraft.entity.Entity;
-import net.minecraft.entity.EntityLivingBase;
-import net.minecraft.entity.item.EntityBoat;
-import net.minecraft.entity.player.PlayerCapabilities;
-import net.minecraft.init.Blocks;
-import net.minecraft.item.ItemBlock;
-import net.minecraft.item.ItemStack;
+import net.minecraft.network.play.client.C18PacketSpectate;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import org.apache.commons.lang3.RandomUtils;
+
+import java.util.function.Consumer;
+
+public class Speed extends Module {
+    private DynamicFriction dynamicNCPFriction = new DynamicFriction();
+    private double speed, currentDistance, lastDistance;
+    public boolean prevOnGround;
+
+    public Speed() {
+        super("Speed", 33, Module.Category.MOVEMENT);
+        addModes("Vanilla", "PvPTemple", "Mineplex", "Mineplex2", "Cubecraft Slow", "NCP Fast", "Cubecraft Fast", "Hypixel");
+        addBoolean("Flag Check", true);
+        addDouble("Vanilla", "Speed", 0.47, 0.25, 5);
+    }
+
+    @Handler
+    public Consumer&lt;PacketInEvent&gt; eventConsumer0 = (event) -&gt; {
+        if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; getBool("Flag Check")) {
+            if (mc.thePlayer != null &amp;&amp; mc.theWorld != null) {
+                ChatUtil.printChat("Speed disabled because you flagged/got teleported!");
+                toggle();
+            }
+        }
+
+    };
+
+    @Handler
+    public Consumer&lt;MovementEvent&gt; eventConsumer1 = (event) -&gt; {
+        if (isMode("Mineplex2")) {
+            if (airSlot() == -10){
+                return;
+            }
+            if (mc.thePlayer.ticksExisted % 3 == 0 &amp;&amp; mc.thePlayer.isMovingOnGround()) {
+                PacketUtil.sendPacketSilent(new C09PacketHeldItemChange(Speed.airSlot()));
+                BlockUtil.placeHeldItemUnderPlayer();
+                speed += 0.125F;
+            }
+            else {
+                PacketUtil.sendPacketSilent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));
+                speed *= 0.98;
+            }
+            if (speed &gt; 1.24) {
+                speed = 1.24;
+            }
+            MovementUtils.setMoveSpeed(event, speed);
+        }
+        if (isMode("PvPTemple")) {
+            if (mc.thePlayer.isMovingOnGround()) {
+                event.setY(mc.thePlayer.motionY = 0.42F);
+                speed = 0.5;
+                prevOnGround = true;
+            }
+            else if (prevOnGround) {
+                speed = 0.8;
+                prevOnGround = false;
+            }
+            else {
+                speed *= 0.932;
+            }
+            MovementUtils.setMoveSpeed(event, speed);
+        }
+
+        if (isMode("Vanilla")) {
+            double max = this.getDouble("Vanilla", "Speed");
+            MovementUtils.setMoveSpeed(event, max);
+        }
+        if (isMode("Cubecraft Slow")) {
+            PacketUtil.sendPacketSilent(new C18PacketSpectate(CubeUtil.CUBECRAFT_UUID));
+            mc.gameSettings.keyBindJump.pressed = false;
+            if (mc.thePlayer.ticksExisted % 4 == 0) {
+                MovementUtils.setMoveSpeed(event, MovementUtils.getBaseMoveSpeed() + 1.276444466666);
+            }
+            else {
+                MovementUtils.setMoveSpeed(event, MovementUtils.getBaseMoveSpeed() + 1.0E-12);
+            }
+        }
+
+        if (isMode("Cubecraft Fast")) {
+            mc.gameSettings.keyBindJump.pressed = false;
+            mc.thePlayer.cameraYaw = 0;
+            if(mc.thePlayer.ticksExisted % 4 == 0)
+                MovementUtils.setMoveSpeed(event, MovementUtils.getBaseMoveSpeed() + 1.55522225D);
+            else
+                MovementUtils.setMoveSpeed(event, MovementUtils.getBaseMoveSpeed());
+
+            if (mc.thePlayer.isMoving() &amp;&amp; mc.thePlayer.onGround &amp;&amp; mc.thePlayer.ticksExisted % 4 == 0)
+                mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY + 0.0922222333D * RandomUtils.nextDouble(0.75D, 1D), mc.thePlayer.posZ);
+
+            if(mc.thePlayer.ticksExisted % 8 == 0)
+                MovementUtils.offsetXZ(0.12115522522);
+        }
+        if (isMode("Mineplex")) {
+            mc.timer.timerSpeed = 1.0F;
+            if (mc.thePlayer.isMovingOnGround()) {
+                mc.timer.timerSpeed = 1F;
+                event.setY(mc.thePlayer.motionY = 0.4F);
+                prevOnGround = true;
+                currentDistance = speed;
+                speed = 0;
+            } else {
+                mc.timer.timerSpeed = 1.0F;
+                if (prevOnGround) {
+                    speed = currentDistance + 0.56F;
+                    prevOnGround = false;
+                } else {
+                    speed = lastDistance * (speed &gt; 2.2 ? 0.975 : speed &gt;= 1.5 ? 0.98 : 0.985);
+                }
+            }
+            double max = this.getDouble("Vanilla", "Speed");
+            MovementUtils.setMoveSpeed(event, Math.max(Math.min(speed, max), prevOnGround ? 0 : 0.42));
+        }
+
+        if (isMode("Vanilla")) {
+            MovementUtils.setMoveSpeed(event, getDouble("Vanilla", "Speed"));
+        }
+
+        if (isMode("Hypixel")) {
+            mc.timer.timerSpeed = 1F;
+
+            if(mc.thePlayer.isMovingOnGround()) {
+                mc.timer.timerSpeed = 1.25F;
+                event.setY(mc.thePlayer.motionY = 0.3999175222222555F);
+                speed = MovementUtils.getBaseMoveSpeed() * 2.1492287832;
+                prevOnGround = true;
+            }
+            else {
+                if (prevOnGround) {
+                    speed -= 0.66333332222 * (speed - MovementUtils.getBaseMoveSpeed());
+                    prevOnGround = false;
+                }
+                else {
+                    speed -= speed / 160 - 1.0E-9;
+                }
+            }
+            MovementUtils.setMoveSpeed(event, speed);
+        }
+        if (isMode("NCP Fast")) {
+            this.dynamicNCPFriction.updateFriction(event, 0.3928999999, 1.14999, 159, 0.66);
+        }
+    };
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer2 = (event) -&gt; {
+        if (event.isPre()) {
+            if (isMode("Hypixel")) {
+                event.setY(event.getY() + 1.73E-11D);
+            }
+            double x = mc.thePlayer.posX - mc.thePlayer.prevPosX;
+            double z = mc.thePlayer.posZ - mc.thePlayer.prevPosZ;
+            this.lastDistance = Math.hypot(x, z);
+        }
+    };
+
+    public static int airSlot() {
+        for (int j = 0; j &lt; 8; ++j) {
+            if (mc.thePlayer.inventory.mainInventory[j] == null) {
+                return j;
+            }
+        }
+        ChatUtil.printChat("Clear a hotbar slot.");
+        return -10;
+    }
+
+    @Override
+    public void onEnable() {
+        speed = 0;
+        prevOnGround = true;
+        lastDistance = 0;
+    }
+
+    @Override
+    public void onDisable() {
+        if (isMode("Mineplex2")) {
+            PacketUtil.sendPacketSilent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));
+        }
+        mc.thePlayer.jumpMovementFactor = 0.0F;
+        MovementUtils.setMoveSpeed(0);
+        mc.timer.timerSpeed = 1.0F;
+
+        if (isMode("Cubecraft Fast") || isMode("Cubecraft Slow")) {
+            mc.thePlayer.motionY = 0F;
+            mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY + 0.2664444, mc.thePlayer.posZ);
+        }
+    }
+}
+// NOTE (AI): The S08 hook is the Flag Check: any S08PacketPlayerPosLook while the setting is enabled is treated as a lag-back and the module toggles itself off with a chat message. This is the crude version of what Rise 5.99 Speed does per-mode (Zonecraft cancels S08 and re-sends C04, Vulcan2 cancels teleports inside 10 blocks, Hypixel2 cancels once, Minemenclub Hop resets its balance counter) and of Tenacity's auto-disable pattern. Nekoware v1 ships the identical Speed.java with the same Flag Check. The CFR decompiler header shows the 1.5.2-era codebase carried into 7.3; the Mineplex2 mode also abuses C09PacketHeldItemChange to place blocks under the player while running.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketInEvent / PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Auto-disable on S08 is the safest reaction because a teleport means the speed boost was already flagged; the chat message is a tell that the module was active, but the server only sees the movement it already flagged.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Nekoware v1 ships the identical Speed.java with the same Flag Check. Rise 5.99 adds the disableOnFlag setting that toggles the module off with a notification on any S08.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Use S08 as the trigger to re-arm spoofing windows, strip rotations, or nudge the teleport position to break server-side state checks.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 6.x VerusCustomDisabler sets disable = -20 on every S08 and re-arms PingSpoofComponent.spoof only after the position history is clean, holding C00 and C0F for 9 seconds. Memeware Disabler in Sloth mode adds 1.0E-4 to the S08 y to trip a spigot PlayerData nulling bug. Sigma Disabler rewrites S08 yaw and pitch and toggles itself off after the Hypixel watchdog window.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 - com/alan/clients/module/impl/exploit/disabler/VerusCustomDisabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/module/impl/exploit/disabler/VerusCustomDisabler.java =====
+package com.alan.clients.module.impl.exploit.disabler;
+
+import com.alan.clients.component.impl.player.PingSpoofComponent;
+import com.alan.clients.component.impl.render.NotificationComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PostStrafeEvent;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.impl.exploit.Disabler;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.module.impl.movement.Speed;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.BooleanValue;
 import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+
+public class VerusCustomDisabler extends Mode&lt;Disabler&gt; {
+
+    private final BooleanValue movementDisabler = new BooleanValue("Movement", this, false);
+    private final BooleanValue sprintDisabler = new BooleanValue("Sprint", this, false);
+
+    private Flight flight = null;
+    private Speed speed = null;
+    private int disable;
+
+    public VerusCustomDisabler(String name, Disabler parent) {
+        super(name, parent);
+    }
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (sprintDisabler.getValue() &amp;&amp; MoveUtil.isMoving() &amp;&amp; mc.thePlayer.ticksExisted &gt; 50) {
+           if (mc.thePlayer.ticksExisted % 5 == 0) {
+               if (mc.thePlayer.ticksExisted % 10 == 0) {
+                   PacketUtil.sendNoEvent(new C0BPacketEntityAction(mc.thePlayer,
+                           C0BPacketEntityAction.Action.START_SPRINTING));
+               } else {
+                   PacketUtil.sendNoEvent(new C0BPacketEntityAction(mc.thePlayer,
+                           C0BPacketEntityAction.Action.STOP_SPRINTING));
+               }
+           }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceive = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof S08PacketPlayerPosLook) {
+            S08PacketPlayerPosLook posLook = ((S08PacketPlayerPosLook) packet);
+
+            disable = -20;
+        }
+
+    };
+
+    @EventLink
+    public final Listener&lt;PostStrafeEvent&gt; onPostStrafeEvent = event -&gt; {
+        if (movementDisabler.getValue()) {
+            int time = 9;
+
+            disable++;
+
+            if (mc.thePlayer.ticksExisted &gt; time * 20 &amp;&amp; disable &gt; 0) {
+                PingSpoofComponent.spoof(time * 1000, true, false, true, false);
+            }
+
+            if (mc.thePlayer.ticksSincePlayerVelocity &gt; 20 * (time) || disable &lt;= 0 || mc.thePlayer.ticksExisted &lt;= time * 2 * 20) {
+                if (speed == null) {
+                    speed = getModule(Speed.class);
+                }
+
+                if (speed.isEnabled()) {
+                    speed.toggle();
+                    MoveUtil.stop();
+                    NotificationComponent.post("Auto Toggle", "Automatically disabled Speed to prevent flags", 1000);
+                }
+            }
+
+            if (mc.thePlayer.ticksSincePlayerVelocity &gt; 20 * (time / 2) || disable &lt;= 0 || mc.thePlayer.ticksExisted &lt;= time * 2 * 20) {
+                if (flight == null) {
+                    flight = getModule(Flight.class);
+                }
+
+                if (flight.isEnabled()) {
+                    flight.toggle();
+                    NotificationComponent.post("Auto Toggle", "Automatically disabled Flight to prevent flags", 1000);
+                }
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (sprintDisabler.getValue() &amp;&amp; packet instanceof C0BPacketEntityAction) {
+            C0BPacketEntityAction c0b = ((C0BPacketEntityAction) packet);
+
+            if (c0b.getAction() == C0BPacketEntityAction.Action.START_SPRINTING ||
+                    c0b.getAction() == C0BPacketEntityAction.Action.STOP_SPRINTING) {
+                event.setCancelled();
+            }
+        }
+    };
+
+}
+// NOTE (AI): S08 is the re-arm trigger: every teleport sets disable = -20, which suppresses the PingSpoofComponent re-arm for 20 post-strafe events. The disabler only starts spoofing once the position history is clean (disable &gt; 0 and ticksSincePlayerVelocity past 9 seconds), then holds C00/C0F for 9 seconds so Verus sees a frozen position window. The movement disabler auto-toggles Speed and Flight if the server keeps applying velocity, which is the S08-means-flag family pattern seen in Memeware Speed and Tenacity. The sprint disabler cancels C0B sprint toggles and re-emits them on a 5-tick cycle via PacketUtil.sendNoEvent, bypassing the event bus.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent; re-arm via PingSpoofComponent.spoof from PostStrafeEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Correlating the spoof window to S08 arrivals keeps the buffered packet stream aligned with the server's position state, which is what makes the frozen-window pattern hard to distinguish from genuine lag.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware 7.3 Sloth mode mutates the y by 1.0E-4 (spigot PlayerData exploit); Sigma 4.11 rewrites rotations and auto-disables after the Hypixel watchdog window; Rise 6.2.4 adds WatchdogDisabler alongside VerusCustomDisabler; Tenacity 6.0 keeps only commented S08 code in AdvancedDisablerModule, and Spicy and Nekoware reference S08 as imports without handling it.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoRotate</span>
+<span class="impl-module-clients">(Rise 5.99, Sigma 4.11)</span>
+</div>
+<p class="impl-pattern">Prevent servers from forcing the player's rotation: overwrite the S08 yaw and pitch with the client's current values before the vanilla handler applies them.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 5.99 NoRot stores the server rotation and overwrites the packet fields per mode: Vanilla replaces both fields, Delay replays the saved rotation on the next PreMotion, Legit applies it only if the mouse has not moved since. Sigma 4.11 NoRotate does the same unconditionally on incoming S08.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 - dev/rise/module/impl/other/NoRot.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/NoRot.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.other;
+
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.ModeSetting;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+
+@ModuleInfo(name = "NoRot", description = "Prevents servers from modifying your rotation", category = Category.OTHER)
+public final class NoRot extends Module {
+
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Vanilla", "Vanilla", "Packet", "Delay", "Legit", "Edit", "Hypixel");
+    private Float yaw, pitch;
+    private Float startingYaw, startingPitch;
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof S08PacketPlayerPosLook) {
+            final S08PacketPlayerPosLook teleport = (S08PacketPlayerPosLook) packet;
+
+            switch (mode.getMode()) {
+                case "Vanilla":
+                    yaw = teleport.yaw;
+                    pitch = teleport.pitch;
+
+                    teleport.yaw = mc.thePlayer.rotationYaw;
+                    teleport.pitch = mc.thePlayer.rotationPitch;
+                    break;
+
+                case "Delay":
+                    yaw = mc.thePlayer.rotationYaw;
+                    pitch = mc.thePlayer.rotationPitch;
+                    break;
+
+                case "Legit":
+                    yaw = teleport.getYaw();
+                    pitch = teleport.getPitch();
+                    startingYaw = mc.thePlayer.rotationYaw;
+                    startingPitch = mc.thePlayer.rotationPitch;
+
+                    teleport.yaw = mc.thePlayer.rotationYaw;
+                    teleport.pitch = mc.thePlayer.rotationPitch;
+                    break;
+            }
+        }
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        switch (mode.getMode()) {
+            case "Delay":
+                if (yaw != null &amp;&amp; pitch != null) {
+                    mc.thePlayer.rotationYaw = yaw;
+                    mc.thePlayer.rotationPitch = pitch;
+
+                    yaw = null;
+                    pitch = null;
+                }
+                break;
+
+            case "Legit":
+                if (yaw != null &amp;&amp; pitch != null &amp;&amp; startingYaw != null &amp;&amp; startingPitch != null) {
+                    if (startingYaw == event.getYaw() &amp;&amp; startingPitch == event.getPitch()) {
+                        event.setYaw(yaw);
+                        event.setPitch(pitch);
+                    } else {
+                        startingPitch = startingYaw = yaw = pitch = null;
+                    }
+                }
+                break;
+        }
+    }
+}
+// NOTE (AI): Pure rotation strip. The S08 yaw and pitch are overwritten with the client's current rotation before the vanilla handler applies them, so the server's forced rotation never lands. The Vanilla mode stores the server rotation and replays it on the next PreMotion; Delay mode defers it explicitly; Legit mode only applies the stored rotation if the mouse has not moved since. Keeping the real server yaw and pitch lets ClickTP, Freecam and aim modules keep working off true values. Sigma 4.11's NoRotate is the same idea with one unconditional mode: yaw and pitch are replaced with the client's, no restore path.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (S08), PreMotionEvent (rotation replay).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The confirm echoes the rewritten rotation, so the server records the client's real aim; servers that enforce rotation on teleport (some kit servers) will loop teleports, which is why the Legit mode exists.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 Freelook also rewrites S08 rotations in its camera handling; Sigma 4.11 has no restore path and no mode switch.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Phase / Blink</span>
+<span class="impl-module-clients">(Sigma 4.11, Rise 6.2.4, Rise 6.1.30, Spicy)</span>
+</div>
+<p class="impl-pattern">Suppress the block push and track teleport pressure: S08 packets are counted as the server's attempt to eject the player from a block.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 6.x VulcanPhase increments teleportCount on every S08 and stands its state machine down after four, letting blocks push the player out; it also cancels PushOutOfBlockEvent and fakes onGround = false while inside a block. Sigma Phase and Blink handle S08 on their packet bus to mask teleports during blink windows.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 - com/alan/clients/module/impl/movement/phase/VulcanPhase.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/module/impl/movement/phase/VulcanPhase.java =====
+package com.alan.clients.module.impl.movement.phase;
+
+import com.alan.clients.component.impl.render.SmoothCameraComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.motion.PushOutOfBlockEvent;
+import com.alan.clients.event.impl.motion.StrafeEvent;
+import com.alan.clients.event.impl.other.BlockAABBEvent;
+import com.alan.clients.event.impl.other.TickEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.impl.movement.Phase;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.util.player.PlayerUtil;
+import com.alan.clients.util.player.SlotUtil;
+import com.alan.clients.value.Mode;
+import net.minecraft.block.BlockAir;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.potion.Potion;
+import net.minecraft.util.AxisAlignedBB;
+
+public class VulcanPhase extends Mode&lt;Phase&gt; {
+
+    private boolean teleport = false;
+
+    private boolean speed2 = false;
+    private boolean enable = true;
+    private int teleportCount = 0;
+    private int timer1 = 0;
+    private int tickCounter = 0;
+    private boolean lastRightClick = false;
+    private boolean done = true;
+    private boolean flag = true;
+
+    public VulcanPhase(String name, Phase parent) {
+        super(name, parent);
+    }
+    @Override
+    public void onEnable() {
+        speed2 = false;
+        done = true;
+        flag = true;
+        timer1 = 0;
+        teleportCount = 0;
+        teleport = false;
+       enable = true;
+       if( mc.thePlayer.onGround ){
+            mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY - 1, mc.thePlayer.posZ);
+            MoveUtil.stop();
+        } else{
+           ChatUtil.display("You must me on the ground to do this");
+           getModule(Phase.class).toggle();
+       }
+
+    }
+
+    @Override
+    public void onDisable() {
+        speed2 = false;
+    }
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotion = event -&gt; {
+        mc.thePlayer.cameraYaw = 0.1F;
+if( timer1 &gt; 25) {
+
+    if(PlayerUtil.insideBlock()) {
+if(mc.thePlayer.motionY&gt;0){
+
+}
+
+        mc.thePlayer.onGround = false;
+
+        }
 
 
+}
 
-public class Disabler extends Module {
-	private final Queue&lt;Packet&gt; packetQueue = new ConcurrentLinkedDeque&lt;&gt;();
+        if(PlayerUtil.insideBlock()){
+            timer1++;
+        }
 
-	private final Queue&lt;Packet&gt; packetQueueC0fOnly = new ConcurrentLinkedDeque&lt;&gt;();
 
-	private final Queue&lt;Packet&gt; packetQueueC00Only = new ConcurrentLinkedDeque&lt;&gt;();
+        if(done &amp;&amp; timer1&lt;25) {
+
+            SmoothCameraComponent.setY();
+
+        } else if(flag){
+
+        }
+
+if((PlayerUtil.insideBlock() &amp;&amp; !enable &amp;&amp; flag)){
+    flag = false;
+    ChatUtil.display("Phased");
+
+        }
+
+        if((PlayerUtil.insideBlock() &amp;&amp; !enable)){
+
+        }
+
+    };
+
+    @EventLink
+    public final Listener&lt;BlockAABBEvent&gt; onBlockAABB = event -&gt; {
+        if (PlayerUtil.insideBlock()) {
+
+
+            event.setBoundingBox(null);
+
+            // Sets The Bounding Box To The Players Y Position.
+            if (!(event.getBlock() instanceof BlockAir) &amp;&amp; !mc.gameSettings.keyBindSneak.isKeyDown()) {
+                final double x = event.getBlockPos().getX(), y = event.getBlockPos().getY(), z = event.getBlockPos().getZ();
+
+                if (y &lt; mc.thePlayer.posY) {
+                    event.setBoundingBox(AxisAlignedBB.fromBounds(-15, -1, -15, 15, 1, 15).offset(x, y, z));
+                }
+            }
+        } else if (!teleport){
+
+
+            if (event.getBlock() instanceof BlockAir &amp;&amp; !mc.thePlayer.isSneaking()) {
+                final double x = event.getBlockPos().getX(), y = event.getBlockPos().getY(), z = event.getBlockPos().getZ();
+
+                if (y &lt; mc.thePlayer.posY) {
+                    event.setBoundingBox(AxisAlignedBB.fromBounds(-15, -1, -15, 15, 1, 15).offset(x, y, z));
+                }
+            }
+        }
+
+        else if (teleport &amp;&amp; !PlayerUtil.insideBlock()){
+            ChatUtil.display("Disabled due to not being in a block");
+            getModule(Phase.class).toggle();
+
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;TickEvent&gt; onTick = event -&gt; {
+    };
+
+    @EventLink
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+        int blockSlot = SlotUtil.findBlock();
+
+        if(mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; mc.thePlayer.hurtTime&gt;0){
+            mc.thePlayer.motionY=.99;
+        } else if (mc.gameSettings.keyBindSneak.isKeyDown()){
+            mc.thePlayer.motionY=-.4;
+        } else if (!mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; PlayerUtil.insideBlock() &amp;&amp;  timer1 &gt; 25){
+
+            mc.thePlayer.motionY=0;
+
+        }
+        if(PlayerUtil.insideBlock()) {
+
+            if (mc.thePlayer.isPotionActive(Potion.moveSpeed)) {
+                event.setSpeed(((.0765*(1+(mc.thePlayer.getActivePotionEffect(Potion.moveSpeed).getAmplifier()))) +.306));
+            } else {
+                event.setSpeed(.306);
+            }
+
+        }
+
+        if (mc.thePlayer.onGround &amp;&amp; enable &amp;&amp; teleport){
+
+mc.thePlayer.jump();
+            teleport = false;
+            enable = false;
+
+        }
+        if (mc.thePlayer.onGround &amp;&amp; !teleport &amp;&amp;!enable) {
+
+            if (mc.thePlayer.ticksExisted % 2 == 1|| !(mc.thePlayer.moveForward ==0 )) {
+
+                event.setForward(1);
+            } else {
+                MoveUtil.strafe(0);
+                event.setForward(-1);
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceive = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof S08PacketPlayerPosLook) {
+            teleport = true;
+            teleportCount++;
+
+        }
+
+        if (teleportCount &gt; 4) {
+
+            done = false;
+
+        } else{
+            done = true;
+        }
+
+    };
+
+    @EventLink
+    public final Listener&lt;PushOutOfBlockEvent&gt; onPushOutOfBlock = event -&gt; {
+        event.setCancelled();
+    };
+
+}
+// NOTE (AI): Teleport-counting phase. Every S08 increments teleportCount and raises the teleport flag; after 4 teleports the module drops done to false so BlockAABBEvent stops suppressing collisions and the server can push the player out. The S08 stream is the signal that Vulcan detected the phase and is forcing the player out; the module uses the count to wind down its own state machine instead of fighting the teleport directly. PreMotion also fakes onGround = false while inside a block so the server's ground state cannot snap the player, and PushOutOfBlockEvent is cancelled outright.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent; BlockAABBEvent and PushOutOfBlockEvent for the collision side.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Fighting the eject teleport directly is a permanent-flag loop; counting teleports and self-disabling after a threshold is the pattern that survives because the server eventually succeeds and the module is already off.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Sigma 4.11 Phase and Blink read S08 on EventPacket; Spicy Phase imports S08 without handling it in the shipped build.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiVoid</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30, Spicy)</span>
+</div>
+<p class="impl-pattern">Use the S08 teleport as the rescue signal: when the server lag-backs the falling player, reset fallDistance so the server's own teleport becomes the save.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Spicy AntiVoid in Hypixel mode hooks EventPacket: on S08 while off ground, past fallDistance 20 (or below y = 0) and over void, it zeroes fallDistance. The EventUpdate path then bounces once per fall with a C03 onGround and a C04 at posY + 12. Rise VulcanAntiVoid clears its noBlock flag on S08 to re-arm the jump suppression.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy - info/spicyclient/modules/player/AntiVoid.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/player/AntiVoid.java =====
+package info.spicyclient.modules.player;
+
+import java.util.Random;
+
+import org.apache.commons.lang3.StringUtils;
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.SpicyClient;
+import info.spicyclient.chatCommands.Command;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventChatmessage;
+import info.spicyclient.events.listeners.EventMotion;
+import info.spicyclient.events.listeners.EventPacket;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.notifications.Color;
+import info.spicyclient.notifications.NotificationManager;
+import info.spicyclient.notifications.Type;
+import info.spicyclient.settings.BooleanSetting;
+import info.spicyclient.settings.ModeSetting;
+import info.spicyclient.settings.NumberSetting;
+import info.spicyclient.util.MovementUtils;
+import info.spicyclient.util.Timer;
+import net.minecraft.block.BlockAir;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.MathHelper;
+
+public class AntiVoid extends Module {
 	
+	public BooleanSetting jumpFirst = new BooleanSetting("Jump first", false);
+	private ModeSetting mode = new ModeSetting("Mode", "Hypixel", "Hypixel");
 	
-	private double x,y,z, yaw, pitch;
-	public static boolean hypixelStrafe, desyncrot;
-	private boolean matrixswitch, verusVoid, watchdogStrafed;
-	
-	private Timer timer = new Timer();
-
-
-	public BooleanSetting Watchdog2020 = new BooleanSetting ("Watchdog2020", false);
-	public BooleanSetting spigot = new BooleanSetting ("SpigotData", false);
-	public BooleanSetting C0F = new BooleanSetting ("C0FData", false);
-	public BooleanSetting C00 = new BooleanSetting ("C00Key", false);
-	public BooleanSetting hsd = new BooleanSetting ("HypixelStrafe", false);
-	public BooleanSetting watchdog = new BooleanSetting ("HypixelTimerTest", false);
-	public BooleanSetting karhu = new BooleanSetting ("KarhuMovement", false);
-	public BooleanSetting ver = new BooleanSetting ("Verus", false);
-	
-	public BooleanSetting loyisaNCP = new BooleanSetting ("NCP", false);
-	public BooleanSetting ncpM = new BooleanSetting ("NCPModulCheck", false);
-	public BooleanSetting pp = new BooleanSetting ("PurplePrison", false);
-	public BooleanSetting spartan = new BooleanSetting ("Spartan", false);
-	public BooleanSetting rede = new BooleanSetting ("Redesky", false);
-	public BooleanSetting wz = new BooleanSetting ("Warzone", false);
-	public BooleanSetting ml = new BooleanSetting ("MineLatino", false);
-	public BooleanSetting zc = new BooleanSetting ("Zonecraft", false);
-	public BooleanSetting had = new BooleanSetting ("Hazel", false);
-	public BooleanSetting matrixstrafe = new BooleanSetting("MatrixSemiStrafe",false);
-	public BooleanSetting superc = new BooleanSetting("SupercraftSkywars", false);
-	public BooleanSetting verusfly = new BooleanSetting("VerusLatestFly", false);
-	public BooleanSetting mineLatino = new BooleanSetting("Test", false);
-	public BooleanSetting matrix = new BooleanSetting("Matrix4.04Damage", false);
-	public BooleanSetting vcmbt = new BooleanSetting("VerusCombat", false);
-	public BooleanSetting vst = new BooleanSetting ("KauriMovement", false);
-	public BooleanSetting test = new BooleanSetting("RotationDesync", false);
-	public BooleanSetting interact = new BooleanSetting("Interact", false);
-	public BooleanSetting entityact = new BooleanSetting("EntityAction", false);
-	public ModeSetting et = new ModeSetting ("EntityActType", "Jump", "Jump", "Sneak", "StopSneak", "Sprint", "Stop Sprint", "Sleep", "Inventory");
-	public ModeSetting ea = new ModeSetting("EntityTargetMode", "Self", "Self", "Random");
-	public BooleanSetting voidtp = new BooleanSetting("VoidTP", false);
-	public BooleanSetting goofyC0C = new BooleanSetting("GoofyC0C", false);
-	public BooleanSetting inp = new BooleanSetting("Input", false);
-	public BooleanSetting dig = new BooleanSetting ("Dig", false);
-	public ModeSetting digtype = new ModeSetting("DigType", "Under", "Under", "Self", "OutOfBounds", "Unloaded");
-	public BooleanSetting place = new BooleanSetting("Place", false);
-	public ModeSetting placetype = new ModeSetting("Placetype", "Under", "Under", "Self", "OutOfBounds", "Unloaded");
-	public BooleanSetting confirmtransaction = new BooleanSetting("ConfirmTransaction", false);
-	public ModeSetting transactiontype = new ModeSetting("TransType", "Delayed", "Delayed", "Cancel");
-	public BooleanSetting creativeact = new BooleanSetting("CreativeAction", false);
-	public BooleanSetting abilities = new BooleanSetting("Abilities", false);
-	public BooleanSetting respawn = new BooleanSetting("Respawn", false);
-	public BooleanSetting spectate = new BooleanSetting("Spectate", false);
-	public static ModeSetting mode = new ModeSetting("ModeDisplay", "Watchdog", "Watchdog","2020Watchdog", "Verus" ,"SpigotData", "C0FData","C00Key", "Minelatino", "Karhu", "Kauri", "UpdatedNCP","VerusCombat", "Supercraft", "MatrixSemiStrafe","RotationDesync", "Interact","Entity", "Void", "SteerMAX", "Steer", "C04", "RoundedPos", "RoundedRot", "Bounds", "Dig", "Place", "NullChange", "C0F", "CreativeAction", "Abilities", "Respawn", "Spectate");
-	
-	float vulcanyaw;
-	double groundpos;
-	
-	public Disabler(){
-		super("Disabler", Keyboard.KEY_F, Category.EXPLOIT, "Cripples anticheats");
-		this.addSettings(hsd, watchdog, Watchdog2020,spigot, C0F, C00,ver,karhu, loyisaNCP, ncpM, pp, spartan, rede,zc,wz,ml,had,matrixstrafe,superc,matrix,verusfly,vcmbt,vst,test,interact,entityact,et, ea,voidtp, inp,goofyC0C, dig,digtype,place, placetype,confirmtransaction, transactiontype,creativeact, abilities, respawn, spectate, mode);
+	public AntiVoid() {
+		super("Anti Void", Keyboard.KEY_NONE, Category.PLAYER);
+		resetSettings();
 	}
 	
+	@Override
+	public void resetSettings() {
+		this.settings.clear();
+		this.addSettings(mode, jumpFirst);
+	}
 	
-	public void onEnable(){
-		verusVoid = watchdogStrafed = false;
-		timer.reset();
-		packetQueue.clear();
-		if(verusfly.isEnabled()) {
-			Epsilon.addChatMessage("Verusfly will not work with blocks in your hand btw");
-		}
-		matrixswitch = false;
-		if(vst.isEnabled()) {
-			vulcanyaw = mc.thePlayer.cameraYaw;
-		}
-		
-	
-		hypixelStrafe = false;
-	
-		
-		if(matrix.isEnabled()) {
-			Epsilon.addChatMessage("Hit yourself with a projectile whilst jumping, enable fly while in air and profit. (colliding with a block will end it)");
-		}
+	public void onEnable() {
 		
 	}
 	
-	public void onDisable(){
-		desyncrot = false;
-		hypixelStrafe = false;
-		mc.thePlayer.isDead = false;
-		for(Packet packet : packetQueue) {
-			mc.getNetHandler().sendPacketNoEvent(packet);
-		}
-		packetQueue.clear();
+	public void onDisable() {
+		
 	}
 	
-	 
-	public void onEvent(Event e){
+	public static boolean bounced = false;
+	
+	public void onEvent(Event e) {
 		
-		
-		if(e instanceof EventReceivePacket &amp;&amp; mc.getNetHandler()!=null) {
+		if (e instanceof EventPacket) {
 			
-
-			Packet p = e.getPacket();
-			
-			if(p instanceof S08PacketPlayerPosLook &amp;&amp; mc.getNetHandler().doneLoadingTerrain &amp;&amp; hsd.isEnabled()) {
+			if (e.isPre()) {
 				
-				watchdogStrafed = true;
+				boolean isOverVoid = true;
+				BlockPos block = mc.thePlayer.getPosition();
 				
-			}
-			
-			if(spigot.isEnabled() &amp;&amp; p instanceof S08PacketPlayerPosLook) {
-
-				final S08PacketPlayerPosLook packet = (S08PacketPlayerPosLook) p;
-				packet.y+= 1.0E-4;
-			}
-			
-			if(ver.isEnabled() &amp;&amp; verusVoid &amp;&amp; p instanceof S08PacketPlayerPosLook) {
-
-			}
-			
-			if(loyisaNCP.isEnabled()&amp;&amp; mc.getNetHandler().doneLoadingTerrain) {
-
-
-				if(p instanceof S08PacketPlayerPosLook) {
-
-					S08PacketPlayerPosLook packet = (S08PacketPlayerPosLook) p;
-					MoveUtil move = new MoveUtil();
+				for (int i = (int) mc.thePlayer.posY; i &gt; 0; i--) {
 					
-					boolean acceptedX = (move.getXZDifference(mc.thePlayer.posX, mc.thePlayer.posZ, packet.x, packet.x)[0] &gt; 0);
-					boolean acceptedZ = (move.getXZDifference(mc.thePlayer.posX, mc.thePlayer.posZ, packet.x, packet.x)[1] &gt; 0);
-
-			        boolean m = true;
-			        boolean fly = false;
-					mc.getNetHandler().sendPacketNoEvent(new C06PacketPlayerPosLook(packet.x, packet.y, packet.z, packet.yaw, packet.pitch, true));
+					if (isOverVoid) {
+						
+						if (!(mc.theWorld.getBlockState(block).getBlock() instanceof BlockAir)) {
 							
-			        
-
+							isOverVoid = false;
+							
+						}
+						
+					}
+					
+					block = block.add(0, -1, 0);
+					
 				}
 				
-				
-			}
-			
-			if(spartan.isEnabled() &amp;&amp; mc.getNetHandler().doneLoadingTerrain) {
-				
-				
-			}
-			
-			if(rede.isEnabled() &amp;&amp; mc.getNetHandler().doneLoadingTerrain) {
-				
-					if(p instanceof S08PacketPlayerPosLook) {
-						S08PacketPlayerPosLook packet = (S08PacketPlayerPosLook) p;
-	        			e.setCancelled();
-	        			mc.getNetHandler().sendPacketNoEvent(new C06PacketPlayerPosLook(packet.x, packet.y, packet.z, packet.yaw, packet.pitch, mc.thePlayer.onGround));
-	        			
-	        			
-	        			
-	    			}
-					if(p instanceof S12PacketEntityVelocity) {
-						e.setCancelled();
+				try {
+					if (mode.is("Hypixel") &amp;&amp; ((EventPacket) e).packet instanceof S08PacketPlayerPosLook &amp;&amp; !MovementUtils.isOnGround(0.001) &amp;&amp; (mc.thePlayer.fallDistance &gt;= 20.0f || mc.thePlayer.posY &lt; 0) &amp;&amp; isOverVoid) {
+						
+						mc.thePlayer.fallDistance = 0;
+						
 					}
+				} catch (NullPointerException e2) {
+					
+				}
+				
 			}
-		}
-		
-		if(e instanceof EventSendPacket &amp;&amp; mc.thePlayer!=null &amp;&amp; mc.getNetHandler()!=null) {
-
-    		Packet p = e.getPacket();
-    		if(mc.getNetHandler().doneLoadingTerrain) {
-    			
-    			if(hsd.isEnabled()) {
-    				if(watchdogStrafed &amp;&amp; !(p instanceof C06PacketPlayerPosLook)) {
-    					e.setCancelled();
-    				}
-    			}
-    			
-    			if(Watchdog2020.isEnabled()) {
-    				
-    				if(p instanceof C0FPacketConfirmTransaction) {
-    					e.setCancelled();
-    					packetQueue.add(p);
-
-		    			if(timer.hasTimeElapsed((15000), true)) {
-		    				for(Packet packet : packetQueue) {
-			    				mc.getNetHandler().sendPacketNoEvent(packet);
-			    			}
-			    			packetQueue.clear();
-		    			}
-    				}
-    				
-    				if(p instanceof C03PacketPlayer) {
-    					mc.getNetHandler().addToSendQueue(new C13PacketPlayerAbilities());
-    				}
-    				
-    				if(p instanceof C13PacketPlayerAbilities) {
-    					C13PacketPlayerAbilities c13 = (C13PacketPlayerAbilities) p;
-    					
-    					c13.setFlying(true);
-    					
-    				}
-    				
-    			}
-
-    			if(C0F.isEnabled()) {
-    				if(p instanceof C0FPacketConfirmTransaction) {
-    					
-    					final C0FPacketConfirmTransaction c0f = (C0FPacketConfirmTransaction) p;
-    					
-    					c0f.uid = 1337;
-    					c0f.accepted = false;
-    					
-    					
-    				}
-    			}
-    			
-    			if(C00.isEnabled() &amp;&amp; p instanceof C00PacketKeepAlive) {
-    				
-    				final C00PacketKeepAlive c00 = (C00PacketKeepAlive) p;
-    				
-    				c00.key = 1337;
-    				
-    				
-    				
-    				
-    			}
-    			
-    			if(ver.isEnabled()) {
-    				
-    				e.setCancelled();
-    				packetQueue.add(p);
-    				
-    				if(p instanceof C0FPacketConfirmTransaction) {
-    					C0FPacketConfirmTransaction c = (C0FPacketConfirmTransaction) p;
-    					
-    					c.id = 69;
-    				}
-
-	    			if(timer.hasTimeElapsed((400), true)) {
-	    				for(Packet packet : packetQueue) {
-		    				mc.getNetHandler().sendPacketNoEvent(packet);
-		    			}
-		    			packetQueue.clear();
-	    			}
-    			}
-    			
-    			if(had.isEnabled()) {
-    				if (this.mc.thePlayer.ticksExisted &lt; 20) {
-    	                return;
-    	            }
-    				
-    				if(e.getPacket() instanceof C0FPacketConfirmTransaction &amp;&amp; this.mc.thePlayer.ticksExisted % 3 == 1) {
-    	            	C0FPacketConfirmTransaction c0F = (C0FPacketConfirmTransaction)e.getPacket();
-    	            	c0F.getUid();
-    	            	C00PacketKeepAlive c00 = (C00PacketKeepAlive)e.getPacket();
-    	                c00.key = (int) ((int) 1000 * Math.random() + Math.PI + Math.E);
-    	                c00.getKey();
-    	                packetQueue.add(e.getPacket());
-    	                e.setCancelled();
-    	            }
-    				if(e.getPacket() instanceof C00PacketKeepAlive &amp;&amp; this.mc.thePlayer.ticksExisted % 3 == 1) {
-    	                C00PacketKeepAlive c00 = (C00PacketKeepAlive)e.getPacket();
-    	                c00.key = (int) ((int) Math.random() + Math.PI + Math.E);
-    	                c00.getKey();
-    	                packetQueue.add(e.getPacket());
-    	            	e.setCancelled();
-    	            }
-    				if (e.getPacket() instanceof C0BPacketEntityAction &amp;&amp; this.mc.thePlayer.ticksExisted % 3 == 1) {
-    	                e.setCancelled();
-    	                packetQueue.add(e.getPacket());
-    	                mc.thePlayer.sendQueue.sendPacketNoEventDelayed(e.getPacket(), 4000);
-    	            }
-    				if(e.getPacket() instanceof C03PacketPlayer.C06PacketPlayerPosLook &amp;&amp; this.mc.thePlayer.ticksExisted % 40 == 0) {
-    	            	C03PacketPlayer.C06PacketPlayerPosLook packet = (C03PacketPlayer.C06PacketPlayerPosLook) e.getPacket();
-    	            	packet.field_149480_h = false;
-    	            	packet.y = (int) ((int) 1000 * Math.random() + Math.PI + Math.E);
-    	            	e.setCancelled();
-    	            	packetQueue.add(e.getPacket());
-    	            }
-    	            
-    	            if(e.getPacket() instanceof C03PacketPlayer.C05PacketPlayerLook &amp;&amp; this.mc.thePlayer.ticksExisted % 40 == 0) {
-    	            	C03PacketPlayer.C05PacketPlayerLook packet = (C03PacketPlayer.C05PacketPlayerLook) e.getPacket();
-    	            	packet.rotating = true;
-    	            	packet.pitch = (int) ((int) 1000 * Math.random() + Math.PI + Math.E);
-    	            	packet.yaw = (int) ((int) 1000 * Math.random() + Math.PI + Math.E);
-    	            	e.setCancelled();
-    	            	packetQueue.add(e.getPacket());
-    	            }
-    	            if (e.getPacket() instanceof C0BPacketEntityAction) {
-    	                C0BPacketEntityAction packetEntityAction = (C0BPacketEntityAction)e.getPacket();
-    	                if (packetEntityAction.getAction() == C0BPacketEntityAction.Action.START_SPRINTING) {
-    	                   e.setCancelled();
-    	                }
-    	            }
-    	            if (this.mc.thePlayer.ticksExisted % 120 == 0) {
-	    				for(Packet packet : packetQueue) {
-		    				mc.getNetHandler().sendPacketNoEvent(packet);
-		    			}
-		    			packetQueue.clear();
-    				}
-    	            
-    	            if(e.getPacket() instanceof C03PacketPlayer) {
-    		            mc.thePlayer.sendQueue.addToSendQueue(new C13PacketPlayerAbilities());
-    				}
-    	            
-    	            if (e.getPacket() instanceof C13PacketPlayerAbilities) {
-    	                C13PacketPlayerAbilities packet = (C13PacketPlayerAbilities) e.getPacket();
-    	                packet.setAllowFlying(true);
-    	                packet.setCreativeMode(true);
-    	                packet.setInvulnerable(true);
-    	                packet.setFlying(true);
-    	            }
-    			}
-
-    			if(watchdog.isEnabled()) {
-    				
-    				
-				
-    			}
-    			
-    			
-    			if(pp.isEnabled()) {
-    				
-    				
-    				if(mc.thePlayer.ticksExisted&gt;60) {
-    					if(p instanceof C03PacketPlayer) {
-    						C03PacketPlayer packet = (C03PacketPlayer) p;
-    						packet.setY(packet.getY()+0.015625);
-    						
-    					}
-    					
-    					
-    				}else {
-    					if(mc.thePlayer.ticksExisted&gt;61) {
-    						if(p instanceof C0FPacketConfirmTransaction) {
-    							e.setCancelled();
-    						}
-    					}else 
-    	    				if(mc.thePlayer.ticksExisted%100==0 &amp;&amp; mc.thePlayer.ticksExisted&gt;100) {
-    	    					if(p instanceof C03PacketPlayer.C04PacketPlayerPosition || p instanceof C03PacketPlayer.C06PacketPlayerPosLook) {
-    	    						C03PacketPlayer packet = (C03PacketPlayer) p;
-    	    						packet.setX(0);
-    	    						packet.setY(-50000);
-    	    						packet.setZ(0);
-    	    					}
-    	    				}
-    				}
-    			}
-    		}
-    		
-    		if(rede.isEnabled() || spartan.isEnabled()) {
-    			
-    			e.setCancelled();
-    			packetQueue.add(p);
-    			
-    			if(timer.hasTimeElapsed((long) (1000*(Math.random()+1)), true)) {
-    				for(Packet packet : packetQueue) {
-	    				mc.getNetHandler().sendPacketNoEvent(packet);
-	    			}
-	    			packetQueue.clear();
-    			}
-    			
-    		}
-    		
-    		if(zc.isEnabled()) {
-    			if(mc.thePlayer.ticksExisted&lt;1)
-    				return;
-    			mc.timer.timerSpeed = 0.8f;
-
-    				e.setCancelled();
-    				short delay = 690;
-    				if(p instanceof C00PacketKeepAlive || p instanceof C0FPacketConfirmTransaction)
-    					delay = 2500;
-    				
-    					mc.getNetHandler().sendPacketNoEventDelayed(p, delay);
-    					
-    				if(p instanceof C03PacketPlayer) {
-    					C03PacketPlayer packet = (C03PacketPlayer) p;
-    					if(!mc.thePlayer.onGround)
-    					packet.onGround = mc.thePlayer.ticksExisted%2==0;
-    				}
-    				
-    				
-    			
-    			
-    			
-    		}
-    		
-    		if(wz.isEnabled()) {
-    			if(p instanceof C0FPacketConfirmTransaction || p instanceof C00PacketKeepAlive) {
-    				if(p instanceof C00PacketKeepAlive) 
-    					packetQueue.add(p);
-    				
-    				if(p instanceof C0FPacketConfirmTransaction)
-    					packetQueueC0fOnly.add(p);
-    				
-					e.setCancelled();
-    			}
-    			
-    			if(timer.hasTimeElapsed((long) (5412+((Math.random()+1)*6)), true)) {
-    				for(Packet packet : packetQueue) {
-	    				mc.getNetHandler().sendPacketNoEvent(packet);
-	    			}
-	    			packetQueue.clear();
-    			
-    			}
-    			if(timer.hasTimeElapsed2((long) (1337+((Math.random()+1)*6)), true)) {
-    				for(Packet packet : packetQueueC0fOnly) {
-	    				mc.getNetHandler().sendPacketNoEvent(packet);
-	    			}
-    				packetQueueC0fOnly.clear();
-    			}
-    			
-				
-    		}
-    		
-    		if(vcmbt.isEnabled() || confirmtransaction.isEnabled()) {
-    			
-    			short delay = 1550;
-    			
-    			if(p instanceof C02PacketUseEntity) {
-    				delay+=15;
-    			}
-    			
-    			if(p instanceof C0FPacketConfirmTransaction) {
-    				e.setCancelled();
-    			
-    			mc.getNetHandler().sendPacketNoEventDelayed(p, delay);
-    			
-    			}
-    		}
-    		if(mc.getNetHandler().getNetworkManager()!=null) {
-	    		if((ml.isEnabled() || superc.isEnabled()) &amp;&amp; mc.getNetHandler()!=null &amp;&amp; mc.thePlayer.ticksExisted&gt;0) {
-	    			short delay = (short) (superc.isEnabled() ? 200 : 505);
-	    			if(p instanceof C01PacketChatMessage) 
-	    				return;
-	    			
-	    			e.setCancelled();
-	    			mc.getNetHandler().sendPacketNoEventDelayed(p, delay);
-	    			if(p instanceof C03PacketPlayer) {
-	    				C03PacketPlayer packet = (C03PacketPlayer) p;
-	    				//packet.onGround = mc.thePlayer.ticksExisted%2==0 ? true : false;
-	    				//packet.setY(packet.getY()+0.015625);
-	    			}
-	    			
-	    			
-	    			
-	    		}
-    		}
 			
 		}
 		
-		if(e instanceof EventMotion &amp;&amp; mc.getNetHandler()!=null) {
-			EventMotion event = (EventMotion)e;
+		if (e instanceof EventUpdate) {
 			
-			MoveUtil move = new MoveUtil();
-			
-			if(karhu.isEnabled()) {
-				event.setY(event.getY()+0.015625);
-			}
-			
-			if(loyisaNCP.isEnabled() &amp;&amp; move.isMoving()) {
-				event.setOnGround(true);
+			if (e.isPre()) {
 				
-				
-				final double yawww = Math.toRadians(mc.thePlayer.rotationYaw);
-				
-				
-				double expectedXX;
-				double expectedYY;
-			    double expectedZZ;
-				
-				double xx = mc.thePlayer.posX;
-		        double yy = mc.thePlayer.posY;
-		        double zz = mc.thePlayer.posZ;
-		        
-
-		        
-		        expectedXX = xx + (-Math.sin(yawww) * 9);
-		        expectedZZ = zz + (Math.cos(yawww) * 9);
-		        if(mc.gameSettings.keyBindJump.getIsKeyPressed())  
-			        yy = 5;
-		        
-				else if (mc.gameSettings.keyBindSneak.getIsKeyPressed())
-					yy = -5;
-				else
-					yy = 0;
-
-		        vulcanyaw = (float) yy;
-		        
-		        boolean m = true;
-		        boolean fly = false;
-		        
-				if(ncpM.isEnabled()) {
-					for(Module a: Epsilon.modules) {
-						if(a.isEnabled() &amp;&amp; a.getCategory() == Category.MOVEMENT) {
-							m = true;
-							if(a.getName() == "Fly") {
-								fly = true;
+				if (mode.is("Hypixel") &amp;&amp; !SpicyClient.config.fly.isEnabled()) {
+					
+					this.additionalInformation = "Hypixel";
+					
+					boolean isOverVoid = true;
+					BlockPos block = mc.thePlayer.getPosition();
+					
+					for (int i = (int) mc.thePlayer.posY; i &gt; 0; i--) {
+						
+						if (isOverVoid) {
+							
+							if (!(mc.theWorld.getBlockState(block).getBlock() instanceof BlockAir)) {
+								
+								isOverVoid = false;
+								
 							}
+							
 						}
-					}
-				}
-		        
-		        if(!ncpM.isEnabled() || m) {
-		        	
-		        	if(!ncpM.isEnabled() || fly ) {
-		        		
-		        		
-		        		
-						if(!mc.thePlayer.onGround || (mc.theWorld.getBlockState(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1, mc.thePlayer.posZ)).getBlock() instanceof BlockAir &amp;&amp; mc.thePlayer.onGround)) {
-							mc.getNetHandler().addToSendQueue(new C04PacketPlayerPosition(expectedXX, mc.thePlayer.posY+yy, expectedZZ, true));
-		
-					        expectedXX = xx + (-Math.sin(yawww) * -9);
-					        expectedZZ = zz + (Math.cos(yawww) * -9);
-							mc.getNetHandler().addToSendQueue(new C04PacketPlayerPosition(expectedXX, mc.thePlayer.posY, expectedZZ, true));
-						}else {
-		
-							mc.getNetHandler().addToSendQueue(new C04PacketPlayerPosition(expectedXX, mc.thePlayer.posY, expectedZZ, true));
-		
-					        expectedXX = xx + (-Math.sin(yawww) * -9);
-					        expectedZZ = zz + (Math.cos(yawww) * -9);
-							mc.getNetHandler().addToSendQueue(new C04PacketPlayerPosition(expectedXX, mc.thePlayer.posY, expectedZZ, true));
-						}
-		        	}
-		        }
-				
-			}
-			
-			
-			if(rede.isEnabled()) {
-				
-				if(mc.thePlayer.ticksExisted&lt;69 &amp;&amp; mc.getNetHandler().doneLoadingTerrain) {
-					event.setY(event.getY()+0.000125);
-				}
-				
-			}
-			
-			if(interact.isEnabled() &amp;&amp; mc.getNetHandler().doneLoadingTerrain &amp;&amp; mc.thePlayer !=null &amp;&amp; e.isPre()) {
-				List&lt;EntityLivingBase&gt; targets = (List&lt;EntityLivingBase&gt;) mc.theWorld.loadedEntityList.stream().filter(EntityLivingBase.class::isInstance).collect(Collectors.toList());
-				
-				targets = targets.stream().filter(entity -&gt; entity.getDistanceToEntity(mc.thePlayer) &gt; 1 &amp;&amp; entity != mc.thePlayer &amp;&amp; !entity.isDead &amp;&amp; entity.getHealth() &gt; 0).collect(Collectors.toList());
-	
-				targets.sort(Comparator.comparingDouble(entity -&gt; ((EntityLivingBase)entity).getDistanceToEntity(mc.thePlayer)));
-				if(mc.thePlayer.ticksExisted%2==0 &amp;&amp; !targets.equals(null)) {
-					Entity target = targets.get(0);
-					mc.getNetHandler().addToSendQueue(new C02PacketUseEntity(target, C02PacketUseEntity.Action.INTERACT));
-				}	
-			}
-			
-			
-			if(matrixstrafe.isEnabled()) {
-				final double yaw;
-				if(mc.thePlayer.ticksExisted%2==0) {
-					yaw = Math.toRadians(mc.thePlayer.cameraYaw);
-					event.setX(event.getX() + (-Math.sin(yaw * 0.001)));
-					event.setZ(event.getZ() + (Math.sin(yaw * 0.001)));
-				}else {
-					yaw = Math.toRadians(mc.thePlayer.cameraYaw);
-					event.setX(event.getX() + (-Math.sin(yaw * -0.001)));
-					event.setZ(event.getZ() + (Math.sin(yaw * -0.001)));
-				}
-			}
-			if(creativeact.isEnabled()) {
-				ItemStack what = null;
-				mc.thePlayer.sendQueue.addToSendQueue(new C10PacketCreativeInventoryAction(1, what));
-			} 
-			
-			if(vst.isEnabled()) {
-				event.setYaw(vulcanyaw);
-				if(mc.thePlayer.ticksExisted %2 ==0) {
-					event.setYaw(-3141);
-					MoveUtil moveUtil = new MoveUtil();
-					if(mc.gameSettings.keyBindForward.getIsKeyPressed()|| mc.gameSettings.keyBindBack.getIsKeyPressed() || mc.gameSettings.keyBindRight.getIsKeyPressed()|| mc.gameSettings.keyBindLeft.getIsKeyPressed())
-					moveUtil.packetComedy( -0.1, -0);
-				}else {
-					MoveUtil moveUtil = new MoveUtil();
-				}
-			}
-			if(voidtp.isEnabled() &amp;&amp; mc.thePlayer.ticksExisted % 20 == 0) 
-				event.setY(-1);
-			
-			
-			
-		}
-		
-		
-		if(e instanceof EventUpdate) {
-			this.displayInfo = mode.getMode();
-			}
-			
-		
-		
-		if(e instanceof EventUpdate &amp;&amp; mc.getNetHandler()!=null) {
-			MoveUtil move = new MoveUtil();
-			
-			
-			
-			if(e.isPre()) {
-				if(verusfly.isEnabled()) {
-					if(mc.thePlayer.onGround)
-						groundpos = mc.thePlayer.posY;
-					//if(move.getBlockRelativeToPlayer(0, 0, 0) instanceof BlockAir) {
-						//mc.thePlayer.swingItem();
-					if(!mc.thePlayer.onGround)
-						place(new BlockPos(mc.thePlayer.posX,mc.thePlayer.posY - groundpos,mc.thePlayer.posZ), 1, new ItemStack(Blocks.stone.getItem(mc.theWorld, new BlockPos(0, 0, 0))), 0.5f, 0.5f, 0.5f);
-					//}
-				}
-			}
-			
-			if(mc.getNetHandler().doneLoadingTerrain &amp;&amp; test.isEnabled()) {
-				
-				desyncrot = true;
-				//if(!(mc.currentScreen instanceof GuiChest))
-				//mc.getNetHandler().addToSendQueue(new C08PacketPlayerBlockPlacement
-					//	(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ), 1,
-						//new ItemStack(Blocks.stone.getItem
-						//(mc.theWorld, new BlockPos(1, 1, 1))), 0, 0f, 0));
-				
-			}
-			
-		}
-		
-		if(ea.getMode() == "Self") {
-			Entity thething = mc.thePlayer;
-		}
-		if(e instanceof EventUpdate){
-			
-			if(matrix.isEnabled()) {
-				if(mc.thePlayer.ticksExisted % 4== 0) {	
-					mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.RIDING_JUMP));
-				}
-			}
-			
-			if(inp.isEnabled()) {
-				mc.thePlayer.sendQueue.addToSendQueue(new C0CPacketInput());
-			}
-			
-			
-			if(e.isPre()) {
-				
-				
-				if(goofyC0C.isEnabled()) {
-					if (mc.thePlayer.ticksExisted % 4 == 0) {
-						mc.thePlayer.sendQueue.addToSendQueue(new C0CPacketInput(Float.MAX_VALUE, Float.MAX_VALUE, false, false));
-		            }
-				}
-				
-				if(spectate.isEnabled()) {
-					mc.thePlayer.sendQueue.addToSendQueue(new C18PacketSpectate(UUID.randomUUID()));
-				}
-				if(place.isEnabled()) {
-					mc.getNetHandler().addToSendQueue(new C08PacketPlayerBlockPlacement
-							(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1, mc.thePlayer.posZ), 1,
-							new ItemStack(Blocks.stone.getItem
-							(mc.theWorld, new BlockPos(0, 0, 0))), 0.5f, 0.5f, 0.5f));
-				}
-				if(dig.isEnabled()) {
-					if(digtype.getMode() == "Under") {
-						final BlockPos blockPos = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1, mc.thePlayer.posZ);
-						mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, EnumFacing.UP));
-					}else if (digtype.getMode() == "Self") {
-						final BlockPos blockPos = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ);
-						mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, EnumFacing.UP));
-					}else if (digtype.getMode() == "OutOfBounds") {
-						final BlockPos blockPos = new BlockPos(mc.thePlayer.posX+12, mc.thePlayer.posY +12, mc.thePlayer.posZ+12);
-						mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, EnumFacing.UP));
-					}else if (digtype.getMode() == "Unloaded") {
-						final BlockPos blockPos = new BlockPos(mc.thePlayer.posX*256, mc.thePlayer.posY*256, mc.thePlayer.posZ*256);
-						mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, blockPos, EnumFacing.UP));
+						
+						block = block.add(0, -1, 0);
+						
 					}
 					
-				}
-				if(entityact.isEnabled()) {
+			        if (!MovementUtils.isOnGround(0.001) &amp;&amp; (mc.thePlayer.fallDistance &gt;= 20.0f || mc.thePlayer.posY &lt; 0) &amp;&amp; isOverVoid) {
+			        	
+			        	if (!bounced) {
+			        		bounced = true;
+			        		
+			        		if (jumpFirst.isEnabled()) {
+				        		mc.thePlayer.motionY = 0.2d*11d;
+				        		mc.thePlayer.fallDistance = 4;
+				        		mc.thePlayer.onGround = false;
+				        		//Command.sendPrivateChatMessage(mc.thePlayer.motionY);
+			        		}
+			        		
+			        	}else {
+			        		
+			        		Random r = new Random();
+				        	
+				        	mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer(true));
+				        	//mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY - 3, mc.thePlayer.posZ, false));
+				        	mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY + 12, mc.thePlayer.posZ, false));
+				        	//mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY + 6, mc.thePlayer.posZ);
+				        	mc.thePlayer.fallDistance = -1;
+				        	NotificationManager.getNotificationManager().createNotification("Antivoid saved you", "", true, 2000, Type.INFO, Color.BLUE);
+				        	//mc.thePlayer.motionY = 1;
+				            //float f = mc.thePlayer.rotationYaw * 0.017453292F;
+				            //mc.thePlayer.motionX -= (double)(MathHelper.sin(f) * 0.035f);
+				            //c.thePlayer.motionZ += (double)(MathHelper.cos(f) * 0.035f);
+			        		
+			        	}
+			        	
+			        }else if (!isOverVoid &amp;&amp; mc.thePlayer.fallDistance &lt;= 2) {
+			        	bounced = false;
+			        }
 					
-					if(et.getMode() == "Jump") {
-					
-					mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.RIDING_JUMP));
-					}
-					if(et.getMode() == "Sneak") {
-					mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
-					}
-					if(et.getMode() == "StopSneak") {
-						mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
-					}
-					if(et.getMode() == "Sprint") {
-						mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SPRINTING));
-					}
-					if(et.getMode() == "StopSprint") {
-						mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
-					}
-					if(et.getMode() == "Sleep") {
-						mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SLEEPING));
-					}	
-					if(et.getMode() == "Inventory") {
-						mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.OPEN_INVENTORY));
-					}	
-				}	
-				if(respawn.isEnabled()) {
-					mc.thePlayer.sendQueue.addToSendQueue(new C16PacketClientStatus(C16PacketClientStatus.EnumState.PERFORM_RESPAWN));
 				}
-				if(abilities.isEnabled()) {
-					mc.thePlayer.sendQueue.addToSendQueue(new C13PacketPlayerAbilities());
-				}
-				
-				
 				
 			}
+			
 		}
+		
 	}
-	private void place(BlockPos b, int placeDirect, ItemStack itemStack, float faceX, float faceY, float faceZ) {
-		mc.getNetHandler().addToSendQueue(new C08PacketPlayerBlockPlacement(b, placeDirect, itemStack, faceX, faceY, faceZ));
-	}
-
-
 	
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoClip</span>
-<span class="impl-module-clients">(Mint B1, Gugustus, Tenacity 6.0, Sigma 4.11, Vestige 3.0, Astro 2.2.1, Flux B39.11)</span>
-</div>
-<p class="impl-pattern">Second most-modded clientbound packet. Flight cancels S08 and sends spoofed C06 to maintain position. Speed cancels to prevent rubberbanding. Freecam cancels to keep camera free. NoRotate strips rotation. NoClip sends confirm + position back then cancels. FlagDetector auto-disables modules on S08 (lag-back detection). Backtrack buffers S08 for delayed processing to extend reach.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Flight — cancel S08 + spoof position
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
 }
-// FlagDetector — auto-disable
-if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; speedModule.isEnabled()) speedModule.toggle();
-// NoRotate — strip yaw/pitch
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  s08.yaw = mc.thePlayer.rotationYaw;
-  s08.pitch = mc.thePlayer.rotationPitch;
-}
-// Freecam — cancel
-if (event.getPacket() instanceof S08PacketPlayerPosLook) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+// NOTE (AI): Hypixel anti-void. When an S08 teleport arrives while the player is off ground, past fallDistance 20 (or below y = 0) and over void, the module resets fallDistance. The trick is that the server only teleports after the fall is confirmed, so zeroing fallDistance on the teleport turns the server's own lag-back into the rescue. The EventUpdate path does the actual bounce (C03 onGround followed by C04 at posY + 12) once per fall via the bounced flag; the S08 hook by itself only eats the flag. A NullPointerException guard wraps the packet read, which is typical of this client's defensive style.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (pre, incoming); EventUpdate for the bounce.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Zeroing fallDistance on the teleport is invisible to the anti-cheat because the packet is not mutated and nothing extra is sent; the module rides the server's own lag-back. Over-triggering is guarded by the isOverVoid ray scan and the bounced flag.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 and 6.2.4 VulcanAntiVoid use S08 only to re-arm the noBlock state that suppresses the jump motion while over void.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Blink</span>
-<span class="impl-module-clients">(Mint B1, Gugustus, Tenacity 6.0, Sigma 4.11, Vestige 3.0, Astro 2.2.1, Flux B39.11)</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent on every client, with the vanilla handler applying the mutation afterwards. Rise 6.x processes S08 in components (PingSpoofComponent, EntityTickComponent, TeleportCheck security) before modules see it.</div>
+<div class="impl-clients">Classic clients (Memeware, Nekoware, Sigma, Spicy) mutate or cancel the packet object inside the event, so the vanilla handler then applies the modified values. Rise 5.99 and 6.x call event.setCancelled on the receive event; Rise 6.x additionally re-arms component state (PingSpoofComponent spoof windows) from the same packet.</div>
 </div>
-<p class="impl-pattern">Second most-modded clientbound packet. Flight cancels S08 and sends spoofed C06 to maintain position. Speed cancels to prevent rubberbanding. Freecam cancels to keep camera free. NoRotate strips rotation. NoClip sends confirm + position back then cancels. FlagDetector auto-disables modules on S08 (lag-back detection). Backtrack buffers S08 for delayed processing to extend reach.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Flight — cancel S08 + spoof position
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// FlagDetector — auto-disable
-if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; speedModule.isEnabled()) speedModule.toggle();
-// NoRotate — strip yaw/pitch
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  s08.yaw = mc.thePlayer.rotationYaw;
-  s08.pitch = mc.thePlayer.rotationPitch;
-}
-// Freecam — cancel
-if (event.getPacket() instanceof S08PacketPlayerPosLook) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">FlagDetector</span>
-<span class="impl-module-clients">(Mint B1, Gugustus, Tenacity 6.0, Sigma 4.11, Vestige 3.0, Astro 2.2.1, Flux B39.11)</span>
-</div>
-<p class="impl-pattern">Second most-modded clientbound packet. Flight cancels S08 and sends spoofed C06 to maintain position. Speed cancels to prevent rubberbanding. Freecam cancels to keep camera free. NoRotate strips rotation. NoClip sends confirm + position back then cancels. FlagDetector auto-disables modules on S08 (lag-back detection). Backtrack buffers S08 for delayed processing to extend reach.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Flight — cancel S08 + spoof position
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// FlagDetector — auto-disable
-if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; speedModule.isEnabled()) speedModule.toggle();
-// NoRotate — strip yaw/pitch
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  s08.yaw = mc.thePlayer.rotationYaw;
-  s08.pitch = mc.thePlayer.rotationPitch;
-}
-// Freecam — cancel
-if (event.getPacket() instanceof S08PacketPlayerPosLook) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Backtrack</span>
-<span class="impl-module-clients">(Mint B1, Gugustus, Tenacity 6.0, Sigma 4.11, Vestige 3.0, Astro 2.2.1, Flux B39.11)</span>
-</div>
-<p class="impl-pattern">Second most-modded clientbound packet. Flight cancels S08 and sends spoofed C06 to maintain position. Speed cancels to prevent rubberbanding. Freecam cancels to keep camera free. NoRotate strips rotation. NoClip sends confirm + position back then cancels. FlagDetector auto-disables modules on S08 (lag-back detection). Backtrack buffers S08 for delayed processing to extend reach.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Flight — cancel S08 + spoof position
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  event.setCancelled(true);
-  mc.thePlayer.sendQueue.addToSendQueue(new C06PacketPlayerPosLook(s08.x, mc.thePlayer.posY, s08.z, s08.yaw, s08.pitch, false));
-}
-// FlagDetector — auto-disable
-if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; speedModule.isEnabled()) speedModule.toggle();
-// NoRotate — strip yaw/pitch
-if (event.getPacket() instanceof S08PacketPlayerPosLook) {
-  S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-  s08.yaw = mc.thePlayer.rotationYaw;
-  s08.pitch = mc.thePlayer.rotationPitch;
-}
-// Freecam — cancel
-if (event.getPacket() instanceof S08PacketPlayerPosLook) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C03PacketPlayer/">C03PacketPlayer</a>
+<a class="related-chip" href="../S12PacketEntityVelocity/">S12PacketEntityVelocity</a>
+<a class="related-chip" href="../S39PacketPlayerAbilities/">S39PacketPlayerAbilities</a>
+<a class="related-chip" href="../S0BPacketAnimation/">S0BPacketAnimation</a>
+<a class="related-chip" href="../C09PacketHeldItemChange/">C09PacketHeldItemChange</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

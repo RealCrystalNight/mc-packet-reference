@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S1DPacketEntityEffect (0x1D): Applies a status/potion effect to an entity.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="PotionHUD, AntiPotion">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S1DPacketEntityEffect — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S1DPacketEntityEffect — Minecraft 1.8.9 Packet Reference","description":"Effect application is a pure server-to-client state push with no module interest in the 8 reference clients. Every effect-aware feature reads the entity's potion map after vanilla applies the packet, and the sole non-vanilla corpus hit is Rise 6.x NetworkAPI registering the class for script injectio","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -77,30 +77,29 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Effect IDs: 1=speed, 2=slowness, 5=strength, 8=jump_boost, 11=absorption, 16=wither, etc.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S1DPacketEntityEffect applies one potion effect to one entity. The server has three send sites: EntityTrackerEntry broadcasts an entity's new effect to every player watching it, EntityPlayerMP.addPotionEffect and refreshActivePotionEffect send it to the affected player directly, and ServerConfigurationManager replays effects (beacon, team) on respawn and on player join. Wire layout is entityId VarInt, effectId byte, amplifier byte, duration VarInt in ticks, hideParticles boolean. In 1.8.9 the effect is a full state push: the client stores it in the entity's active potion map and the server never asks for confirmation.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleEntityEffect runs on the client thread via PacketThreadUtil, resolves the entity with getEntityByID, and for EntityLivingBase targets builds a PotionEffect(effectId, duration, amplifier, false, hideParticles), calls setPotionDurationMax(duration), then addPotionEffect. From that point every renderer (armor, HUD, particles, the player's own effect tab) reads the entity's activePotionMap. Effects on non-living entities are silently dropped, and an unknown entityId does nothing.</p>
+<h4>Why clients touch it</h4>
+<p>None of the 8 reference clients hook S1D in a module. The only non-vanilla corpus hit is Rise 6.1.30 and 6.2.4 NetworkAPI.java, which registers S1DPacketEntityEffect in the clientbound class table (index 72) so scripts can build and inject it via receivePacket. Effect-aware features in these clients (effect HUD rows, potion ESP) poll the entity's active potion map after vanilla applies the packet, or render from EntityLivingBase state, so no packet interception is needed. The PotionHUD/AntiPotion entries in older packet docs come from Sigma 3.9, which is not part of the reference set; Sigma 4.11's corpus has no S1D hit.</p>
+<h4>Exploit surface</h4>
+<p>Cancelling S1D in a receive event is a client-side potion bypass: the server keeps applying the effect and its movement math, the client simply never renders or stores it. That grants nothing for movement because speed, jump and health attributes are server-authoritative. Anti-cheats never measure this packet; it is one-directional cosmetic state. The only bandwidth note is that EntityTrackerEntry sends one S1D per effect per tracked entity on the tracking loop, so rapid effect churn is amplification surface for griefing plugins, not for cheat modules.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityTrackerEntry line 418 sends S1D to each playerNetServerHandler in the watching list when a tracked entity gains an effect; EntityPlayerMP lines 922/927 send it to the affected player for addPotionEffect and refreshActivePotionEffect; ServerConfigurationManager lines 193/509 replay active effects on respawn and join. The server does no validation on the receiving side: there is no processX handler because the packet is clientbound only.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>The amplifier byte is the level minus one (0 means level I). Duration is in ticks on the wire; the client stores it as the effect duration and also as durationMax, so the potion icon countdown and the expiry timestamp both come from this single value. hideParticles maps to the PotionEffect showParticles flag; an S1D with the same effectId overwrites the previous entry in the active potion map rather than stacking.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>No anti-cheat in the 1.8.9 ecosystem flags S1D handling. Movement-relevant effects (speed, jump boost, slowness) are validated from server-side attribute and motion math, so a client that drops the packet only sees wrong visuals. Servers that want to detect a modified client would have to query the client for its potion state, which vanilla 1.8.9 has no packet for.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PotionHUD</span>
-<span class="impl-module-clients">(Sigma 3.9, Tenacity 6.0)</span>
+<p class="impl-pattern">Effect application is a pure server-to-client state push with no module interest in the 8 reference clients. Every effect-aware feature reads the entity's potion map after vanilla applies the packet, and the sole non-vanilla corpus hit is Rise 6.x NetworkAPI registering the class for script injection.</p>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">No module in the 8 clients registers a packet receive handler for S1D. The only hook surface that exists in the corpus is Rise 6.x NetworkAPI, which exposes clientbound packets to JavaScript scripts by class-table index.</div>
+<div class="impl-clients">Memeware 7.3, Nekoware v1 private, Sigma 4.11, Spicy and Tenacity 6.0 ship the vanilla handler byte-for-byte. Rise 6.1.30 and 6.2.4 additionally register the class in NetworkAPI (script/api/NetworkAPI.java), the only place any of the 8 clients references the packet outside net/minecraft.</div>
 </div>
-<p class="impl-pattern">Detect potion effects applied to entities. PotionHUD shows active effects. AntiPotion cancels negative effects.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S1DPacketEntityEffect) {
-  S1DPacketEntityEffect s1d = (S1DPacketEntityEffect) event.getPacket();
-  if (s1d.getEntityId() == mc.thePlayer.getEntityId() &amp;&amp; isNegativeEffect(s1d.getEffectId()))
-    event.setCancelled(true);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiPotion</span>
-<span class="impl-module-clients">(Sigma 3.9, Tenacity 6.0)</span>
-</div>
-<p class="impl-pattern">Detect potion effects applied to entities. PotionHUD shows active effects. AntiPotion cancels negative effects.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S1DPacketEntityEffect) {
-  S1DPacketEntityEffect s1d = (S1DPacketEntityEffect) event.getPacket();
-  if (s1d.getEntityId() == mc.thePlayer.getEntityId() &amp;&amp; isNegativeEffect(s1d.getEffectId()))
-    event.setCancelled(true);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S1EPacketRemoveEntityEffect/">S1EPacketRemoveEntityEffect</a>
+<a class="related-chip" href="../S1CPacketEntityMetadata/">S1CPacketEntityMetadata</a>
+<a class="related-chip" href="../S20PacketEntityProperties/">S20PacketEntityProperties</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C08PacketPlayerBlockPlacement (0x08): Player places a block or uses an item. Can also be used for empty-hand interactions (e.g., pressing buttons).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Scaffold, KillAura (Autoblock), NoSlowdown, FastUse">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Scaffold, KillAura (Autoblock), NoSlow, AutoPot / AutoSoup (fast item use)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C08PacketPlayerBlockPlacement — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C08PacketPlayerBlockPlacement — Minecraft 1.8.9 Packet Reference","description":"The use/place workhorse. Clients split it into three dialects: the item-use form (direction 255) for AutoPot/NoSlow/autoblock, the placement form for Scaffold, and the invalid-position form as a fake-use trick for disablers and speed modules.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -76,297 +76,1514 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayServer.processPlayerBlockPlacement()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C08 is the serverbound use/place packet. With placedBlockDirection == 255 it is a pure item use (eating, blocking, throwing), otherwise it is a block placement against the BlockPos + face with a cursor offset. The stack field lets the server verify the client's inventory state. This dual role makes it the single most-abused packet for movement and combat bypasses: it is how scaffold places blocks, how killaura holds a shield or sword block, how noslow keeps the use-item state alive, and how item-spam modules (AutoPot, AutoSoup) consume consumables at inhuman speed.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayServer.processPlayerBlockPlacement branches on the direction byte. For 255 it calls theItemInWorldManager.tryUseItem, which starts the item's use-tick state server-side. For a face it checks build limit, distance (hasMoved and 8-block radius), world border, then calls func_180236_a to place. The server compares packetIn.getStack() against the real inventory slot and re-sends S2FPacketSetSlot on mismatch, which is why clients that spoof the stack field get desynced slots.</p>
+<h4>Why clients touch it</h4>
+<p>All 8 clients construct C08 directly. Scaffold modules (Rise 5.99, Rise 6.x, Sigma 4.11) send placements with computed BlockPos + face; Memeware and Nekoware auras send the autoblock form (new BlockPos(-1, -1, -1), 255) to start blocking mid-aura; NoSlow modules (Rise 5.99 NoSlow, Rise 6.x IntaveNoSlow/LegitNoSlow/NCPNoSlow/NewNCPNoSlow/WatchdogNoSlow, Sigma NoSlowdown, Spicy NoSlow) re-send the item-use C08 to keep the server believing the player is using the item; AutoPot/AutoSoup/AutoGap/AutoHead (Memeware, Rise 5.99, Rise 6.x, Sigma) spam the item-use form to consume faster than vanilla allows. Rise 6.2.4 even wraps placement in PlayBlockPlacementC2SPacket for its script/NetworkAPI layer.</p>
+<h4>Exploit surface</h4>
+<p>The 255-use form has no cooldown server-side in 1.8.9, so item-use spam is only throttled by client ticks; anti-cheats flag the resulting consumption rate. The invalid-position form (pos -1,-1,-1, face 255) is silently accepted by vanilla (it falls into the item-use branch when direction == 255) but stands out to anti-cheats that track block-place patterns around the player's head. Scaffold places at the feet with yaw-derived face values, which NCP and Vulcan correlate against the player's rotation. C08 is also sent at 20+ per second by Rise 6.2.4 WatchdogDisabler as a fake water-bucket placement to reset watchdog's fall tracking, and by Speed/Fly modules to place blocks under the player mid-air.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processPlayerBlockPlacement: if direction == 255, tryUseItem (no position checks); else enforce build limit, 8-block distance from the last confirmed position, world border and block protection before placing. Stack mismatch with the real inventory triggers an S2FPacketSetSlot resync. The server never validates that the client's held item matches the packet's stack for the 255 path beyond the slot resync.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Fields: BlockPos (long), direction byte (255 = no face), ItemStack, three cursor bytes (0-16 mapped from floats). The item-use form still carries a position (usually BlockPos.ORIGIN or (-1,-1,-1)); vanilla ignores it when direction == 255. ViaVersion clients (Rise 6.2.4 BlockPlacementFixComponent) translate this to newer protocol versions where the packet was split into UseItemOn/UseItem.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>NCP flags scaffold rotations vs placement faces, Verus tracks placement frequency, Watchdog detects fake water-bucket placements when the inventory does not contain a bucket (Rise 6.2.4 WatchdogDisabler guards with BadPacketsComponent checks). AutoPot spam is caught by consumption-rate checks on popular servers; Noslow C08 spam is a classic Intave/Verus detection vector, hence the many per-AC modes in Rise 6.x.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
+<p class="impl-pattern">The use/place workhorse. Clients split it into three dialects: the item-use form (direction 255) for AutoPot/NoSlow/autoblock, the placement form for Scaffold, and the invalid-position form as a fake-use trick for disablers and speed modules.</p>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Mint B1, Gugustus)</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Scaffold places blocks silently. Autoblock sends invalid placement (pos=-1,-1,-1, face=255) to start blocking. NoSlow sends C08 with current item to bypass use-item slowdown.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>//package dev.tenacity.module.impl.funny;
-//
-//import dev.tenacity.event.IEventListener;
-//import dev.tenacity.event.impl.packet.PacketSendEvent;
-//import dev.tenacity.event.impl.player.BlockPlaceableEvent;
-//import dev.tenacity.event.impl.player.MotionEvent;
-//import dev.tenacity.module.Module;
-//import dev.tenacity.module.ModuleCategory;
-//import dev.tenacity.setting.impl.BooleanSetting;
-//import dev.tenacity.setting.impl.ModeSetting;
-//import dev.tenacity.setting.impl.NumberSetting;
-//import dev.tenacity.util.misc.ChatUtil;
-//import dev.tenacity.util.misc.RaycastUtil;
-//import dev.tenacity.util.misc.TimerUtil;
-//import dev.tenacity.util.player.InventoryUtil;
-//import dev.tenacity.util.player.MovementUtil;
-//import dev.tenacity.util.player.RotationUtil;
-//import net.minecraft.block.BlockAir;
-//import net.minecraft.block.material.Material;
-//import net.minecraft.network.play.client.C09PacketHeldItemChange;
-//import net.minecraft.network.play.client.C0APacketAnimation;
-//import net.minecraft.util.BlockPos;
-//import net.minecraft.util.EnumFacing;
-//import net.minecraft.util.MovingObjectPosition;
-//import net.minecraft.util.Vec3;
-//import org.apache.velocity.runtime.log.NullLogChute;
-//import org.lwjgl.input.Keyboard;
-//import org.lwjgl.util.vector.Vector2f;
-//
-//public final class realwatchdogfullstrafeandautoblockand8bpsscaffoldModule extends Module {
-//
-//    private final BooleanSetting sprint = new BooleanSetting("Sprint", true),
-//            swing = new BooleanSetting("Swing", true),
-//            rotate = new BooleanSetting("Rotate", true),
-//            tower = new BooleanSetting("Tower", true);
-//
-//    private final NumberSetting searchRange = new NumberSetting("Sell range", 3, 1, 6, 1),
-//            bruteForceRayCastIntensity = new NumberSetting("aggressive humping intensity", 5, 1, 10, 1);
-//
-//    private final ModeSetting switchItemMode = new ModeSetting("Switch Item Mode", "Dog pee", "Dog Piss Sever"),
-//            swingMode = new ModeSetting("Swing Mode", "Dog pee", "Dog piss server"),
-//            rotationMode = new ModeSetting("Rotation Mode", "Watchdog", "WatchCat"),
-//            towerMode = new ModeSetting("Tower Mode", "Watchdog", "realwatchdogfullstrafeandautoblockand8bpsscaffoldModule");
-//
-//    private BlockCache blockCache, lastBlockCache;
-//    private int startSlot, slot, lastSlot;
-//    private final TimerUtil timerUtil = new TimerUtil();
-//
-//    private float yaw, pitch;
-//
-//    public realwatchdogfullstrafeandautoblockand8bpsscaffoldModule() {
-//        super("realwatchdogfullstrafeandautoblockand8bpsscaffoldModule", "realwatchdogfullstrafeandautoblockand8bpsscaffoldModule", ModuleCategory.FUNNY);
-//        swingMode.addParent(swing, BooleanSetting::isEnabled);
-//        rotationMode.addParent(rotate, BooleanSetting::isEnabled);
-//        towerMode.addParent(tower, BooleanSetting::isEnabled);
-//        bruteForceRayCastIntensity.addParent(rotationMode, rotation -&gt; rotationMode.isMode("aggressive humping intensity"));
-//        initializeSettings(sprint, searchRange, rotate, rotationMode, bruteForceRayCastIntensity, switchItemMode, swing, swingMode, tower, towerMode);
-//    }
-//
-//    private final IEventListener&lt;BlockPlaceableEvent&gt; onBlockPlaceableEvent = event -&gt; {
-//        placeBlock();
-//    };
-//
-//    private final IEventListener&lt;MotionEvent&gt; onMotionEvent = event -&gt; {
-//        slot = InventoryUtil.getBlockSlot();
-//
-//        if(sprint.isEnabled())
-//            mc.gameSettings.keyBindSprint.pressed = true;
-//        else {
-//            mc.gameSettings.keyBindSprint.pressed = false;
-//            mc.thePlayer.setSprinting(false);
-//        }
-//
-//        if(slot != -1) {
-//            if(switchItemMode.isMode("Client") &amp;&amp; mc.thePlayer.inventory.currentItem != slot)
-//                mc.thePlayer.inventory.currentItem = slot;
-//            if(switchItemMode.isMode("Server") &amp;&amp; lastSlot != slot) {
-//                mc.getNetHandler().addToSendQueueNoEvent(new C09PacketHeldItemChange(slot));
-//                lastSlot = slot;
-//            }
-//        }
-//
-//        if(event.isPre()) {
-//            blockCache = getBlockCache();
-//            if(blockCache != null)
-//                lastBlockCache = blockCache;
-//
-//            final float sensitivityMultiplier = RotationUtil.getSensitivityMultiplier();
-//            final float fixedYaw = yaw - yaw % sensitivityMultiplier;
-//            final float fixedPitch = pitch - pitch % sensitivityMultiplier;
-//
-//            event.setYaw(fixedYaw);
-//            event.setPitch(fixedPitch);
-//
-//            // Have to do this or else watchdog will delete your blocks
-//            if(mc.thePlayer.onGround) {
-//                mc.thePlayer.motionX *= 0.91f;
-//                mc.thePlayer.motionZ *= 0.91f;
-//            }
-//
-//            if(tower.isEnabled() &amp;&amp; mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; blockCache != null) {
-//                switch (towerMode.getCurrentMode()) {
-//                    case "Watchdog":
-//                        mc.thePlayer.motionY = 0.02f;
-//                        break;
-//                    case "realwatchdogfullstrafeandautoblockand8bpsscaffoldModule":
-//                        mc.thePlayer.motionY = 1f;
-//                        break;
-//                }
-//            }
-//        }
-//
-//    };
-//    @Override
-//    public void onEnable() {
-//        if (mc.thePlayer != null) {
-//            startSlot = mc.thePlayer.inventory.currentItem;
-//        } else {
-//            return;
-//        }
-//
-//        slot = lastSlot = -1;
-//        blockCache = lastBlockCache = null;
-//
-//        yaw = MovementUtil.getMoveYaw() + 180;
-//        pitch = 80;
-//        super.onEnable();
-//    }
-//
-//    @Override
-//    public void onDisable() {
-//        if(mc.thePlayer.inventory.currentItem != startSlot || lastSlot != startSlot) {
-//            if(switchItemMode.isMode("Client"))
-//                mc.thePlayer.inventory.currentItem = startSlot;
-//            else
-//                mc.getNetHandler().addToSendQueueNoEvent(new C09PacketHeldItemChange(startSlot));
-//        }
-//        super.onDisable();
-//    }
-//
-//    private void placeBlock() {
-//        if(blockCache == null || lastBlockCache == null || slot == -1) return;
-//
-//        if(mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, mc.thePlayer.inventory.getStackInSlot(slot),
-//                lastBlockCache.getBlockPos(), lastBlockCache.getEnumFacing(), getHitVec())) {
-//
-//            if(rotate.isEnabled())
-//                updateRotations();
-//
-//            if(swing.isEnabled()) {
-//                if(swingMode.isMode("Client"))
-//                    mc.thePlayer.swingItem();
-//                else
-//                    mc.getNetHandler().addToSendQueue(new C0APacketAnimation());
-//            }
-//
-//        }
-//        blockCache = null;
-//    }
-//
-//    private void updateRotations() {
-//        switch(rotationMode.getCurrentMode()) {
-//            case "Enum":
-//                this.yaw = (float) lastBlockCache.getEnumFacing().angleFromEnumFacing() - 180;
-//                this.pitch = 77;
-//                break;
-//            case "Brute Force RayCast":
-//                for (float yaw = MovementUtil.getMoveYaw() - 180; yaw &lt; MovementUtil.getMoveYaw() + 180; yaw += bruteForceRayCastIntensity.getCurrentValue()) {
-//                    for (float pitch = 90; pitch &gt; -90; pitch -= bruteForceRayCastIntensity.getCurrentValue()) {
-//                        final MovingObjectPosition cursor = RaycastUtil.getMouseOver(new Vector2f(yaw, pitch), searchRange.getCurrentValue());
-//                        if (cursor != null &amp;&amp; cursor.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK) {
-//                            BlockPos pos = cursor.getBlockPos();
-//                            if (pos.getX() == lastBlockCache.getBlockPos().getX() &amp;&amp; pos.getY() == lastBlockCache.getBlockPos().getY() &amp;&amp; pos.getZ() == lastBlockCache.getBlockPos().getZ()) {
-//                                this.yaw = yaw;
-//                                this.pitch = pitch;
-//                                break;
-//                            }
-//                        }
+<p class="impl-pattern">Place a block under the player every tick while moving, using silent rotations and silent item switching.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On each pre-motion tick, raycast or brute-force a BlockPos below/around the player, pick the best block slot, send C09 to switch if needed, then send C08 with the target pos, the face, the held ItemStack and cursor offsets. Rise 5.99 additionally cancels incoming C09PacketHeldItemChange so the visible hotbar never moves, sends START/STOP_SNEAKING C0B for eagle mode, and releases the placement via PacketUtil.sendPacket.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/player/Scaffold.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/player/Scaffold.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.player;
+
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PostMotionEvent;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.other.CanPlaceBlockEvent;
+import dev.rise.event.impl.other.MoveButtonEvent;
+import dev.rise.event.impl.other.StrafeEvent;
+import dev.rise.event.impl.other.WorldChangedEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.event.impl.packet.PacketSendEvent;
+import dev.rise.event.impl.render.BlurEvent;
+import dev.rise.event.impl.render.Render2DEvent;
+import dev.rise.event.impl.render.Render3DEvent;
+import dev.rise.font.CustomFont;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.module.impl.movement.Speed;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.setting.impl.NoteSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.math.MathUtil;
+import dev.rise.util.math.TimeUtil;
+import dev.rise.util.player.MoveUtil;
+import dev.rise.util.player.PacketUtil;
+import dev.rise.util.player.PlayerUtil;
+import dev.rise.util.player.RotationUtil;
+import dev.rise.util.render.RenderUtil;
+import dev.rise.util.world.BlockUtil;
+import dev.rise.util.world.EnumFacingOffset;
+import dev.rise.viamcp.ViaMCP;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockAir;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.ScaledResolution;
+import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.client.renderer.RenderHelper;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.item.ItemBlock;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.S0BPacketAnimation;
+import net.minecraft.network.play.server.S2FPacketSetSlot;
+import net.minecraft.potion.Potion;
+import net.minecraft.util.*;
+import org.lwjgl.input.Keyboard;
+import org.lwjgl.input.Mouse;
+
+import java.awt.*;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
+/**
+ * This module automatically puts a block under you to easily bridge effortlessly.
+ */
+@ModuleInfo(name = "Scaffold", description = "Places blocks under you", category = Category.PLAYER)
+public final class Scaffold extends Module {
+
+    private final NoteSetting modeSettings = new NoteSetting("Mode Settings", this);
+    private final ModeSetting rotations = new ModeSetting("Rotations", this, "Normal", "None", "Normal", "Simple", "Down", "Snap", "Bruteforce", "Pitch Abuse", "Hypixel");
+    private final ModeSetting tower = new ModeSetting("Tower", this, "None", "None", "Vanilla", "Slow", "Verus", "Intave", "Hypixel", "NCP");
+    private final ModeSetting movementFix = new ModeSetting("Movement Fix", this, "None", "None", "Yaw", "Hidden");
+    private final ModeSetting sprint = new ModeSetting("Sprint", this, "Normal", "Normal", "None", "Bypass", "Legit", "Hypixel");
+    //    private final ModeSetting speed = new ModeSetting("Speed", this, "None", "None", "NCP", "AAC", "Experimental");
+    private final ModeSetting blockCounter = new ModeSetting("Block Counter", this, "Normal", "Normal", "Minecraft");
+
+    private final NoteSetting generalSettings = new NoteSetting("General Settings", this);
+    private final NumberSetting timer = new NumberSetting("Timer", this, 1, 0.1, 10, 0.1);
+    private final NumberSetting towerTimer = new NumberSetting("Tower Timer", this, 1, 0.1, 10, 0.1);
+    private final BooleanSetting towerMove = new BooleanSetting("Tower Move", this, false);
+    private final BooleanSetting downwards = new BooleanSetting("Downwards", this, true);
+    private final BooleanSetting safewalk = new BooleanSetting("Safe Walk", this, true);
+    private final BooleanSetting strafe = new BooleanSetting("Strafe", this, false);
+    private final BooleanSetting sameY = new BooleanSetting("Same Y", this, false);
+    private final BooleanSetting swing = new BooleanSetting("Swing", this, true);
+    private final BooleanSetting disableOnWorldChange = new BooleanSetting("Disable on World Change", this, false);
+    private final BooleanSetting disableSpeed = new BooleanSetting("Disable Speed", this, false);
+
+    private final NoteSetting bypassSettings = new NoteSetting("Bypass Settings", this);
+    private final NumberSetting range = new NumberSetting("Range", this, 3, 1, 6, 0.5);
+    private final BooleanSetting randomiseRotationSpeedOnEnable = new BooleanSetting("Randomise Rotation Speed On Enable", this, false);
+    private final NumberSetting rotationSpeed = new NumberSetting("Rotation Speed", this, 50, 5, 360, 5);
+    private final NumberSetting randomisation = new NumberSetting("Randomisation", this, 1, 0, 6, 0.1);
+    private final NumberSetting placeDelay = new NumberSetting("Place Delay", this, 0, 0, 5, 0.1);
+    private final BooleanSetting randomisePlaceDelay = new BooleanSetting("Randomise Place Delay", this, false);
+    private final NumberSetting speedMultiplier = new NumberSetting("Speed Multiplier", this, 1, 0, 2, 0.05);
+    private final NumberSetting eagle = new NumberSetting("Eagle", this, 4, 0, 15, 1, "15-Never", "0-Packet");
+    private final NumberSetting expand = new NumberSetting("Expand", this, 0, 0, 5, 0.1);
+    private final BooleanSetting ignoreSpeed = new BooleanSetting("Ignore Speed", this, false);
+    private final ModeSetting rayCast = new ModeSetting("Ray Cast", this, "Normal", "Normal", "Strict", "Off");
+    private final ModeSetting placeOn = new ModeSetting("Place on", this, "Legit", "Legit", "Post", "Pre");
+    private final BooleanSetting dragClick = new BooleanSetting("Drag Click", this, false);
+    private final BooleanSetting jitter = new BooleanSetting("Jitter", this, false);
+    private final BooleanSetting telly = new BooleanSetting("Telly", this, false);
+    private final ModeSetting tellyMode = new ModeSetting("Telly Mode", this, "Legit", "Legit", "Teleport", "Custom");
+    private final NumberSetting teleportOhMyGod = new NumberSetting("Teleport Height", this, 0.42, 0.01, 5.00, 0.01);
+    private final NumberSetting tellyVerticalAmount = new NumberSetting("Custom Vertical Amount", this, 0.42, 0.01, 1.00, 0.01);
+    private final NumberSetting tellyHorizontalAmount = new NumberSetting("Custom Horizontal Amount", this, 0.35, 0.0, 4.0, 0.01);
+    private final BooleanSetting hideJumps = new BooleanSetting("Hide Jumps", this, false);
+
+    private Vec3 targetBlock;
+    private List&lt;Vec3&gt; placePossibilities = new ArrayList&lt;&gt;();
+    private EnumFacingOffset enumFacing;
+    private BlockPos blockFace;
+    private boolean touchedGround;
+    private int slowTicks;
+
+    private float targetYaw, targetPitch, yaw, lastYaw, lastPitch;
+    public static float pitch;
+
+    private boolean lastGround;
+    private int blockCount;
+    private int ticksOnAir;
+    private double startY;
+    private int slot;
+    private int offGroundTicks;
+    private int blocksPlaced;
+    private int towerOnGroundTicks;
+    private boolean sneaking;
+    private boolean shiftPressed;
+    private boolean shouldEnableSpeed;
+    private float offsetYaw, offsetPitch;
+    TimeUtil timer3 = new TimeUtil();
+
+    @Override
+    public void onUpdateAlwaysInGui() {
+        rotationSpeed.hidden = rotations.is("None");
+
+        tellyMode.hidden = !telly.isEnabled();
+
+        tellyVerticalAmount.hidden = tellyHorizontalAmount.hidden = !tellyMode.is("Custom") || !telly.isEnabled();
+
+        teleportOhMyGod.hidden = !tellyMode.is("Teleport") || !telly.isEnabled();
+    }
+
+    @Override
+    protected void onEnable() {
+        if (this.getModule(Speed.class).isEnabled() &amp;&amp; disableSpeed.isEnabled()) {
+            shouldEnableSpeed = true;
+            this.getModule(Speed.class).setEnabled(false);
+            this.registerNotification("Disabled Speed to prevent flags.");
+        } else {
+            shouldEnableSpeed = false;
+        }
+        slowTicks = 0;
+        slot = mc.thePlayer.inventory.currentItem;
+
+        yaw = lastYaw = mc.thePlayer.rotationYaw;
+        pitch = lastPitch = mc.thePlayer.rotationPitch;
+        if (sprint.is("Hypixel") &amp;&amp; !mc.thePlayer.onGround) {
+            MoveUtil.stop();
+        }
+        if (rotations.is("Pitch Abuse")) {
+            targetYaw = mc.thePlayer.rotationYaw;
+            targetPitch = 94;
+        } else {
+            targetYaw = mc.thePlayer.rotationYaw - 180;
+            targetPitch = 90;
+        }
+
+        startY = mc.thePlayer.posY;
+        targetBlock = null;
+        placePossibilities.clear();
+
+        if (randomiseRotationSpeedOnEnable.isEnabled()) {
+            rotationSpeed.setValue(50 + (85 - 50) * Math.random());
+        }
+
+        offsetYaw = (float) ((Math.random() - 0.5) * 2);
+        offsetPitch = (float) ((Math.random() - 0.5) * 2);
+
+    }
+
+    @Override
+    public void onWorldChanged(final WorldChangedEvent event) {
+        if (disableOnWorldChange.isEnabled()) {
+            this.toggleModule();
+        }
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (p instanceof S2FPacketSetSlot) event.setCancelled(true);
+    }
+
+    @Override
+    protected void onDisable() {
+        mc.gameSettings.keyBindForward.setKeyPressed(Keyboard.isKeyDown(mc.gameSettings.keyBindForward.getKeyCode()));
+        blocksPlaced = 0;
+        if (shouldEnableSpeed) {
+            if (!this.getModule(Speed.class).isEnabled()) {
+                this.getModule(Speed.class).setEnabled(true);
+                this.registerNotification("Enabled Speed since it was previously enabled.");
+            }
+        }
+        if (slot != mc.thePlayer.inventory.currentItem)
+            PacketUtil.sendPacketWithoutEvent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));
+
+        EntityPlayer.movementYaw = null;
+        mc.timer.timerSpeed = 1;
+        mc.gameSettings.keyBindSneak.setKeyPressed(false);
+        EntityPlayer.enableCameraYOffset = false;
+
+        if (sneaking) {
+            sneaking = false;
+            PacketUtil.sendPacket(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
+        }
+    }
+
+    @Override
+    public void onStrafe(final StrafeEvent event) {
+        if (movementFix.is("Hidden")) {
+            event.setCancelled(true);
+            silentRotationStrafe(event, yaw);
+        }
+
+        if (strafe.isEnabled()) MoveUtil.strafe();
+    }
+
+    @Override
+    public void onRender3DEvent(final Render3DEvent event) {
+        if (!rotations.is("None")) {
+            if (enumFacing == null || blockFace == null) return;
+
+            this.calculateRotations();
+        }
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+
+        if (disableSpeed.isEnabled() &amp;&amp; this.getModule(Speed.class).isEnabled()) {
+            this.toggleModule();
+            this.registerNotification("Disabled " + this.getModuleInfo().name() + " to prevent flags.");
+        }
+        if (this.placeOn.is("Pre")) {
+            this.placeBlock();
+        }
+        double forward = 0, posX = 0, posZ = 0;
+
+        float direction = (float) MoveUtil.getDirection();
+        posX = -MathHelper.sin(direction) * forward + mc.thePlayer.posX;
+        posZ = MathHelper.cos(direction) * forward + mc.thePlayer.posZ;
+
+        for (forward = 0; forward &lt;= expand.getValue() &amp;&amp; !(PlayerUtil.getBlock(posX, mc.thePlayer.posY - 1, posZ) instanceof BlockAir); forward += 0.1) {
+            if (tower.is("Hypixel") &amp;&amp; Keyboard.isKeyDown(mc.gameSettings.keyBindJump.getKeyCode()) &amp;&amp; !this.getModule(Speed.class).isEnabled() &amp;&amp; mc.currentScreen == null) {
+                if (blocksPlaced % 3 == 0) {
+                    forward = 1;
+                }
+            } else {
+                forward = expand.getValue();
+            }
+            direction = (float) MoveUtil.getDirection();
+            posX = -MathHelper.sin(direction) * forward + mc.thePlayer.posX;
+            posZ = MathHelper.cos(direction) * forward + mc.thePlayer.posZ;
+        }
+
+        if (!MoveUtil.isMoving() &amp;&amp; !tower.is("Hypixel")) {
+            forward = 0;
+            posX = -MathHelper.sin(direction) * forward + mc.thePlayer.posX;
+            posZ = MathHelper.cos(direction) * forward + mc.thePlayer.posZ;
+        }
+
+
+        if (PlayerUtil.getBlock(posX, mc.thePlayer.posY - 1, posZ) instanceof BlockAir) ticksOnAir++;
+        else ticksOnAir = 0;
+
+        if (mc.thePlayer.onGround) {
+            offGroundTicks = 0;
+        } else offGroundTicks++;
+
+        EntityPlayer.enableCameraYOffset = false;
+
+        if (mc.thePlayer.posY &gt; startY &amp;&amp; hideJumps.isEnabled() &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown()) {
+            EntityPlayer.enableCameraYOffset = true;
+            EntityPlayer.cameraYPosition = startY;
+        }
+
+        // Ghost item fix
+        for (int slot = 0; slot &lt; 9; slot++) {
+            if (mc.thePlayer.inventory.getStackInSlot(slot) != null &amp;&amp; mc.thePlayer.inventory.getStackInSlot(slot).getItem() instanceof ItemBlock) {
+                ItemStack stack = mc.thePlayer.inventory.getStackInSlot(slot);
+
+                if (stack.getStackSize() == 0) mc.thePlayer.inventory.setInventorySlotContents(slot, null);
+            }
+        }
+
+        int blocks = 0;
+
+        for (int i = 36; i &lt; 45; ++i) {
+            final ItemStack itemStack = mc.thePlayer.inventoryContainer.getSlot(i).getStack();
+            if (itemStack != null &amp;&amp; itemStack.getItem() instanceof ItemBlock &amp;&amp; itemStack.stackSize &gt; 0) {
+                final Block block = ((ItemBlock) itemStack.getItem()).getBlock();
+                if (block.isFullCube() &amp;&amp; !BlockUtil.BLOCK_BLACKLIST.contains(block))
+                    blocks += itemStack.getStackSize();
+            }
+        }
+
+        blockCount = blocks;
+
+        if (mc.thePlayer.onGround || (mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; !sameY.isEnabled()))
+            startY = mc.thePlayer.posY;
+
+        final int blockSlot = BlockUtil.findBlock() - 36;
+
+        if (blockSlot &lt; 0 || blockSlot &gt; 9) return;
+
+        // Sprinting
+        switch (sprint.getMode()) {
+            case "None": {
+                mc.gameSettings.keyBindSprint.setKeyPressed(false);
+                mc.thePlayer.setSprinting(false);
+                break;
+            }
+
+            case "Bypass": {
+                mc.thePlayer.setSprinting(false);
+                break;
+            }
+
+            case "Legit": {
+                if (Math.abs(MathHelper.wrapAngleTo180_float(mc.thePlayer.rotationYaw) - MathHelper.wrapAngleTo180_float(yaw)) &gt; 90) {
+                    mc.gameSettings.keyBindSprint.setKeyPressed(false);
+                    mc.thePlayer.setSprinting(false);
+                }
+                break;
+            }
+
+            case "Hypixel": {
+                if (MoveUtil.isMoving() &amp;&amp; slowTicks &lt;= 3 &amp;&amp; mc.thePlayer.onGround &amp;&amp; slowTicks &gt;= 0) {
+                    mc.gameSettings.keyBindSprint.setKeyPressed(true);
+                    mc.thePlayer.setSprinting(true);
+                    final double[] xz = yawPos((float) ((float) MoveUtil.getDirection()), (MoveUtil.getBaseMoveSpeed() / 2) - Math.random() / 100);
+                    PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX - xz[0], mc.thePlayer.posY, mc.thePlayer.posZ - xz[1], true));
+                    if (mc.thePlayer.ticksExisted % 5 == 0) {
+                        mc.thePlayer.setPosition(mc.thePlayer.posX - getRandomHypixelValues(), mc.thePlayer.posY, mc.thePlayer.posZ - getRandomHypixelValues());
+                    }
+                    slowTicks--;
+                }
+                mc.thePlayer.motionX *= .975;
+                mc.thePlayer.motionZ *= .975;
+            }
+        }
+
+        // Speed
+//        switch (speed.getMode()) {
+//            case "NCP": {
+//                if (mc.thePlayer.onGround) {
+//                    if (mc.thePlayer.ticksExisted % 15 == 0) {
+//                        mc.thePlayer.motionX *= 1.5 + Math.random() / 100D;
+//                        mc.thePlayer.motionZ *= 1.5 + Math.random() / 100D;
+//                    } else if (mc.thePlayer.ticksExisted - 2 % 15 == 0) {
+//                        mc.thePlayer.motionX *= 0.7;
+//                        mc.thePlayer.motionZ *= 0.7;
 //                    }
 //                }
+//            }
+//            case "AAC": {
 //                break;
-//        }
-//    }
-//
-//    private Vec3 getHitVec() {
-//        double x = lastBlockCache.getBlockPos().getX() + 0.5,
-//                y = lastBlockCache.getBlockPos().getY() + 0.5,
-//                z = lastBlockCache.getBlockPos().getZ() + 0.5;
-//
-//        if(lastBlockCache.getEnumFacing() != EnumFacing.UP &amp;&amp; lastBlockCache.getEnumFacing() != EnumFacing.DOWN) {
-//            y += 0.5;
-//        } else {
-//            x += 0.3;
-//            z += 0.3;
-//        }
-//
-//        if(lastBlockCache.getEnumFacing() == EnumFacing.SOUTH || lastBlockCache.getEnumFacing() == EnumFacing.NORTH)
-//            x += 0.15;
-//        if(lastBlockCache.getEnumFacing() == EnumFacing.EAST || lastBlockCache.getEnumFacing() == EnumFacing.WEST)
-//            z += 0.15;
-//
-//        return new Vec3(x, y, z);
-//    }
-//
-//    private BlockCache getBlockCache() {
-//        final BlockPos belowBlockPos = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1, mc.thePlayer.posZ);
-//        if (mc.theWorld.getBlockState(belowBlockPos).getBlock() instanceof BlockAir) {
-//            for (int x = 0; x &lt; searchRange.getCurrentValue(); x++) {
-//                for (int z = 0; z &lt; searchRange.getCurrentValue(); z++) {
-//                    for (int i = 1; i &gt; -3; i -= 2) {
-//                        final BlockPos blockPos = belowBlockPos.add(x * i, 0, z * i);
-//                        if (mc.theWorld.getBlockState(blockPos).getBlock() instanceof BlockAir) {
-//                            for (final EnumFacing direction : EnumFacing.values()) {
-//                                final BlockPos block = blockPos.offset(direction);
-//                                final Material material = mc.theWorld.getBlockState(block).getBlock().getMaterial();
-//                                if (material.isSolid() &amp;&amp; !material.isLiquid())
-//                                    return new BlockCache(block, direction.getOpposite());
-//                            }
-//                        }
-//                    }
-//                }
+//            }
+//            case "Experimental": {
+//                break;
 //            }
 //        }
-//        return null;
-//    }
+
+        placePossibilities = getPlacePossibilities();
+
+        if (placePossibilities.isEmpty()) return;
+
+        double finalPosX = posX;
+        double finalPosZ = posZ;
+        placePossibilities.sort(Comparator.comparingDouble(vec3 -&gt; {
+
+            final double d0 = finalPosX - vec3.xCoord;
+            final double d1 = mc.thePlayer.posY - 1 - vec3.yCoord;
+            final double d2 = finalPosZ - vec3.zCoord;
+            return MathHelper.sqrt_double(d0 * d0 + d1 * d1 + d2 * d2);
+
+        }));
+
+        targetBlock = placePossibilities.get(0);
+
+        enumFacing = getEnumFacing(targetBlock);
+
+        if (downwards.isEnabled() &amp;&amp; mc.gameSettings.keyBindSneak.isKeyDown() &amp;&amp; mc.thePlayer.onGround &amp;&amp; enumFacing != null &amp;&amp; enumFacing.getEnumFacing() != null)
+            enumFacing.enumFacing = EnumFacing.DOWN;
+
+        if (sameY.isEnabled() &amp;&amp; mc.thePlayer.posY &lt; startY) startY = mc.thePlayer.posY;
+
+        if (enumFacing == null) return;
+
+        final BlockPos position = new BlockPos(targetBlock.xCoord, targetBlock.yCoord, targetBlock.zCoord);
+
+        blockFace = position.add(enumFacing.getOffset().xCoord, enumFacing.getOffset().yCoord, enumFacing.getOffset().zCoord);
+
+        if (blockFace == null) return;
+
+        shiftPressed = mc.theWorld.getBlockState(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1.0, mc.thePlayer.posZ)).getBlock() instanceof BlockAir &amp;&amp; mc.thePlayer.onGround &amp;&amp; blocksPlaced == eagle.getValue() &amp;&amp; eagle.getValue() != 15 &amp;&amp; eagle.getValue() != 0;
+
+        if (mc.theWorld.getBlockState(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1.0, mc.thePlayer.posZ)).getBlock() instanceof BlockAir &amp;&amp; eagle.getValue() == 0) {
+            if (!sneaking) {
+                sneaking = true;
+                PacketUtil.sendPacket(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
+            }
+        } else {
+            if (sneaking) {
+                sneaking = false;
+                PacketUtil.sendPacket(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
+            }
+        }
+
+        if (blocksPlaced &gt; eagle.getValue()) blocksPlaced = 1;
+
+        if (!rotations.is("None")) {
+            if (PlayerUtil.isOnServer("hypixel")) {
+                event.setYaw((float) (yaw + offsetYaw + ((Math.random() &gt; 0.7) ? (Math.random() - 0.5) : 0)));
+                event.setPitch((float) (pitch + offsetPitch + ((Math.random() &gt; 0.7) ? (Math.random() - 0.5) : 0)));
+
+            } else {
+                event.setYaw(yaw);
+                event.setPitch(pitch);
+            }
+
+            mc.thePlayer.renderYawOffset = yaw;
+            mc.thePlayer.rotationYawHead = yaw;
+
+//            mc.thePlayer.rotationYaw = yaw;
+//            mc.thePlayer.rotationPitch = pitch;
+
+            lastYaw = yaw;
+            lastPitch = pitch;
+        } else {
+            yaw = mc.thePlayer.rotationYaw;
+            pitch = mc.thePlayer.rotationPitch;
+        }
+
+        if (placePossibilities.isEmpty() || targetBlock == null || enumFacing == null || blockFace == null || slot &lt; 0 || slot &gt; 9)
+            return;
+
+        mc.timer.timerSpeed = (float) timer.getValue();
+
+
+        // Tower
+        if (Keyboard.isKeyDown(mc.gameSettings.keyBindJump.getKeyCode()) &amp;&amp; !this.getModule(Speed.class).isEnabled() &amp;&amp; mc.currentScreen == null) {
+            mc.timer.timerSpeed = (float) towerTimer.getValue();
+
+            if (!tower.is("None")) mc.gameSettings.keyBindJump.setKeyPressed(false);
+
+            if (!towerMove.isEnabled() &amp;&amp; !tower.is("None"))
+                mc.thePlayer.setPosition(Math.floor(mc.thePlayer.posX) + 0.5, mc.thePlayer.posY, Math.floor(mc.thePlayer.posZ) + 0.5);
+
+            switch (tower.getMode()) {
+                case "Vanilla": {
+                    mc.thePlayer.motionY = 0.42F;
+                    break;
+                }
+
+                case "Hypixel": {
+                    mc.thePlayer.setSprinting(false);
+                    if (mc.thePlayer.posY % 1 &lt;= 0.00153598) {
+                        mc.thePlayer.setPosition(mc.thePlayer.posX, Math.floor(mc.thePlayer.posY), mc.thePlayer.posZ);
+//                        mc.thePlayer.jump();
+                        mc.thePlayer.motionY = 0.42F - Math.random() / 10000f;
+                    } else if (mc.thePlayer.posY % 1 &lt; 0.1 &amp;&amp; offGroundTicks != 0) {
+                        mc.thePlayer.motionY = 0;
+                        mc.thePlayer.setPosition(mc.thePlayer.posX, Math.floor(mc.thePlayer.posY), mc.thePlayer.posZ);
+                    }
+                    break;
+                }
+
+                case "Slow": {
+                    if (mc.thePlayer.onGround) mc.thePlayer.motionY = 0.4F;
+                    else if (PlayerUtil.getBlockRelativeToPlayer(0, -1, 0) instanceof BlockAir)
+                        mc.thePlayer.motionY -= 0.4F;
+
+                    MoveUtil.stop();
+                    break;
+                }
+
+                case "Verus": {
+                    if (mc.thePlayer.ticksExisted % 2 == 0) {
+                        mc.thePlayer.motionY = 0.42F;
+                    }
+                    break;
+                }
+
+                case "Intave": {
+                    if (mc.thePlayer.onGround) {
+                        mc.thePlayer.motionY = 0.40444491418477924;
+                    }
+
+                    if (offGroundTicks == 5) {
+                        mc.thePlayer.motionY = MoveUtil.getPredictedMotionY(mc.thePlayer.motionY);
+                    }
+                    break;
+                }
+
+                case "NCP": {
+
+                    if (mc.thePlayer.posY % 1 &lt;= 0.00153598) {
+                        mc.thePlayer.setPosition(mc.thePlayer.posX, Math.floor(mc.thePlayer.posY), mc.thePlayer.posZ);
+//                        mc.thePlayer.jump();
+                        mc.thePlayer.motionY = 0.41998F - getRandomHypixelValues() / 2;
+                    } else if (mc.thePlayer.posY % 1 &lt; 0.1 &amp;&amp; offGroundTicks != 0) {
+                        mc.thePlayer.setPosition(mc.thePlayer.posX, Math.floor(mc.thePlayer.posY), mc.thePlayer.posZ);
+                    }
+                    break;
+                }
+            }
+        }
+
+        final double baseSpeed = getBaseSpeed();
+        final double speedMultiplier = this.speedMultiplier.getValue();
+        if (Math.abs(speedMultiplier - 1.0) &gt; 1E-4 &amp;&amp; mc.thePlayer.onGround &amp;&amp; !(mc.thePlayer.isPotionActive(Potion.moveSpeed) &amp;&amp; mc.thePlayer.getActivePotionEffect(Potion.moveSpeed).getAmplifier() &gt; 2 - 1) &amp;&amp; baseSpeed != 0) {
+            MoveUtil.strafe(baseSpeed * speedMultiplier);
+        }
+    }
+
+    public double getBaseSpeed() {
+        if (mc.gameSettings.keyBindSprint.isKeyDown()) {
+            if (mc.thePlayer.isPotionActive(Potion.moveSpeed) &amp;&amp; !ignoreSpeed.isEnabled()) {
+                if (mc.thePlayer.getActivePotionEffect(Potion.moveSpeed).getAmplifier() + 1 == 1) {
+                    return 0.18386012061481244;
+                } else {
+                    return 0.21450346015841276;
+                }
+            } else {
+                return 0.15321676228437875;
+            }
+        } else {
+            if (mc.thePlayer.isPotionActive(Potion.moveSpeed) &amp;&amp; !ignoreSpeed.isEnabled()) {
+                if (mc.thePlayer.getActivePotionEffect(Potion.moveSpeed).getAmplifier() + 1 == 1) {
+                    return 0.14143085686761;
+                } else {
+                    return 0.16500264553372018;
+                }
+            } else {
+                return 0.11785905094607611;
+            }
+        }
+    }
+
+    public float[] calculateRotations() {
+        if (((ticksOnAir &gt; placeDelay.getValue()) || rotations.is("Snap")) || movementFix.is("Yaw")) {
+            final float[] rotations = BlockUtil.getDirectionToBlock(blockFace.getX(), blockFace.getY(), blockFace.getZ(), enumFacing.getEnumFacing());
+
+            if (movementFix.is("Yaw")) {
+                targetYaw = (float) (MoveUtil.getDirectionWrappedTo90() * (180 / Math.PI) - 180);
+                targetPitch = rotations[1];
+
+                switch (this.rotations.getMode()) {
+                    case "Snap": {
+                        if (ticksOnAir &gt; placeDelay.getValue()) {
+                            targetYaw = (float) (MoveUtil.getDirectionWrappedTo90() * (180 / Math.PI) - 180);
+                            targetPitch = rotations[1];
+                        } else {
+                            targetYaw = (float) (mc.thePlayer.rotationYaw + Math.random());
+                            targetPitch = mc.thePlayer.rotationPitch;
+                        }
+                        break;
+                    }
+                }
+            } else {
+                switch (this.rotations.getMode()) {
+                    case "Normal": {
+                        targetYaw = rotations[0];
+                        targetPitch = rotations[1];
+                        break;
+                    }
+
+                    case "Simple": {
+                        float yaw = 0;
+
+                        switch (enumFacing.getEnumFacing()) {
+                            case SOUTH: {
+                                yaw = 180;
+                                break;
+                            }
+
+                            case EAST: {
+                                yaw = 90;
+                                break;
+                            }
+
+                            case WEST: {
+                                yaw = -90;
+                                break;
+                            }
+                        }
+
+                        targetYaw = yaw;
+                        targetPitch = 90;
+                        break;
+                    }
+
+                    case "Down": {
+                        targetPitch = (float) (89 + Math.random() / 200f);
+                        targetYaw = (float) (mc.thePlayer.rotationYaw - 180 - Math.random() * 15);
+                        break;
+                    }
+                    case "Hypixel": {
+                        targetPitch = (float) (89 + Math.random() / 100f);
+                        targetYaw = (float) (mc.thePlayer.rotationYaw + 180 - Math.random() * 10);
+                        break;
+                    }
+
+                    case "Snap": {
+                        targetYaw = rotations[0];
+                        targetPitch = rotations[1];
+                        if (ticksOnAir &lt;= placeDelay.getValue()) {
+                            targetYaw = (float) (mc.thePlayer.rotationYaw + Math.random());
+                            targetPitch = mc.thePlayer.rotationPitch;
+                        }
+                        break;
+                    }
+
+                    case "Bruteforce": {
+                        boolean found = false;
+                        for (float yaw = mc.thePlayer.rotationYaw - 180; yaw &lt;= mc.thePlayer.rotationYaw + 360 - 180 &amp;&amp; !found; yaw += 45) {
+                            for (float pitch = 90; pitch &gt; 30 &amp;&amp; !found; pitch -= 1) {
+                                if (BlockUtil.lookingAtBlock(blockFace, yaw, pitch, enumFacing.getEnumFacing(), rayCast.is("Strict"))) {
+                                    targetYaw = yaw;
+                                    targetPitch = pitch;
+                                    found = true;
+                                }
+                            }
+                        }
+
+                        if (!found) {
+                            targetYaw = (float) (rotations[0] + (Math.random() - 0.5) * 4);
+                            targetPitch = (float) (rotations[1] + (Math.random() - 0.5) * 4);
+                        }
+                        break;
+                    }
+
+                    case "Pitch Abuse":
+                        boolean found = false;
+
+                        boolean strict = rayCast.is("Strict");
+
+                        for (float yaw = mc.thePlayer.rotationYaw; yaw &lt;= mc.thePlayer.rotationYaw + 360 &amp;&amp; !found; yaw += 5) {
+                            for (float pitch = 120; pitch &lt; 180 &amp;&amp; !found; pitch += 1) {
+                                if (BlockUtil.lookingAtBlock(blockFace, yaw, pitch, enumFacing.getEnumFacing(), strict)) {
+                                    targetYaw = yaw;
+                                    targetPitch = pitch;
+                                    found = true;
+                                }
+                            }
+                        }
+
+                        if (!found) {
+                            targetYaw = mc.thePlayer.rotationYaw;
+                            targetPitch = 94;
+                        }
+                        break;
+                }
+            }
+        }
+
+        final int fps = (int) (Minecraft.getDebugFPS() / 20.0F);
+
+        final float rotationSpeed = (float) (this.rotationSpeed.getValue() + Math.random() * 20) * 6 / fps;
+
+        final float deltaYaw = (((targetYaw - lastYaw) + 540) % 360) - 180;
+        final float deltaPitch = targetPitch - lastPitch;
+
+        final float distanceYaw = MathHelper.clamp_float(deltaYaw, -rotationSpeed, rotationSpeed);
+        final float distancePitch = MathHelper.clamp_float(deltaPitch, -rotationSpeed, rotationSpeed);
+
+        yaw = lastYaw + distanceYaw;
+        pitch = lastPitch + distancePitch;
+
+        targetPitch += (float) (this.randomisation.getValue() * (Math.random() - 0.5) * 3);
+        targetYaw += (float) (this.randomisation.getValue() * (Math.random() - 0.5) * 3);
+
+        if (rotationSpeed &gt;= 355) {
+            yaw = targetYaw;
+            pitch = targetPitch;
+        }
+
+        final float[] currentRotations = new float[]{yaw, pitch};
+        final float[] lastRotations = new float[]{lastYaw, lastPitch};
+
+        final float[] fixedRotations = RotationUtil.getFixedRotation(currentRotations, lastRotations);
+
+        yaw = fixedRotations[0];
+        pitch = fixedRotations[1];
+
+        if (!rotations.is("Pitch Abuse")) pitch = MathHelper.clamp_float(pitch, -90, 90);
+
+        return new float[]{yaw, pitch};
+    }
+
+    @Override
+    public void onRender2DEvent(final Render2DEvent event) {
+        if (blockCount == 0) return;
+
+        final ScaledResolution sr = event.getScaledResolution();
+        final ItemStack itemStack = mc.thePlayer.inventory.getStackInSlot(slot);
+        Color color;
+
+        if (blockCount &lt;= 63) {
+            color = Color.RED;
+        } else color = Color.GREEN;
+
+
+        if (blockCounter.is("MC")) {
+            final int height = sr.getScaledHeight() / 2;
+
+            mc.fontRendererObj.drawStringWithShadow(String.valueOf(blockCount), sr.getScaledWidth() / 2F + 1F, height + 9, color.getRGB());
+
+            if (itemStack != null) {
+                GlStateManager.pushMatrix();
+                GlStateManager.enableRescaleNormal();
+                GlStateManager.enableBlend();
+                GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0);
+                RenderHelper.enableGUIStandardItemLighting();
+                mc.getRenderItem().renderItemAndEffectIntoGUI(itemStack, sr.getScaledWidth() / 2F - 17F, height + 4);
+                GlStateManager.disableRescaleNormal();
+                GlStateManager.disableBlend();
+                RenderHelper.disableStandardItemLighting();
+                GlStateManager.popMatrix();
+            } else CustomFont.drawCenteredString("?", sr.getScaledWidth() / 2F + 0.5F, height + 6, -1);
+        }
+
+
+        if (blockCounter.is("Normal")) {
+            final int height = sr.getScaledHeight() - 90;
+            RenderUtil.roundedRect((sr.getScaledWidth() / 2F) - 15, height, 30, 30, 6, new Color(0, 0, 0, 80));
+
+            CustomFont.drawCenteredString(String.valueOf(blockCount), sr.getScaledWidth() / 2F, height + 19, -1);
+
+            if (itemStack != null) {
+                GlStateManager.pushMatrix();
+                GlStateManager.enableRescaleNormal();
+                GlStateManager.enableBlend();
+                GlStateManager.tryBlendFuncSeparate(770, 771, 1, 0);
+                RenderHelper.enableGUIStandardItemLighting();
+                mc.getRenderItem().renderItemAndEffectIntoGUI(itemStack, sr.getScaledWidth() / 2F - 8F, height + 2);
+                GlStateManager.disableRescaleNormal();
+                GlStateManager.disableBlend();
+                RenderHelper.disableStandardItemLighting();
+                GlStateManager.popMatrix();
+            } else CustomFont.drawCenteredString("?", sr.getScaledWidth() / 2F + 0.5F, height + 6, -1);
+        }
+    }
+
+    @Override
+    public void onBlur(final BlurEvent event) {
+        if (blockCounter.is("Normal")) {
+            final ScaledResolution sr = new ScaledResolution(mc);
+            final int height = sr.getScaledHeight() - 90;
+
+            RenderUtil.roundedRect((sr.getScaledWidth() / 2F) - 15, height, 30, 30, 6, new Color(0, 0, 0, 80));
+        }
+    }
+
+    @Override
+    public void onMoveButton(final MoveButtonEvent event) {
+        if (jitter.isEnabled()) {
+            if (mc.gameSettings.keyBindForward.isKeyDown() || mc.gameSettings.keyBindBack.isKeyDown()) {
+                if (mc.thePlayer.ticksExisted % 2 == 0) event.setLeft(true);
+                else event.setRight(true);
+            }
+
+            if (mc.gameSettings.keyBindLeft.isKeyDown() || mc.gameSettings.keyBindRight.isKeyDown()) {
+                if (mc.thePlayer.ticksExisted % 2 == 0) event.setForward(true);
+                else event.setBackward(true);
+            }
+        }
+        if (telly.isEnabled() &amp;&amp; MoveUtil.isMoving() &amp;&amp; mc.thePlayer.onGround) {
+            switch (tellyMode.getMode()) {
+                case "Legit":
+                    event.setJump(true);
+                    break;
+                case "Custom":
+                    mc.thePlayer.motionY = tellyVerticalAmount.getValue();
+                    MoveUtil.strafe(tellyHorizontalAmount.getValue());
+                case "Teleport":
+                    mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY + teleportOhMyGod.getValue(), mc.thePlayer.posZ);
+                    break;
+        }
+    }
+        event.setSneak(shiftPressed);
+}
+
+    @Override
+    public void onPacketSend(final PacketSendEvent event) {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (p instanceof C09PacketHeldItemChange) event.setCancelled(true);
+
+    }
+
+    @Override
+    public void onCanPlaceBlockEvent(final CanPlaceBlockEvent event) {
+        if (placeOn.is("Legit")) {
+            this.placeBlock();
+        }
+    }
+
+    @Override
+    public void onPostMotion(final PostMotionEvent event) {
+        if (placeOn.is("Post")) {
+            this.placeBlock();
+        }
+
+
+//        mc.gameSettings.keyBindJump.setKeyPressed(false);
 //
-//    public static final class BlockCache {
+//        if (mc.thePlayer.onGround &amp;&amp; towerOnGroundTicks &gt;= 3) {
+//            float[] jumpPos = new float[]{0.42f, 0.7532f, 1.00134f};
 //
-//        private final BlockPos blockPos;
-//        private final EnumFacing enumFacing;
+//            for (float pos : jumpPos) {
+//                PacketUtil.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY + pos, mc.thePlayer.posZ, false));
+//            }
 //
-//        public BlockCache(final BlockPos blockPos, final EnumFacing enumFacing) {
-//            this.blockPos = blockPos;
-//            this.enumFacing = enumFacing;
+//            mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY + 1.1661, mc.thePlayer.posZ);
 //        }
-//
-//        public BlockPos getBlockPos() {
-//            return blockPos;
-//        }
-//
-//        public EnumFacing getEnumFacing() {
-//            return enumFacing;
-//        }
-//    }
-//
-//}
+
+    }
+
+    public static double getRandomHypixelValues() {
+        SecureRandom secureRandom = new SecureRandom();
+        double value = secureRandom.nextDouble() * (1.0 / System.currentTimeMillis());
+        for (int i = 0; i &lt; MathUtil.getRandom(MathUtil.getRandom(4, 6), MathUtil.getRandom(8, 20)); i++)
+            value *= (1.0 / System.currentTimeMillis());
+        return value;
+    }
+
+    public static double[] yawPos(float yaw, double value) {
+        return new double[]{-MathHelper.sin(yaw) * value, MathHelper.cos(yaw) * value};
+    }
+
+    public void placeBlock() {
+        final int blockSlot = BlockUtil.findBlock() - 36;
+
+        if (blockSlot &lt; 0 || blockSlot &gt; 9) return;
+
+        boolean switchedSlot = false;
+        if (slot != blockSlot) {
+            slot = blockSlot;
+            PacketUtil.sendPacketWithoutEvent(new C09PacketHeldItemChange(slot));
+            switchedSlot = true;
+        }
+
+        if (placePossibilities.isEmpty() || targetBlock == null || enumFacing == null || blockFace == null || slot &lt; 0 || slot &gt; 9)
+            return;
+
+        final MovingObjectPosition movingObjectPosition = mc.thePlayer.rayTraceCustom(mc.playerController.getBlockReachDistance(), mc.timer.renderPartialTicks, yaw, pitch);
+
+        if (movingObjectPosition == null) return;
+
+        final boolean sameY = (this.sameY.isEnabled() || (this.getModule(Speed.class).isEnabled() &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown())) &amp;&amp; MoveUtil.isMoving();
+        if (((int) startY - 1 != (int) targetBlock.yCoord &amp;&amp; sameY)) return;
+
+        final Vec3 hitVec = movingObjectPosition.hitVec;
+        final ItemStack item = mc.thePlayer.inventoryContainer.getSlot(slot + 36).getStack();
+
+        if (!switchedSlot &amp;&amp; ticksOnAir &gt; placeDelay.getValue() + (randomisePlaceDelay.isEnabled() &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() ? Math.random() * 3 : 0) &amp;&amp; ((BlockUtil.lookingAtBlock(blockFace, yaw, pitch, enumFacing.getEnumFacing(), rayCast.is("Strict"))) || this.rayCast.is("Off"))) {
+            if (!BlockUtil.lookingAtBlock(blockFace, yaw, pitch, enumFacing.getEnumFacing(), rayCast.is("Strict"))) {
+                hitVec.yCoord = Math.random() + blockFace.getY();
+                hitVec.zCoord = Math.random() + blockFace.getZ();
+                hitVec.xCoord = Math.random() + blockFace.getX();
+            }
+
+            if (ViaMCP.getInstance().getVersion() &gt; 47) {
+                if (swing.isEnabled()) mc.thePlayer.swingItem();
+                else PacketUtil.sendPacket(new C0APacketAnimation());
+            }
+
+            mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, item, blockFace, enumFacing.getEnumFacing(), hitVec);
+
+            if (ViaMCP.getInstance().getVersion() &lt;= 47) {
+                if (swing.isEnabled()) mc.thePlayer.swingItem();
+                else PacketUtil.sendPacket(new C0APacketAnimation());
+            }
+
+            slowTicks = 3;
+            blocksPlaced++;
+        } else if (dragClick.isEnabled() &amp;&amp; Math.random() &gt; 0.5)
+            PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(item));
+    }
+
+    public static void silentRotationStrafe(final StrafeEvent event, final float yaw) {
+        final int dif = (int) ((MathHelper.wrapAngleTo180_float(mc.thePlayer.rotationYaw - yaw - 23.5F - 135.0F) + 180.0F) / 45.0F);
+        final float strafe = event.getStrafe();
+        final float forward = event.getForward();
+        final float friction = event.getFriction();
+        float calcForward = 0.0F;
+        float calcStrafe = 0.0F;
+        switch (dif) {
+            case 0: {
+                calcForward = forward;
+                calcStrafe = strafe;
+                break;
+            }
+
+            case 1: {
+                calcForward += forward;
+                calcStrafe -= forward;
+                calcForward += strafe;
+                calcStrafe += strafe;
+                break;
+            }
+
+            case 2: {
+                calcForward = strafe;
+                calcStrafe = -forward;
+                break;
+            }
+
+            case 3: {
+                calcForward -= forward;
+                calcStrafe -= forward;
+                calcForward += strafe;
+                calcStrafe -= strafe;
+                break;
+            }
+
+            case 4: {
+                calcForward = -forward;
+                calcStrafe = -strafe;
+                break;
+            }
+
+            case 5: {
+                calcForward -= forward;
+                calcStrafe += forward;
+                calcForward -= strafe;
+                calcStrafe -= strafe;
+                break;
+            }
+
+            case 6: {
+                calcForward = -strafe;
+                calcStrafe = forward;
+                break;
+            }
+
+            case 7: {
+                calcForward += forward;
+                calcStrafe += forward;
+                calcForward -= strafe;
+                calcStrafe += strafe;
+                break;
+            }
+        }
+
+        if (calcForward &gt; 1.0F || (calcForward &lt; 0.9F &amp;&amp; calcForward &gt; 0.3F) || calcForward &lt; -1.0F || (calcForward &gt; -0.9F &amp;&amp; calcForward &lt; -0.3F))
+            calcForward *= 0.5F;
+
+        if (calcStrafe &gt; 1.0F || (calcStrafe &lt; 0.9F &amp;&amp; calcStrafe &gt; 0.3F) || calcStrafe &lt; -1.0F || (calcStrafe &gt; -0.9F &amp;&amp; calcStrafe &lt; -0.3F))
+            calcStrafe *= 0.5F;
+
+        float d;
+        if ((d = calcStrafe * calcStrafe + calcForward * calcForward) &gt;= 1.0E-4F) {
+            if ((d = MathHelper.sqrt_float(d)) &lt; 1.0F) {
+                d = 1.0F;
+            }
+            d = friction / d;
+            final float yawSin = MathHelper.sin((float) (yaw * Math.PI / 180.0));
+            final float yawCos = MathHelper.cos((float) (yaw * Math.PI / 180.0));
+            mc.thePlayer.motionX += (calcStrafe *= d) * yawCos - (calcForward *= d) * yawSin;
+            mc.thePlayer.motionZ += calcForward * yawCos + calcStrafe * yawSin;
+        }
+    }
+
+    private EnumFacingOffset getEnumFacing(final Vec3 position) {
+        for (int x2 = -1; x2 &lt;= 1; x2 += 2) {
+            if (!(PlayerUtil.getBlock(position.xCoord + x2, position.yCoord, position.zCoord) instanceof BlockAir)) {
+                if (x2 &gt; 0) {
+                    return new EnumFacingOffset(EnumFacing.WEST, new Vec3(x2, 0, 0));
+                } else {
+                    return new EnumFacingOffset(EnumFacing.EAST, new Vec3(x2, 0, 0));
+                }
+            }
+        }
+
+        for (int y2 = -1; y2 &lt;= 1; y2 += 2) {
+            if (!(PlayerUtil.getBlock(position.xCoord, position.yCoord + y2, position.zCoord) instanceof BlockAir)) {
+                if (y2 &lt; 0) {
+                    return new EnumFacingOffset(EnumFacing.UP, new Vec3(0, y2, 0));
+                }
+            }
+        }
+
+        for (int z2 = -1; z2 &lt;= 1; z2 += 2) {
+            if (!(PlayerUtil.getBlock(position.xCoord, position.yCoord, position.zCoord + z2) instanceof BlockAir)) {
+                if (z2 &lt; 0) {
+                    return new EnumFacingOffset(EnumFacing.SOUTH, new Vec3(0, 0, z2));
+                } else {
+                    return new EnumFacingOffset(EnumFacing.NORTH, new Vec3(0, 0, z2));
+                }
+            }
+        }
+
+        return null;
+    }
+
+
+    //This methods purpose is to get block placement possibilities, blocks are 1 unit thick so please don't change it to 0.5 it causes bugs
+    private List&lt;Vec3&gt; getPlacePossibilities() {
+        final List&lt;Vec3&gt; possibilities = new ArrayList&lt;&gt;();
+        final int range = (int) Math.ceil(this.range.getValue() + this.expand.getValue() + 1);
+
+        for (int x = -range; x &lt;= range; ++x) {
+            for (int y = -range; y &lt;= range; ++y) {
+                for (int z = -range; z &lt;= range; ++z) {
+                    final Block block = PlayerUtil.getBlockRelativeToPlayer(x, y, z);
+
+                    if (!(block instanceof BlockAir)) {
+                        for (int x2 = -1; x2 &lt;= 1; x2 += 2)
+                            possibilities.add(new Vec3(mc.thePlayer.posX + x + x2, mc.thePlayer.posY + y, mc.thePlayer.posZ + z));
+
+                        for (int y2 = -1; y2 &lt;= 1; y2 += 2)
+                            possibilities.add(new Vec3(mc.thePlayer.posX + x, mc.thePlayer.posY + y + y2, mc.thePlayer.posZ + z));
+
+                        for (int z2 = -1; z2 &lt;= 1; z2 += 2)
+                            possibilities.add(new Vec3(mc.thePlayer.posX + x, mc.thePlayer.posY + y, mc.thePlayer.posZ + z + z2));
+                    }
+                }
+            }
+        }
+
+        possibilities.removeIf(vec3 -&gt; !(PlayerUtil.getBlock(vec3.xCoord, vec3.yCoord, vec3.zCoord) instanceof BlockAir) || (mc.thePlayer.posX == vec3.xCoord &amp;&amp; mc.thePlayer.posY + 1 == vec3.yCoord &amp;&amp; mc.thePlayer.posZ == vec3.zCoord));
+
+        return possibilities;
+    }
+}
+
+// NOTE (AI): Rise 5.99's flagship scaffold: silent C09 switch (line ~856), cancelled C09 echoes (line ~804), C0B sneaking for eagle (lines ~414-421), placement send at line ~894. The full file shows the complete state machine: tower, eagle, sprint, rotations.
 </code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreMotionEvent for placement, PacketSendEvent to cancel C09, onDisable to release sneak.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Placement frequency and rotation-vs-face mismatch are the main flags. Rise 6.x splits scaffold into sprint/tower/downwards sub-modes (VulcanSprint, WatchdogJumpSprint, NCPTower, VerusDownwards) each tuned to a specific AC's rotation and timing checks.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.2.4/6.1.30 Scaffold.java routes placement through PlayBlockPlacementC2SPacket and Slot component; Sigma 4.11 Scaffold.java (1232 lines) has its own rotation and switch logic referencing C09 and C0B; Tenacity ScaffoldModule does not construct C08 directly.</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KillAura (Autoblock)</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Mint B1, Gugustus)</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">Scaffold places blocks silently. Autoblock sends invalid placement (pos=-1,-1,-1, face=255) to start blocking. NoSlow sends C08 with current item to bypass use-item slowdown.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Autoblock (start blocking)
-mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, mc.thePlayer.getHeldItem(), 0, 0, 0));
-// Scaffold — silent place
-mc.getNetHandler().addToSendQueue(new C08PacketPlayerBlockPlacement(blockPos, direction, itemStack, faceX, faceY, faceZ));
-// NoSlow — bypass
-mc.getNetHandler().addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, mc.thePlayer.getHeldItem(), 0, 0, 0));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Send the invalid-position C08 (pos -1,-1,-1, face 255) so the server starts the item-use (blocking) state while the aura attacks.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Inside the aura's attack tick, before or after the C02 attack packet, send new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, heldItem, 0, 0, 0). The server's direction==255 branch runs tryUseItem, which sets isBlocking/isUsingItem on the player entity, giving damage reduction. Memeware's SingleAura sends it via PacketUtil.sendPacket with the current held item.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/combat/aura/SingleAura.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/combat/aura/SingleAura.java =====
+
+package me.memewaredevs.client.module.combat.aura;
+
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.combat.Aura;
+import me.memewaredevs.client.module.combat.AutoPotion;
+import me.memewaredevs.client.util.combat.CombatUtil;
+import me.memewaredevs.client.util.combat.RotationUtils;
+import me.memewaredevs.client.util.misc.Timer;
+import me.memewaredevs.client.util.packet.PacketUtil;
+import net.minecraft.client.Minecraft;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.item.ItemSword;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+
+public class SingleAura {
+    private static Timer timer = new Timer();
+    private static boolean block;
+    public static boolean unblock;
+    private static boolean unblocked;
+    public static void doUpdate(final Aura aura, final UpdateEvent e, final Minecraft mc) {
+        boolean invisible = aura.getBool("Invisibles");
+        double range = aura.getDouble("Range");
+        boolean players = aura.getBool("Players");
+        boolean monsters = aura.getBool("Monsters");
+        boolean teams = false;
+        final Entity entity = CombatUtil.getTarget(teams, monsters, players, range, invisible);
+        final boolean autoBlock = aura.getBool("Auto Block");
+        final long clickSpeed = aura.getDouble("Click Speed").longValue();
+        Aura.isBlocking = mc.thePlayer.getHeldItem() != null
+                &amp;&amp; mc.thePlayer.getHeldItem().getItem() instanceof ItemSword &amp;&amp; autoBlock &amp;&amp; CombatUtil.canBlock(
+                teams, false, true, range + 4.0, true);
+        BlockPos a = new BlockPos(-0.2223, -0.132, -0.312);
+        if (Aura.isBlocking) {
+            if (e.isPost() &amp;&amp; block) {
+                PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(a, 255, mc.thePlayer.getHeldItem(), 0.0F, 0.0F, 0.0F));
+                unblock = true;
+            }
+        }
+        block = true;
+        if (AutoPotion.isPotting())
+            return;
+        Aura.currentEntity = (EntityLivingBase) entity;
+        if (entity != null) {
+            final float[] rots = RotationUtils.getRotations((EntityLivingBase) entity);
+            e.setYaw(rots[0]);
+            e.setPitch(rots[1]);
+            if (unblocked) {
+                mc.thePlayer.swingItem();
+                PacketUtil.sendPacket(new C02PacketUseEntity(entity, C02PacketUseEntity.Action.ATTACK));
+                unblocked = false;
+            }
+            if (timer.delay(1000L / clickSpeed) &amp;&amp; e.isPre()) {
+                PacketUtil.sendPacket(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, a.offsetDown(), EnumFacing.UP));
+                unblocked = true;
+                block = false;
+                timer.reset();
+            }
+        }
+    }
+}
+
+// NOTE (AI): Memeware SingleAura: line ~41 sends the invalid-position C08 with face 255 to enter the blocking state. The file is the complete single-target aura with target validation and the autoblock send.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent / attack loop; PacketUtil.sendPacket for the C08.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The (BlockPos.ORIGIN, 255) pattern is a well-known autoblock signature; anti-cheats that count invalid placements flag it. Modern auras toggle between blocking and attacking with C07 RELEASE_USE_ITEM to look like legit sword play.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Nekoware SingleAura/SwitchAura do the same; Rise 5.99 Aura.java and Rise 6.2.4/6.1.30 KillAura.java send it from their own packet paths; Sigma Killaura and InfiniteAura; Spicy Killaura; Tenacity KillAuraModule and TPAura reference C08 for the same trick.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoSlowdown</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Mint B1, Gugustus)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoSlow</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Spicy)</span>
 </div>
-<p class="impl-pattern">Scaffold places blocks silently. Autoblock sends invalid placement (pos=-1,-1,-1, face=255) to start blocking. NoSlow sends C08 with current item to bypass use-item slowdown.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Autoblock (start blocking)
-mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, mc.thePlayer.getHeldItem(), 0, 0, 0));
-// Scaffold — silent place
-mc.getNetHandler().addToSendQueue(new C08PacketPlayerBlockPlacement(blockPos, direction, itemStack, faceX, faceY, faceZ));
-// NoSlow — bypass
-mc.getNetHandler().addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, mc.thePlayer.getHeldItem(), 0, 0, 0));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Keep the server-side item-use state alive so eating/blocking does not slow the player, or cancel the slowdown server-side by re-sending C08.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">While mc.thePlayer.isUsingItem(), repeatedly send new C08PacketPlayerBlockPlacement(currentEquippedItem) (the 255 item-use form) so the server keeps the use state and the client's movement speed is not reduced. Rise 5.99 NoSlow sends it from the motion event and cancels the vanilla slowdown; Rise 6.x splits into per-AC modes (NCP, Intave, Watchdog, Grim, Legit) that vary the packet rate and whether the item-use C08 or a click-window trick is used.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/movement/NoSlow.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/movement/NoSlow.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.movement;
+
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PostMotionEvent;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.module.impl.combat.Aura;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.math.TimeUtil;
+import dev.rise.util.player.PacketUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import org.lwjgl.input.Mouse;
+
+/**
+ * Makes you automatically sprint without pressing the sprint key.
+ * &lt;p&gt;
+ * Wtf is this description
+ */
+@ModuleInfo(name = "NoSlow", description = "Prevents you from slowing down when using items", category = Category.MOVEMENT)
+public final class NoSlow extends Module {
+
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Vanilla", "Vanilla", "NCP", "Reverse NCP", "Hypixel", "Delay", "Intave");
+    public final NumberSetting slowdown = new NumberSetting("Slowdown", this, 0, 0, 80, 1);
+
+    //EntityPlayerSP 783
+
+    private boolean aBoolean, blocking, intaveFunnyBoolean;
+    private final TimeUtil timer = new TimeUtil();
+    private long delay;
+    private int ticks;
+
+    @Override
+    protected void onEnable() {
+        ticks = 0;
+        blocking = false;
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        final Packet&lt;?&gt; p = event.getPacket();
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        switch (mode.getMode()) {
+            case "NCP": {
+                if (mc.thePlayer.isBlocking()) {
+                    mc.playerController.syncCurrentPlayItem();
+                    PacketUtil.sendPacket(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+                }
+                break;
+            }
+
+            case "Hypixel": {
+                if (mc.thePlayer.isBlocking()) {
+                    mc.gameSettings.keyBindUseItem.setKeyPressed(true);
+                }
+                break;
+            }
+
+            case "Delay": {
+                if (!mc.thePlayer.isBlocking()) aBoolean = false;
+
+                if (mc.thePlayer.isBlocking() &amp;&amp; mc.thePlayer.ticksExisted % 5 == 0 &amp;&amp; aBoolean) {
+                    mc.playerController.syncCurrentPlayItem();
+                    PacketUtil.sendPacket(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+
+                    aBoolean = false;
+                }
+
+                if (mc.thePlayer.isBlocking() &amp;&amp; mc.thePlayer.ticksExisted % 5 == 1 &amp;&amp; !aBoolean) {
+                    mc.playerController.syncCurrentPlayItem();
+                    PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(mc.thePlayer.getCurrentEquippedItem()));
+
+                    aBoolean = true;
+                }
+                break;
+            }
+
+            case "Reverse NCP": {
+                if (mc.thePlayer.isBlocking()) {
+                    mc.playerController.syncCurrentPlayItem();
+                    PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(mc.thePlayer.getCurrentEquippedItem()));
+                }
+
+                break;
+            }
+
+            case "Intave":
+                if (mc.thePlayer.isBlocking() &amp;&amp; timer.hasReached(delay)) {
+                    mc.playerController.syncCurrentPlayItem();
+                    PacketUtil.sendPacket(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+                }
+                break;
+        }
+
+    }
+
+    @Override
+    public void onPostMotion(final PostMotionEvent event) {
+
+        switch (mode.getMode()) {
+            case "NCP": {
+                if (mc.thePlayer.isBlocking()) {
+                    mc.playerController.syncCurrentPlayItem();
+                    PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(mc.thePlayer.getCurrentEquippedItem()));
+                }
+                break;
+            }
+
+//            case "Hypixel": {
+//                if (mc.thePlayer.isBlocking()) {
+//                    mc.playerController.syncCurrentPlayItem();
+//                    PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(mc.thePlayer.getCurrentEquippedItem()));
+//                    PacketUtil.sendPacket(new C03PacketPlayer(mc.thePlayer.onGround));
+//                    PacketUtil.sendPacket(new C03PacketPlayer(mc.thePlayer.onGround));
+//                    PacketUtil.sendPacket(new C03PacketPlayer(mc.thePlayer.onGround));
+//                }
+//                break;
+//            }
+
+            case "Reverse NCP": {
+                if (mc.thePlayer.isBlocking()) {
+                    mc.playerController.syncCurrentPlayItem();
+                    PacketUtil.sendPacket(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+                }
+
+                break;
+            }
+
+            case "Intave":
+                if (mc.thePlayer.isBlocking() &amp;&amp; timer.hasReached(delay)) {
+                    mc.playerController.syncCurrentPlayItem();
+                    PacketUtil.sendPacket(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+                    delay = 200;
+                    if (intaveFunnyBoolean) {
+                        delay = 100;
+                        intaveFunnyBoolean = false;
+                    } else
+                        intaveFunnyBoolean = true;
+                    timer.reset();
+                }
+                break;
+        }
+    }
+}
+
+// NOTE (AI): Rise 5.99 NoSlow: sends the item-use C08 (single-arg constructor, line ~87/97/120) from the movement handler while using an item. Complete file with mode toggles.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreMotion/Motion event; PacketUtil.sendPacket.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Spamming the use C08 every tick is detected by Intave and Verus unless the rate matches legit eat patterns (hence Rise 6.x's GrimNoslow, OldIntaveNoSlow, NewNCPNoSlow, WatchdogNoSlow variants). Tenacity 6.0's NoSlowModule takes a different route: it sends C0EPacketClickWindow against the armor slot instead of C08.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Sigma NoSlowdown.java and Spicy NoSlow.java send the same item-use C08; Rise 6.2.4/6.1.30 ship 5+ named modes sharing the C08 use form.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">FastUse</span>
-<span class="impl-module-clients">(Tenacity 6.0, Flux B39.11, Monsoon 3.0-A6, Mint B1, Gugustus)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoPot / AutoSoup (fast item use)</span>
+<span class="impl-module-clients">(Memeware 7.3, Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Scaffold places blocks silently. Autoblock sends invalid placement (pos=-1,-1,-1, face=255) to start blocking. NoSlow sends C08 with current item to bypass use-item slowdown.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Autoblock (start blocking)
-mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, mc.thePlayer.getHeldItem(), 0, 0, 0));
-// Scaffold — silent place
-mc.getNetHandler().addToSendQueue(new C08PacketPlayerBlockPlacement(blockPos, direction, itemStack, faceX, faceY, faceZ));
-// NoSlow — bypass
-mc.getNetHandler().addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, mc.thePlayer.getHeldItem(), 0, 0, 0));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Consume potions, soup, gaps or heads faster than vanilla allows by spamming the item-use C08.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Scan the hotbar/inventory for the consumable, switch to its slot with C09, then send the C08 item-use form every tick (or on a cooldown) so the server processes the consumption without waiting for the client's use-tick timer. Rise 5.99 AutoPot switches to the potion slot with C09 and sends new C08PacketPlayerBlockPlacement(itemStack); Memeware AutoPotion does the same with the raw stack from the slot.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/combat/AutoPot.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/combat/AutoPot.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.combat;
+
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.player.PacketUtil;
+import dev.rise.util.player.PlayerUtil;
+import net.minecraft.block.BlockAir;
+import net.minecraft.block.BlockLadder;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemPotion;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C09PacketHeldItemChange;
+import net.minecraft.potion.PotionEffect;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import org.apache.commons.lang3.RandomUtils;
+
+import java.util.ArrayList;
+import java.util.Objects;
+
+@ModuleInfo(name = "AutoPot", description = "Throws potions for you", category = Category.COMBAT)
+public final class AutoPot extends Module {
+
+    private final NumberSetting minHealth = new NumberSetting("Health", this, 15, 1, 20, 1);
+    private final BooleanSetting randomiseRots = new BooleanSetting("Randomise Rotations", this, true);
+    private final BooleanSetting packet = new BooleanSetting("Extra Packet", this, false);
+    private final BooleanSetting jump = new BooleanSetting("Jump", this, false);
+
+    private int ticksSinceLastSplash, ticksSinceCanSplash, oldSlot;
+    private boolean needSplash, switchBack;
+
+    private final ArrayList&lt;Integer&gt; acceptedPotions = new ArrayList() {{
+        add(6);
+        add(1);
+        add(5);
+        add(8);
+        add(14);
+        add(12);
+        add(10);
+        add(16);
+    }};
+
+    @Override
+    public void onDisable() {
+        needSplash = switchBack = false;
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        ticksSinceLastSplash++;
+
+        if (Objects.requireNonNull(Rise.INSTANCE.getModuleManager().getModule("Scaffold")).isEnabled() || mc.thePlayer.isInLiquid() || (PlayerUtil.getBlockRelativeToPlayer(0, -1, 0) instanceof BlockAir || PlayerUtil.getBlockRelativeToPlayer(0, -1, 0) instanceof BlockLadder))
+            ticksSinceCanSplash = 0;
+        else
+            ticksSinceCanSplash++;
+
+        if (switchBack) {
+            PacketUtil.sendPacket(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+            PacketUtil.sendPacket(new C09PacketHeldItemChange(oldSlot));
+            switchBack = false;
+            return;
+        }
+
+        if (ticksSinceCanSplash &lt;= 1 || !mc.thePlayer.onGround)
+            return;
+
+        oldSlot = mc.thePlayer.inventory.currentItem;
+        for (int i = 36; i &lt; 45; ++i) {
+            final ItemStack itemStack = mc.thePlayer.inventoryContainer.getSlot(i).getStack();
+            if (itemStack != null &amp;&amp; mc.currentScreen == null) {
+                final Item item = itemStack.getItem();
+                if (item instanceof ItemPotion) {
+                    final ItemPotion p = (ItemPotion) item;
+                    if (ItemPotion.isSplash(itemStack.getMetadata())) {
+                        if (p.getEffects(itemStack.getMetadata()) != null) {
+                            final int potionID = p.getEffects(itemStack.getMetadata()).get(0).getPotionID();
+                            boolean hasPotionIDActive = false;
+
+                            for (final PotionEffect potion : mc.thePlayer.getActivePotionEffects()) {
+                                if (potion.getPotionID() == potionID &amp;&amp; potion.getDuration() &gt; 0) {
+                                    hasPotionIDActive = true;
+                                    break;
+                                }
+                            }
+
+                            if (acceptedPotions.contains(potionID) &amp;&amp; !hasPotionIDActive &amp;&amp; ticksSinceLastSplash &gt; 20) {
+                                final String effectName = p.getEffects(itemStack.getMetadata()).get(0).getEffectName();
+
+                                if ((effectName.contains("regeneration") || effectName.contains("heal")) &amp;&amp; mc.thePlayer.getHealth() &gt; minHealth.getValue())
+                                    continue;
+
+                                if (jump.isEnabled()) {
+                                    event.setPitch(randomiseRots.isEnabled() ? -RandomUtils.nextFloat(89, 90) : -90);
+                                    if (!needSplash) {
+                                        mc.thePlayer.jump();
+                                        needSplash = true;
+
+                                        new Thread(() -&gt; {
+                                            try {
+                                                Thread.sleep(300L); // TODO: fix
+                                            } catch (final InterruptedException e) {
+                                                e.printStackTrace();
+                                            }
+
+                                            if (packet.isEnabled())
+                                                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C06PacketPlayerPosLook(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, mc.thePlayer.rotationYaw, randomiseRots.isEnabled() ? -RandomUtils.nextFloat(89, 90) : -90, mc.thePlayer.onGround));
+
+                                            needSplash = false;
+                                        }).start();
+                                    } else {
+                                        event.setPitch(randomiseRots.isEnabled() ? RandomUtils.nextFloat(89, 90) : 90);
+                                        if(event.getPitch() &gt; 88) {
+                                            PacketUtil.sendPacket(new C09PacketHeldItemChange(i - 36));
+                                            PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(itemStack));
+                                            switchBack = true;
+                                            ticksSinceLastSplash = 0;
+                                            needSplash = false;
+                                        }
+                                    }
+                                } else {
+                                    event.setPitch(randomiseRots.isEnabled() ? RandomUtils.nextFloat(89, 90) : 90);
+                                    if (!needSplash) {
+                                        if (packet.isEnabled())
+                                            PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C06PacketPlayerPosLook(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, mc.thePlayer.rotationYaw, randomiseRots.isEnabled() ? RandomUtils.nextFloat(89, 90) : 90, mc.thePlayer.onGround));
+
+                                        needSplash = true;
+                                    } else {
+                                        event.setPitch(randomiseRots.isEnabled() ? RandomUtils.nextFloat(89, 90) : 90);
+                                        if(event.getPitch() &gt; 88) {
+                                            PacketUtil.sendPacket(new C09PacketHeldItemChange(i - 36));
+                                            PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(itemStack));
+                                            switchBack = true;
+
+                                            ticksSinceLastSplash = 0;
+                                            needSplash = false;
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// NOTE (AI): Rise 5.99 AutoPot: full file. Lines ~126-144 send the item-use C08 for the potion while C09 (line ~72/126/143) switches slots, letting the module drink multiple pots in the time vanilla would drink one.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreMotionEvent loop with a TimeUtil cooldown; PacketUtil.sendPacket.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The consumption rate is the giveaway; servers with eat-tick validation (checks that the item use duration elapsed) flag instant potion spam. On servers without it, this is a pure DPS gain.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware AutoPotion/AutoSoup, Rise 5.99 AutoSoup/AutoGap/AutoHead/FastBow/Infinite, Rise 6.2.4/6.1.30 AutoHead/AutoPot, Sigma AutoPot/AutoSoup/AutoGApple/AutoEat all follow the C09-switch + C08-use pattern.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PreMotionEvent / UpdateEvent for the send loop; PacketSendEvent in Rise 5.99 Scaffold to silence C09; direct PacketUtil.sendPacket or sendQueue.addToSendQueue everywhere else.</div>
+<div class="impl-clients">Rise 5.99/6.x use PacketUtil.sendPacket and can replace packets on the event (event.setPacket). Memeware/Nekoware/Spicy construct C08 directly and push via sendQueue or PacketUtil. Sigma routes through playerController for clicks but constructs C08 raw for use spam. Tenacity sends via NetHandler.addToSendQueueNoEvent in ScaffoldModule and references C08 in PacketUtil.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S23PacketBlockChange/">S23PacketBlockChange</a>
+<a class="related-chip" href="../S2FPacketSetSlot/">S2FPacketSetSlot</a>
+<a class="related-chip" href="../C09PacketHeldItemChange/">C09PacketHeldItemChange</a>
+<a class="related-chip" href="../C0BPacketEntityAction/">C0BPacketEntityAction</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

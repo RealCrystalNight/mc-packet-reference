@@ -48,6 +48,65 @@ function buildSidebarHtml(allPkts) {
 
 function esc(s) { if (!s) return ''; return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
+// Lightweight prose renderer: paragraphs, ```java fences, inline `code`.
+function renderProse(s) {
+  if (!s) return '';
+  var out = '';
+  var fences = s.split(/```/);
+  for (var i = 0; i < fences.length; i++) {
+    if (i % 2 === 1) {
+      // fenced code block (may carry a language tag on first line)
+      var lines = fences[i].replace(/^\n/, '').split('\n');
+      if (/^[a-zA-Z0-9_+-]*$/.test(lines[0].trim())) lines.shift();
+      out += '<pre class="writeup-code"><code>' + esc(lines.join('\n')) + '</code></pre>';
+      continue;
+    }
+    var paras = fences[i].split(/\n{2,}/);
+    for (var j = 0; j < paras.length; j++) {
+      var para = paras[j].trim();
+      if (!para) continue;
+      para = esc(para).replace(/`([^`]+)`/g, '<code>$1</code>');
+      if (/^[-*] /.test(para)) {
+        // simple bullet list — split into <li>
+        var items = para.split(/\n/).filter(function(l) { return /^[-*] /.test(l.trim()); });
+        out += '<ul class="writeup-list">' + items.map(function(it) {
+          return '<li>' + it.replace(/^[-*] /, '').trim() + '</li>';
+        }).join('') + '</ul>';
+      } else {
+        out += '<p>' + para + '</p>';
+      }
+    }
+  }
+  return out;
+}
+
+function renderWriteup(w) {
+  if (!w || !w.length) return '';
+  var parts = ['<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">'];
+  w.forEach(function(sec) {
+    if (sec.h) parts.push('<h4>' + esc(sec.h) + '</h4>');
+    if (sec.p) parts.push(renderProse(sec.p));
+  });
+  parts.push('</div></div>');
+  return parts.join('\n');
+}
+
+function renderCallout(title, cls, body) {
+  if (!body) return '';
+  return '<div class="detail-section"><h3>' + esc(title) + '</h3><div class="callout ' + cls + '">'
+    + renderProse(body) + '</div></div>';
+}
+
+function renderRelated(ids) {
+  if (!ids || !ids.length) return '';
+  var parts = ['<div class="detail-section"><h3>Related Packets</h3><div class="related-list">'];
+  ids.forEach(function(id) {
+    parts.push('<a class="related-chip" href="../' + id + '/">' + esc(id) + '</a>');
+  });
+  parts.push('</div></div>');
+  return parts.join('\n');
+}
+
 function renderDetail(p) {
   var parts = [];
   if (p.fields && p.fields.length) {
@@ -78,6 +137,10 @@ function renderDetail(p) {
   }
   if (p.implementation) {
     var impl = p.implementation;
+    if (impl.writeup && impl.writeup.length) parts.push(renderWriteup(impl.writeup));
+    if (impl.server_handling) parts.push(renderCallout('Server-Side Handling', 'callout-server', impl.server_handling));
+    if (impl.protocol_notes) parts.push(renderCallout('Protocol Analysis', 'callout-proto', impl.protocol_notes));
+    if (impl.anticheat_landscape) parts.push(renderCallout('Anti-Cheat Landscape', 'callout-ac', impl.anticheat_landscape));
     parts.push('<div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>');
     if (impl.overview) parts.push('<p class="impl-pattern">' + impl.overview + '</p>');
     if (impl.modules && impl.modules.length) {
@@ -87,15 +150,18 @@ function renderDetail(p) {
         parts.push('</div>');
         if (m.purpose) parts.push('<p class="impl-pattern">' + m.purpose + '</p>');
         if (m.how_it_works) parts.push('<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">' + m.how_it_works + '</p>');
+        if (m.code_source) parts.push('<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> ' + esc(m.code_source) + '</span></p>');
         if (m.detailed_code) parts.push('<div class="impl-code-wrap collapsed"><div class="impl-code"><code>' + esc(m.detailed_code) + '</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle(\'collapsed\');w.classList.toggle(\'expanded\');this.querySelector(\'.expand-label\').textContent=w.classList.contains(\'collapsed\')?\'Show more\':\'Show less\'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>');
         if (m.vanilla_hook) parts.push('<div class="impl-meta"><span><strong>Vanilla hook:</strong> ' + m.vanilla_hook + '</span></div>');
         if (m.anti_cheat_notes) parts.push('<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>' + m.anti_cheat_notes + '</span></div>');
+        if (m.variations) parts.push('<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> ' + m.variations + '</span></div>');
         parts.push('</div>');
       });
     }
     if (impl.general_hooks) parts.push('<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">' + impl.general_hooks + '</div>');
     if (impl.client_variations) parts.push('<div class="impl-clients">' + impl.client_variations + '</div>');
     parts.push('</div>');
+    if (impl.related && impl.related.length) parts.push(renderRelated(impl.related));
   }
   return parts.join('\n');
 }

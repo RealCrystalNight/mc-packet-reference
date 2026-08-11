@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S00PacketKeepAlive (0x00): Server sends a keep-alive ID that the client must echo back in C00PacketKeepAlive.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="PingSpoof, Disabler, Timer, Backtrack">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Debugger, WatchdogVelocity / WatchdogPredictionVelocity (keepalive cancel), Disabler (Erisium keepalive replay), NetworkAPI (script registry)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S00PacketKeepAlive — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S00PacketKeepAlive — Minecraft 1.8.9 Packet Reference","description":"The clientbound keepalive, echoed instantly by vanilla and used by clients as the timing reference for ping, disabler and velocity-spoof logic. Corpus hits: Debugger (Rise 5.99/6.x), WatchdogVelocity and WatchdogPredictionVelocity (Rise 6.2.4), Sigma's Erisium disabler mode, and the Rise 6.x script ","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -68,320 +68,679 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayClient.handleKeepAlive()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S00PacketKeepAlive is the clientbound half of the play-state liveness probe. NetHandlerPlayServer sends it roughly once per second from its update loop with a server-chosen int key (field_147378_h), and the vanilla client echoes it back as C00PacketKeepAlive with the same key. NetHandlerPlayServer.processKeepAlive compares the echoed key and folds the round-trip into the player's ping EMA: ping = (ping * 3 + delta) / 4. Because it is the only timing-only packet in the play state, it is the reference clock that ping spoofers, disablers and timing-based velocity exploits all anchor on.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleKeepAlive echoes immediately: addToSendQueue(new C00PacketKeepAlive(packetIn.func_149134_c())). Server side, processKeepAlive is a pure timing check: a matching key updates the ping EMA, a wrong key is silently ignored. There is no per-connection timeout in the vanilla 1.8.9 server for a missing echo; timeouts are enforced by the network layer read timeout or by anti-cheat plugins. That asymmetry, an immediate client echo versus a server that never punishes a missing one, is what every keepalive-timing exploit depends on.</p>
+<h4>Why clients touch it</h4>
+<p>Four distinct uses in the 8 clients. (1) Debugger in Rise 5.99, 6.1.30 and 6.2.4 prints incoming keepalive ids to chat so the user can watch server cadence while tuning other modules. (2) Rise 6.2.4 WatchdogVelocity and WatchdogPredictionVelocity cancel the keepalive while a velocity spoof is armed, silencing the server's timing reference during the spoof window. (3) Sigma 4.11 Disabler Erisium mode captures the key on receive and replays a stale C00 every 1500ms, freezing the measured ping. (4) Rise 6.x NetworkAPI registers the class so JavaScript scripts can hook its receive. Note the corpus has no PingSpoof hit for S00: the spoofers in these clients intercept the C00 echo side instead.</p>
+<h4>Exploit surface</h4>
+<p>Because the vanilla echo is immediate, any delay, cancellation or replay shows up as a ping shift or a stalled keepalive stream. The Watchdog velocity modules cancel S00 while holding S12/S32 packets so the server cannot correlate a latency spike with the velocity cancel; WatchdogPredictionVelocity re-injects the buffered keepalive on the strafe trigger to restore sequencing. Sigma's Erisium mode cancels C00 echoes and re-sends the last captured key on a timer, which keeps the server's key comparison failing silently so the ping EMA never updates. The trade-off is structural: cancellation is invisible to the packet stream but leaves the connection dead on servers that do track keepalive gaps.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>NetHandlerPlayServer sends S00PacketKeepAlive(field_147378_h) roughly every second from its tick loop. processKeepAlive: if the echoed key matches field_147378_h, ping = (ping * 3 + (now - lastPingTime)) / 4; wrong or missing keys are silently dropped with no penalty. There is no vanilla timeout for a dead keepalive; connection liveness is the network layer's job.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>PLAY state, id 0x00, one VarInt int key (server-tick counter in vanilla). Clientbound; the serverbound echo is C00PacketKeepAlive with the same id value but a different class in the opposite direction. The key is opaque to the client: modules that mutate or replay it rely on the server never validating beyond equality with the last sent key. Because it arrives constantly, it is also the cheapest packet for modules to use as a timing beacon.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>NCP and AAC track keepalive timing to separate real latency from timer abuse; a frozen or wildly inflated ping is a classic timer/fly tell. Verus-era checks correlate keepalive gaps with C0F transaction gaps, which is why the Rise 6.2.4 Watchdog modes cancel S00 and S32 together, and why Sigma's Erisium mode replays keys instead of cancelling outright: pure cancellation is strong but lethal on servers with keepalive timeouts. Debugger and NetworkAPI are observation-only and never flag.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoof</span>
-<span class="impl-module-clients">(Astro 2.2.1, Tenacity 5.1, Sigma 3.9, Lycoris 2.0, Helium B41420)</span>
+<p class="impl-pattern">The clientbound keepalive, echoed instantly by vanilla and used by clients as the timing reference for ping, disabler and velocity-spoof logic. Corpus hits: Debugger (Rise 5.99/6.x), WatchdogVelocity and WatchdogPredictionVelocity (Rise 6.2.4), Sigma's Erisium disabler mode, and the Rise 6.x script NetworkAPI registry.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Debugger</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Delay/cancel incoming keepalive. PingSpoof delays S00 and sends back C00 with modified key. Disabler cancels S00 entirely. Backtrack buffers S00 for delayed processing.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// PingSpoof — delay + modify response
-if (event.getPacket() instanceof S00PacketKeepAlive) {
-  event.setCancelled();
-  S00PacketKeepAlive s00 = (S00PacketKeepAlive) event.getPacket();
-  mc.getNetHandler().getNetworkManager().sendPacket(new C00PacketKeepAlive(s00.func_149134_c() + mc.getDebugFPS() / 2));
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler</span>
-<span class="impl-module-clients">(Astro 2.2.1, Tenacity 5.1, Sigma 3.9, Lycoris 2.0, Helium B41420)</span>
-</div>
-<p class="impl-pattern">Delay/cancel incoming keepalive. PingSpoof delays S00 and sends back C00 with modified key. Disabler cancels S00 entirely. Backtrack buffers S00 for delayed processing.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>package dev.tenacity.module.impl.exploit;
+<p class="impl-pattern">Print incoming keepalive ids to chat so the user can observe the server's keepalive cadence while developing or tuning timing-based modules.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PacketReceiveEvent handler checks instanceof S00PacketKeepAlive and prints 'KeepAlive | id: <key>' via Rise.addChatMessage; it prints S32PacketConfirmTransaction ids the same way. Rise 6.x gates the branch behind a keepAlive BooleanValue and formats through ChatUtil.display.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/Debugger.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/Debugger.java =====
+package dev.rise.module.impl.other;
 
-import dev.tenacity.Tenacity;
-import dev.tenacity.event.impl.game.WorldEvent;
-import dev.tenacity.event.impl.network.PacketReceiveEvent;
-import dev.tenacity.event.impl.network.PacketSendEvent;
-import dev.tenacity.event.impl.player.MotionEvent;
-import dev.tenacity.module.Category;
-import dev.tenacity.module.Module;
-import dev.tenacity.module.impl.movement.Speed;
-import dev.tenacity.module.settings.impl.BooleanSetting;
-import dev.tenacity.module.settings.impl.MultipleBoolSetting;
-import dev.tenacity.module.settings.impl.NumberSetting;
-import dev.tenacity.ui.mainmenu.CustomMainMenu;
-import dev.tenacity.utils.misc.MathUtils;
-import dev.tenacity.utils.player.ChatUtil;
-import dev.tenacity.utils.player.MovementUtils;
-import dev.tenacity.utils.player.RotationUtils;
-import dev.tenacity.utils.server.PacketUtils;
-import dev.tenacity.utils.server.ServerUtils;
-import dev.tenacity.utils.time.TimerUtil;
-import net.minecraft.client.entity.EntityPlayerSP;
-import net.minecraft.client.gui.inventory.GuiInventory;
-import net.minecraft.client.multiplayer.GuiConnecting;
-import net.minecraft.entity.player.PlayerCapabilities;
+import dev.rise.Rise;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
 import net.minecraft.network.Packet;
-import net.minecraft.network.play.client.*;
-import net.minecraft.network.play.server.S07PacketRespawn;
-import net.minecraft.network.play.server.S08PacketPlayerPosLook;
-import net.minecraft.potion.Potion;
-import net.minecraft.util.AxisAlignedBB;
-import net.minecraft.util.ChatComponentText;
+import net.minecraft.network.play.server.S00PacketKeepAlive;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.stream.Collectors;
-
-public final class Disabler extends Module {
-
-    private final MultipleBoolSetting disablers = new MultipleBoolSetting("Disablers",
-            new BooleanSetting("Watchdog Strafe", false),
-            new BooleanSetting("Watchdog Timer", false),
-            new BooleanSetting("MMC", false),
-            new BooleanSetting("C06-&gt;C04", false),
-            new BooleanSetting("C04-&gt;C06", false),
-            new BooleanSetting("Hover", false),
-            new BooleanSetting("Spoof Ground", false),
-            new BooleanSetting("C0B Cancel", false),
-            new BooleanSetting("C0C Spam", false),
-            new BooleanSetting("Verus", false),
-            new BooleanSetting("Omni Sprint", false),
-            new BooleanSetting("Void TP", false),
-            new BooleanSetting("Silent S08", false));
-
-    private final NumberSetting hoverHeight = new NumberSetting("Hover Height", 0.1, 5, 0.01, 0.01);
-
-    private final BooleanSetting onGround = new BooleanSetting("On Ground", true);
-
-    private final NumberSetting TPDelay = new NumberSetting("TP Delay", 20, 100, 5, 1);
-
-    private final TimerUtil timer = new TimerUtil(), joinTimer = new TimerUtil();
-
-    private boolean synced;
-
-    private final CopyOnWriteArrayList&lt;Packet&gt; watchdogPlayerPackets = new CopyOnWriteArrayList&lt;&gt;(), watchdogC0FC00Packets = new CopyOnWriteArrayList&lt;&gt;(), watchdogInvPackets = new CopyOnWriteArrayList&lt;&gt;();
-
-    private final CopyOnWriteArrayList&lt;Packet&gt; packets = new CopyOnWriteArrayList&lt;&gt;();
-
-    private double s08Y;
-
-    public static boolean spiking;
-    public static final TimerUtil spikeTimer = new TimerUtil();
-
-    private int airTicks;
-
-    public Disabler() {
-        super("Disabler", Category.EXPLOIT, "Disables some anticheats");
-        TPDelay.addParent(disablers, voidTPDisabler -&gt; voidTPDisabler.getSetting("Void TP").isEnabled());
-        hoverHeight.addParent(disablers, hoverDisabler -&gt; hoverDisabler.getSetting("Hover").isEnabled());
-        onGround.addParent(disablers, spoofGroundDisabler -&gt; spoofGroundDisabler.getSetting("Spoof Ground").isEnabled());
-        this.addSettings(disablers, TPDelay, onGround, hoverHeight);
-    }
+@ModuleInfo(name = "Debugger", description = "Debugs packets", category = Category.OTHER)
+public final class Debugger extends Module {
 
     @Override
-    public void onMotionEvent(MotionEvent event) {
-        final List&lt;BooleanSetting&gt; enabledBooleanSettings = disablers.getBoolSettings().stream().filter(BooleanSetting::isEnabled).collect(Collectors.toList());
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        final Packet&lt;?&gt; packet = event.getPacket();
 
+        if (packet instanceof S32PacketConfirmTransaction) {
+            final S32PacketConfirmTransaction wrapper = ((S32PacketConfirmTransaction) packet);
 
-        if(enabledBooleanSettings.size() == 1) {
-            setSuffix(enabledBooleanSettings.get(0).name);
-        } else if(enabledBooleanSettings.size() &gt; 1) {
-            setSuffix(enabledBooleanSettings.size() + " Enabled");
-        } else {
-            setSuffix("None");
+            Rise.addChatMessage("Transaction | id: " + wrapper.getActionNumber());
         }
 
-        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
-            if(booleanSetting.isEnabled()) {
-                switch(booleanSetting.name) {
-                    case "MMC":
-                        if (timer.hasTimeElapsed(MathUtils.getRandomInRange(1000, 1500), true)) {
-                            packets.forEach(PacketUtils::sendPacketNoEvent);
-                            packets.clear();
-                        }
-                        break;
-                    case "Watchdog Timer":
-                        if(spikeTimer.hasTimeElapsed(700, true)) {
-                            timer.reset();
-                        }
-                        break;
-                    case "C0C Spam":
-                        PacketUtils.sendPacketNoEvent(new C0CPacketInput());
-                        break;
-                }
-            }
+        if (packet instanceof S00PacketKeepAlive) {
+            final S00PacketKeepAlive wrapper = ((S00PacketKeepAlive) packet);
+
+            Rise.addChatMessage("KeepAlive | id: " + wrapper.func_149134_c());
         }
-    }
-
-    @Override
-    public void onPacketSendEvent(PacketSendEvent event) {
-        if(mc.thePlayer == null) return;
-        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
-            if(booleanSetting.isEnabled()) {
-                switch(booleanSetting.name) {
-                    case "Watchdog Strafe":
-                        if(ServerUtils.isOnHypixel()) {
-                            if(event.getPacket() instanceof C03PacketPlayer &amp;&amp; !mc.thePlayer.isPotionActive(Potion.jump)) {
-                                final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                                if(Tenacity.INSTANCE.getModuleCollection().getModule(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.fallDistance &lt; 1)
-                                    c03.setOnGround(true);
-
-                                if(Tenacity.INSTANCE.getModuleCollection().getModule(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.ticksExisted % 4 != 0 &amp;&amp; mc.thePlayer.fallDistance &lt; 1) {
-                                    event.cancel();
-                                    watchdogPlayerPackets.add(event.getPacket());
-                                } else if (!watchdogPlayerPackets.isEmpty()) {
-                                    watchdogPlayerPackets.forEach(PacketUtils::sendPacketNoEvent);
-                                    watchdogPlayerPackets.clear();
-                                }
-                            }
-                        }
-                        break;
-                    case "Watchdog Timer":
-                        if(ServerUtils.isOnHypixel()) {
-                            if(event.getPacket() instanceof C03PacketPlayer) {
-                                final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                                if(!c03.isMoving() &amp;&amp; !c03.getRotating()) {
-                                    event.cancel();
-                                    break;
-                                }
-                            }
-                            if(!timer.hasTimeElapsed(350)) {
-                                if(event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) {
-                                    event.cancel();
-                                    watchdogC0FC00Packets.add(event.getPacket());
-                                }
-                            } else if(!watchdogC0FC00Packets.isEmpty()) {
-                                watchdogC0FC00Packets.forEach(PacketUtils::sendPacketNoEvent);
-                                watchdogC0FC00Packets.clear();
-                            }
-                        }
-                        break;
-                    case "Void TP":
-                        if(event.getPacket() instanceof C03PacketPlayer) {
-                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                            if(mc.thePlayer.ticksExisted % TPDelay.getValue() == 0) {
-                                c03.setY(c03.getPositionY() - 1000);
-                            }
-                        }
-                        break;
-                    case "MMC":
-                        if (event.getPacket() instanceof C0BPacketEntityAction) {
-                            final C0BPacketEntityAction c0b = (C0BPacketEntityAction) event.getPacket();
-                            if (c0b.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
-                                if (EntityPlayerSP.serverSprintState) {
-                                    PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
-                                    EntityPlayerSP.serverSprintState = false;
-                                }
-                            }
-                            event.cancel();
-                        }
-
-                        if (event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) {
-                            event.cancel();
-                            packets.add(event.getPacket());
-                        }
-                        break;
-                    case "C06-&gt;C04":
-                        if (event.getPacket() instanceof C03PacketPlayer.C06PacketPlayerPosLook) {
-                            final C03PacketPlayer.C06PacketPlayerPosLook c06 = (C03PacketPlayer.C06PacketPlayerPosLook) event.getPacket();
-                            event.setPacket(new C03PacketPlayer.C04PacketPlayerPosition(c06.getPositionX(), c06.getPositionY(), c06.getPositionZ(), c06.isOnGround()));
-                        }
-                        break;
-                    case "C04-&gt;C06":
-                        if (event.getPacket() instanceof C03PacketPlayer.C04PacketPlayerPosition) {
-                            final C03PacketPlayer.C04PacketPlayerPosition c04 = (C03PacketPlayer.C04PacketPlayerPosition) event.getPacket();
-                            event.setPacket(new C03PacketPlayer.C06PacketPlayerPosLook(c04.getPositionX(), c04.getPositionY(), c04.getPositionZ(), mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch, c04.isOnGround()));
-                        }
-                        break;
-                    case "Hover":
-                        if (event.getPacket() instanceof C03PacketPlayer) {
-                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                            c03.setY(mc.thePlayer.posY + hoverHeight.getValue());
-                        }
-                        break;
-                    case "Spoof Ground":
-                        if (event.getPacket() instanceof C03PacketPlayer) {
-                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                            c03.setOnGround(onGround.isEnabled());
-                        }
-                        break;
-                    case "C0B Cancel":
-                        if (event.getPacket() instanceof C0BPacketEntityAction) event.cancel();
-                        break;
-                    case "Verus":
-                        if(event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) event.cancel();
-                        break;
-                    case "Omni Sprint":
-                        if (event.getPacket() instanceof C0BPacketEntityAction) {
-                            final C0BPacketEntityAction c0b = (C0BPacketEntityAction) event.getPacket();
-                            if (c0b.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
-                                if (EntityPlayerSP.serverSprintState) {
-                                    PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
-                                    EntityPlayerSP.serverSprintState = false;
-                                }
-                            }
-                            event.cancel();
-                        }
-                        break;
-                }
-            }
-        }
-    }
-
-    @Override
-    public void onPacketReceiveEvent(PacketReceiveEvent event) {
-        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
-            if (booleanSetting.isEnabled()) {
-                switch (booleanSetting.name) {
-                    case "Silent S08":
-                        if(event.getPacket() instanceof S08PacketPlayerPosLook) {
-                            final S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-                            event.cancel();
-                            PacketUtils.sendPacketNoEvent(new C03PacketPlayer.C06PacketPlayerPosLook(s08.getX(), s08.getY(), s08.getZ(), s08.getYaw(), s08.getPitch(), false));
-                        }
-                        break;
-                }
-            }
-        }
-    }
-
-    private boolean isBlockUnder() {
-        if (mc.thePlayer.posY &lt; 0) return false;
-        for (int offset = 0; offset &lt; (int) mc.thePlayer.posY + 2; offset += 2) {
-            AxisAlignedBB bb = mc.thePlayer.getEntityBoundingBox().offset(0, -offset, 0);
-            if (!mc.theWorld.getCollidingBoundingBoxes(mc.thePlayer, bb).isEmpty()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    @Override
-    public void onWorldEvent(WorldEvent event) {
-        watchdogC0FC00Packets.clear();
-        timer.reset();
     }
 }
 
-</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+
+// NOTE (AI): Debugger never mutates the packet, so the vanilla echo in NetHandlerPlayClient.handleKeepAlive still fires and the ping EMA updates normally. It exists to expose keepalive cadence and ids in chat, which is exactly the information the authors needed when tuning the ping-spoof and disabler timings elsewhere in the client. The paired S32 logging shows keepalive and transaction were inspected together, matching the Verus-style correlation anti-cheats use.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None: observation only, no wire mutation, so the vanilla echo still fires and nothing is flagged.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 and 6.2.4 Debugger.java (lines 113-114) add the keepAlive BooleanValue toggle and switch to ChatUtil.display; both still read func_149134_c() for the id.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Timer</span>
-<span class="impl-module-clients">(Astro 2.2.1, Tenacity 5.1, Sigma 3.9, Lycoris 2.0, Helium B41420)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WatchdogVelocity / WatchdogPredictionVelocity (keepalive cancel)</span>
+<span class="impl-module-clients">(Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Delay/cancel incoming keepalive. PingSpoof delays S00 and sends back C00 with modified key. Disabler cancels S00 entirely. Backtrack buffers S00 for delayed processing.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// PingSpoof — delay + modify response
-if (event.getPacket() instanceof S00PacketKeepAlive) {
-  event.setCancelled();
-  S00PacketKeepAlive s00 = (S00PacketKeepAlive) event.getPacket();
-  mc.getNetHandler().getNetworkManager().sendPacket(new C00PacketKeepAlive(s00.func_149134_c() + mc.getDebugFPS() / 2));
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Cancel incoming keepalives while a velocity spoof is armed, so the server's timing probes stay silent during the window where the client holds velocity and transaction packets.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PacketReceiveEvent switch: while active, S12PacketEntityVelocity and S32PacketConfirmTransaction are buffered and cancelled, and the S00PacketKeepAlive case either cancels outright (WatchdogVelocity, gated by a spoof BooleanValue) or buffers it on every third tick (WatchdogPredictionVelocity). On the strafe/boost trigger the buffer is replayed through PacketUtil.receive, restoring the keepalive and transaction sequence.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/WatchdogPredictionVelocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/WatchdogPredictionVelocity.java =====
+package com.alan.clients.module.impl.combat.velocity;
+
+import com.alan.clients.component.impl.player.BadPacketsComponent;
+import com.alan.clients.component.impl.player.PingSpoofComponent;
+import com.alan.clients.component.impl.player.TargetComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.motion.StrafeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.impl.combat.Velocity;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.module.impl.movement.LongJump;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.util.vector.Vector2d;
+import com.alan.clients.value.Mode;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.network.play.server.S00PacketKeepAlive;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
+
+import java.util.ArrayList;
+import java.util.List;
+
+public class WatchdogPredictionVelocity extends Mode&lt;Velocity&gt; {
+    public WatchdogPredictionVelocity(String name, Velocity parent) {
+        super(name, parent);
+    }
+
+    private boolean active, receiving;
+    private int offGroundTicks;
+    private final ArrayList&lt;Packet&lt;?&gt;&gt; packets = new ArrayList&lt;&gt;();
+    private float desiredYaw;
+    private double velX, velZ;
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceive = event -&gt; {
+
+
+        if (receiving || getModule(LongJump.class).isEnabled() &amp;&amp; mc.thePlayer.offGroundTicks &lt; 29 || getModule(Flight.class).isEnabled())
+            return;
+
+        switch (event.getPacket()) {
+            case S12PacketEntityVelocity velocity -&gt; {
+
+                if (velocity.getEntityID() == mc.thePlayer.getEntityId()) {
+                    if (!event.isCancelled()) {
+                        active = true;
+                      //  packets.add(velocity);
+                        //  PingSpoofComponent.spoof(50, true, false, false, false, false, false);
+
+                     //   mc.thePlayer.motionY = velocity.getMotionY() / 8000.0D;
+                        active = true;
+                        // Calculate desiredYaw based on incoming velocity
+                        double velX = velocity.getMotionX() / 8000.0D;
+                        double velZ = velocity.getMotionZ() / 8000.0D;
+                        desiredYaw = (float) Math.toDegrees(Math.atan2(velZ, velX));
+
+                        // Adjust desiredYaw to match the player's yaw range (-180 to 180)
+                        if (desiredYaw &lt; -180) desiredYaw += 360;
+                        if (desiredYaw &gt; 180) desiredYaw -= 360;
+
+    packets.add(velocity);
+    event.setCancelled();
+
+                        this.velX = velX;
+                        this.velZ = velZ;
+
+                        velocity.motionY *= 1;
+
+                        event.setPacket(velocity);
+
+                    }
+
+
+                }
+
+            }
+
+            case S32PacketConfirmTransaction transaction -&gt; {
+                if (active) {
+                    packets.add(transaction);
+                    event.setCancelled();
+                    //   active = false;
+                    // PingSpoofComponent.spoof(50, true, false, false, false, false, false);
+                }
+
+            }
+
+            case S00PacketKeepAlive keepAlive -&gt; {
+                if (active) {
+                    if(mc.thePlayer.ticksExisted % 3 ==0){
+                   //     ChatUtil.display("added");
+                        packets.add(keepAlive);
+                    }else{
+                   //     ChatUtil.display("lost");
+                    }
+
+                    event.setCancelled();
+                }
+            }
+
+            default -&gt; {
+            }
+        }
+
+    };
+
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        List&lt;EntityLivingBase&gt; targets = TargetComponent.getTargets(7);
+
+        if (targets.isEmpty()) return;
+
+
+
+
+        if(active &amp;&amp; mc.thePlayer.onGround || receiving){
+            double cancelX = -this.velX;
+            double cancelZ = -this.velZ;
+          //  ChatUtil.display("s");
+            mc.thePlayer.motionX = cancelX;
+            mc.thePlayer.motionZ = cancelZ;
+          //  event.setPosY(event.getPosY() -  1);
+
+        } else if(mc.thePlayer.onGround &amp;&amp; mc.thePlayer.hurtTime &gt; 7){
+
+
+            double cancelX = -this.velX;
+            double cancelZ = -this.velZ;
+          //  cancelX = Math.max(-1D, Math.min(1D, cancelX));
+          //  cancelZ = Math.max(-1D, Math.min(1D, cancelZ));
+          //  ChatUtil.display("s");
+            mc.thePlayer.motionX *= cancelX;
+            mc.thePlayer.motionZ *= cancelZ;
+            mc.thePlayer.jump();
+        }
+    };
+
+
+
+    @EventLink
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+
+        if (active) {
+            // Get the player's current yaw
+            float playerYaw = mc.thePlayer.rotationYaw % 360F;
+            if (playerYaw &lt; -180F) playerYaw += 360F;
+            if (playerYaw &gt; 180F) playerYaw -= 360F;
+
+            // Calculate the difference between the player's yaw and desiredYaw
+            float yawDifference = Math.abs(playerYaw - desiredYaw);
+
+            // Define the leeway in degrees (e.g., 10 degrees)
+            float leeway = 20F;
+
+            // Check if the yaw difference is within the leeway
+            if (yawDifference &lt;= leeway || yawDifference &gt;= (360F - leeway)) {
+                // Process the packets to give a boost
+                receiving = true;
+                active = false;
+                ChatUtil.display("boost");
+                packets.forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+                offGroundTicks = 0;
+
+            } else if(mc.thePlayer.onGround ) {
+              //  ChatUtil.display("jump reset");
+                if(!mc.thePlayer.isJumping){
+                 //   mc.thePlayer.jump();
+                 //   ChatUtil.display("jump reset 2");
+                }
+                mc.thePlayer.motionX *= -1D;
+                mc.thePlayer.motionZ *= -1D;
+                // If offGroundTicks exceed 11, release the packets when back on the ground
+
+
+                        receiving = true;
+                        active = false;
+                        packets.forEach(PacketUtil::receive);
+                        packets.clear();
+
+                        receiving = false;
+
+                    } else if (mc.thePlayer.offGroundTicks&gt;12){
+                receiving = true;
+                active = false;
+                packets.forEach(PacketUtil::receive);
+                packets.clear();
+                mc.thePlayer.jump();
+                mc.thePlayer.motionX *= 0.6D;
+                mc.thePlayer.motionZ *= 0.6D;
+                receiving = false;
+            }
+
+
+        }
+    };
+}
+
+
+// NOTE (AI): The keepalive case runs only while the velocity spoof is armed: WatchdogPredictionVelocity buffers the packet on every third tick and cancels it otherwise, so the server's timing probe stays quiet during the spoof window. The buffered keepalive and transactions are replayed through PacketUtil.receive on the strafe trigger, which restores the S00/C00 and C0F sequencing the server expects. The cancelled keepalive means the vanilla echo never fires, so the server's ping EMA freezes for the duration of the spoof.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, PreMotionEvent, StrafeEvent</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Suppressing keepalive echoes during a knockback spoof prevents the server from measuring a latency spike that correlates with the velocity cancel. Cancelling S00 and S32 together keeps the two timing references consistent, which matters because Verus-style checks correlate keepalive gaps with transaction gaps.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> WatchdogVelocity.java (line 125) cancels the keepalive without buffering it, gated by its own spoof BooleanValue and paired with S16/S15/S17 entity-look buffering; WatchdogPredictionVelocity adds the 3-tick buffering and yaw-based release logic.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Backtrack</span>
-<span class="impl-module-clients">(Astro 2.2.1, Tenacity 5.1, Sigma 3.9, Lycoris 2.0, Helium B41420)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler (Erisium keepalive replay)</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Delay/cancel incoming keepalive. PingSpoof delays S00 and sends back C00 with modified key. Disabler cancels S00 entirely. Backtrack buffers S00 for delayed processing.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// PingSpoof — delay + modify response
-if (event.getPacket() instanceof S00PacketKeepAlive) {
-  event.setCancelled();
-  S00PacketKeepAlive s00 = (S00PacketKeepAlive) event.getPacket();
-  mc.getNetHandler().getNetworkManager().sendPacket(new C00PacketKeepAlive(s00.func_149134_c() + mc.getDebugFPS() / 2));
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Freeze the server's ping measurement by cancelling C00 echoes and re-sending a stale captured key on a fixed 1500ms cadence.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The EventPacket receive handler intercepts S00PacketKeepAlive, stores func_149134_c() as lastKey, and arms the erisium flag. In EventUpdate, when erisium is set and the timer hits 1500ms, the module sends C00PacketKeepAlive(lastKey) via sendPacketNoEvent. The send-side branch cancels real C00 echoes in Faithful, Erisium, SagePvP and ColdNetwork modes.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/other/Disabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/other/Disabler.java =====
+package info.sigmaclient.module.impl.other;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+
+import info.sigmaclient.Client;
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.event.impl.EventUpdate;
+import info.sigmaclient.management.MoveUtils;
+import info.sigmaclient.management.notifications.Notifications;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.module.data.Options;
+import info.sigmaclient.module.data.Setting;
+import info.sigmaclient.module.impl.movement.Phase;
+import info.sigmaclient.util.Timer;
+import info.sigmaclient.util.misc.ChatUtil;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemBook;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.Packet;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
+import net.minecraft.network.play.server.S00PacketKeepAlive;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+
+
+public class Disabler extends Module {
+    String MODE = "MODE";
+    boolean faithful = false, watchdog = false, erisium = false;
+    Timer timer = new Timer();
+    int lastKey;
+    String mode;
+
+    public Disabler(ModuleData data) {
+        super(data);
+        settings.put(MODE, new Setting&lt;&gt;(MODE, new Options("Mode", "Hypixel", new String[]{"Hypixel", "Faithful", "Erisium", "SagePvP", "ColdNetwork"}), "Disabler method."));
+    }
+
+    @Override
+    public void onEnable() {
+        if (mc.theWorld == null)
+            return;
+        erisium = false;
+        timer.reset();
+        mode = ((Options) settings.get(MODE).getValue()).getSelected();
+        if (mode.equalsIgnoreCase("ViperMC")) {
+            if (!MoveUtils.isOnGround(0.0001)) {
+                this.toggle();
+                Notifications.getManager().post("Disabler", "Try again on ground !", Notifications.Type.WARNING);
+            }
+        }
+        if (mode.equalsIgnoreCase("Hypixel")) {
+            if (MoveUtils.isOnGround(0.001) &amp;&amp; mc.thePlayer.isCollidedVertically) {
+                double x = mc.thePlayer.posX;
+                double y = mc.thePlayer.posY;
+                double z = mc.thePlayer.posZ;
+                mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.16, z, true));
+                mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.07, z, true));
+                watchdog = true;
+                Notifications.getManager().post("Disabler", "Wait 5s.", Notifications.Type.INFO);
+            } else {
+                watchdog = false;
+            }
+        } else if (mode.equalsIgnoreCase("Faithful")) {
+            Notifications.getManager().post("Disabler", "Relog to disable Area 51.", Notifications.Type.INFO);
+        }
+    }
+
+    @Override
+    @RegisterEvent(events = {EventUpdate.class, EventPacket.class})
+    public void onEvent(Event event) {
+        if (mode == null) {
+            mode = ((Options) settings.get(MODE).getValue()).getSelected();
+        }
+        if (!mode.equalsIgnoreCase(((Options) settings.get(MODE).getValue()).getSelected())) {
+
+            mode = ((Options) settings.get(MODE).getValue()).getSelected();
+            if (mode.equalsIgnoreCase("Faithful")) {
+                Notifications.getManager().post("Disabler", "Relog to disable Area 51.", Notifications.Type.INFO);
+            }
+        }
+        this.setSuffix(mode);
+        if (event instanceof EventUpdate) {
+            EventUpdate em = (EventUpdate) event;
+            if (em.isPre()) {
+                if (mc.thePlayer.ticksExisted &lt;= 1) {
+                    erisium = false;
+                }
+                if (mode.equalsIgnoreCase("ViperMC")) {
+                    if (timer.delay(3000)) {
+                        em.setY(mc.thePlayer.posY + 0.4);
+                        return;
+                    }
+                    for (int i = 0; i &lt; 10; ++i) {
+                        boolean i2 = i &gt; 2 &amp;&amp; i &lt; 8;
+                        double x = i2 ? 0.2 : -0.2D;
+                        C03PacketPlayer.C04PacketPlayerPosition packet = new C03PacketPlayer.C04PacketPlayerPosition(
+                                mc.thePlayer.posX, mc.thePlayer.posY + x, mc.thePlayer.posZ, true);
+                        mc.thePlayer.sendQueue.addToSendQueue(packet);
+                    }
+                }
+                if (mode.equalsIgnoreCase("Hypixel"))
+                    if (!watchdog) {
+                        if (MoveUtils.isOnGround(0.001) &amp;&amp; mc.thePlayer.isCollidedVertically) {
+                            double x = mc.thePlayer.posX;
+                            double y = mc.thePlayer.posY;
+                            double z = mc.thePlayer.posZ;
+                            mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y, z, true));
+                            mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.16, z, true));
+                            mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.07, z, true));
+                            watchdog = true;
+                            Notifications.getManager().post("Disabler", "Please wait 5s.", Notifications.Type.INFO);
+                        }
+                    } else {
+                        mc.thePlayer.motionX = 0;
+                        mc.thePlayer.motionY = 0;
+                        mc.thePlayer.motionZ = 0;
+                        mc.thePlayer.jumpMovementFactor = 0;
+                        mc.thePlayer.noClip = true;
+                        mc.thePlayer.onGround = false;
+                    }
+                if (mode.equalsIgnoreCase("Erisium")) {
+                    if (erisium &amp;&amp; timer.delay(1500)) {
+                        erisium = !erisium;
+                        mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C00PacketKeepAlive(lastKey));
+                    }
+                }
+
+            }
+        } else if (event instanceof EventPacket) {
+            EventPacket ep = (EventPacket) event;
+            Packet p = ep.getPacket();
+            if (ep.isPre()) {
+                if (p instanceof C03PacketPlayer) {
+                    if (mode.equalsIgnoreCase("Hypixel") &amp;&amp; watchdog) {
+                        ep.setCancelled(true);
+                    }
+                }
+                if (p instanceof S08PacketPlayerPosLook) {
+                    S08PacketPlayerPosLook pac = (S08PacketPlayerPosLook) ep.getPacket();
+                    pac.yaw = mc.thePlayer.rotationYaw;
+                    pac.pitch = mc.thePlayer.rotationPitch;
+                    if (watchdog &amp;&amp; mode.equalsIgnoreCase("Hypixel")) {
+                        Notifications.getManager().post("Disabler", "You can do what you want for 5s !", Notifications.Type.INFO);
+                        this.toggle();
+                    }
+                }
+                if (p instanceof S00PacketKeepAlive) {
+                    S00PacketKeepAlive packet = (S00PacketKeepAlive) p;
+                    int KEY = packet.func_149134_c();
+                    if (mode.equalsIgnoreCase("Erisium")) {
+                        timer.reset();
+                        erisium = true;
+                        lastKey = KEY;
+                    }
+                }
+                if (p instanceof C00PacketKeepAlive) {
+                    C00PacketKeepAlive packet = (C00PacketKeepAlive) p;
+                    if (mode.equalsIgnoreCase("Faithful") || mode.equalsIgnoreCase("Erisium") || mode.equalsIgnoreCase("SagePvP") || mode.equalsIgnoreCase("ColdNetwork")) {
+                        ep.setCancelled(true);
+                    }
+                }
+                if (p instanceof C0FPacketConfirmTransaction) {
+                    C0FPacketConfirmTransaction packet = (C0FPacketConfirmTransaction) p;
+                    int id = packet.getId();
+                    boolean accepted = packet.isAccepted();
+                    int uid = packet.getUid();
+                    if (id == 0 &amp;&amp; accepted)
+                        if (mode.equalsIgnoreCase("SagePvP") || mode.equalsIgnoreCase("ColdNetwork")) {
+                            ep.setCancelled(true);
+                        }
+
+                }
+            }
+        }
+    }
+}
+
+
+// NOTE (AI): The S00PacketKeepAlive branch is the capture half of Erisium mode: it stores the key and arms the replay timer. The replay half lives in the EventUpdate handler, which every 1500ms pushes C00PacketKeepAlive(lastKey) through sendPacketNoEvent, bypassing the event bus. Because the send-side branch cancels the real echo, the server's key comparison keeps failing and the ping EMA never updates, freezing the tab-list ping instead of letting it grow.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (receive), EventUpdate (replay timer)</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The stale key makes processKeepAlive drop the update silently, freezing ping with no packet-level anomaly. The periodic replay keeps the connection alive on servers that do track keepalive gaps, which pure cancellation cannot claim. The mode pairs with the transaction cancels in the same module (SagePvP/ColdNetwork) for servers that correlate the two.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other client in the corpus implements the capture-and-replay pattern on this packet; Rise 6.x and Memeware implement the same idea on the C00 send side instead.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NetworkAPI (script registry)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
+<p class="impl-pattern">Expose S00PacketKeepAlive to the JavaScript scripting API so user scripts can hook its receive event.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A static Class array named clientbound lists S00PacketKeepAlive.class alongside every other play-state server packet; the script engine maps the registered classes to receive events for script handlers. The corresponding serverbound array lists C00PacketKeepAlive.class for the send side.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/script/api/NetworkAPI.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/script/api/NetworkAPI.java =====
+package com.alan.clients.script.api;
+
+import com.alan.clients.util.chat.ChatUtil;
+import lombok.SneakyThrows;
+import net.minecraft.network.EnumPacketDirection;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.INetHandlerPlayClient;
+import net.minecraft.network.play.INetHandlerPlayServer;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+
+import javax.script.ScriptException;
+import java.util.Arrays;
+
+public class NetworkAPI extends API {
+
+    public final static Class&lt;Packet&lt;INetHandlerPlayServer&gt;&gt;[] serverbound = new Class[]{
+            C00PacketKeepAlive.class,
+            C01PacketChatMessage.class,
+            C02PacketUseEntity.class,
+            C03PacketPlayer.class,
+            C03PacketPlayer.C04PacketPlayerPosition.class,
+            C03PacketPlayer.C05PacketPlayerLook.class,
+            C03PacketPlayer.C06PacketPlayerPosLook.class,
+            C07PacketPlayerDigging.class,
+            C08PacketPlayerBlockPlacement.class,
+            C09PacketHeldItemChange.class,
+            C0APacketAnimation.class,
+            C0BPacketEntityAction.class,
+            C0CPacketInput.class,
+            C0DPacketCloseWindow.class,
+            C0EPacketClickWindow.class,
+            C0FPacketConfirmTransaction.class,
+            C10PacketCreativeInventoryAction.class,
+            C11PacketEnchantItem.class,
+            C12PacketUpdateSign.class,
+            C13PacketPlayerAbilities.class,
+            C14PacketTabComplete.class,
+            C15PacketClientSettings.class,
+            C16PacketClientStatus.class,
+            C17PacketCustomPayload.class,
+            C18PacketSpectate.class,
+            C19PacketResourcePackStatus.class,
+    };
+    public final static Class&lt;Packet&lt;INetHandlerPlayClient&gt;&gt;[] clientbound = new Class[]{
+            S00PacketKeepAlive.class,
+            S01PacketJoinGame.class,
+            S02PacketChat.class,
+            S03PacketTimeUpdate.class,
+            S04PacketEntityEquipment.class,
+            S05PacketSpawnPosition.class,
+            S06PacketUpdateHealth.class,
+            S07PacketRespawn.class,
+            S08PacketPlayerPosLook.class,
+            S09PacketHeldItemChange.class,
+            S0APacketUseBed.class,
+            S0BPacketAnimation.class,
+            S0CPacketSpawnPlayer.class,
+            S0DPacketCollectItem.class,
+            S0EPacketSpawnObject.class,
+            S0FPacketSpawnMob.class,
+            S10PacketSpawnPainting.class,
+            S11PacketSpawnExperienceOrb.class,
+            S12PacketEntityVelocity.class,
+            S13PacketDestroyEntities.class,
+            S14PacketEntity.class,
+            S18PacketEntityTeleport.class,
+            S19PacketEntityHeadLook.class,
+            S19PacketEntityStatus.class,
+            S1BPacketEntityAttach.class,
+            S1CPacketEntityMetadata.class,
+            S1DPacketEntityEffect.class,
+            S1EPacketRemoveEntityEffect.class,
+            S1FPacketSetExperience.class,
+            S20PacketEntityProperties.class,
+            S21PacketChunkData.class,
+            S22PacketMultiBlockChange.class,
+            S23PacketBlockChange.class,
+            S24PacketBlockAction.class,
+            S25PacketBlockBreakAnim.class,
+            S26PacketMapChunkBulk.class,
+            S27PacketExplosion.class,
+            S28PacketEffect.class,
+            S29PacketSoundEffect.class,
+            S2APacketParticles.class,
+            S2BPacketChangeGameState.class,
+            S2CPacketSpawnGlobalEntity.class,
+            S2DPacketOpenWindow.class,
+            S2EPacketCloseWindow.class,
+            S2FPacketSetSlot.class,
+            S30PacketWindowItems.class,
+            S31PacketWindowProperty.class,
+            S32PacketConfirmTransaction.class,
+            S33PacketUpdateSign.class,
+            S34PacketMaps.class,
+            S35PacketUpdateTileEntity.class,
+            S36PacketSignEditorOpen.class,
+            S37PacketStatistics.class,
+            S38PacketPlayerListItem.class,
+            S39PacketPlayerAbilities.class,
+            S3APacketTabComplete.class,
+            S3BPacketScoreboardObjective.class,
+            S3CPacketUpdateScore.class,
+            S3DPacketDisplayScoreboard.class,
+            S3EPacketTeams.class,
+            S3FPacketCustomPayload.class,
+            S40PacketDisconnect.class,
+            S41PacketServerDifficulty.class,
+            S42PacketCombatEvent.class,
+            S43PacketCamera.class,
+            S44PacketWorldBorder.class,
+            S45PacketTitle.class,
+            S46PacketSetCompressionLevel.class,
+            S47PacketPlayerListHeaderFooter.class,
+            S48PacketResourcePackSend.class,
+            S49PacketUpdateEntityNBT.class
+    };
+
+    @SneakyThrows
+    private static Packet&lt;?&gt; instantiatePacket(final EnumPacketDirection direction, final int id, final Object... params) {
+        Packet&lt;?&gt; packet = null;
+        try {
+            if (direction == EnumPacketDirection.CLIENTBOUND) {
+                packet = (Packet&lt;?&gt;) Arrays.stream(clientbound[id].getConstructors()).filter(x -&gt; x.getParameterCount() == params.length).findFirst().get().newInstance(params);
+            } else if (direction == EnumPacketDirection.SERVERBOUND) {
+                packet = (Packet&lt;?&gt;) Arrays.stream(serverbound[id].getConstructors()).filter(x -&gt; x.getParameterCount() == params.length).findFirst().get().newInstance(params);
+            }
+        } catch (Exception ex) {
+            ChatUtil.display("Failed to instantiate packet!");
+            throw new ScriptException(ex);
+        }
+        return packet;
+    }
+
+    public void sendPacket(final int id, final Object... params) {
+        final Packet&lt;?&gt; packet = instantiatePacket(EnumPacketDirection.SERVERBOUND, id, params);
+        MC.getNetHandler().addToSendQueue(packet);
+    }
+
+    public void receivePacket(final int id, final Object... params) {
+        final Packet&lt;?&gt; packet = instantiatePacket(EnumPacketDirection.CLIENTBOUND, id, params);
+        MC.getNetHandler().addToReceiveQueue(packet);
+    }
+
+    public boolean isSingleplayer() {
+        return MC.isSingleplayer();
+    }
+
+    public boolean isMultiplayer() {
+        return !MC.isSingleplayer() &amp;&amp; MC.getCurrentServerData() != null;
+    }
+
+    public String getServerIP() {
+        return MC.getCurrentServerData() != null
+                ? MC.getCurrentServerData().serverIP
+                : null;
+    }
+
+    public String getServerName() {
+        return MC.getCurrentServerData() != null
+                ? MC.getCurrentServerData().serverName
+                : null;
+    }
+
+    public String getServerMOTD() {
+        return MC.getCurrentServerData() != null
+                ? MC.getCurrentServerData().serverMOTD
+                : null;
+    }
+}
+
+
+// NOTE (AI): This is the script bridge, not a gameplay module: S00PacketKeepAlive.class sits in the static clientbound registry that the engine uses to route receive events to JavaScript handlers. Scripts can therefore observe keepalive timing without touching Java, which makes it the scripting counterpart of the Debugger module. The registry spans the full play-state packet table, and the keepalive entry is what lets script-based ping spoofers exist in Rise 6.x.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> Script event dispatch (receive routing)</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None: scripts run client-side and the registry itself never mutates packets; any flagging risk comes from what the script does with the event.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 ships the identical registry at com/alan/clients/script/api/NetworkAPI.java. No other client exposes this packet to a scripting layer.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent is the universal hook for the clientbound S00. Rise 6.x uses @EventLink listeners; Sigma uses its RegisterEvent EventPacket bus; the script path routes through NetworkAPI's class registry.</div>
+<div class="impl-clients">Rise 5.99 uses per-module onPacketReceive overrides; Rise 6.x uses component and @EventLink listener APIs with PacketUtil.receive/sendNoEvent for replay; Sigma mutates nothing on receive but stores the key for its send-side replay; Spicy, Memeware, Nekoware and Tenacity have no module-level reference in this corpus.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C00PacketKeepAlive/">C00PacketKeepAlive</a>
+<a class="related-chip" href="../C0FPacketConfirmTransaction/">C0FPacketConfirmTransaction</a>
+<a class="related-chip" href="../S32PacketConfirmTransaction/">S32PacketConfirmTransaction</a>
+<a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S1CPacketEntityMetadata (0x1C): Updates an entity's DataWatcher metadata (health, skin, flags, name, etc.).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ESP, NameTags, AntiBot">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="EagleA, AutoPot / InventoryManager">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S1CPacketEntityMetadata — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S1CPacketEntityMetadata — Minecraft 1.8.9 Packet Reference","description":"The metadata stream is the server's mirror of entity state, but only one module in the corpus genuinely reads it: Rise 5.99's EagleA, which checks the sneak flag byte. Sigma's AutoPot and InventoryManager carry dead imports, and Rise 6.x classifies the packet for ping-spoof delay and scripts.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -71,26 +71,322 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">S1C carries changed or new DataWatcher entries for an entity. Metadata indexes: 0=flags (onFire/sneaking/riding/sprinting/flying), 1=airTicks, 2=nameTag, 3=nameVisible, 6=health (for living), 15/variant, 16/color (for horses), etc.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S1CPacketEntityMetadata carries DataWatcher updates for one entity: a list of WatchableObject entries, or the full watcher dump on spawn. EntityTrackerEntry sends the full watcher with the metadata flag true when a player enters tracking range (corpus line 360) and incremental changed entries otherwise (line 303). The client merges them into the entity's DataWatcher. Relevant indexes: 0 is the byte flags (sneaking, sprinting, invisible, riding), 2 the name tag, 3 name visibility, 6 health for living entities. The sneak flag (bit 1, byte value 2) is the one the corpus actually reads.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleEntityMetadata (Memeware 7.3 bundle, line 468) resolves the entity, guards against a null list and calls entity.getDataWatcher().updateWatchedObjectsFromList(list). The DataWatcher then notifies the renderer and any systems watching specific indexes. The same list rides inside S0CPacketSpawnPlayer and S0FPacketSpawnMob for the initial state.</p>
+<h4>Why clients touch it</h4>
+<p>The canonical ESP/AntiInvis reads (invisibility flag, name-tag index) do not appear in the 8 clients; their renderers read entity fields after the vanilla handler applies S1C. The real hits: Rise 5.99 EagleA reads the sneak byte from the WatchableObjects, the only genuine module consumer; Sigma 4.11 AutoPot and InventoryManager import the class but never process it, polling isPotionActive and inventoryContainer on EventUpdate instead, so both imports are dead code; Rise 6.x PingSpoofComponent classifies S1C in its regular tuple, delayed with C0F and C00 during spoof, and NetworkAPI whitelists it for scripts.</p>
+<h4>Exploit surface</h4>
+<p>Metadata is read-only intelligence: 1.8.9 has no serverbound metadata packet, so the stream is the only place the server's view of entity state leaks back to the client. That makes it the natural feed for anti-invis and name-tag modules, and its absence in these 8 clients is a design choice, not a protocol limitation. The sneak flag is the load-bearing bit for anticheats: eagle checks (Rise 5.99) read it against the S14 ground state, and any client that spoofs sneak serverbound via C0B must keep the server-visible flag consistent or the mismatch is a flag.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>Clientbound only. EntityTrackerEntry sends the full DataWatcher on tracking start and incremental entries on change; the client merges them via updateWatchedObjectsFromList. Index 0 byte flags encode sneaking (bit 1), sprinting (bit 3), invisible (bit 5) and riding (bit 6). No validation is applied to incoming values, so a malicious server can inject arbitrary metadata, which is why clients that care about server-side state reads (name tags, invisibility) consume it defensively.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>The packet carries a VarInt entityId followed by the DataWatcher serialization: repeated (index byte, type byte, value) triples terminated by 127, with an empty list meaning no changes. A full dump is flagged server-side by the boolean constructor argument (true on tracking start). Sneak is bit 1 of the flags byte, which decodes to exactly 2 when it is the only set bit, matching EagleA's equality check. Metadata changes do not touch position or rotation, so the packet interleaves freely with the S14/S18 stream.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>The sneak flag is the anticheat-relevant field: eagle and shift-tap checks correlate the flag with S14 ground transitions, and the Rise 5.99 EagleA check flags a sneak byte that appears within two ticks of walking off a ledge. Server anticheats compare the sneak flag against serverbound C0B sneak actions; a client whose metadata-visible sneak disagrees with its C0B stream leaks the discrepancy. Everything else in the packet (name tags, health) is cosmetic to anticheats.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ESP</span>
-<span class="impl-module-clients">(Sigma 3.9)</span>
+<p class="impl-pattern">The metadata stream is the server's mirror of entity state, but only one module in the corpus genuinely reads it: Rise 5.99's EagleA, which checks the sneak flag byte. Sigma's AutoPot and InventoryManager carry dead imports, and Rise 6.x classifies the packet for ping-spoof delay and scripts.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">EagleA</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Track entity metadata (name tags, visibility, flags) for ESP and bot detection.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Detect eagle (auto-sneak at block edges) by reading the sneak flag byte out of the tracked player's metadata stream.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On S14 relative moves it sets shouldEagle when the packet's onGround flag is true and the block below the reconstructed position is air, then counts ticks. On S1CPacketEntityMetadata for the tracked player it scans the WatchableObjects for a Byte whose value is exactly 2 (the sneak bit alone), and if shouldEagle is set with ticks <= 2 it increases the buffer and fails past 10; otherwise the buffer decays by 5.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/anticheat/check/impl/other/eagle/EagleA.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/anticheat/check/impl/other/eagle/EagleA.java =====
+package dev.rise.anticheat.check.impl.other.eagle;
+
+import dev.rise.anticheat.check.Check;
+import dev.rise.anticheat.check.api.CheckInfo;
+import dev.rise.anticheat.data.PlayerData;
+import dev.rise.anticheat.util.PacketUtil;
+import dev.rise.util.player.PlayerUtil;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockAir;
+import net.minecraft.entity.DataWatcher;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S14PacketEntity;
+import net.minecraft.network.play.server.S1CPacketEntityMetadata;
+
+@CheckInfo(name = "Eagle", type = "A", description = "Detects Eagle")
+public final class EagleA extends Check {
+
+    private boolean shouldEagle;
+    private int ticks;
+
+    public EagleA(final PlayerData data) {
+        super(data);
+    }
+
+    @Override
+    public void handle(final Packet&lt;?&gt; packet) {
+        if (PacketUtil.isRelMove(packet)) {
+            final S14PacketEntity wrapper = ((S14PacketEntity) packet);
+
+            if (wrapper.onGround) {
+                final Block block = PlayerUtil.getBlock(data.getX(), data.getY() - 1, data.getZ());
+
+                if (block instanceof BlockAir) {
+                    shouldEagle = true;
+                    ticks++;
+                } else {
+                    shouldEagle = false;
+                    ticks = 0;
+                }
+            } else {
+                shouldEagle = false;
+                ticks = 0;
+            }
+        }
+
+        if (packet instanceof S1CPacketEntityMetadata) {
+            final S1CPacketEntityMetadata wrapper = (S1CPacketEntityMetadata) packet;
+            if (wrapper.func_149376_c() != null &amp;&amp; wrapper.getEntityId() == data.getPlayer().getEntityId()) {
+                for (final DataWatcher.WatchableObject object : wrapper.func_149376_c()) {
+                    if (object.getObject() instanceof Byte &amp;&amp; (byte) object.getObject() == 2) {
+                        if (shouldEagle &amp;&amp; ticks &lt;= 2) {
+                            if (increaseBuffer() &gt; 10) {
+                                fail();
+                                shouldEagle = false;
+                                ticks = 0;
+                            }
+                        } else
+                            decreaseBufferBy(5);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// NOTE (AI): The only genuine S1C consumer in the corpus. The check reads the DataWatcher sneak byte
+// NOTE (AI): (exactly 2) from the metadata stream for the tracked player and flags when it appears
+// NOTE (AI): within two S14 ticks of walking off a ledge, which is the signature of a client that
+// NOTE (AI): auto-sneaks at the edge instead of staying shifted.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> Raw packet stream via PlayerData.handle (S14 and S1C).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>This is Rise's own client-side anticheat check. The equality check (byte == 2) only fires when sneak is the sole flag set, which misses combos (sneak + invisible), a blind spot of the shipped check.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> EagleA is the only check in the Rise 5.99 anticheat that consumes S1C; the S14 branch it shares with KeepSprintA, SpeedA and GroundSpoofA/B is documented under S14PacketEntity.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NameTags</span>
-<span class="impl-module-clients">(Sigma 3.9)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoPot / InventoryManager</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Track entity metadata (name tags, visibility, flags) for ESP and bot detection.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Corpus hit is an import only: both modules import S1CPacketEntityMetadata but no shipped handler branches on it.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">AutoPot registers only EventUpdate and decides when to drink from mc.thePlayer.isPotionActive and getHealth, then pots by swapping, sending C05 look and C08 placement. InventoryManager likewise registers only EventUpdate and manages inventoryContainer slots. The metadata import is a development leftover from an earlier design that read potion or armor state from the watcher stream; the shipped logic polls local state instead, which is equivalent because the vanilla handler already applied S1C to the entity.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/combat/AutoPot.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/combat/AutoPot.java =====
+package info.sigmaclient.module.impl.combat;
+
+import java.util.ArrayList;
+
+import net.minecraft.client.gui.GuiChat;
+import net.minecraft.client.gui.inventory.GuiFurnace;
+import net.minecraft.client.gui.inventory.GuiInventory;
+import net.minecraft.enchantment.Enchantment;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemAppleGold;
+import net.minecraft.item.ItemArmor;
+import net.minecraft.item.ItemAxe;
+import net.minecraft.item.ItemBlock;
+import net.minecraft.item.ItemBow;
+import net.minecraft.item.ItemFood;
+import net.minecraft.item.ItemGlassBottle;
+import net.minecraft.item.ItemPickaxe;
+import net.minecraft.item.ItemPotion;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.ItemSword;
+import net.minecraft.item.ItemTool;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C09PacketHeldItemChange;
+import net.minecraft.network.play.client.C0EPacketClickWindow;
+import net.minecraft.network.play.server.S1CPacketEntityMetadata;
+import net.minecraft.potion.Potion;
+import net.minecraft.potion.PotionEffect;
+import net.minecraft.potion.PotionHelper;
+import net.minecraft.util.MathHelper;
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.event.impl.EventUpdate;
+import info.sigmaclient.management.MoveUtils;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.module.data.Setting;
+import info.sigmaclient.module.impl.player.Scaffold;
+import info.sigmaclient.util.RotationUtils;
+import info.sigmaclient.util.misc.ChatUtil;
+import info.sigmaclient.util.misc.Timer;
+
+/*
+ * Made by LeakedPvP
+ */
+public class AutoPot extends Module {
+
+	public static final String SPEED = "SPEED";
+	public static final String REGEN = "REGEN";
+	public static final String HEALTH = "HEALTH";
+	public static final String PREDICT = "PREDICT";
+    public AutoPot(ModuleData data) {   	   
+        super(data);
+        settings.put(SPEED, new Setting&lt;&gt;(SPEED, true, "Uses Speed pots."));
+        settings.put(REGEN, new Setting&lt;&gt;(REGEN, true, "Uses Regen pots."));
+        settings.put(HEALTH, new Setting&lt;&gt;(HEALTH, 6, "Maximum health before healing.", 0.5, 0.5, 10));
+        settings.put(PREDICT, new Setting&lt;&gt;(PREDICT, false, "Predicts where to pot when moving."));
+        
+    }
+
+    public static boolean potting;
+    Timer timer = new Timer();
+    @Override
+    public void onEnable() {
+        super.onEnable();
+    }
+    public static boolean isPotting(){
+    	return potting;
+    }
+    @Override
+    @RegisterEvent(events = {EventUpdate.class})
+    public void onEvent(Event event) {
+    	if(event instanceof EventUpdate){
+            EventUpdate em =(EventUpdate)event;
+            final boolean speed = (Boolean) settings.get(SPEED).getValue();
+            final boolean regen = (Boolean) settings.get(REGEN).getValue();
+            if(!em.isPre())
+            	return;
+            if(timer.check(200)){
+            	if(potting)
+            		potting = false;
+            }
+            int spoofSlot = getBestSpoofSlot();
+            int pots[] = {6,-1,-1};
+            if(regen)
+            	pots[1] = 10;
+            if(speed)
+            	pots[2] = 1;
+            
+            for(int i = 0; i &lt; pots.length; i ++){
+            	if(pots[i] == -1)
+            		continue;
+            	if(pots[i] == 6 || pots[i] == 10){
+            		if(timer.check(900) &amp;&amp; !mc.thePlayer.isPotionActive(pots[i])){
+                		if(mc.thePlayer.getHealth() &lt; ((Number)settings.get(HEALTH).getValue()).doubleValue()*2){
+                			getBestPot(spoofSlot, pots[i]);
+                		}
+            		}
+            	}else
+            	if(timer.check(1000) &amp;&amp; !mc.thePlayer.isPotionActive(pots[i])){
+            		getBestPot(spoofSlot, pots[i]);               		
+            	}
+            }       
+    	}
+    }
+  
+    public void swap(int slot1, int hotbarSlot){
+    	mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, slot1, hotbarSlot, 2, mc.thePlayer);
+    }
+    float[] getRotations(){    	
+        double movedPosX = mc.thePlayer.posX + mc.thePlayer.motionX * 26.0D;
+        double movedPosY = mc.thePlayer.boundingBox.minY - 3.6D;
+        double movedPosZ = mc.thePlayer.posZ + mc.thePlayer.motionZ * 26.0D;	
+        if((Boolean) settings.get(PREDICT).getValue())
+        	return RotationUtils.getRotationFromPosition(movedPosX, movedPosZ, movedPosY);
+        else
+        	return new float[]{mc.thePlayer.rotationYaw, 90};
+    }
+    int getBestSpoofSlot(){  	
+    	int spoofSlot = 5;
+    	for (int i = 36; i &lt; 45; i++) {       		
+    		if (!mc.thePlayer.inventoryContainer.getSlot(i).getHasStack()) {
+     			spoofSlot = i - 36;
+     			break;
+            }else if(mc.thePlayer.inventoryContainer.getSlot(i).getStack().getItem() instanceof ItemPotion) {
+            	spoofSlot = i - 36;
+     			break;
+            }
+        }
+    	return spoofSlot;
+    }
+    void getBestPot(int hotbarSlot, int potID){
+    	for (int i = 9; i &lt; 45; i++) {
+            if (mc.thePlayer.inventoryContainer.getSlot(i).getHasStack() &amp;&amp;(mc.currentScreen == null || mc.currentScreen instanceof GuiInventory)) {
+                ItemStack is = mc.thePlayer.inventoryContainer.getSlot(i).getStack();
+                if(is.getItem() instanceof ItemPotion){
+              	  ItemPotion pot = (ItemPotion)is.getItem();
+              	  if(pot.getEffects(is).isEmpty())
+              		  return;
+              	  PotionEffect effect = (PotionEffect) pot.getEffects(is).get(0);              	  
+                  int potionID = effect.getPotionID();
+                  if(potionID == potID)
+              	  if(ItemPotion.isSplash(is.getItemDamage()) &amp;&amp; isBestPot(pot, is)){
+              		  if(36 + hotbarSlot != i)
+              			  swap(i, hotbarSlot);
+              		  timer.reset();
+              		  boolean canpot = true;
+              		  int oldSlot = mc.thePlayer.inventory.currentItem;
+              		  mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(hotbarSlot));
+          			  mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C05PacketPlayerLook(getRotations()[0], getRotations()[1], mc.thePlayer.onGround));
+          			  mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(mc.thePlayer.inventory.getCurrentItem()));
+          			  mc.thePlayer.sendQueue.addToSendQueue(new C09PacketHeldItemChange(oldSlot));
+          			  potting = true;
+          			  break;
+              	  }               	  
+                }              
+            }
+        }
+    }
+    
+    boolean isBestPot(ItemPotion potion, ItemStack stack){
+    	if(potion.getEffects(stack) == null || potion.getEffects(stack).size() != 1)
+    		return false;
+        PotionEffect effect = (PotionEffect) potion.getEffects(stack).get(0);
+        int potionID = effect.getPotionID();
+        int amplifier = effect.getAmplifier(); 
+        int duration = effect.getDuration();
+    	for (int i = 9; i &lt; 45; i++) {    		
+            if (mc.thePlayer.inventoryContainer.getSlot(i).getHasStack()) {           	
+                ItemStack is = mc.thePlayer.inventoryContainer.getSlot(i).getStack();
+                if(is.getItem() instanceof ItemPotion){
+                	ItemPotion pot = (ItemPotion)is.getItem();
+                	 if (pot.getEffects(is) != null) {
+                         for (Object o : pot.getEffects(is)) {
+                             PotionEffect effects = (PotionEffect) o;
+                             int id = effects.getPotionID();
+                             int ampl = effects.getAmplifier(); 
+                             int dur = effects.getDuration();
+                             if (id == potionID &amp;&amp; ItemPotion.isSplash(is.getItemDamage())){
+                            	 if(ampl &gt; amplifier){
+                            		 return false;
+                            	 }else if (ampl == amplifier &amp;&amp; dur &gt; duration){
+                            		 return false;
+                            	 }
+                             }                            
+                         }
+                     }
+                }
+            }
+        }
+    	return true;
+    }
+}
+
+// NOTE (AI): The S1CPacketEntityMetadata import is dead code: the module registers only EventUpdate and
+// NOTE (AI): decides when to pot from mc.thePlayer.isPotionActive and getHealth, not from the metadata
+// NOTE (AI): stream. The import is a development leftover from an earlier metadata-driven design.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventUpdate only; the S1C import is unused.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Dead imports have no detection surface. The honest takeaway is that Sigma's potion logic trusts local entity state, which the server already keeps consistent via S1C.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> InventoryManager (info/sigmaclient/module/impl/player/InventoryManager.java, 498 lines) carries the same dead import and the same EventUpdate-only design; AutoArmor in the same client shares the pattern.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiBot</span>
-<span class="impl-module-clients">(Sigma 3.9)</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Rise 5.99 anticheat consumes S1C through PlayerData.handle; Rise 6.x components hook it via the packet event system for classification.</div>
+<div class="impl-clients">Rise 5.99 reads the WatchableObjects list via func_149376_c and iterates raw objects; Rise 6.x never reads fields, only classifies the packet class. Sigma's modules import the class without using it, which the corpus confirms by the absence of any EventPacket registration for S1C.</div>
 </div>
-<p class="impl-pattern">Track entity metadata (name tags, visibility, flags) for ESP and bot detection.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S0CPacketSpawnPlayer/">S0CPacketSpawnPlayer</a>
+<a class="related-chip" href="../S14PacketEntity/">S14PacketEntity</a>
+<a class="related-chip" href="../S12PacketEntityVelocity/">S12PacketEntityVelocity</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

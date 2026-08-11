@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S01PacketJoinGame (0x01): Welcomes the player into the world. Sends entity ID, gamemode, dimension, difficulty, max players, world type, and reduc">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="SessionInfo, AutoRegister, NameProtect">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="NetworkAPI (script api), VulcanSpeed">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S01PacketJoinGame — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S01PacketJoinGame — Minecraft 1.8.9 Packet Reference","description":"The world-join packet: vanilla handleJoinGame constructs the entire client world from its fields. Module interest is minimal in the corpus: Rise 6.x exposes it to scripts via NetworkAPI and one Rise 6.2.4 speed mode carries a dead import. World-change events in the other clients fire from their own ","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -81,41 +81,225 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">This is the VERY FIRST PLAY-state packet the client receives after login. It creates the WorldClient and EntityPlayerSP. All modules that depend on mc.theWorld or mc.thePlayer being non-null must wait for this packet. It's the universal 'onWorldLoad' trigger.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>The first PLAY-state packet and the world-join trigger. ServerConfigurationManager sends it as the final step of player placement: <code>new S01PacketJoinGame(entityId, gameType, hardcore, dimension, difficulty, maxPlayers, worldType, reducedDebugInfo)</code>. The client handler is where the world is born: NetHandlerPlayClient.handleJoinGame creates the PlayerControllerMP and WorldClient from the packet's world type and dimension, calls loadWorld, sets the player's entity id and dimension, shows GuiDownloadTerrain, and replies with the MC|Brand custom payload. Everything that needs mc.theWorld or mc.thePlayer non-null waits on this packet.</p>
+<h4>Vanilla handling</h4>
+<p>handleJoinGame first runs PacketThreadUtil.checkThreadAndEnqueue, which in the Rise 6.x and Tenacity trees special-cases S01PacketJoinGame in clientPreProcessPacket so the world creation is guaranteed on the main thread. Then: <code>this.gameController.playerController = new PlayerControllerMP(...)</code>, <code>this.clientWorldController = new WorldClient(this, new WorldSettings(...), ...)</code>, <code>loadWorld</code>, dimension and entity id assignment, currentServerMaxPlayers, reduced-debug flag, game type set, settings re-sent, and the C17PacketCustomPayload MC|Brand reply. After that the server streams chunks and the respawn/spawn chain.</p>
+<h4>Why clients touch it</h4>
+<p>Only two non-vanilla references exist in the corpus, both Rise 6.x. NetworkAPI (script api) lists S01PacketJoinGame.class at index 1 of its clientbound packet table, so JavaScript scripts can construct and inject it and can key script logic off world join. VulcanSpeed (movement/speed) imports the class but never uses it: the reference is a dead import, the only one of its kind in the 8-client corpus. The clients that need join-time resets (Rise 5.99's WorldChangedEvent, Sigma's event system) fire their own world-change events from elsewhere rather than hooking this packet.</p>
+<h4>Exploit surface</h4>
+<p>S01PacketJoinGame carries no movement data, so anti-cheats ignore it; its value is state. A module that misorders its join handling can inherit stale state: old entity id, wrong dimension, or a game type that contradicts the client's PlayerControllerMP. The vanilla handler is also the moment the client reveals its brand via MC|Brand, which server plugins use for client detection. Script-injected S01 packets (NetworkAPI receivePacket) let a script replay a join outside the normal flow, which desynchronizes client and server state; none of the 8 clients ships a module that does this.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>ServerConfigurationManager.initializeConnectionToPlayer builds the S01 payload from the player's game type, hardcore flag, the world provider's dimension id, difficulty, server max players, terrain type, and the reducedDebugInfo gamerule, then sends it as the first packet of the PLAY stream. The server then follows with S41PacketServerDifficulty, spawn position, and the chunk bulk. The client's MC|Brand reply arrives as C17PacketCustomPayload and is how vanilla records the client mod name.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Wire layout: int entityId, unsigned byte gamemode, byte dimension (signed: -1 nether, 0 overworld, 1 end), unsigned byte difficulty, unsigned byte maxPlayers, String worldType, boolean reducedDebugInfo. Ordering constraint: S01 is the very first PLAY-state packet; the client transitions the connection into PLAY on login success and expects S01 before any world-bearing packet. Re-sent on dimension change only via the respawn path, never as a plain re-join.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>No anti-cheat measures this packet; it precedes position tracking. The security-relevant detail is the MC|Brand exchange immediately after it: brand-based client detection is a server plugin reading the C17 reply, and clients that want to hide their brand forge that packet, not this one. State-reset discipline after S01 matters for movement modules (fresh timer baselines), which is the reason Rise 6.x scripts hook it.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">SessionInfo</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<p class="impl-pattern">The world-join packet: vanilla handleJoinGame constructs the entire client world from its fields. Module interest is minimal in the corpus: Rise 6.x exposes it to scripts via NetworkAPI and one Rise 6.2.4 speed mode carries a dead import. World-change events in the other clients fire from their own infrastructure.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NetworkAPI (script api)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Capture entity ID, gamemode, dimension on join. Used by modules for initialization.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S01PacketJoinGame) {
-  S01PacketJoinGame s01 = (S01PacketJoinGame) event.getPacket();
-  playerEntityId = s01.getEntityId();
-  gamemode = s01.getGameType();
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Expose S01PacketJoinGame to JavaScript scripts: scripts can detect world join and inject or read the packet through the Network API object.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">NetworkAPI keeps two Class arrays indexed by packet id (serverbound and clientbound). S01PacketJoinGame sits at clientbound index 1. instantiatePacket picks the constructor matching the argument count and either sends the packet through addToSendQueue or injects it into the receive queue via addToReceiveQueue; scripts call Network.receivePacket(1, params) to synthesize a join packet client-side.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/script/api/NetworkAPI.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/script/api/NetworkAPI.java =====
+package com.alan.clients.script.api;
+
+import com.alan.clients.util.chat.ChatUtil;
+import lombok.SneakyThrows;
+import net.minecraft.network.EnumPacketDirection;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.INetHandlerPlayClient;
+import net.minecraft.network.play.INetHandlerPlayServer;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+
+import javax.script.ScriptException;
+import java.util.Arrays;
+
+public class NetworkAPI extends API {
+
+    public final static Class&lt;Packet&lt;INetHandlerPlayServer&gt;&gt;[] serverbound = new Class[]{
+            C00PacketKeepAlive.class,
+            C01PacketChatMessage.class,
+            C02PacketUseEntity.class,
+            C03PacketPlayer.class,
+            C03PacketPlayer.C04PacketPlayerPosition.class,
+            C03PacketPlayer.C05PacketPlayerLook.class,
+            C03PacketPlayer.C06PacketPlayerPosLook.class,
+            C07PacketPlayerDigging.class,
+            C08PacketPlayerBlockPlacement.class,
+            C09PacketHeldItemChange.class,
+            C0APacketAnimation.class,
+            C0BPacketEntityAction.class,
+            C0CPacketInput.class,
+            C0DPacketCloseWindow.class,
+            C0EPacketClickWindow.class,
+            C0FPacketConfirmTransaction.class,
+            C10PacketCreativeInventoryAction.class,
+            C11PacketEnchantItem.class,
+            C12PacketUpdateSign.class,
+            C13PacketPlayerAbilities.class,
+            C14PacketTabComplete.class,
+            C15PacketClientSettings.class,
+            C16PacketClientStatus.class,
+            C17PacketCustomPayload.class,
+            C18PacketSpectate.class,
+            C19PacketResourcePackStatus.class,
+    };
+    public final static Class&lt;Packet&lt;INetHandlerPlayClient&gt;&gt;[] clientbound = new Class[]{
+            S00PacketKeepAlive.class,
+            S01PacketJoinGame.class,
+            S02PacketChat.class,
+            S03PacketTimeUpdate.class,
+            S04PacketEntityEquipment.class,
+            S05PacketSpawnPosition.class,
+            S06PacketUpdateHealth.class,
+            S07PacketRespawn.class,
+            S08PacketPlayerPosLook.class,
+            S09PacketHeldItemChange.class,
+            S0APacketUseBed.class,
+            S0BPacketAnimation.class,
+            S0CPacketSpawnPlayer.class,
+            S0DPacketCollectItem.class,
+            S0EPacketSpawnObject.class,
+            S0FPacketSpawnMob.class,
+            S10PacketSpawnPainting.class,
+            S11PacketSpawnExperienceOrb.class,
+            S12PacketEntityVelocity.class,
+            S13PacketDestroyEntities.class,
+            S14PacketEntity.class,
+            S18PacketEntityTeleport.class,
+            S19PacketEntityHeadLook.class,
+            S19PacketEntityStatus.class,
+            S1BPacketEntityAttach.class,
+            S1CPacketEntityMetadata.class,
+            S1DPacketEntityEffect.class,
+            S1EPacketRemoveEntityEffect.class,
+            S1FPacketSetExperience.class,
+            S20PacketEntityProperties.class,
+            S21PacketChunkData.class,
+            S22PacketMultiBlockChange.class,
+            S23PacketBlockChange.class,
+            S24PacketBlockAction.class,
+            S25PacketBlockBreakAnim.class,
+            S26PacketMapChunkBulk.class,
+            S27PacketExplosion.class,
+            S28PacketEffect.class,
+            S29PacketSoundEffect.class,
+            S2APacketParticles.class,
+            S2BPacketChangeGameState.class,
+            S2CPacketSpawnGlobalEntity.class,
+            S2DPacketOpenWindow.class,
+            S2EPacketCloseWindow.class,
+            S2FPacketSetSlot.class,
+            S30PacketWindowItems.class,
+            S31PacketWindowProperty.class,
+            S32PacketConfirmTransaction.class,
+            S33PacketUpdateSign.class,
+            S34PacketMaps.class,
+            S35PacketUpdateTileEntity.class,
+            S36PacketSignEditorOpen.class,
+            S37PacketStatistics.class,
+            S38PacketPlayerListItem.class,
+            S39PacketPlayerAbilities.class,
+            S3APacketTabComplete.class,
+            S3BPacketScoreboardObjective.class,
+            S3CPacketUpdateScore.class,
+            S3DPacketDisplayScoreboard.class,
+            S3EPacketTeams.class,
+            S3FPacketCustomPayload.class,
+            S40PacketDisconnect.class,
+            S41PacketServerDifficulty.class,
+            S42PacketCombatEvent.class,
+            S43PacketCamera.class,
+            S44PacketWorldBorder.class,
+            S45PacketTitle.class,
+            S46PacketSetCompressionLevel.class,
+            S47PacketPlayerListHeaderFooter.class,
+            S48PacketResourcePackSend.class,
+            S49PacketUpdateEntityNBT.class
+    };
+
+    @SneakyThrows
+    private static Packet&lt;?&gt; instantiatePacket(final EnumPacketDirection direction, final int id, final Object... params) {
+        Packet&lt;?&gt; packet = null;
+        try {
+            if (direction == EnumPacketDirection.CLIENTBOUND) {
+                packet = (Packet&lt;?&gt;) Arrays.stream(clientbound[id].getConstructors()).filter(x -&gt; x.getParameterCount() == params.length).findFirst().get().newInstance(params);
+            } else if (direction == EnumPacketDirection.SERVERBOUND) {
+                packet = (Packet&lt;?&gt;) Arrays.stream(serverbound[id].getConstructors()).filter(x -&gt; x.getParameterCount() == params.length).findFirst().get().newInstance(params);
+            }
+        } catch (Exception ex) {
+            ChatUtil.display("Failed to instantiate packet!");
+            throw new ScriptException(ex);
+        }
+        return packet;
+    }
+
+    public void sendPacket(final int id, final Object... params) {
+        final Packet&lt;?&gt; packet = instantiatePacket(EnumPacketDirection.SERVERBOUND, id, params);
+        MC.getNetHandler().addToSendQueue(packet);
+    }
+
+    public void receivePacket(final int id, final Object... params) {
+        final Packet&lt;?&gt; packet = instantiatePacket(EnumPacketDirection.CLIENTBOUND, id, params);
+        MC.getNetHandler().addToReceiveQueue(packet);
+    }
+
+    public boolean isSingleplayer() {
+        return MC.isSingleplayer();
+    }
+
+    public boolean isMultiplayer() {
+        return !MC.isSingleplayer() &amp;&amp; MC.getCurrentServerData() != null;
+    }
+
+    public String getServerIP() {
+        return MC.getCurrentServerData() != null
+                ? MC.getCurrentServerData().serverIP
+                : null;
+    }
+
+    public String getServerName() {
+        return MC.getCurrentServerData() != null
+                ? MC.getCurrentServerData().serverName
+                : null;
+    }
+
+    public String getServerMOTD() {
+        return MC.getCurrentServerData() != null
+                ? MC.getCurrentServerData().serverMOTD
+                : null;
+    }
+}
+// NOTE (AI): The clientbound Class array is indexed by packet id, so S01PacketJoinGame sits at index 1 and scripts can construct or inject it via Network.receivePacket(1, params).
+// NOTE (AI): This is the only functional (non-import) module reference to S01PacketJoinGame in the 8-client corpus. The same API file also lists S02PacketChat at index 2, which is why it appears in both corpora.
+// NOTE (AI): instantiatePacket resolves the constructor by parameter count and reflects a new instance; failures surface as a ScriptException after a ChatUtil.display error line, keeping script errors off the critical path.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> No event hook; a direct script API. Scripts register packet listeners through the same Network object and receive S01PacketJoinGame instances as typed objects.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Read-side use is invisible to the server. Injecting a synthetic S01 via receivePacket desynchronizes client world state from the server and would cascade into movement flags, but no shipped script does this.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 ships the identical file at com/alan/clients/script/api/NetworkAPI.java; the clientbound table (and S01's index 1) matches 6.2.4 exactly.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoRegister</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">VulcanSpeed</span>
+<span class="impl-module-clients">(Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Capture entity ID, gamemode, dimension on join. Used by modules for initialization.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S01PacketJoinGame) {
-  S01PacketJoinGame s01 = (S01PacketJoinGame) event.getPacket();
-  playerEntityId = s01.getEntityId();
-  gamemode = s01.getGameType();
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">A Vulcan-server speed mode; its only link to this packet is an unused import.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The corpus hit is line 28, `import net.minecraft.network.play.server.S01PacketJoinGame;`, and a grep of the whole file confirms no other occurrence: the import is dead. The mode itself implements a Vulcan bypass via block-placement tricks (C08PacketPlayerBlockPlacement against BlockAir checks) and never reads join state.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/movement/speed/VulcanSpeed.java</span></p>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> None. The reference is an import only; the mode runs on motion events.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The dead import has no detection relevance. It suggests the author once planned a join-triggered state reset (common for speed modes that must survive world changes) and dropped it.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other client references S01PacketJoinGame from a module; all remaining corpus hits are vanilla.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NameProtect</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Rise 6.x scripts access the packet through the NetworkAPI object; the other 6 clients have no module-level hook for this packet and rely on their own world-change events.</div>
+<div class="impl-clients">Rise 6.1.30 and 6.2.4 both ship NetworkAPI and the vanilla handler with PacketThreadUtil special-casing S01PacketJoinGame; Tenacity 6.0 also carries the PacketThreadUtil special case; Memeware, Nekoware, Sigma, Spicy use the stock handler without module involvement.</div>
 </div>
-<p class="impl-pattern">Capture entity ID, gamemode, dimension on join. Used by modules for initialization.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S01PacketJoinGame) {
-  S01PacketJoinGame s01 = (S01PacketJoinGame) event.getPacket();
-  playerEntityId = s01.getEntityId();
-  gamemode = s01.getGameType();
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S02PacketLoginSuccess/">S02PacketLoginSuccess</a>
+<a class="related-chip" href="../S03PacketTimeUpdate/">S03PacketTimeUpdate</a>
+<a class="related-chip" href="../S41PacketServerDifficulty/">S41PacketServerDifficulty</a>
+<a class="related-chip" href="../C17PacketCustomPayload/">C17PacketCustomPayload</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

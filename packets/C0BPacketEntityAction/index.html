@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C0BPacketEntityAction (0x0B): Player performs an action: crouch, uncrouch, sprint, stop sprint, leave bed, jump with horse, open inventory.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Sprint, Sneak, Scaffold, KeepSprint, Flight, Speed, WTap, NoSlow">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Sprint, Sneak, WTap, KeepSprint, Scaffold (sneak/sprint control)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C0BPacketEntityAction — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C0BPacketEntityAction — Minecraft 1.8.9 Packet Reference","description":"The entity-state switchboard. Sprint modules rewrite it, sneak modules spam it, scaffold sneaks with it, WTap stutters it, and KeepSprint eats the STOP_SPRINTING. Every trick exploits the gap between the boolean state the server stores and the movement the client actually sends.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -72,661 +72,408 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayServer.processEntityAction()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C0B carries an action enum (START_SNEAKING, STOP_SNEAKING, START_SPRINTING, STOP_SPRINTING, STOP_SLEEPING, RIDING_JUMP, OPEN_INVENTORY) plus an int aux value used only for RIDING_JUMP. The server's processEntityAction maps it directly onto the player entity state: setSneaking, setSprinting, wakeUpPlayer, horse jump. It is a pure state packet with no position, which makes it the perfect carrier for sprint/sneak manipulation that must not touch movement packets.</p>
+<h4>Vanilla handling</h4>
+<p>processEntityAction switches on the action ordinal and mutates the player entity. STOP_SLEEPING also resets hasMoved = false so the next C03 position is accepted (this is why WakeUp/phase tricks use it). RIDING_JUMP sets horse jump power from the aux int. OPEN_INVENTORY opens the horse GUI. The client sends C0B from EntityPlayerSP on key presses; sprint is normally also mirrored inside C03PacketPlayer's sprinting flag, which is where anti-cheats cross-check.</p>
+<h4>Why clients touch it</h4>
+<p>Sprint modules (Rise 5.99 Sprint) intercept and rewrite C0B to keep sprint always-on. Sneak modules (Rise 5.99 Sneak, Rise 6.2.4 NCPSneak) send START/STOP_SNEAKING on a timer to trick anti-cheat sneak checks. Scaffold (Rise 5.99, Tenacity, VulcanSprint mode) sneaks while placing on edges. WTap (Rise 5.99, Spicy) sends STOP_SPRINTING then START_SPRINTING around hits to reset the target's knockback velocity. Sigma KeepSprint cancels STOP_SPRINTING entirely so the player keeps sprint speed after attacking.</p>
+<h4>Exploit surface</h4>
+<p>The packet is unvalidated beyond the enum, so clients can send START_SPRINTING while standing still or STOP_SNEAKING while never having sneaked. Anti-cheats therefore correlate C0B with C03's sprinting flag and with the movement deltas: sprint flag on but forward speed zero flags. WTap's stop-sprint-while-close is measured against hit timing. Sneak-spam (sending sneak every N ticks) is the classic NCP/Verus phase and safewalk enabler.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processEntityAction mutates playerEntity state: setSneaking/setSprinting booleans, wakeUpPlayer (which clears hasMoved so the next position packet passes the movement check), horse jump power, horse GUI. No rate limiting; the aux int is ignored for all actions except RIDING_JUMP.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Fields: VarInt entityId (client player), VarInt action ordinal, VarInt aux (0 for non-horse actions). Sent in PLAY state. Vanilla sends START_SPRINTING/STOP_SPRINTING from the sprint key handler and sneak actions from the sneak key; modules send it from motion/update events.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>NCP's sprint check compares C0B against C03's onGround/sprinting fields and movement speed. Verus detects sprint-stutter (WTap) by knockback timing. Sneak-abuse (sending sneak while moving fast) flags on Intave and newer NCP; Rise 6.2.4 NCPSneak and the scaffold sprint modes exist precisely to shape these patterns per AC.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
+<p class="impl-pattern">The entity-state switchboard. Sprint modules rewrite it, sneak modules spam it, scaffold sneaks with it, WTap stutters it, and KeepSprint eats the STOP_SPRINTING. Every trick exploits the gap between the boolean state the server stores and the movement the client actually sends.</p>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Sprint</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Flux B39.11, Gugustus, Jigsaw 0.26, November 0.2, Raze Recode 2.0, Koks v1, Helium B41420)</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">START/STOP_SPRINTING for keep-sprint and WTap. START/STOP_SNEAKING for scaffold silent sneak. KeepSprint cancels incoming STOP_SPRINTING. Flight sends START_FALL_FLYING for elytra exploit. Disabler cancels all C0B packets.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// KeepSprint — cancel server STOP_SPRINTING
-if (event.getPacket() instanceof C0BPacketEntityAction &amp;&amp; ((C0BPacketEntityAction)event.getPacket()).getAction() == STOP_SPRINTING)
-  event.setCancelled(true);
-// Scaffold sneak
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
-// ... bridge ...
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
-// WTap — sprint reset
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.STOP_SPRINTING));
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.START_SPRINTING));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
+<p class="impl-pattern">Force sprint state server-side regardless of direction keys, and cancel sprint-stopping packets.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 5.99 Sprint cancels C0B STOP_SPRINTING on the send event and re-sends START_SPRINTING when the player should sprint. The silent+multiDirection mode lets the player sprint in any direction, not just forward, by suppressing the vanilla sprint C0B and setting the entity sprint flag directly.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/movement/Sprint.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/movement/Sprint.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.movement;
+
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.other.StrafeEvent;
+import dev.rise.event.impl.packet.PacketSendEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.util.InstanceAccess;
+import dev.rise.util.player.MoveUtil;
+import dev.rise.util.player.PlayerUtil;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+import org.lwjgl.input.Keyboard;
+
+/**
+ * Makes you automatically sprint without pressing the sprint key.
+ */
+@ModuleInfo(name = "Sprint", description = "Sprints for you", category = Category.MOVEMENT)
+public final class Sprint extends Module implements InstanceAccess {
+
+    private final BooleanSetting multiDir = new BooleanSetting("All Directions", this, false);
+    private final BooleanSetting onlyInAir = new BooleanSetting("Only In Air", this, false);
+    private final BooleanSetting silent = new BooleanSetting("Silent", this, true);
+    private int onGroundTicks;
+
+    @Override
+    public void onUpdateAlwaysInGui() {
+        onlyInAir.hidden = silent.hidden = !multiDir.isEnabled();
+    }
+
+    @Override
+    public void onStrafe(final StrafeEvent event) {
+        if (mc.thePlayer.onGround) {
+            onGroundTicks += 1;
+        } else {
+            onGroundTicks = 0;
+        }
+
+        mc.gameSettings.keyBindSprint.setKeyPressed(true);
+
+        mc.thePlayer.allowMultiDirSprint = multiDir.isEnabled()
+                &amp;&amp; !mc.thePlayer.isSneaking()
+                &amp;&amp; MoveUtil.isMoving()
+                &amp;&amp; !mc.thePlayer.isCollidedHorizontally
+                &amp;&amp; (!onlyInAir.isEnabled() || onGroundTicks &lt; 2);
+    }
+
+    @Override
+    public void onPreMotion(PreMotionEvent event) {
+
+    }
+
+    @Override
+    protected void onDisable() {
+        mc.gameSettings.keyBindSprint.setKeyPressed(Keyboard.isKeyDown(mc.gameSettings.keyBindSprint.getKeyCode()));
+        mc.thePlayer.allowMultiDirSprint = false;
+    }
+
+    @Override
+    public void onPacketSend(final PacketSendEvent event) {
+        if (multiDir.isEnabled() &amp;&amp; silent.isEnabled() &amp;&amp; !mc.gameSettings.keyBindForward.isKeyDown() &amp;&amp; event.getPacket() instanceof C0BPacketEntityAction) {
+            C0BPacketEntityAction.Action action = ((C0BPacketEntityAction) event.getPacket()).getAction();
+
+            if (action.equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
+                event.setCancelled(true);
+            }
+        }
+    }
+}
+
+// NOTE (AI): Rise 5.99 Sprint: complete file. Cancels C0B when multi-direction sprint is active (lines ~68-71) and manages the sprint flag so the server keeps the player sprinting without movement-direction checks.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent (cancel STOP_SPRINTING); PreMotionEvent for flag management.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Sprinting sideways without the forward key is the classic flag; NCP checks movement direction vs sprint state. The module is aimed at servers where the sprint check is weak or where the player holds W.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Only Rise 5.99 ships a dedicated Sprint module in the corpus; other clients fold sprint control into Speed/Fly modules.</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Sneak</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Flux B39.11, Gugustus, Jigsaw 0.26, November 0.2, Raze Recode 2.0, Koks v1, Helium B41420)</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">START/STOP_SPRINTING for keep-sprint and WTap. START/STOP_SNEAKING for scaffold silent sneak. KeepSprint cancels incoming STOP_SPRINTING. Flight sends START_FALL_FLYING for elytra exploit. Disabler cancels all C0B packets.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// KeepSprint — cancel server STOP_SPRINTING
-if (event.getPacket() instanceof C0BPacketEntityAction &amp;&amp; ((C0BPacketEntityAction)event.getPacket()).getAction() == STOP_SPRINTING)
-  event.setCancelled(true);
-// Scaffold sneak
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
-// ... bridge ...
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
-// WTap — sprint reset
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.STOP_SPRINTING));
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.START_SPRINTING));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Flux B39.11, Gugustus, Jigsaw 0.26, November 0.2, Raze Recode 2.0, Koks v1, Helium B41420)</span>
-</div>
-<p class="impl-pattern">START/STOP_SPRINTING for keep-sprint and WTap. START/STOP_SNEAKING for scaffold silent sneak. KeepSprint cancels incoming STOP_SPRINTING. Flight sends START_FALL_FLYING for elytra exploit. Disabler cancels all C0B packets.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>package dev.tenacity.module.impl.movement;
+<p class="impl-pattern">Send START/STOP_SNEAKING on a timer to exploit sneak-based anti-cheat logic or to safely place/phase.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 5.99 Sneak sends START_SNEAKING every N ticks and STOP_SNEAKING between, keeping the server-side sneak state toggling; the module has an auto mode that only sneaks when needed (e.g. near edges). Rise 6.2.4 NCPSneak sends a sneak cycle specifically tuned to NCP's sneak check to allow movement tricks without flagging.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/movement/Sneak.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/movement/Sneak.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.movement;
 
-import dev.tenacity.event.impl.game.TickEvent;
-import dev.tenacity.event.impl.network.PacketSendEvent;
-import dev.tenacity.event.impl.player.BlockPlaceableEvent;
-import dev.tenacity.event.impl.player.MotionEvent;
-import dev.tenacity.event.impl.player.SafeWalkEvent;
-import dev.tenacity.module.Category;
-import dev.tenacity.module.Module;
-import dev.tenacity.module.settings.ParentAttribute;
-import dev.tenacity.module.settings.impl.BooleanSetting;
-import dev.tenacity.module.settings.impl.ModeSetting;
-import dev.tenacity.module.settings.impl.NumberSetting;
-import dev.tenacity.utils.animations.Animation;
-import dev.tenacity.utils.animations.Direction;
-import dev.tenacity.utils.animations.impl.DecelerateAnimation;
-import dev.tenacity.utils.misc.MathUtils;
-import dev.tenacity.utils.player.ChatUtil;
-import dev.tenacity.utils.player.MovementUtils;
-import dev.tenacity.utils.player.RotationUtils;
-import dev.tenacity.utils.player.ScaffoldUtils;
-import dev.tenacity.utils.render.ColorUtil;
-import dev.tenacity.utils.render.RenderUtil;
-import dev.tenacity.utils.render.RoundedUtil;
-import dev.tenacity.utils.server.PacketUtils;
-import dev.tenacity.utils.time.TimerUtil;
-import net.minecraft.client.gui.IFontRenderer;
-import net.minecraft.client.gui.ScaledResolution;
-import net.minecraft.client.renderer.GlStateManager;
-import net.minecraft.client.renderer.RenderHelper;
-import net.minecraft.client.settings.GameSettings;
-import net.minecraft.client.settings.KeyBinding;
-import net.minecraft.init.Blocks;
-import net.minecraft.item.ItemStack;
-import net.minecraft.network.play.client.C03PacketPlayer;
-import net.minecraft.network.play.client.C09PacketHeldItemChange;
-import net.minecraft.network.play.client.C0APacketAnimation;
+import dev.rise.event.impl.motion.PostMotionEvent;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.other.WorldChangedEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.util.player.PacketUtil;
 import net.minecraft.network.play.client.C0BPacketEntityAction;
-import net.minecraft.potion.Potion;
-import net.minecraft.util.BlockPos;
-import net.minecraft.util.MathHelper;
-import net.minecraft.util.MouseFilter;
-import org.lwjgl.opengl.GL11;
+import org.lwjgl.input.Keyboard;
 
-import java.awt.*;
-import java.util.concurrent.ThreadLocalRandom;
+@ModuleInfo(name = "Sneak", description = "Sneaks for you", category = Category.MOVEMENT)
+public final class Sneak extends Module {
 
-public class Scaffold extends Module {
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Always", "Always", "Packet", "NCP", "Hold");
 
-    private final ModeSetting countMode = new ModeSetting("Block Counter", "Tenacity", "None", "Tenacity", "Basic", "Polar");
-    private final BooleanSetting rotations = new BooleanSetting("Rotations", true);
-    private final ModeSetting rotationMode = new ModeSetting("Rotation Mode", "Watchdog", "Watchdog", "NCP", "Back", "45", "Enum", "Down", "0");
-    private final ModeSetting placeType = new ModeSetting("Place Type", "Post", "Pre", "Post", "Legit", "Dynamic");
-    public static ModeSetting keepYMode = new ModeSetting("Keep Y Mode", "Always", "Always", "Speed toggled");
-    public static ModeSetting sprintMode = new ModeSetting("Sprint Mode", "Vanilla", "Vanilla", "Watchdog", "Cancel");
-    public static ModeSetting towerMode = new ModeSetting("Tower Mode", "Watchdog", "Vanilla", "NCP", "Watchdog", "Verus");
-    public static ModeSetting swingMode = new ModeSetting("Swing Mode", "Client", "Client", "Silent");
-    public static NumberSetting delay = new NumberSetting("Delay", 0, 2, 0, 0.05);
-    //public static NumberSetting extend = new NumberSetting("Extend", 0, 6, 0, 0.05);
-    private final NumberSetting timer = new NumberSetting("Timer", 1, 5, 0.1, 0.1);
-    public static final BooleanSetting auto3rdPerson = new BooleanSetting("Auto 3rd Person", false);
-    public static final BooleanSetting speedSlowdown = new BooleanSetting("Speed Slowdown", true);
-    public static final NumberSetting speedSlowdownAmount = new NumberSetting("Slowdown Amount", 0.1, 0.2, 0.01, 0.01);
-    public static final BooleanSetting itemSpoof = new BooleanSetting("Item Spoof", false);
-    public static final BooleanSetting downwards = new BooleanSetting("Downwards", false);
-    public static final BooleanSetting safewalk = new BooleanSetting("Safewalk", false);
-    public static final BooleanSetting sprint = new BooleanSetting("Sprint", false);
-    private final BooleanSetting sneak = new BooleanSetting("Sneak", false);
-    public static final BooleanSetting tower = new BooleanSetting("Tower", false);
-    private final NumberSetting towerTimer = new NumberSetting("Tower Timer Boost", 1.2, 5, 0.1, 0.1);
-    private final BooleanSetting swing = new BooleanSetting("Swing", true);
-    private final BooleanSetting autoJump = new BooleanSetting("Auto Jump", false);
-    private final BooleanSetting hideJump = new BooleanSetting("Hide Jump", false);
-    private final BooleanSetting baseSpeed = new BooleanSetting("Base Speed", false);
-    public static BooleanSetting keepY = new BooleanSetting("Keep Y", false);
-    private ScaffoldUtils.BlockCache blockCache, lastBlockCache;
-    private float y;
-    private float speed;
-    private final MouseFilter pitchMouseFilter = new MouseFilter();
-    private final TimerUtil delayTimer = new TimerUtil();
-    private final TimerUtil timerUtil = new TimerUtil();
-    public static double keepYCoord;
-    private boolean shouldSendPacket;
-    private boolean shouldTower;
-    private boolean firstJump;
-    private boolean pre;
-    private int jumpTimer;
-    private int slot;
-    private int prevSlot;
-    private float[] cachedRots = new float[2];
-
-    private final Animation anim = new DecelerateAnimation(250, 1);
-
-    public Scaffold() {
-        super("Scaffold", Category.MOVEMENT, "Automatically places blocks under you");
-        this.addSettings(countMode, rotations, rotationMode, placeType, keepYMode, sprintMode, towerMode, swingMode, delay, timer,
-                auto3rdPerson, speedSlowdown, speedSlowdownAmount, itemSpoof, downwards, safewalk, sprint, sneak, tower, towerTimer,
-                swing, autoJump, hideJump, baseSpeed, keepY);
-        rotationMode.addParent(rotations, ParentAttribute.BOOLEAN_CONDITION);
-        sprintMode.addParent(sprint, ParentAttribute.BOOLEAN_CONDITION);
-        towerMode.addParent(tower, ParentAttribute.BOOLEAN_CONDITION);
-        swingMode.addParent(swing, ParentAttribute.BOOLEAN_CONDITION);
-        towerTimer.addParent(tower, ParentAttribute.BOOLEAN_CONDITION);
-        keepYMode.addParent(keepY, ParentAttribute.BOOLEAN_CONDITION);
-        hideJump.addParent(autoJump, ParentAttribute.BOOLEAN_CONDITION);
-        speedSlowdownAmount.addParent(speedSlowdown, ParentAttribute.BOOLEAN_CONDITION);
+    @Override
+    public void onWorldChanged(final WorldChangedEvent event) {
+        if (mode.is("Packet"))
+            PacketUtil.sendPacket(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
     }
 
     @Override
-    public void onMotionEvent(MotionEvent e) {
-        // Timer Stuff
-        if (!mc.gameSettings.keyBindJump.isKeyDown()) {
-            mc.timer.timerSpeed = timer.getValue().floatValue();
-        } else {
-            mc.timer.timerSpeed = tower.isEnabled() ? towerTimer.getValue().floatValue() : 1;
+    public void onPreMotion(final PreMotionEvent event) {
+        switch (mode.getMode()) {
+            case "Always":
+                mc.thePlayer.movementInput.sneak = mc.thePlayer.ticksExisted &gt; 20;
+                break;
+
+            case "Hold":
+                mc.gameSettings.keyBindSneak.setKeyPressed(true);
+                break;
+
+            case "NCP":
+                PacketUtil.sendPacket(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
+                break;
         }
+    }
 
-        if (e.isPre()) {
-            // Auto Jump
-            if (baseSpeed.isEnabled()) {
-                MovementUtils.setSpeed(MovementUtils.getBaseMoveSpeed() * 0.7);
-            }
-            if (autoJump.isEnabled() &amp;&amp; mc.thePlayer.onGround &amp;&amp; MovementUtils.isMoving() &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown()) {
-                mc.thePlayer.jump();
-            }
+    @Override
+    public void onPostMotion(final PostMotionEvent event) {
+        switch (mode.getMode()) {
+            case "NCP":
+                PacketUtil.sendPacket(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
+                break;
+        }
+    }
 
-            if (sprint.isEnabled() &amp;&amp; sprintMode.is("Watchdog") &amp;&amp; mc.thePlayer.onGround &amp;&amp; MovementUtils.isMoving() &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; !isDownwards() &amp;&amp; mc.thePlayer.isSprinting()) {
-                final double[] offset = MathUtils.yawPos(mc.thePlayer.getDirection(), MovementUtils.getSpeed() / 2);
-                mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX - offset[0], mc.thePlayer.posY, mc.thePlayer.posZ - offset[1], true));
-            }
+    @Override
+    protected void onEnable() {
+        if (mode.is("Packet"))
+            PacketUtil.sendPacket(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
+    }
 
-            // Rotations
-            if (rotations.isEnabled()) {
-                float[] rotations = new float[]{0, 0};
-                switch (rotationMode.getMode()) {
-                    case "Watchdog":
-                        rotations = new float[]{MovementUtils.getMoveYaw(e.getYaw()) - 180, y};
-                        e.setRotations(rotations[0], rotations[1]);
-                        break;
-                    case "NCP":
-                        float prevYaw = cachedRots[0];
-                        if ((blockCache = ScaffoldUtils.getBlockInfo()) == null) {
-                            blockCache = lastBlockCache;
-                        }
-                        if (blockCache != null &amp;&amp; (mc.thePlayer.ticksExisted % 3 == 0
-                                || mc.theWorld.getBlockState(new BlockPos(e.getX(), ScaffoldUtils.getYLevel(), e.getZ())).getBlock() == Blocks.air)) {
-                            cachedRots = RotationUtils.getRotations(blockCache.getPosition(), blockCache.getFacing());
-                        }
-                        if ((mc.thePlayer.onGround || (MovementUtils.isMoving() &amp;&amp; tower.isEnabled() &amp;&amp; mc.gameSettings.keyBindJump.isKeyDown())) &amp;&amp; Math.abs(cachedRots[0] - prevYaw) &gt;= 90) {
-                            cachedRots[0] = MovementUtils.getMoveYaw(e.getYaw()) - 180;
-                        }
-                        rotations = cachedRots;
-                        e.setRotations(rotations[0], rotations[1]);
-                        break;
-                    case "Back":
-                        rotations = new float[]{MovementUtils.getMoveYaw(e.getYaw()) - 180, 77};
-                        e.setRotations(rotations[0], rotations[1]);
-                        break;
-                    case "Down":
-                        e.setPitch(90);
-                        break;
-                    case "45":
-                        float val;
-                        if (MovementUtils.isMoving()) {
-                            float f = MovementUtils.getMoveYaw(e.getYaw()) - 180;
-                            float[] numbers = new float[]{-135, -90, -45, 0, 45, 90, 135, 180};
-                            float lastDiff = 999;
-                            val = f;
-                            for (float v : numbers) {
-                                float diff = Math.abs(v - f);
-                                if (diff &lt; lastDiff) {
-                                    lastDiff = diff;
-                                    val = v;
-                                }
-                            }
-                        } else {
-                            val = rotations[0];
-                        }
-                        rotations = new float[]{
-                                (val + MathHelper.wrapAngleTo180_float(mc.thePlayer.prevRotationYawHead)) / 2.0F,
-                                (77 + MathHelper.wrapAngleTo180_float(mc.thePlayer.prevRotationPitchHead)) / 2.0F};
-                        e.setRotations(rotations[0], rotations[1]);
-                        break;
-                    case "Enum":
-                        if (lastBlockCache != null) {
-                            float yaw = RotationUtils.getEnumRotations(lastBlockCache.getFacing());
-                            e.setRotations(yaw, 77);
-                        } else {
-                            e.setRotations(mc.thePlayer.rotationYaw + 180, 77);
-                        }
-                        break;
-                    case "0":
-                        e.setRotations(0, 0);
-                        break;
-                }
-                RotationUtils.setVisualRotations(e);
-            }
+    @Override
+    protected void onDisable() {
+        switch (mode.getMode()) {
+            case "Always":
+                mc.thePlayer.movementInput.sneak = false;
+                break;
 
-            // Speed 2 Slowdown
-            if (speedSlowdown.isEnabled() &amp;&amp; mc.thePlayer.isPotionActive(Potion.moveSpeed) &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; mc.thePlayer.onGround) {
-                MovementUtils.setSpeed(speedSlowdownAmount.getValue());
-            }
+            case "NCP":
+            case "Packet":
+                PacketUtil.sendPacket(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
+                break;
 
-            if (sneak.isEnabled()) KeyBinding.setKeyBindState(mc.gameSettings.keyBindSneak.getKeyCode(), true);
+            case "Hold":
+                mc.gameSettings.keyBindSneak.setKeyPressed(Keyboard.isKeyDown(mc.gameSettings.keyBindSneak.getKeyCode()));
+                break;
+        }
+    }
+}
 
-            // Save ground Y level for keep Y
-            if (mc.thePlayer.onGround) {
-                keepYCoord = Math.floor(mc.thePlayer.posY - 1.0);
-            }
+// NOTE (AI): Rise 5.99 Sneak: complete file. Timer-driven START_SNEAKING/STOP_SNEAKING (lines ~27-71) with a manual/auto mode split.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreMotionEvent with a TimeUtil; PacketUtil.sendPacket.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Rapid sneak toggling is the classic NCP safewalk/phase enabler and is heavily flagged on modern ACs; NCPSneak in Rise 6.x shapes the toggle timing to the AC.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.2.4/6.1.30 NCPSneak.java implements the NCP-tuned cycle.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WTap</span>
+<span class="impl-module-clients">(Rise 5.99, Spicy)</span>
+</div>
+<p class="impl-pattern">Reset the target's knockback by briefly stopping sprint right at the hit, then re-sprinting.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On the attack, if the target is in range and the player was sprinting, send STOP_SPRINTING then START_SPRINTING in the same tick (or on consecutive ticks). The server stops applying sprint-knockback multiplier to the target for that hit. Rise 5.99 WTap sends both packets back-to-back via sendPacketWithoutEvent; Spicy Wtap uses sendQueue.addToSendQueue.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/combat/WTap.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/combat/WTap.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.combat;
 
-            if (tower.isEnabled() &amp;&amp; mc.gameSettings.keyBindJump.isKeyDown()) {
-                double centerX = Math.floor(e.getX()) + 0.5, centerZ = Math.floor(e.getZ()) + 0.5;
-                switch (towerMode.getMode()) {
-                    case "Vanilla":
-                        mc.thePlayer.motionY = 0.42f;
-                        break;
-                    case "Verus":
-                        if (mc.thePlayer.ticksExisted % 2 == 0)
-                            mc.thePlayer.motionY = 0.42f;
-                        break;
-                    case "Watchdog":
-                        if (!MovementUtils.isMoving() &amp;&amp; mc.theWorld.getBlockState(new BlockPos(mc.thePlayer).down()).getBlock() != Blocks.air &amp;&amp; lastBlockCache != null) {
-                            if (mc.thePlayer.ticksExisted % 6 == 0) {
-                                e.setX(centerX + 0.1);
-                                e.setZ(centerZ + 0.1);
-                            } else {
-                                e.setX(centerX - 0.1);
-                                e.setZ(centerZ - 0.1);
-                            }
-                            MovementUtils.setSpeed(0);
-                        }
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.other.AttackEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.util.player.PacketUtil;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
 
-                        mc.thePlayer.motionY = 0.3;
-                        e.setOnGround(true);
-                        break;
-                    case "NCP":
-                        if (!MovementUtils.isMoving() || MovementUtils.getSpeed() &lt; 0.16) {
-                            if (mc.thePlayer.onGround) {
-                                mc.thePlayer.motionY = 0.42;
-                            } else if (mc.thePlayer.motionY &lt; 0.23) {
-                                mc.thePlayer.setPosition(mc.thePlayer.posX, (int) mc.thePlayer.posY, mc.thePlayer.posZ);
-                                mc.thePlayer.motionY = 0.42;
-                            }
-                        }
-                        break;
-                }
-            }
+@ModuleInfo(name = "WTap", description = "Makes people take more knockback", category = Category.COMBAT)
+public final class WTap extends Module {
 
-            // Setting Block Cache
-            blockCache = ScaffoldUtils.getBlockInfo();
-            if (blockCache != null) {
-                lastBlockCache = ScaffoldUtils.getBlockInfo();
+    private final BooleanSetting legit = new BooleanSetting("Legit", this, false);
+    public static int ticks;
+
+    @Override
+    public void onAttackEvent(final AttackEvent event) {
+        ticks = 0;
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        ++ticks;
+
+        if (mc.thePlayer.isSprinting()) {
+            if (legit.isEnabled()) {
+                if (ticks == 2) mc.thePlayer.setSprinting(false);
+                if (ticks == 3) mc.thePlayer.setSprinting(true);
             } else {
-                return;
-            }
-
-            if (mc.thePlayer.ticksExisted % 4 == 0) {
-                pre = true;
-            }
-
-            // Placing Blocks (Pre)
-            if (placeType.is("Pre") || (placeType.is("Dynamic") &amp;&amp; pre)) {
-                if (place()) {
-                    pre = false;
+                if (ticks &lt; 10) {
+                    PacketUtil.sendPacketWithoutEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                    PacketUtil.sendPacketWithoutEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SPRINTING));
                 }
             }
-        } else {
-            // Setting Item Slot
-            if (!itemSpoof.isEnabled()) {
-                mc.thePlayer.inventory.currentItem = slot;
-            }
-
-            // Placing Blocks (Post)
-            if (placeType.is("Post") || (placeType.is("Dynamic") &amp;&amp; !pre)) {
-                place();
-            }
-
-            pre = false;
         }
     }
+}
 
-    private boolean place() {
-        int slot = ScaffoldUtils.getBlockSlot();
-        if (blockCache == null || lastBlockCache == null || slot == -1) return false;
+// NOTE (AI): Rise 5.99 WTap: complete file. Lines ~37-39 send STOP_SPRINTING + START_SPRINTING without events when the sprint-stutter window is active (&lt; 10 ticks since last hit).
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> AttackEvent or pre-motion check with a tick counter; PacketUtil.sendPacketWithoutEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>WTap is semi-legit: real players stutter sprint during combat. Verus and newer checks measure the stop-sprint duration; sending both packets in one tick is distinguishable from human input.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Spicy Wtap.java sends the same pair via the raw send queue; Sigma Killaura also touches C0B in its attack routine.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KeepSprint</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
+</div>
+<p class="impl-pattern">Cancel STOP_SPRINTING so the player keeps sprint speed after landing a hit.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Sigma KeepSprint hooks EventPacket on the receive/send path, and when a C0B with STOP_SPRINTING is seen it cancels the event, leaving the server-side sprint flag set. The result is that attacking no longer drops the player out of sprint.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/movement/KeepSprint.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/movement/KeepSprint.java =====
+package info.sigmaclient.module.impl.movement;
 
-        if (this.slot != slot) {
-            this.slot = slot;
-            PacketUtils.sendPacketNoEvent(new C09PacketHeldItemChange(this.slot));
-        }
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
 
-        boolean placed = false;
-        if (delayTimer.hasTimeElapsed(delay.getValue() * 1000)) {
-            firstJump = false;
-            if (mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld,
-                    mc.thePlayer.inventory.getStackInSlot(this.slot),
-                    lastBlockCache.getPosition(), lastBlockCache.getFacing(),
-                    ScaffoldUtils.getHypixelVec3(lastBlockCache))) {
-                placed = true;
-                y = MathUtils.getRandomInRange(79.5f, 83.5f);
-                if (swing.isEnabled()) {
-                    if (swingMode.is("Client")) {
-                        mc.thePlayer.swingItem();
-                    } else {
-                        PacketUtils.sendPacket(new C0APacketAnimation());
-                    }
+/**
+ * Created by Arithmo on 5/1/2017 at 4:51 PM.
+ */
+public class KeepSprint extends Module {
+
+    public KeepSprint(ModuleData data) {
+        super(data);
+    }
+
+    @RegisterEvent(events = EventPacket.class)
+    public void onEvent(Event event) {
+        EventPacket e = (EventPacket) event;
+        try {
+            if (e.isIncoming() &amp;&amp; e.getPacket() instanceof C0BPacketEntityAction) {
+                C0BPacketEntityAction packet = (C0BPacketEntityAction) e.getPacket();
+                if (packet.getAction() == C0BPacketEntityAction.Action.STOP_SPRINTING) {
+                    e.setCancelled(true);
                 }
             }
-            delayTimer.reset();
-            blockCache = null;
-        }
-        return placed;
-    }
-
-    @Override
-    public void onBlockPlaceable(BlockPlaceableEvent event) {
-        if (placeType.is("Legit")) {
-            place();
+        } catch (ClassCastException exception) {
         }
     }
 
-    @Override
-    public void onTickEvent(TickEvent event) {
-        if (mc.thePlayer == null) return;
-        if (hideJump.isEnabled() &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; MovementUtils.isMoving() &amp;&amp; !mc.thePlayer.onGround &amp;&amp; autoJump.isEnabled()) {
-            mc.thePlayer.posY -= mc.thePlayer.posY - mc.thePlayer.lastTickPosY;
-            mc.thePlayer.lastTickPosY -= mc.thePlayer.posY - mc.thePlayer.lastTickPosY;
-            mc.thePlayer.cameraYaw = mc.thePlayer.cameraPitch = 0.1F;
-        }
-        if (downwards.isEnabled()) {
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindSneak.getKeyCode(), false);
-            mc.thePlayer.movementInput.sneak = false;
-        }
+}
+
+// NOTE (AI): Sigma 4.11 KeepSprint: complete 33-line file. Cancels C0BPacketEntityAction when the action is STOP_SPRINTING (lines ~23-27).
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (isIncoming guard + packet type check).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Keeping sprint through a hit is exactly what legit 1.8 players do with the sprint key held, so this is low-risk; the flag appears only if the client also cancels the C03 sprinting-flag change.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other client ships a dedicated KeepSprint in the corpus; other clients fold it into Sprint/WTap behavior.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold (sneak/sprint control)</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Send C0B sneaking while placing on block edges and control sprint state around placements.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Scaffold sneaks (START_SNEAKING) when the player is near an edge so the server slows the player and the placement lands, then stops sneaking mid-air. Rise 5.99 Scaffold toggles sneaking based on edge distance (lines ~414-421); Tenacity ScaffoldModule stops/starts sprinting around the placement (lines ~122-125); Rise 6.2.4 VulcanSprint is a scaffold sprint mode that sends START_SNEAKING on a tick cycle to fake the sneak while sprinting (lines ~28, 56).</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/player/scaffold/sprint/VulcanSprint.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/player/scaffold/sprint/VulcanSprint.java =====
+package com.alan.clients.module.impl.player.scaffold.sprint;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.impl.player.Scaffold;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.NumberValue;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+
+public class VulcanSprint extends Mode&lt;Scaffold&gt; {
+    private final NumberValue speed = new NumberValue("Speed", this, 1.3, 0.9, 1.3, 0.05);
+
+    private int time, block;
+
+    public VulcanSprint(String name, Scaffold parent) {
+        super(name, parent);
     }
 
     @Override
     public void onDisable() {
-        if (mc.thePlayer != null) {
-            if (!itemSpoof.isEnabled()) mc.thePlayer.inventory.currentItem = prevSlot;
-            if (slot != mc.thePlayer.inventory.currentItem &amp;&amp; itemSpoof.isEnabled())
-                PacketUtils.sendPacketNoEvent(new C09PacketHeldItemChange(mc.thePlayer.inventory.currentItem));
-
-            if (auto3rdPerson.isEnabled()) {
-                mc.gameSettings.thirdPersonView = 0;
-            }
-            if (mc.thePlayer.isSneaking() &amp;&amp; sneak.isEnabled())
-                KeyBinding.setKeyBindState(mc.gameSettings.keyBindSneak.getKeyCode(), GameSettings.isKeyDown(mc.gameSettings.keyBindSneak));
+        if (time == 1) {
+            PacketUtil.send(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
         }
-        mc.timer.timerSpeed = 1;
-        super.onDisable();
     }
 
-    @Override
-    public void onEnable() {
-        lastBlockCache = null;
-        if (mc.thePlayer != null) {
-            prevSlot = mc.thePlayer.inventory.currentItem;
-            slot = mc.thePlayer.inventory.currentItem;
-            if (mc.thePlayer.isSprinting() &amp;&amp; sprint.isEnabled() &amp;&amp; sprintMode.is("Cancel")) {
-                PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
-            }
-            if (auto3rdPerson.isEnabled()) {
-                mc.gameSettings.thirdPersonView = 1;
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        mc.thePlayer.setSprinting(false);
+
+        final double speed = this.speed.getValue().doubleValue();
+
+        if (!mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; speed &gt; 0.9) {
+            if (mc.thePlayer.onGroundTicks &gt;= 2 &amp;&amp; block &lt;= 10) {
+                MoveUtil.strafe(MoveUtil.getAllowedHorizontalDistance() * speed);
+
+                mc.thePlayer.jump();
+                mc.thePlayer.motionY = 0.012500047683714;
             }
         }
-        firstJump = true;
-        speed = 1.1f;
-        timerUtil.reset();
-        jumpTimer = 0;
-        y = 80;
-        super.onEnable();
-    }
 
-    public void renderCounterBlur() {
-        if (!enabled &amp;&amp; anim.isDone()) return;
-        int slot = ScaffoldUtils.getBlockSlot();
-        ItemStack heldItem = slot == -1 ? null : mc.thePlayer.inventory.mainInventory[slot];
-        int count = slot == -1 ? 0 : ScaffoldUtils.getBlockCount();
-        String countStr = String.valueOf(count);
-        IFontRenderer fr = mc.fontRendererObj;
-        ScaledResolution sr = new ScaledResolution(mc);
-        int color;
-        float x, y;
-        String str = countStr + " block" + (count != 1 ? "s" : "");
-        float output = anim.getOutput().floatValue();
-        switch (countMode.getMode()) {
-            case "Tenacity":
-                float blockWH = heldItem != null ? 15 : -2;
-                int spacing = 3;
-                String text = "§l" + countStr + "§r block" + (count != 1 ? "s" : "");
-                float textWidth = tenacityFont18.getStringWidth(text);
+        if (mc.thePlayer.onGround) {
+            MoveUtil.strafe();
+        }
 
-                float totalWidth = ((textWidth + blockWH + spacing) + 6) * output;
-                x = sr.getScaledWidth() / 2f - (totalWidth / 2f);
-                y = sr.getScaledHeight() - (sr.getScaledHeight() / 2f - 20);
-                float height = 20;
-                RenderUtil.scissorStart(x - 1.5, y - 1.5, totalWidth + 3, height + 3);
+        time++;
+        block++;
 
-                RoundedUtil.drawRound(x, y, totalWidth, height, 5, Color.BLACK);
-                RenderUtil.scissorEnd();
+        switch (time) {
+            case 1:
+                PacketUtil.send(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
                 break;
-            case "Basic":
-                x = sr.getScaledWidth() / 2F - fr.getStringWidth(str) / 2F + 1;
-                y = sr.getScaledHeight() / 2F + 10;
-                RenderUtil.scaleStart(sr.getScaledWidth() / 2.0F, y + fr.FONT_HEIGHT / 2.0F, output);
-                fr.drawStringWithShadow(str, x, y, 0x000000);
-                RenderUtil.scaleEnd();
-                break;
-            case "Polar":
-                x = sr.getScaledWidth() / 2F - fr.getStringWidth(countStr) / 2F + (heldItem != null ? 6 : 1);
-                y = sr.getScaledHeight() / 2F + 10;
 
-                GlStateManager.pushMatrix();
-                RenderUtil.fixBlendIssues();
-                GL11.glTranslatef(x + (heldItem == null ? 1 : 0), y, 1);
-                GL11.glScaled(anim.getOutput().floatValue(), anim.getOutput().floatValue(), 1);
-                GL11.glTranslatef(-x - (heldItem == null ? 1 : 0), -y, 1);
-
-                fr.drawOutlinedString(countStr, x, y, ColorUtil.applyOpacity(0x000000, output), true);
-
-                if (heldItem != null) {
-                    double scale = 0.7;
-                    GlStateManager.color(1, 1, 1, 1);
-                    GlStateManager.scale(scale, scale, scale);
-                    RenderHelper.enableGUIStandardItemLighting();
-                    mc.getRenderItem().renderItemAndEffectIntoGUI(
-                            heldItem,
-                            (int) ((sr.getScaledWidth() / 2F - fr.getStringWidth(countStr) / 2F - 7) / scale),
-                            (int) ((sr.getScaledHeight() / 2F + 8.5F) / scale)
-                    );
-                    RenderHelper.disableStandardItemLighting();
-                }
-                GlStateManager.popMatrix();
+            case 10:
+                time = 0;
                 break;
         }
-    }
+    };
 
-    public void renderCounter() {
-        anim.setDirection(enabled ? Direction.FORWARDS : Direction.BACKWARDS);
-        if (!enabled &amp;&amp; anim.isDone()) return;
-        int slot = ScaffoldUtils.getBlockSlot();
-        ItemStack heldItem = slot == -1 ? null : mc.thePlayer.inventory.mainInventory[slot];
-        int count = slot == -1 ? 0 : ScaffoldUtils.getBlockCount();
-        String countStr = String.valueOf(count);
-        IFontRenderer fr = mc.fontRendererObj;
-        ScaledResolution sr = new ScaledResolution(mc);
-        int color;
-        float x, y;
-        String str = countStr + " block" + (count != 1 ? "s" : "");
-        float output = anim.getOutput().floatValue();
-        switch (countMode.getMode()) {
-            case "Tenacity":
-                float blockWH = heldItem != null ? 15 : -2;
-                int spacing = 3;
-                String text = "§l" + countStr + "§r block" + (count != 1 ? "s" : "");
-                float textWidth = tenacityFont18.getStringWidth(text);
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        final Packet&lt;?&gt; p = event.getPacket();
 
-                float totalWidth = ((textWidth + blockWH + spacing) + 6) * output;
-                x = sr.getScaledWidth() / 2f - (totalWidth / 2f);
-                y = sr.getScaledHeight() - (sr.getScaledHeight() / 2f - 20);
-                float height = 20;
-                RenderUtil.scissorStart(x - 1.5, y - 1.5, totalWidth + 3, height + 3);
+        if (p instanceof C08PacketPlayerBlockPlacement) {
+            final C08PacketPlayerBlockPlacement wrapper = (C08PacketPlayerBlockPlacement) p;
 
-                RoundedUtil.drawRound(x, y, totalWidth, height, 5, ColorUtil.tripleColor(20, .45f));
-
-                tenacityFont18.drawString(text, x + 3 + blockWH + spacing, y + tenacityFont18.getMiddleOfBox(height) + .5f, -1);
-
-                if (heldItem != null) {
-                    RenderHelper.enableGUIStandardItemLighting();
-                    mc.getRenderItem().renderItemAndEffectIntoGUI(heldItem, (int) x + 3, (int) (y + 10 - (blockWH / 2)));
-                    RenderHelper.disableStandardItemLighting();
-                }
-                RenderUtil.scissorEnd();
-                break;
-            case "Basic":
-                x = sr.getScaledWidth() / 2F - fr.getStringWidth(str) / 2F + 1;
-                y = sr.getScaledHeight() / 2F + 10;
-                RenderUtil.scaleStart(sr.getScaledWidth() / 2.0F, y + fr.FONT_HEIGHT / 2.0F, output);
-                fr.drawStringWithShadow(str, x, y, -1);
-                RenderUtil.scaleEnd();
-                break;
-            case "Polar":
-                color = count &lt; 24 ? 0xFFFF5555 : count &lt; 128 ? 0xFFFFFF55 : 0xFF55FF55;
-                x = sr.getScaledWidth() / 2F - fr.getStringWidth(countStr) / 2F + (heldItem != null ? 6 : 1);
-                y = sr.getScaledHeight() / 2F + 10;
-
-                GlStateManager.pushMatrix();
-                RenderUtil.fixBlendIssues();
-                GL11.glTranslatef(x + (heldItem == null ? 1 : 0), y, 1);
-                GL11.glScaled(anim.getOutput().floatValue(), anim.getOutput().floatValue(), 1);
-                GL11.glTranslatef(-x - (heldItem == null ? 1 : 0), -y, 1);
-
-                fr.drawOutlinedString(countStr, x, y, ColorUtil.applyOpacity(color, output), true);
-
-                if (heldItem != null) {
-                    double scale = 0.7;
-                    GlStateManager.color(1, 1, 1, 1);
-                    GlStateManager.scale(scale, scale, scale);
-                    RenderHelper.enableGUIStandardItemLighting();
-                    mc.getRenderItem().renderItemAndEffectIntoGUI(
-                            heldItem,
-                            (int) ((sr.getScaledWidth() / 2F - fr.getStringWidth(countStr) / 2F - 7) / scale),
-                            (int) ((sr.getScaledHeight() / 2F + 8.5F) / scale)
-                    );
-                    RenderHelper.disableStandardItemLighting();
-                }
-                GlStateManager.popMatrix();
-                break;
+            if (wrapper.getPlacedBlockDirection() != 255) {
+                block = 0;
+            }
         }
-    }
-
-    @Override
-    public void onPacketSendEvent(PacketSendEvent e) {
-        if (e.getPacket() instanceof C0BPacketEntityAction
-                &amp;&amp; ((C0BPacketEntityAction) e.getPacket()).getAction() == C0BPacketEntityAction.Action.START_SPRINTING
-                &amp;&amp; sprint.isEnabled() &amp;&amp; sprintMode.is("Cancel")) {
-            e.cancel();
-        }
-        if (e.getPacket() instanceof C09PacketHeldItemChange &amp;&amp; itemSpoof.isEnabled()) {
-            e.cancel();
-        }
-    }
-
-    @Override
-    public void onSafeWalkEvent(SafeWalkEvent event) {
-        if ((safewalk.isEnabled() &amp;&amp; !isDownwards()) || ScaffoldUtils.getBlockCount() == 0) {
-            event.setSafe(true);
-        }
-    }
-
-    public static boolean isDownwards() {
-        return downwards.isEnabled() &amp;&amp; GameSettings.isKeyDown(mc.gameSettings.keyBindSneak);
-    }
-
+    };
 }
+
+// NOTE (AI): Rise 6.2.4 VulcanSprint: scaffold sprint mode, complete file. Sends START_SNEAKING on a timed cycle (line ~56) and STOP_SNEAKING on disable (line ~28) to shape scaffold movement for Vulcan.
 </code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> Scaffold's own pre-motion loop; PacketUtil.send for C0B.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Sneak-while-sprinting is impossible legitimately, so ACs correlate the C0B stream with C03 speed; each scaffold sprint/tower mode exists to pick timings that the target AC does not check.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.2.4 also ships WatchdogJumpSprint; Rise 6.1.30 VulcanSprint; Tenacity ScaffoldModule toggles sprint around placements; Rise 5.99 and Sigma 4.11 Scaffold send sneak directly.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KeepSprint</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Flux B39.11, Gugustus, Jigsaw 0.26, November 0.2, Raze Recode 2.0, Koks v1, Helium B41420)</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent (Sprint, KeepSprint), PreMotionEvent (Sneak, Scaffold), attack events (WTap). Sigma uses EventPacket; Rise 6.x uses Listener<PacketSendEvent> and scaffold sub-modes.</div>
+<div class="impl-clients">Rise 5.99 uses PacketUtil.sendPacketWithoutEvent to bypass its own event loop. Spicy pushes to sendQueue directly. Sigma hooks EventPacket with an isIncoming guard. Rise 6.x uses PacketUtil.send and EventLink listeners, and its PingSpoofComponent parks C0B in the blink class list.</div>
 </div>
-<p class="impl-pattern">START/STOP_SPRINTING for keep-sprint and WTap. START/STOP_SNEAKING for scaffold silent sneak. KeepSprint cancels incoming STOP_SPRINTING. Flight sends START_FALL_FLYING for elytra exploit. Disabler cancels all C0B packets.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// KeepSprint — cancel server STOP_SPRINTING
-if (event.getPacket() instanceof C0BPacketEntityAction &amp;&amp; ((C0BPacketEntityAction)event.getPacket()).getAction() == STOP_SPRINTING)
-  event.setCancelled(true);
-// Scaffold sneak
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
-// ... bridge ...
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
-// WTap — sprint reset
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.STOP_SPRINTING));
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.START_SPRINTING));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Flight</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Flux B39.11, Gugustus, Jigsaw 0.26, November 0.2, Raze Recode 2.0, Koks v1, Helium B41420)</span>
-</div>
-<p class="impl-pattern">START/STOP_SPRINTING for keep-sprint and WTap. START/STOP_SNEAKING for scaffold silent sneak. KeepSprint cancels incoming STOP_SPRINTING. Flight sends START_FALL_FLYING for elytra exploit. Disabler cancels all C0B packets.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// KeepSprint — cancel server STOP_SPRINTING
-if (event.getPacket() instanceof C0BPacketEntityAction &amp;&amp; ((C0BPacketEntityAction)event.getPacket()).getAction() == STOP_SPRINTING)
-  event.setCancelled(true);
-// Scaffold sneak
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
-// ... bridge ...
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
-// WTap — sprint reset
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.STOP_SPRINTING));
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.START_SPRINTING));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Speed</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Flux B39.11, Gugustus, Jigsaw 0.26, November 0.2, Raze Recode 2.0, Koks v1, Helium B41420)</span>
-</div>
-<p class="impl-pattern">START/STOP_SPRINTING for keep-sprint and WTap. START/STOP_SNEAKING for scaffold silent sneak. KeepSprint cancels incoming STOP_SPRINTING. Flight sends START_FALL_FLYING for elytra exploit. Disabler cancels all C0B packets.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// KeepSprint — cancel server STOP_SPRINTING
-if (event.getPacket() instanceof C0BPacketEntityAction &amp;&amp; ((C0BPacketEntityAction)event.getPacket()).getAction() == STOP_SPRINTING)
-  event.setCancelled(true);
-// Scaffold sneak
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
-// ... bridge ...
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
-// WTap — sprint reset
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.STOP_SPRINTING));
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.START_SPRINTING));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WTap</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Flux B39.11, Gugustus, Jigsaw 0.26, November 0.2, Raze Recode 2.0, Koks v1, Helium B41420)</span>
-</div>
-<p class="impl-pattern">START/STOP_SPRINTING for keep-sprint and WTap. START/STOP_SNEAKING for scaffold silent sneak. KeepSprint cancels incoming STOP_SPRINTING. Flight sends START_FALL_FLYING for elytra exploit. Disabler cancels all C0B packets.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// KeepSprint — cancel server STOP_SPRINTING
-if (event.getPacket() instanceof C0BPacketEntityAction &amp;&amp; ((C0BPacketEntityAction)event.getPacket()).getAction() == STOP_SPRINTING)
-  event.setCancelled(true);
-// Scaffold sneak
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
-// ... bridge ...
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
-// WTap — sprint reset
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.STOP_SPRINTING));
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.START_SPRINTING));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoSlow</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Flux B39.11, Gugustus, Jigsaw 0.26, November 0.2, Raze Recode 2.0, Koks v1, Helium B41420)</span>
-</div>
-<p class="impl-pattern">START/STOP_SPRINTING for keep-sprint and WTap. START/STOP_SNEAKING for scaffold silent sneak. KeepSprint cancels incoming STOP_SPRINTING. Flight sends START_FALL_FLYING for elytra exploit. Disabler cancels all C0B packets.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// KeepSprint — cancel server STOP_SPRINTING
-if (event.getPacket() instanceof C0BPacketEntityAction &amp;&amp; ((C0BPacketEntityAction)event.getPacket()).getAction() == STOP_SPRINTING)
-  event.setCancelled(true);
-// Scaffold sneak
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SNEAKING));
-// ... bridge ...
-mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SNEAKING));
-// WTap — sprint reset
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.STOP_SPRINTING));
-PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, Action.START_SPRINTING));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket / EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C03PacketPlayer/">C03PacketPlayer</a>
+<a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
+<a class="related-chip" href="../C16PacketClientStatus/">C16PacketClientStatus</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

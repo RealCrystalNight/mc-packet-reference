@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S0CPacketSpawnPlayer (0x0C): Spawns another player entity in the world with UUID, position (fixed-point int × 32), rotation (byte × 256/360), held it">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ESP, NameTags, AntiBot, Teams">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="AntiBot, DougDimmadome / FloofyFoxes / Furries (entity overrides)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S0CPacketSpawnPlayer — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S0CPacketSpawnPlayer — Minecraft 1.8.9 Packet Reference","description":"The player-spawn announcement: fixed-point position, byte rotations, item id and metadata. In this corpus it is the anti-bot veto point: Spicy cancels suspicious spawns outright and Sigma inspects them, while the meme modules only import it. ESP and nametag modules never touch S0C because they itera","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -82,48 +82,371 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">This is received when another player enters the client's render distance. ESP modules add the entity to their target list. AntiBot modules check the UUID against tab list entries.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S0C spawns a player entity: VarInt entity id, UUID, fixed-point x/y/z as ints scaled by 32, byte yaw and pitch scaled by 256/360, a short current-item id, then the DataWatcher metadata. EntityTrackerEntry constructs it when a player enters render distance. The client builds an EntityOtherPlayerMP from it. MessageSerializer carries a no-op special case for S0C in the bundled 1.8 sources, a decompile artifact of the 1.7.x-era encoding special case.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleSpawnPlayer decodes the fixed-point coordinates, reads the metadata and registers the entity in the world. From then on the entity is driven by S14 relative moves and S18 teleports. ESP and nametag modules do not hook S0C in these clients: they iterate the world entity list, which is why S0C only shows up in anti-bot and meme modules.</p>
+<h4>Why clients touch it</h4>
+<p>S0C is the only packet that announces a new player with a position, which makes it the anti-bot veto point. Spicy's Antibot cancels the packet outright when the spawn looks like a bot (within 17 blocks, more than 1 block above the player, not at the player's coordinates) on non-Hypixel servers; the Hypixel branch is commented out because Hypixel bots carry plausible spawn data, so bots are removed from the entity list per-tick instead. Sigma 4.11 AntiBot inspects spawn packets the same way. The Spicy meme modules (DougDimmadome, FloofyFoxes, Furries) import S0C for skin and model replacement but ship empty handlers.</p>
+<h4>Exploit surface</h4>
+<p>Cancelling S0C is client-only: the server keeps simulating the bot, but the local world never receives the entity, so aim and ESP never lock onto it. The risk is entity-id desync if later packets reference the cancelled id, which vanilla guards by simply not spawning the entity. Anti-cheats do not measure S0C; anti-bot heuristics are purely client-side (spawn position relative to the player, invisibility plus name quirks, tab-list absence), and servers that want bots to survive these filters just spawn them with realistic positions, which is exactly what Hypixel does.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityTrackerEntry.getPacket constructs S0C from the tracked EntityPlayer with x, y and z scaled by 32, yaw and pitch scaled by 256/360, the held item id as a short, and the DataWatcher data. The server does no per-recipient filtering beyond the tracker's render-distance logic.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Fields: VarInt entity id, UUID (most and least significant longs), three ints scaled by 32, two bytes scaled by 256/360, a short item id (0 when empty), then DataWatcher metadata. The scaling is why the client divides by 32 and multiplies by 360/256. S0C is the only spawn packet with a UUID, which is what makes it the natural hook for anti-bot and name-based filtering.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>No anti-cheat reads S0C. The client-side heuristics in Spicy (17-block range, height above the player, non-coincident coordinates) and the Hypixel per-tick removal (invisibility, name formatting, tab-list absence, Watchdog naming) are the whole anti-bot landscape in this corpus, and servers defeat them by making spawn data indistinguishable from real players.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ESP</span>
-<span class="impl-module-clients">(Sigma 3.9, Tenacity 6.0)</span>
-</div>
-<p class="impl-pattern">Detect player spawns for ESP targets and bot filtering. AntiBot checks spawn data for fake players.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S0CPacketSpawnPlayer) {
-  S0CPacketSpawnPlayer s0c = (S0CPacketSpawnPlayer) event.getPacket();
-  if (isValidPlayer(s0c)) targetList.add(s0c.getEntityID());
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NameTags</span>
-<span class="impl-module-clients">(Sigma 3.9, Tenacity 6.0)</span>
-</div>
-<p class="impl-pattern">Detect player spawns for ESP targets and bot filtering. AntiBot checks spawn data for fake players.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S0CPacketSpawnPlayer) {
-  S0CPacketSpawnPlayer s0c = (S0CPacketSpawnPlayer) event.getPacket();
-  if (isValidPlayer(s0c)) targetList.add(s0c.getEntityID());
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
+<p class="impl-pattern">The player-spawn announcement: fixed-point position, byte rotations, item id and metadata. In this corpus it is the anti-bot veto point: Spicy cancels suspicious spawns outright and Sigma inspects them, while the meme modules only import it. ESP and nametag modules never touch S0C because they iterate the entity list instead.</p>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiBot</span>
-<span class="impl-module-clients">(Sigma 3.9, Tenacity 6.0)</span>
+<span class="impl-module-clients">(Sigma 4.11, Spicy)</span>
 </div>
-<p class="impl-pattern">Detect player spawns for ESP targets and bot filtering. AntiBot checks spawn data for fake players.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S0CPacketSpawnPlayer) {
-  S0CPacketSpawnPlayer s0c = (S0CPacketSpawnPlayer) event.getPacket();
-  if (isValidPlayer(s0c)) targetList.add(s0c.getEntityID());
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Veto bots at the spawn point: cancel S0C for suspicious spawns so the entity never enters the local world and cannot be targeted.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Spicy hooks EventPacket pre: on non-Hypixel servers, a spawn within 17 blocks, more than 1 block above the player and not at the player's exact coordinates is cancelled with a chat notice; on Hypixel the packet path is commented out and hypixelAntibot() removes bots from the entity list per-tick using invisibility, name formatting, tab-list absence and Watchdog naming heuristics. Sigma inspects incoming S0C the same way on its own packet bus.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy - info/spicyclient/modules/combat/Antibot.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/combat/Antibot.java =====
+package info.spicyclient.modules.combat;
+
+import java.util.ArrayList;
+import java.util.ConcurrentModificationException;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.chatCommands.Command;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventPacket;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.settings.ModeSetting;
+import info.spicyclient.util.PlayerUtils;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.network.play.server.S0CPacketSpawnPlayer;
+import net.minecraft.util.MathHelper;
+
+public class Antibot extends Module {
+	
+	public static EntityLivingBase target = null;
+	
+	private ModeSetting AntibotMode = new ModeSetting("Antibot Mode", "Advanced", "Advanced");
+	
+	public Antibot() {
+		super("Antibot", Keyboard.KEY_NONE, Category.COMBAT);
+		resetSettings();
+	}
+	
+	@Override
+	public void resetSettings() {
+		this.settings.clear();
+		this.addSettings(AntibotMode);
+	}
+	
+	public void onEnable() {
+		
+		removeThese.clear();
+		dontRemove.clear();
+		
+	}
+	
+	public void onDisable() {
+		
+		removeThese.clear();
+		dontRemove.clear();
+		
+	}
+	
+	public void onEvent(Event e) {
+		
+		if (e instanceof EventUpdate) {
+			
+			if (e.isPre()) {
+				
+				if (!mc.isSingleplayer() &amp;&amp; mc.getCurrentServerData().serverIP.toLowerCase().contains("hypixel")) {
+					this.additionalInformation = "Hypixel";
+				}else {
+					this.additionalInformation = "Advanced";
+				}
+				
+			}
+			
+		}
+		
+		if (e instanceof EventPacket &amp;&amp; AntibotMode.is("Advanced")) {
+			
+			if (e.isIncoming() &amp;&amp; e.isPre()) {
+				
+				EventPacket packet = (EventPacket) e;
+				
+				if (packet.packet instanceof S0CPacketSpawnPlayer &amp;&amp; !(mc.getCurrentServerData().serverIP.toLowerCase().contains("hypixel"))) {
+					
+	                S0CPacketSpawnPlayer p = (S0CPacketSpawnPlayer) packet.packet;
+	                double entX = p.getX() / 32D;
+	                double entY = p.getY() / 32D;
+	                double entZ = p.getZ() / 32D;
+	                double diffX = mc.thePlayer.posX - entX;
+	                double diffY = mc.thePlayer.posY - entY;
+	                double diffZ = mc.thePlayer.posZ - entZ;
+	                
+	                float distance = MathHelper.sqrt_double(diffX * diffX + diffY * diffY + diffZ * diffZ);
+	                
+	                if (distance &lt;= 17 &amp;&amp; entY &gt; mc.thePlayer.posY + 1 &amp;&amp; (entX != mc.thePlayer.posX &amp;&amp; entY != mc.thePlayer.posY &amp;&amp; entZ != mc.thePlayer.posZ)) {
+	                	//Entity entity = mc.theWorld.getEntityByID(p.getEntityID());
+	                	//Command.sendPrivateChatMessage("The " + entity.getDisplayName().getFormattedText() + " bot was removed from your game");
+	                	packet.setCanceled(true);
+	                	Command.sendPrivateChatMessage("A bot was removed from your game");
+	                }
+					
+				}
+				else if (packet.packet instanceof S0CPacketSpawnPlayer &amp;&amp; !mc.isSingleplayer() &amp;&amp; mc.getCurrentServerData().serverIP.toLowerCase().contains("hypixel")) {
+
+					//hypixelAntibot();
+					/*
+					S0CPacketSpawnPlayer p = (S0CPacketSpawnPlayer) packet.packet;
+					Entity entity = mc.theWorld.getEntityByID(p.getEntityID());
+					
+					if (entity == null) {
+						return;
+					}
+					
+	                if (entity.getDisplayName().getFormattedText().startsWith("\u00a7") &amp;&amp; !entity.isInvisible() &amp;&amp; !entity.getDisplayName().getFormattedText().toLowerCase().contains("npc")) {
+	                	
+	                }else {
+	                	Command.sendPrivateChatMessage("The " + entity.getDisplayName().getFormattedText() + " bot was removed from your game");
+	                	packet.setCanceled(true);
+	                }
+					*/
+				}
+				
+			}
+			
+		}
+		
+		if (e instanceof EventUpdate) {
+			
+			if (e.isPre() &amp;&amp; AntibotMode.is("Advanced") &amp;&amp; !mc.isSingleplayer() &amp;&amp; !(mc.getCurrentServerData().serverIP.toLowerCase().contains("hypixel"))) {
+				
+				for (Object entity : mc.theWorld.loadedEntityList) {
+					
+					if (((Entity)entity).isInvisible() &amp;&amp; entity != mc.thePlayer) {
+						
+						//Command.sendPrivateChatMessage("a bot was removed from your game");
+						Command.sendPrivateChatMessage("A bot was removed from your game");
+						mc.theWorld.removeEntity(((Entity)entity));
+						
+					}
+					
+				}
+				
+			}
+			else if (!mc.isSingleplayer() &amp;&amp; mc.getCurrentServerData().serverIP.toLowerCase().contains("hypixel")) {
+				
+				if (e.isPre()) {
+					hypixelAntibot();
+				}
+				else if (e.isPost()) {
+					
+					for (EntityPlayer ent : removeThese) {
+						
+						try {
+							mc.theWorld.removeEntity(ent);
+						} catch (ConcurrentModificationException e2) {
+							Command.sendPrivateChatMessage("Could not remove bot due to ConcurrentModificationException, please report this to a dev");
+						} catch (Exception e2) {
+							Command.sendPrivateChatMessage("Could not remove bot due to an unknown error, please report this to a dev");
+						}
+						
+					}
+					
+				}
+				
+				/*
+				S0CPacketSpawnPlayer p = (S0CPacketSpawnPlayer) packet.packet;
+				Entity entity = mc.theWorld.getEntityByID(p.getEntityID());
+				
+				if (entity == null) {
+					return;
+				}
+				
+                if (entity.getDisplayName().getFormattedText().startsWith("\u00a7") &amp;&amp; !entity.isInvisible() &amp;&amp; !entity.getDisplayName().getFormattedText().toLowerCase().contains("npc")) {
+                	
+                }else {
+                	Command.sendPrivateChatMessage("The " + entity.getDisplayName().getFormattedText() + " bot was removed from your game");
+                	packets.add(p);
+                	packet.setCanceled(true);
+                }
+                */
+			}
+			
+		}
+		
+	}
+	
+	// Prevents non bots from being removed
+	private static transient List&lt;EntityPlayer&gt; dontRemove = new ArrayList&lt;&gt;();
+	private static transient CopyOnWriteArrayList&lt;EntityPlayer&gt; removeThese = new CopyOnWriteArrayList&lt;EntityPlayer&gt;();
+	
+	private void hypixelAntibot() {
+		
+		for (Object o : mc.theWorld.getLoadedEntityList()) {
+			
+            if (o instanceof EntityPlayer) {
+            	
+                EntityPlayer ent = (EntityPlayer) o;
+                
+                
+                
+                if (ent != mc.thePlayer &amp;&amp; !dontRemove.contains(ent)) {
+                	
+                	String customName = ent.getCustomNameTag();
+                	String formattedName = ent.getDisplayName().getFormattedText();
+                    String name = ent.getName();
+                    
+                    if(ent.isInvisible() &amp;&amp; !formattedName.startsWith("§c") &amp;&amp; formattedName.endsWith("§r") &amp;&amp; customName.equals(name)){
+                    	
+    					double diffX = Math.abs(ent.posX - mc.thePlayer.posX);
+    					double diffY = Math.abs(ent.posY - mc.thePlayer.posY);
+    					double diffZ = Math.abs(ent.posZ - mc.thePlayer.posZ);
+    					double diffH = Math.sqrt(diffX * diffX + diffZ * diffZ);
+    					
+    					if(diffY &lt; 13 &amp;&amp; diffY &gt; 10 &amp;&amp; diffH &lt; 3){
+    						
+    						List&lt;EntityPlayer&gt; list = PlayerUtils.getTabPlayerList();
+    						
+    						if(!list.contains(ent)){
+    							
+    							//Command.sendPrivateChatMessage("The bot " + name + " bot was removed from your game");
+                          		removeThese.add(ent);
+                          		
+    						}
+    						
+    					}
+    				
+    				}
+                    
+                    if(ent.isInvisible()){
+                    	
+                    	if(!customName.equalsIgnoreCase("") &amp;&amp; customName.toLowerCase().contains("§c§c") &amp;&amp; name.contains("§c")){
+                    		//Command.sendPrivateChatMessage("The bot " + name + " bot was removed from your game");
+                    		removeThese.add(ent);
+                    	}
+                    	
+                    }
+                    
+	                if (formattedName.startsWith("\u00a7") &amp;&amp; !ent.isInvisible() &amp;&amp; !formattedName.toLowerCase().contains("npc")) {
+	                	
+	                }else {
+	                	//Command.sendPrivateChatMessage("The " + ent.getDisplayName().getFormattedText() + " bot was removed from your game");
+	                	removeThese.add(ent);
+	                }
+                    
+                    // Watchdog bots
+                    if(!customName.equalsIgnoreCase("") &amp;&amp; customName.toLowerCase().contains("§c") &amp;&amp; customName.toLowerCase().contains("§r")){
+                    	Command.sendPrivateChatMessage("A watchdog bot named " + name + "was removed from your game");
+                    	removeThese.add(ent);
+                    }
+                    
+                    // npcs
+                    if(formattedName.contains("§8[NPC]")){
+                    	
+                    	dontRemove.add(ent);
+                    	
+                    }
+                    
+                    if(!formattedName.contains("§c") &amp;&amp; !customName.equalsIgnoreCase("")){
+
+                    	dontRemove.add(ent);
+                    }
+                    
+                    // bedwars shop
+                    if(!formattedName.startsWith("§") &amp;&amp; formattedName.endsWith("§r")){
+                    	dontRemove.add(ent);
+                    }
+                    
+                }
+                
+            }
+            
+        }
+		
+	}
+	
+}
+// NOTE (AI): The only module in the corpus that cancels S0CPacketSpawnPlayer outright. On non-Hypixel servers a spawn within 17 blocks, more than 1 block above the player and not at the player's exact coordinates is assumed to be a bot, and the packet is cancelled before the entity ever enters the world. The Hypixel branch is commented out: Hypixel bots carry plausible spawn data, so on that server the module instead removes bots per-tick from the entity list (hypixelAntibot checks invisibility, name formatting, tab-list absence and known Watchdog naming conventions). Cancelling the spawn packet is client-only: the server keeps simulating the bot, but the local world never receives the entity.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (pre, incoming); EventUpdate for the per-tick Hypixel removal.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancelling the spawn is invisible to the server and to anti-cheats; the visible effect is that legitimate players matching the heuristic vanish too, which is the trade-off of position-based filtering.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Sigma 4.11 AntiBot reads S0C on EventPacket and filters on spawn data; Spicy splits the logic per server family and keeps the Hypixel path entity-list based.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Teams</span>
-<span class="impl-module-clients">(Sigma 3.9, Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">DougDimmadome / FloofyFoxes / Furries (entity overrides)</span>
+<span class="impl-module-clients">(Spicy)</span>
 </div>
-<p class="impl-pattern">Detect player spawns for ESP targets and bot filtering. AntiBot checks spawn data for fake players.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S0CPacketSpawnPlayer) {
-  S0CPacketSpawnPlayer s0c = (S0CPacketSpawnPlayer) event.getPacket();
-  if (isValidPlayer(s0c)) targetList.add(s0c.getEntityID());
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Meme-module family that imports S0C as the hook point for replacing spawned player models and skins; the shipped builds contain no handling.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">All three modules import S0CPacketSpawnPlayer and define empty onEvent bodies. The import marks the intended integration point (hook player spawns, replace the entity render) but no spawn handling exists in the shipped files.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy - info/spicyclient/modules/memes/DougDimmadome.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/memes/DougDimmadome.java =====
+package info.spicyclient.modules.memes;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Random;
+import java.util.stream.Collectors;
+
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventChatmessage;
+import info.spicyclient.events.listeners.EventMotion;
+import info.spicyclient.events.listeners.EventPacket;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.settings.BooleanSetting;
+import info.spicyclient.settings.ModeSetting;
+import info.spicyclient.settings.SettingChangeEvent;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.monster.EntityMob;
+import net.minecraft.entity.passive.EntityAnimal;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.network.play.server.S0CPacketSpawnPlayer;
+import net.minecraft.network.play.client.C02PacketUseEntity.Action;
+
+public class DougDimmadome extends Module {
+	
+	public DougDimmadome() {
+		super("Doug Dimmadome", Keyboard.KEY_NONE, Category.MEMES);
+	}
+	
+	public void onEnable() {
+		
+	}
+	
+	public void onDisable() {
+		
+	}
+	
+	public void onEvent(Event e) {
+		
+	}
+	
+}
+// NOTE (AI): The corpus hit is import-only: the shipped module body is empty scaffolding with empty onEvent. The S0C import marks the intended hook point (spawned player entities, for the skin and model replacement joke), but no handling exists in this build. FloofyFoxes and Furries are the same meme-module family with identical import-only S0C references, and Account.java imports S0C in the same client for the same reason.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> None in the shipped builds (import only).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>No detection relevance: an unused import changes nothing on the wire.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Spicy also imports S0C in files/Account.java; the FloofyFoxes and Furries modules are the same empty family.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">EventPacket with pre and incoming checks on Spicy and Sigma; nothing else in the corpus hooks S0C at module level.</div>
+<div class="impl-clients">Spicy cancels the packet object (packet.setCanceled) inside a single EventPacket; Sigma reads spawn data on its EventPacket bus; Rise 6.x lists S0C only in the NetworkAPI script whitelist.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S0FPacketSpawnMob/">S0FPacketSpawnMob</a>
+<a class="related-chip" href="../S13PacketDestroyEntities/">S13PacketDestroyEntities</a>
+<a class="related-chip" href="../S18PacketEntityTeleport/">S18PacketEntityTeleport</a>
+<a class="related-chip" href="../S0BPacketAnimation/">S0BPacketAnimation</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

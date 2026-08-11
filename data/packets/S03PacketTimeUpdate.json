@@ -40,40 +40,65 @@
   "handler": "INetHandlerPlayClient",
   "notes": "Time values: 0=dawn, 6000=noon, 12000=sunset, 18000=midnight. When all players sleep, time jumps to 0 (dawn). S03 is used by modules to calculate server TPS (ticks per second) by measuring the time between S03 updates.",
   "implementation": {
+    "writeup": [
+      {
+        "h": "Role in the protocol",
+        "p": "Two longs, totalWorldTime and worldTime, broadcast by MinecraftServer to every player in a dimension once per second (tickCounter % 20 == 0, line ~701 in the MCP builds) and re-sent on player join by ServerConfigurationManager (line ~787). worldTime is the day/night counter the client renders modulo 24000: 0 dawn, 6000 noon, 12000 sunset, 18000 midnight. The constructor folds the doDaylightCycle gamerule into the wire format by negation: when the rule is off the server transmits -worldTime, so the sign bit is the freeze flag and the boolean never exists as a packet field."
+      },
+      {
+        "h": "Vanilla handling",
+        "p": "NetHandlerPlayClient.handleTimeUpdate runs on the main thread via PacketThreadUtil and performs two writes: theWorld.setTotalWorldTime(packet.func_149366_c()) and theWorld.setWorldTime(packet.func_149365_d()). Between corrections the client advances time-of-day itself in its tick loop, so the packet is a periodic correction, not the clock source. That is the property the Ambiance family exploits: cancel the correction and the locally pinned time holds until the next one would have arrived."
+      },
+      {
+        "h": "Why clients touch it",
+        "p": "The Ambiance family spans Memeware 7.3, Rise 5.99, Rise 6.1.30 and Rise 6.2.4, and Tenacity 6.0 ships the same idea as AlwaysNight. All five cancel S03 on the receive event and overwrite world time on a per-frame hook: Memeware writes 0 or 20000 depending on a Morning/Night mode, Rise 5.99 writes time + elapsed * timeSpeed, Rise 6.x adds weather forcing, Tenacity writes a configurable value defaulting to 12000. Notably absent is Fullbright: it is a gamma/lighting override that never touches this packet, and no TPS estimator in the corpus derives server lag from S03 deltas even though the two longs are a natural clock."
+      },
+      {
+        "h": "Exploit surface",
+        "p": "Cosmetic only and invisible to the server, because the client never reports displayed time back. Observers see the desync side effects: a pinned clock shows a frozen sky on the client's own screen, and when all players sleep and the server jumps time to 0 the module visibly fights the correction. No anti-cheat measures this packet. The only hazard is a module that writes worldTime unclamped, which can push the negative freeze encoding into the local renderer and break the sky shader path."
+      }
+    ],
+    "overview": "Once-per-second world-clock correction (two longs, doDaylightCycle encoded as a sign bit). Five modules across the 8 clients cancel it and pin the client clock locally, all with the same two-step shape: cancel on receive, rewrite on frame. Pure client-side cosmetics with zero server visibility.",
+    "server_handling": "MinecraftServer broadcasts S03PacketTimeUpdate(totalWorldTime, worldTime, doDaylightCycle) to all players in the dimension every 20 ticks (line ~701), and ServerConfigurationManager sends a fresh copy on player join (line ~787). When doDaylightCycle is false the server negates worldTime before sending; the constructor also maps a negated 0 to -1 so the freeze flag survives the zero case. The server never validates or rates the packet stream because it is the sole author.",
+    "protocol_notes": "Two raw longs on the wire; the third constructor argument (doDaylightCycle) is encoded by negation, so worldTime < 0 means the day/night cycle is frozen server-side and the client should display abs(worldTime) without local advancement. Clients that only read the longs (all 5 module implementations here) are unaffected by the sign trick. The packet is sent in the PLAY state and is dimension-scoped, so it stops at the dimension boundary and a fresh one arrives on respawn.",
+    "anticheat_landscape": "No anti-cheat flags time manipulation: the client clock is cosmetic, server-authoritative only in the sense that the server periodically corrects it, and nothing gameplay-relevant derives from it. The modules are undetectable from the wire because cancellation happens before the packet reaches the vanilla handler and no corresponding serverbound traffic exists.",
     "modules": [
       {
-        "name": "Ambience",
+        "name": "Ambiance / Ambience",
         "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
+          "Memeware 7.3",
+          "Rise 5.99",
+          "Rise 6.1.30",
+          "Rise 6.2.4"
         ],
-        "purpose": "Cancel or modify world time for custom day/night cycle.",
-        "how_it_works": "",
-        "detailed_code": "if (event.getPacket() instanceof S03PacketTimeUpdate) {\n  S03PacketTimeUpdate s03 = (S03PacketTimeUpdate) event.getPacket();\n  event.setCancelled(true);\n  // Send modified time\n}",
-        "vanilla_hook": "EventReceivePacket"
+        "purpose": "Pin the client's day/night clock to a fixed value by cancelling server time corrections.",
+        "how_it_works": "A receive-side packet event cancels every S03PacketTimeUpdate, then a per-frame hook rewrites the world clock: Memeware 7.3 sets 0 (Morning) or 20000 (Night) on UpdateEvent; Rise 5.99 computes time + elapsedMillis * timeSpeed on Render3D; Rise 6.x does the same and additionally forces weather by cancelling S2BPacketChangeGameState states 1 and 2. The cancel prevents the server value from ever landing, so the local write is the only clock.",
+        "detailed_code": "// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/render/Ambiance.java =====\npackage me.memewaredevs.client.module.render;\n\nimport me.hippo.api.lwjeb.annotation.Handler;\nimport me.memewaredevs.client.event.events.PacketInEvent;\nimport me.memewaredevs.client.event.events.UpdateEvent;\nimport me.memewaredevs.client.module.Module;\nimport net.minecraft.network.play.server.S03PacketTimeUpdate;\n\nimport java.util.function.Consumer;\n\npublic class Ambiance extends Module {\n\n\tpublic Ambiance() {\n\t\tsuper(\"Ambience\", 0, Module.Category.RENDER);\n\t\tthis.addModes(\"Morning\", \"Night\");\n\t}\n\n\t@Handler\n\tpublic Consumer<PacketInEvent> eventConsumer0 = (event) -> {\n\t\tif (event.getPacket() instanceof S03PacketTimeUpdate) {\n\t\t\tevent.cancel();\n\t\t}\n\t};\n\n\t@Handler\n\tpublic Consumer<UpdateEvent> eventConsumer1 = (event) -> {\n\t\tmc.theWorld.getWorldInfo().setWorldTime(this.isMode(\"Morning\") ? 0 : 20000);\n\t};\n\n}\n\n// NOTE (AI): The class is Ambiance but the module registers under the name 'Ambience'.\n// The two modes map to worldTime 0 (dawn) and 20000 (night, 24000 - 4000). Cancelling on\n// PacketInEvent and writing on UpdateEvent means the client clock survives every server\n// correction; because no packet reports time back, the server cannot observe the desync.\n// This is the smallest complete example of the cancel-and-pin pattern in the corpus.\n",
+        "code_source": "Memeware 7.3 — me/memewaredevs/client/module/render/Ambiance.java",
+        "vanilla_hook": "PacketInEvent (cancel); UpdateEvent (rewrite).",
+        "anti_cheat_notes": "No detection surface: the packet is receive-only, the server never learns the client's displayed time, and the cancelled packets are invisible on the wire. The only tell is a frozen or wrong sky on the client's own screen.",
+        "variations": "Rise 5.99 cancels on PacketReceiveEvent and writes time + elapsed * timeSpeed on Render3DEvent. Rise 6.1.30 and 6.2.4 (renamed Ambience) add a weather mode that also cancels S2BPacketChangeGameState rain/thunder states, a snow color override and a temperature hook for particle rendering. Rise 6.x additionally whitelists S03 in the script API (com/alan/clients/script/api/NetworkAPI.java) so JS scripts can observe it."
       },
       {
-        "name": "TimeChanger",
+        "name": "AlwaysNight",
         "found_in": [
-          "Gugustus",
           "Tenacity 6.0"
         ],
-        "purpose": "Cancel or modify world time for custom day/night cycle.",
-        "how_it_works": "",
-        "detailed_code": "if (event.getPacket() instanceof S03PacketTimeUpdate) {\n  S03PacketTimeUpdate s03 = (S03PacketTimeUpdate) event.getPacket();\n  event.setCancelled(true);\n  // Send modified time\n}",
-        "vanilla_hook": "EventReceivePacket"
-      },
-      {
-        "name": "WorldTime",
-        "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
-        ],
-        "purpose": "Cancel or modify world time for custom day/night cycle.",
-        "how_it_works": "",
-        "detailed_code": "if (event.getPacket() instanceof S03PacketTimeUpdate) {\n  S03PacketTimeUpdate s03 = (S03PacketTimeUpdate) event.getPacket();\n  event.setCancelled(true);\n  // Send modified time\n}",
-        "vanilla_hook": "EventReceivePacket"
+        "purpose": "Hold the client's world time at a configurable value (default 12000, midnight) by cancelling server time updates.",
+        "how_it_works": "A PacketReceiveEvent handler cancels S03PacketTimeUpdate; onEnable and a render-tick listener write the configured value into the world, and onDisable restores time 0. The number setting accepts any value in 0..24000 in 1000-step increments, so the module is a general time pin despite the AlwaysNight name.",
+        "detailed_code": "// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/world/AlwaysNight.java =====\npackage dev.tenacity.module.impl.world;\n\nimport com.viaversion.viaversion.libs.kyori.adventure.util.Ticks;\nimport dev.tenacity.event.IEventListener;\nimport dev.tenacity.event.impl.packet.PacketReceiveEvent;\nimport dev.tenacity.module.Module;\nimport dev.tenacity.module.ModuleCategory;\nimport dev.tenacity.setting.impl.NumberSetting;\nimport net.minecraft.network.play.server.S03PacketTimeUpdate;\n\npublic class AlwaysNight extends Module {\n\n    private final NumberSetting time = new NumberSetting(\"Time\", 12000, 0, 24000, 1000);\n\n    public AlwaysNight() {\n        super(\"Ambience\", \"Set world time\", ModuleCategory.WORLD);\n        initializeSettings(time);\n    }\n\n    public void update() {\n        mc.theWorld.setWorldTime((long) time.getCurrentValue());\n    }\n    private final IEventListener<Ticks> onRender2d = e -> {\n        if (mc.theWorld != null) {\n            mc.theWorld.setWorldTime((long) time.getCurrentValue());\n            update();\n        }\n    };\n\n    @Override\n    public void onEnable() {\n        if (mc.thePlayer != null) {\n            mc.theWorld.setWorldTime((long) time.getCurrentValue());\n            update();\n        }\n        super.onEnable();\n    }\n    @Override\n    public void onDisable() {\n        if (mc.thePlayer == null) {\n            return;\n        }\n        mc.theWorld.setWorldTime((0));\n        super.onDisable();\n    }\n\n    private final IEventListener<PacketReceiveEvent> onPacketReceive = event -> {\n        if (event.getPacket() instanceof S03PacketTimeUpdate) {\n            event.cancel();\n        }\n    };\n}\n\n// NOTE (AI): The class is AlwaysNight but the module registers under the alias 'Ambience'\n// in the WORLD category, and the Time setting defaults to 12000. The onRender2d listener\n// rewrites the clock every frame, which keeps the pinned time stable between the cancelled\n// S03 corrections. onDisable resets to 0 rather than to the server value, a cosmetic choice\n// that differs from the Rise and Memeware implementations.\n",
+        "code_source": "Tenacity 6.0 — dev/tenacity/module/impl/world/AlwaysNight.java",
+        "vanilla_hook": "PacketReceiveEvent (cancel); render tick (rewrite).",
+        "anti_cheat_notes": "Identical to the Ambiance family: receive-side cancellation is unobservable by the server, and no gameplay state depends on the client clock.",
+        "variations": "Tenacity is the only one of the 8 clients that ships this as a World-category module with a user-configurable value; the other four hardcode or speed-adjust the time in the render category."
       }
+    ],
+    "general_hooks": "PacketReceiveEvent (PacketInEvent on Memeware) to cancel, plus a per-frame hook (UpdateEvent, Render3DEvent or render tick) to rewrite world time.",
+    "client_variations": "Memeware uses the lwjeb-style PacketInEvent with event.cancel(); Rise 5.99 and 6.x use PacketReceiveEvent with setCancelled and write on Render3D; Tenacity uses its IEventListener<PacketReceiveEvent> and cancels via event.cancel(). All five share the same two-step shape: cancel the correction, then own the clock.",
+    "related": [
+      "S2BPacketChangeGameState",
+      "S07PacketRespawn",
+      "S05PacketSpawnPosition"
     ]
   }
 }

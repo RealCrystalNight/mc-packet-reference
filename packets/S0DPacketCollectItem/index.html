@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S0DPacketCollectItem (0x0D): Shows an item being collected (picked up) by a player entity. Plays the pickup animation.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ItemESP, ItemStealer">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="AdaptiveRefreshRateComponent">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S0DPacketCollectItem — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S0DPacketCollectItem — Minecraft 1.8.9 Packet Reference","description":"The pickup animation packet: item entity id plus collector id, driving particles, sound and a despawn. Module interest is essentially zero: the only functional use in the whole corpus is Rise's AdaptiveRefreshRateComponent, which treats S0D as a game-activity signal to keep the HUD refresh awake.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -70,18 +70,107 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayClient.handleCollectItem()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S0D plays the item pickup animation: a VarInt item-entity id and a VarInt collector-entity id. The server emits it from EntityLivingBase.onCollideWithPlayer, which sends up to three tracking broadcasts per pickup depending on the item-count branch. The client spawns the collect particles, plays the sound and removes the item entity. It is a pure presentation packet.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleCollectItem removes the item entity by id, spawns the pickup particles and plays the collect sound. Nothing on the client validates the collector id; the animation is cosmetic. The server side is equally dumb: three sendToAllTrackingEntity calls in onCollideWithPlayer with no rate limiting.</p>
+<h4>Why clients touch it</h4>
+<p>Almost nobody. The single functional hit is Rise 6.x AdaptiveRefreshRateComponent, which uses S0D as a cheap game-activity signal: an item pickup forces the HUD cache dirty for 5 ticks so the adaptive refresh rate does not sleep through pickups. Everything else in the corpus is vanilla. The ItemESP and ItemStealer families that one might expect to care about pickups do not hook S0D in these clients: they track item entities directly on the entity list.</p>
+<h4>Exploit surface</h4>
+<p>None. S0D carries two entity ids and drives only particles and a despawn. There is no state, no timing heuristic and no anti-cheat that measures pickups, so modules have nothing to cancel, spoof or time. The honest assessment is that S0D is the least interesting packet in this range: its only corpus use is a HUD perf component treating it as an activity tick.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityLivingBase.onCollideWithPlayer sends S0D through the entity tracker in three branches covering the pickup conditions, each a sendToAllTrackingEntity with the item entity id and the collector's own id. No server-side rate limit or validation exists.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Two VarInts: collected item entity id first, collector player id second (the vanilla constructor takes (collectedItemEntityId, entityId)). Clientbound in PLAY state. The collector id is not required to be the local player, which is why the packet also animates other players' pickups.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Nothing to flag. No anti-cheat measures item pickups, and the packet carries no position or timing data. The only ecosystem interaction is visual: a client that suppresses S0D would still receive the items in inventory, so even packet-cancelling modules would gain nothing.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ItemESP</span>
+<p class="impl-pattern">The pickup animation packet: item entity id plus collector id, driving particles, sound and a despawn. Module interest is essentially zero: the only functional use in the whole corpus is Rise's AdaptiveRefreshRateComponent, which treats S0D as a game-activity signal to keep the HUD refresh awake.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AdaptiveRefreshRateComponent</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Track item pickups. ItemESP uses for visual effects.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Keep the HUD refresh awake around pickups: an S0D forces the HUD cache dirty for 5 ticks so the adaptive refresh does not sleep through game activity.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketReceiveEvent, S0D sets disabledFor = 5, which disables the adaptive refresh for that many ticks in PreMotionEvent; S02 chat, S30 window items and S2F slot updates drive the same dirty path. The component runs at component level in the HUD module tree.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 - com/alan/clients/component/impl/hud/AdaptiveRefreshRateComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/component/impl/hud/AdaptiveRefreshRateComponent.java =====
+package com.alan.clients.component.impl.hud;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.render.Render2DEvent;
+import com.alan.clients.ui.ingame.GuiIngameCache;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.network.play.server.S0DPacketCollectItem;
+import net.minecraft.network.play.server.S2FPacketSetSlot;
+import net.minecraft.network.play.server.S30PacketWindowItems;
+import rip.vantage.commons.util.time.StopWatch;
+
+public class AdaptiveRefreshRateComponent extends Component {
+
+    private boolean playerList, debugInfo;
+    private boolean setDirty;
+    private int disabledFor;
+    private float health;
+    public final StopWatch stopWatch = new StopWatch();
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (mc.thePlayer.ticksExisted % 100 == 0 || setDirty ||
+                mc.gameSettings.keyBindPlayerList.isKeyDown() != playerList || mc.gameSettings.showDebugInfo != debugInfo ||
+                mc.thePlayer.ticksExisted &lt;= 10 || disabledFor &gt; 0) {
+            GuiIngameCache.dirty = true;
+            playerList = mc.gameSettings.keyBindPlayerList.isKeyDown();
+            debugInfo = mc.gameSettings.showDebugInfo;
+            setDirty = false;
+        }
+
+        if (health != mc.thePlayer.getHealth()) {
+            disabledFor = 3;
+            health = mc.thePlayer.getHealth();
+        }
+
+        disabledFor--;
+    };
+
+    @EventLink
+    public final Listener&lt;Render2DEvent&gt; onRender2D = event -&gt; {
+        if (mc.currentScreen != null) {
+            setDirty = true;
+            GuiIngameCache.dirty = true;
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        Packet packet = event.getPacket();
+
+        if (packet instanceof S02PacketChat || packet instanceof S30PacketWindowItems || packet instanceof S2FPacketSetSlot) {
+            stopWatch.reset();
+            setDirty = true;
+        }
+
+        if (packet instanceof S0DPacketCollectItem) {
+            disabledFor = 5;
+        }
+    };
+}
+// NOTE (AI): A HUD performance component, not a cheat module. S0D is used as a cheap game-activity signal: when an item is collected, the HUD cache is forced dirty for 5 ticks so the adaptive refresh does not sleep through pickups. Chat, window items, slot updates and health changes drive the same dirty path. This is the only functional use of S0D in the entire 8-client corpus; every other reference is vanilla.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (S0D), PreMotionEvent (tick accounting), Render2DEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None: the component mutates only the local HUD cache and never touches the packet or the wire.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical in 6.1.30 and 6.2.4; no other client in the corpus references S0D in non-vanilla code.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ItemStealer</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent only, and only in Rise 6.x; the component model is the sole consumer.</div>
+<div class="impl-clients">Rise 6.1.30 and 6.2.4 share the component; Memeware, Nekoware, Sigma, Spicy and Tenacity have no non-vanilla S0D code at all.</div>
 </div>
-<p class="impl-pattern">Track item pickups. ItemESP uses for visual effects.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S0CPacketSpawnPlayer/">S0CPacketSpawnPlayer</a>
+<a class="related-chip" href="../S2FPacketSetSlot/">S2FPacketSetSlot</a>
+<a class="related-chip" href="../S30PacketWindowItems/">S30PacketWindowItems</a>
+<a class="related-chip" href="../S0BPacketAnimation/">S0BPacketAnimation</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

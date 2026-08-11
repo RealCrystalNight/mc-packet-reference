@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S38PacketPlayerListItem (0x38): Adds, updates, or removes entries from the tab player list. Used for player join/leave, gamemode changes, ping updates, ">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="NameProtect, AntiBot, TabGUI">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Denicker, StaffDetector, AntiVanish, FriendAlert">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S38PacketPlayerListItem — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S38PacketPlayerListItem — Minecraft 1.8.9 Packet Reference","description":"The tab list state machine and the most information-dense clientbound metadata channel: ADD_PLAYER carries full GameProfiles with signed skin properties. Four corpus modules live on it: Rise 5.99 Denicker decodes skin payloads to un-nick players, Rise 6.x StaffDetector carries a disabled S38 hook, a","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -72,26 +72,421 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Action 0 (ADD_PLAYER): UUID, name, skin properties, gamemode, ping, display name. Action 4 (REMOVE_PLAYER): just UUID. Action 2 (UPDATE_LATENCY): UUID + ping. This is how the client builds the tab list and gets player skins.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>The tab list state machine: one VarInt action plus a list of per-player records. ADD_PLAYER (0) ships UUID, name, the skin property map, gamemode, ping and an optional display name; UPDATE_GAME_MODE (1) and UPDATE_LATENCY (2) carry a UUID plus one field; UPDATE_DISPLAY_NAME (3) a UUID plus an optional chat component; REMOVE_PLAYER (4) a bare UUID. ServerConfigurationManager broadcasts ADD on join, REMOVE on leave, and every 600 ticks it broadcasts UPDATE_LATENCY for the whole list, which is how ping reaches the tab GUI.</p>
+<h4>Vanilla handling</h4>
+<p>handlePlayerListItem branches per action and mutates the player info map: ADD builds a NetworkPlayerInfo from the AddPlayerData, UPDATE_LATENCY overwrites the ping field, UPDATE_DISPLAY_NAME swaps the display name, REMOVE drops the entry. The ADD path doubles as the skin pipeline: the textures property is consumed by the player renderer. Server side, the packet constructors snapshot each EntityPlayerMP's profile, ping, gamemode and tab display name into records.</p>
+<h4>Why clients touch it</h4>
+<p>Four modules across three clients. Rise 5.99 Denicker intercepts ADD_PLAYER, decodes the base64 textures property from the GameProfile and compares the embedded profileName against the displayed name to reveal nicked players, pairing results with S02PacketChat join lines. Rise 6.1.30 and 6.2.4 StaffDetector keep a hardcoded staff list, but the S38 handler is commented out in both builds, leaving only the PreMotion decay counter live. Sigma 4.11 AntiVanish reads UPDATE_LATENCY and REMOVE_PLAYER to catch vanished players, and FriendAlert notifies when an ADD_PLAYER name matches the friend list.</p>
+<h4>Exploit surface</h4>
+<p>The ADD_PLAYER payload is the richest unencrypted metadata stream in the protocol: the full GameProfile including signed skin properties, which Denicker turns into an identity oracle that nick plugins do not scrub. UPDATE_LATENCY is a ping heartbeat that enables vanish detection: a vanished player stops appearing, and AntiVanish also flags latency updates for UUIDs absent from the player info map. No anti-cheat polices the packet; the countermeasures are tab-list plugins that strip or re-sign properties.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>ServerConfigurationManager sends ADD to everyone when a player joins and REMOVE on quit; the joining player additionally receives ADD records for everyone already online. onTick broadcasts UPDATE_LATENCY for the whole list every 600 ticks. The channel is broadcast-only: the server never validates what the client does with the data, and there is no clientbound acknowledgment.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>The action is a VarInt enum. Record layout depends on action; the widest is ADD_PLAYER: UUID, name capped at 16 chars, VarInt property count, then per property name, value and optional signature strings with a boolean flag, then gamemode VarInt, ping VarInt and an optional chat component. Property strings cap at 32767 bytes. UPDATE_LATENCY entries are only UUID plus ping VarInt, which is why ping refreshes stay cheap.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Not a detection surface; no anti-cheat measures tab list traffic. The realistic risks are social and structural: Denicker's un-nicking fails when servers strip profileName from the textures payload, and vanish alerts are defeated by networks that keep vanished players in the tab list, which is exactly why Sigma hard-disables AntiVanish on hypixel, hive and mineplex via a server-IP check.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NameProtect</span>
-<span class="impl-module-clients">(Sigma 3.9, Tenacity 6.0)</span>
+<p class="impl-pattern">The tab list state machine and the most information-dense clientbound metadata channel: ADD_PLAYER carries full GameProfiles with signed skin properties. Four corpus modules live on it: Rise 5.99 Denicker decodes skin payloads to un-nick players, Rise 6.x StaffDetector carries a disabled S38 hook, and Sigma 4.11 AntiVanish and FriendAlert track the latency heartbeat and join records.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Denicker</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Track player list changes for name protect and tab GUI. AntiBot uses tab list to verify real players.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Reveal the real identity of nicked players by decoding the signed skin texture payload from ADD_PLAYER records.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketReceiveEvent, an ADD_PLAYER S38 is read: the first AddPlayerData's GameProfile is taken, the textures property is base64-decoded into JSON, and the embedded profileName is compared with the displayed name. Mismatches are queued as realName=nickedName pairs; S02PacketChat join messages are then scanned on a background thread, and a matching nick triggers a notification plus a log4j chat rewrite when overlay support is on.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/Denicker.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/Denicker.java =====
+package dev.rise.module.impl.other;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.mojang.authlib.GameProfile;
+import com.mojang.authlib.properties.Property;
+import com.mojang.authlib.properties.PropertyMap;
+import dev.rise.Rise;
+import dev.rise.event.impl.other.WorldChangedEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.notifications.NotificationType;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.util.render.InGameBlurUtil;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.ScaledResolution;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.network.play.server.S38PacketPlayerListItem;
+import net.minecraft.util.ChatComponentText;
+import net.minecraft.util.StringUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collection;
+import java.util.Objects;
+
+@ModuleInfo(name = "Denicker", description = "Denicks any nicked players in your game", category = Category.OTHER)
+public class Denicker extends Module {
+
+    private final BooleanSetting overlaySupport = new BooleanSetting("Overlay Support", this, true);
+
+    private ArrayList&lt;String&gt; denickQueue = new ArrayList&lt;String&gt;();
+    private static final Logger logger = LogManager.getLogger();
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        if (event.getPacket() instanceof S38PacketPlayerListItem) {
+            S38PacketPlayerListItem s38 = (S38PacketPlayerListItem) event.getPacket();
+
+            if (s38.func_179768_b().equals(S38PacketPlayerListItem.Action.ADD_PLAYER) &amp;&amp; (s38.func_179767_a().get(0) != null)) {
+                try {
+                    S38PacketPlayerListItem.AddPlayerData addPlayerData = s38.func_179767_a().get(0);
+                    GameProfile gameProfile = addPlayerData.getProfile();
+                    PropertyMap propertyMap = gameProfile.getProperties();
+                    String nickedName = gameProfile.getName();
+
+                    if (Objects.equals(nickedName, mc.thePlayer.getName())) return;
+
+                    // get base64 skin data from s38
+                    Collection&lt;Property&gt; values = propertyMap.get("textures");
+                    if (values.isEmpty()) return;
+
+                    String skinDataRaw = ((Property) values.toArray()[0]).getValue();
+                    String skinData = new String(Base64.getDecoder().decode(skinDataRaw)); // decode base 64
+
+                    // json decoding
+                    JsonObject jsonObject = new JsonParser().parse(skinData).getAsJsonObject();
+                    String realName = jsonObject.get("profileName").getAsString();
+
+                    if (!Objects.equals(realName, nickedName) &amp;&amp; !denickQueue.contains(nickedName)) {
+                        denickQueue.add(realName + "=" + nickedName);
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        } else if (event.getPacket() instanceof S02PacketChat) {
+            String message = ((S02PacketChat) event.getPacket()).chatComponent.getUnformattedText();
+
+            if (message.contains("has joined") &amp;&amp; !denickQueue.isEmpty()) {
+                Thread thread = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        for (String s : denickQueue) {
+
+                            String realName = s.split("=")[0];
+                            String nickedName = s.split("=")[1];
+
+                            if (message.contains(s.split("=")[1])) {
+                                Rise.INSTANCE.getNotificationManager().registerNotification(realName + " is nicked as " + nickedName, 7500, NotificationType.NOTIFICATION);
+
+                                if (overlaySupport.isEnabled()) {
+                                    logger.info("[CHAT] " + StringUtils.stripControlCodes(message.replace(nickedName, realName)));
+                                }
+                            }
+                        }
+                    }
+                });
+
+                thread.start();
+            }
+        }
+    }
+
+    @Override
+    public void onWorldChanged(final WorldChangedEvent event) {
+        denickQueue.clear();
+    }
+}
+// NOTE (AI): The identity oracle is the signed textures property: Mojang puts the real profileName inside the base64 payload, and nick plugins rewrite only the display name. The queue pairs realName=nickedName and matches them against S02 join messages on a background thread; the chat rewrite is injected through log4j, not through a packet. The world-change handler clears the queue so nicks do not leak across servers.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent; state reset on WorldChangedEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>No anti-cheat involvement; the countermeasure is server-side property scrubbing. Servers that strip or re-sign the textures property defeat the decode, which is why the module only works on networks that leave profileName intact.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 only; no other corpus client ships an S38-based denicker.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiBot</span>
-<span class="impl-module-clients">(Sigma 3.9, Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">StaffDetector</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Track player list changes for name protect and tab GUI. AntiBot uses tab list to verify real players.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Detect staff on the server by matching tab list names against a hardcoded staff list, then auto-leave via /hub.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The module keeps a hardcoded comma-separated staff name list and a PreMotion counter that decays each tick. In both corpus builds the actual packet handling is commented out: the S38 ADD_PLAYER and S3EPacketTeams branches that would count staff sightings and send /hub at count 6 are dead code. Only the name list and the decay counter remain live.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/StaffDetector.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/StaffDetector.java =====
+package com.alan.clients.module.impl.exploit;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.Module;
+import com.alan.clients.module.api.Category;
+import com.alan.clients.module.api.ModuleInfo;
+import com.alan.clients.value.impl.BooleanValue;
+import net.minecraft.network.Packet;
+
+@ModuleInfo(aliases = {"module.combat.staffdetector.name"}, description = "module.exploit.staffdetector.description", category = Category.EXPLOIT)
+public class StaffDetector extends Module {
+
+    BooleanValue autoLeave = new BooleanValue("Auto Leave", this, true);
+
+    private String[] staff;
+
+    private int count;
+
+    public StaffDetector() {
+        String input = "idhoom,7so,1sweet,jinaaan,ev2n,eissaa,mohmad_q8,1daykel,ximtaig_,nshme,comsterr,e9_,1meko,1lab,mk_f16,loovq,_sadeq,nv0ola,1f5amh___3oo,frecss217,xmz7,a2bod,eyeso_diamond,bunkrat,1rana,1ahmd,1heyimhasson_,casteret,1elyy,1zeyad,lt1x,firas,postme,3mmr,xl2d,yzed,y2men,iv2a,_nonameishere_,0hfault,deficency,anauri,xluffy1,kinderbueno__,_revoox_,xidayzer,i7ilin,1adam__,27bk,ventz_,awfultimes,ahm2d,gsomar,mvp11,xxkhaledxxcraft,aymann_,1iraqi,rambokinq,undertest,zswift,strongest0ne,neverletyouknow,zixgamer,sanfoor_j,ixghoul_,imbexsl_,glowdown_,hunter47,fexoranep,1reyleigh,420waffle,ywgiz,sweetyalice,xfahadq,mr3nb_,akash1004,zaytonaaa,rma7o,mr_1990,iali_305,wacros,lwwh,pynifical,rivsci,itsjuan_,meedo_qb,_r3,1speedo_,_justidk,505t,xzvv,mauveracer,_1hypersx_,rayqquaza,swivee,absqtulate,opgaming2009,vhagardracarys,luffy404,faisaal420,hdzt,sunsnipebeastwtf,_odex,1ashu,n13m_,callinu,sh59,drnyx,iisrab5bgii,haoeris,lxrayanxl,toxiclayer,greatm7md,brksfrb2,madix707,hnxrr,1sweetty,ohhhhqls,solidfying,_i_b,escoco,dreadpirater0b,aboshxm,0ryze,spuvr,va_1,kingpvp90,rieus,prebowed,mitsichu,gogglas,battlebay,32lbo,7far_8bor,evenfai,hlazny,valrm";
+
+        staff = input.split(",");
+    }
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotion = event -&gt; {
+        count = Math.max(0, count - 1);
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceive = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+
+//        if (packet instanceof S3EPacketTeams) {
+//            final S3EPacketTeams teams = (S3EPacketTeams) packet;
+//
+//            for (final String name : teams.func_149310_g()) {
+//                if (Arrays.asList(staff).contains(name.toLowerCase())) {
+//                    count++;
+//
+//                    if (count == 6) {
+//                        ChatUtil.display("Staff Detected " + name);
+//
+//                        if (autoLeave.getValue()) PacketUtil.send(new C01PacketChatMessage("/hub"));
+//                    }
+//                }
+//            }
+//        }
+
+//        if (packet instanceof S38PacketPlayerListItem) {
+//            S38PacketPlayerListItem item = ((S38PacketPlayerListItem) packet);
+//
+//            for (S38PacketPlayerListItem.AddPlayerData player : item.func_179767_a()) {
+//                if (player == null || player.getProfile() == null || player.getProfile().getName() == null) {
+//                    continue;
+//                } else if (!player.getProfile().getName().equals("SHOP") &amp;&amp; !player.getProfile().getName().equals("UPGRADES")) {
+//                    ChatUtil.display("Username: " + player.getProfile().getName());
+//                }
+//
+//                if (Arrays.asList(staff).contains(player.getProfile().getName().toLowerCase())) {
+//                    ChatUtil.display("Staff Detected " + player.getProfile().getName());
+//
+//                    if (autoLeave.getValue()) PacketUtil.send(new C01PacketChatMessage("/hub"));
+//                }
+//            }
+//        }
+
+//        if (packet instanceof S) {
+//            S06PacketUpdateHealth health = ((S06PacketUpdateHealth) packet);
+//
+//        }
+    };
+}
+// NOTE (AI): The S38 handler is commented out in both 6.1.30 and 6.2.4: only the hardcoded staff list and the PreMotion decay counter remain live. The dead code documents the intended design: count staff sightings on S38 ADD_PLAYER and S3EPacketTeams, then send /hub once the counter reaches 6. The S38 block also shows the SHOP/UPGRADES filter used to skip NPC tab entries.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (disabled), PreMotionEvent (counter decay).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>No anti-cheat risk; the feature is a reconnaissance countermeasure. The hardcoded list is per-network and rots quickly, which is presumably why the hook was disabled in the shipped builds.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 carries the same file under com/alan/clients/module/impl/exploit with the same commented-out S38 branch.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">TabGUI</span>
-<span class="impl-module-clients">(Sigma 3.9, Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiVanish</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Track player list changes for name protect and tab GUI. AntiBot uses tab list to verify real players.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Detect vanished players by watching UPDATE_LATENCY and REMOVE_PLAYER records that reference UUIDs absent from the tab list.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On EventPacket (incoming), UPDATE_LATENCY records are checked against mc.getNetHandler().getPlayerInfo(uuid): a latency update for a UUID with no player info entry is flagged as a vanished player and added to a watch list. On the update event, any watched UUID that later gains a player info entry is reported as un-vanished. A REMOVE_PLAYER branch prints the removed display name. A server-IP guard auto-disables on hypixel, hive and mineplex.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/other/AntiVanish.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/other/AntiVanish.java =====
+package info.sigmaclient.module.impl.other;
+
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.event.impl.EventRenderGui;
+import info.sigmaclient.event.impl.EventUpdate;
+import info.sigmaclient.management.command.Command;
+import info.sigmaclient.management.notifications.Notifications;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.util.misc.ChatUtil;
+import net.minecraft.network.play.server.S38PacketPlayerListItem;
+
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class AntiVanish extends Module {
+
+    private List&lt;UUID&gt; vanished = new CopyOnWriteArrayList&lt;&gt;();
+    private HashMap&lt;UUID, String&gt; uuidNames = new HashMap&lt;&gt;();
+    private int delay = 20 * -160;
+
+    public AntiVanish(ModuleData data) {
+        super(data);
+    }
+
+    @RegisterEvent(events = {EventUpdate.class, EventPacket.class, EventRenderGui.class})
+    public void onEvent(Event event) {
+
+        if (event instanceof EventUpdate) {
+            EventUpdate em = (EventUpdate) event;
+            if (em.isPre() &amp;&amp; mc.getCurrentServerData() != null) {
+                String server = mc.getCurrentServerData().serverIP.toLowerCase();
+                if (server.contains("hypixel") || server.contains("hive") || server.contains("mineplex")) {
+                    Notifications.getManager().post("Auto Config", "AntiVanish disabled for spam reasons.", 1500, Notifications.Type.WARNING);
+                    toggle();
+                }
+                if (!vanished.isEmpty()) {
+                    if (delay &gt; 20 * 160) {
+                        vanished.clear();
+                        Notifications.getManager().post("Vanish Cleared", "\247fVanish List has been \2476Cleared.", 2500L,
+                                Notifications.Type.NOTIFY);
+                        delay = 20 * -160;
+                    } else {
+                        delay++;
+                    }
+                }
+                try {
+                    for (UUID uuid : vanished) {
+                        if (mc.getNetHandler().func_175102_a(uuid) != null &amp;&amp; vanished.contains(uuid)) {
+                            Notifications.getManager().post("Vanish Warning",
+                                    "\247b" + mc.getNetHandler().func_175102_a(uuid).getDisplayName() + "is no longer \2476Vanished",
+                                    2500L, Notifications.Type.NOTIFY);
+                            DateFormat dateFormat = new SimpleDateFormat("hh:mm a");
+                            Date date = new Date();
+                            ChatUtil.printChat(Command.chatPrefix + "\2477[" + dateFormat.format(date) + "]\247f " + mc.getNetHandler().func_175102_a(uuid).getDisplayName() + "is no longer \247cVanished");
+                        }
+                        vanished.remove(uuid);
+                    }
+                } catch (Exception e) {
+                    Notifications.getManager().post("Vanish Error", "\247cSomething happened.");
+                }
+            }
+        }
+        if (event instanceof EventPacket) {
+            EventPacket ep = (EventPacket) event;
+            if (ep.isIncoming() &amp;&amp; (mc.theWorld != null) &amp;&amp; ((ep.getPacket() instanceof S38PacketPlayerListItem))) {
+            	S38PacketPlayerListItem listItem = (S38PacketPlayerListItem) ep.getPacket();
+                if (listItem.func_179768_b() == S38PacketPlayerListItem.Action.UPDATE_LATENCY) {
+                    for (Object o : listItem.func_179767_a()) {
+                        S38PacketPlayerListItem.AddPlayerData data = (S38PacketPlayerListItem.AddPlayerData) o;
+                        if ((mc.getNetHandler().func_175102_a(data.field_179964_d.getId()) == null)
+                                &amp;&amp; (!checkList(data.field_179964_d.getId()))) {
+                            Notifications.getManager().post("Vanish Warning",
+                                    "\247bA player is \2476Vanished!", 2500L,
+                                    Notifications.Type.WARNING);
+                            DateFormat dateFormat = new SimpleDateFormat("hh:mm a");
+                            Date date = new Date();
+                            ChatUtil.printChat(Command.chatPrefix + "\2477[" + dateFormat.format(date) + "] \247cVanish Alert.");
+                            delay = 20 * -160;
+                        }
+                    }
+                } else if (listItem.func_179768_b() == S38PacketPlayerListItem.Action.REMOVE_PLAYER) {
+                    for (Object o : listItem.func_179767_a()) {
+                        S38PacketPlayerListItem.AddPlayerData data = (S38PacketPlayerListItem.AddPlayerData) o;
+                        UUID uuid = data.field_179964_d.getId();
+                        if(mc.getNetHandler().func_175102_a(uuid) != null &amp;&amp; mc.getNetHandler().func_175102_a(uuid).getDisplayName() != null){
+                        	ChatUtil.printChat("" +  mc.getNetHandler().func_175102_a(uuid));
+                        }
+                    }
+                }	
+            }
+        }
+
+    }
+
+    private boolean checkList(final UUID uuid) {
+        if (this.vanished.contains(uuid)) {
+            return true;
+        }
+        this.vanished.add(uuid);
+        return false;
+    }
+}
+// NOTE (AI): UPDATE_LATENCY is the vanish oracle: every 600 ticks the server pings the whole list, so a UUID that receives latency updates without a matching player info entry is a vanished player. checkList() adds the UUID to the watch list on first miss. Note the hard server-IP guard that auto-disables on hypixel/hive/mineplex because those networks keep vanished players in the tab list, which would make every latency update a false positive.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (incoming), EventUpdate (pre), EventRenderGui.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>No anti-cheat risk; the module is pure tab list observation. Its practical weakness is structural: any server that keeps vanished players listed (Hypixel-style) defeats the oracle, which is why the module refuses to run there.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Sigma-only. Rise 6.x attempts the inverse (staff detection) with a name list; no other client watches the latency heartbeat.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">FriendAlert</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
 </div>
+<p class="impl-pattern">Notify when a friend joins by matching ADD_PLAYER profile names against the friend manager.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On incoming EventPacket, an ADD_PLAYER S38 is iterated and each AddPlayerData's profile name is checked with FriendManager.isFriend; a match posts a Friend Alert notification with the name. The module reads only the name field and ignores the skin properties.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/other/FriendAlert.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/other/FriendAlert.java =====
+/**
+ * Time: 8:22:36 PM
+ * Date: Jan 5, 2017
+ * Creator: cool1
+ */
+package info.sigmaclient.module.impl.other;
+
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.management.friend.FriendManager;
+import info.sigmaclient.management.notifications.Notifications;
+import info.sigmaclient.management.notifications.Notifications.Type;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.util.Timer;
+import net.minecraft.network.play.server.S38PacketPlayerListItem;
+
+/**
+ * @author cool1
+ */
+public class FriendAlert extends Module {
+
+    private boolean connect;
+    private String name;
+    private int currentY, targetY;
+    Timer timer = new Timer();
+
+    public FriendAlert(ModuleData data) {
+        super(data);
+        // TODO Auto-generated constructor stub
+    }
+
+    @Override
+    @RegisterEvent(events = {EventPacket.class})
+    public void onEvent(Event event) {
+        EventPacket ep = (EventPacket) event;
+        if (ep.isIncoming() &amp;&amp; ep.getPacket() instanceof S38PacketPlayerListItem) {
+            S38PacketPlayerListItem packet = (S38PacketPlayerListItem) ep.getPacket();
+            if (packet.func_179768_b() == S38PacketPlayerListItem.Action.ADD_PLAYER) {
+                for (Object o : packet.func_179767_a()) {
+                    S38PacketPlayerListItem.AddPlayerData data = (S38PacketPlayerListItem.AddPlayerData) o;
+                    if (FriendManager.isFriend(data.field_179964_d.getName())) {
+                        Notifications.getManager().post("Friend Alert", "\247b" + data.field_179964_d.getName() + " has joined!", 2500L, Type.INFO);
+                    }
+                }
+            }
+        }
+    }
+}
+// NOTE (AI): A minimal ADD_PLAYER consumer: it matches the profile name against FriendManager and posts a notification. It reads only the name field, so it is cheap and cannot be defeated by property stripping; the same handler shape is the base for every tab-list alert module.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (incoming).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>No detection surface; join alerts are indistinguishable from passive tab list rendering to the server.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Sigma-only in the corpus; Rise 5.99's Denicker pairs ADD_PLAYER with S02 join messages instead of relying on the friend manager.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent / incoming EventPacket is universal; Rise 6.x adds its component system on top of the same receive bus.</div>
+<div class="impl-clients">Sigma reads fields through the MCP accessors (func_179768_b, func_179767_a, field_179964_d); Rise 5.99 uses the same MCP names; Rise 6.x uses renamed accessors (getMatches-style). None of the four modules mutate the packet; all are read-only consumers.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S0CPacketSpawnPlayer/">S0CPacketSpawnPlayer</a>
+<a class="related-chip" href="../S02PacketChat/">S02PacketChat</a>
+<a class="related-chip" href="../S39PacketPlayerAbilities/">S39PacketPlayerAbilities</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

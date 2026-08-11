@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S19PacketEntityHeadLook (0x19): Updates an entity's head yaw rotation independently of body rotation.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ESP, Tracers, AntiAim">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="WatchdogVelocity, PingSpoofComponent, PacketType (translation component)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S19PacketEntityHeadLook — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S19PacketEntityHeadLook — Minecraft 1.8.9 Packet Reference","description":"The head-look packet is the least-touched entity packet in the corpus: no renderer or aim module in the 8 clients reads it. It survives only in Rise 6.x packet-classification components (PingSpoofComponent, translation PacketType) and WatchdogVelocity's backtrack set, plus the script API whitelist.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -71,23 +71,787 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Head yaw is separate from body yaw — entities can look in a different direction than they're moving. Used by Backtrack modules to track the full entity rotation, and by ESP modules for accurate head-position aim prediction.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S19PacketEntityHeadLook updates only the head yaw of an entity, independent of the body yaw carried by S16/S17. The wire format is a VarInt entityId plus one byte decoded as yaw * 360 / 256. The server sends it whenever the head rotation changes: EntityTrackerEntry broadcasts it to tracked players (corpus line 236, sendPacketToTrackedPlayers(new S19PacketEntityHeadLook(trackedEntity, (byte) l))) while body rotation travels in the S14 family. It is the only rotation packet keyed to the head rather than the body.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleEntityHeadLook (Memeware 7.3 bundle, line 573) resolves the entity and calls setRotationYawHead(yaw * 360 / 256.0F). Only yaw is transmitted; the head pitch is derived from the body pitch at render time, and the model's head mesh rotates around the neck joint using this value. The body rotation is untouched, which is why a player can look sideways while running straight.</p>
+<h4>Why clients touch it</h4>
+<p>None of the 8 clients has an ESP, Tracers or KillAura module that reads S19. The corpus consumers are all Rise 6.x infrastructure and one velocity module: WatchdogVelocity includes S19 in the spoof packet set so a held head-look update completes the backtrack illusion, PingSpoofComponent classifies it in the players tuple (delayed with the S14 family and S18), the translation PacketType maps ENTITY_HEAD_LOOK into the position cache, and NetworkAPI whitelists it for scripts in both 6.1.30 and 6.2.4. Renderers skip it because aim indicators are derived from body yaw/pitch in S16/S17; head yaw only affects the model mesh.</p>
+<h4>Exploit surface</h4>
+<p>The packet is cosmetic clientbound state with no serverbound counterpart and no server-side validation, so there is no direct abuse. The interesting quirk is in the translation cache: ENTITY_HEAD_LOOK writes the decoded head yaw into the Position.yaw slot while keeping pitch, so the cached orientation becomes the head yaw until the next S16/S17 overwrites it. Any aim or rotation math fed from that cache inherits the error. Backtrack modules that hold S19 along with the movement set produce the visible frozen-head artifact, which is a staff-visible tell rather than a detection risk.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>Clientbound only. The server emits it from EntityTrackerEntry when the tracked entity's head yaw changes, and the client applies it as setRotationYawHead with the * 360 / 256 decode. There is no rate limit or validation; a server can spam it harmlessly. The client-side consequence is limited to the model's head rotation and any module that consumes rotation state.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Single byte angle, decode yaw * 360 / 256.0F. Body yaw lives in S16/S17; head yaw lives here; the two can differ by up to 180 degrees for a player looking over the shoulder. S19 arrives at the same tracking cadence as the S14 family and typically interleaves with it. The translation cache's ENTITY_HEAD_LOOK handler overwrites the yaw slot, so cached positions diverge from vanilla rotation semantics until the next look packet.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>No server anticheat consumes head yaw; killaura rotation-sync detection works on the serverbound C05/C06 look packets, not on this clientbound announcement. For cheat clients the only relevance is fidelity: backtrack and reach modules that reconstruct entity state must either include S19 in the held set (WatchdogVelocity) or accept that the reconstructed orientation drifts. There is no flag surface, only visual artifacts.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ESP</span>
+<p class="impl-pattern">The head-look packet is the least-touched entity packet in the corpus: no renderer or aim module in the 8 clients reads it. It survives only in Rise 6.x packet-classification components (PingSpoofComponent, translation PacketType) and WatchdogVelocity's backtrack set, plus the script API whitelist.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WatchdogVelocity</span>
+<span class="impl-module-clients">(Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Track entity head rotations for visual indicators.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Hold S19PacketEntityHeadLook with the S14 movement subclasses and S18 so the backtracked target's full state, including head rotation, replays coherently.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">isSpoof2Packet returns true for S19PacketEntityHeadLook, so while the backtrack is active the packet is cancelled in PacketReceiveEvent and queued, then replayed through PacketUtil.receive on the flush conditions (elapsed 100-250 ms, distance threshold crossing, hurtTime == 9, world age under 100 ticks).</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/WatchdogVelocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/WatchdogVelocity.java =====
+package com.alan.clients.module.impl.combat.velocity;
+
+import com.alan.clients.component.impl.player.PingSpoofComponent;
+import com.alan.clients.component.impl.player.TargetComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.*;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.event.impl.render.Render3DEvent;
+import com.alan.clients.module.impl.combat.Criticals;
+import com.alan.clients.module.impl.combat.KillAura;
+import com.alan.clients.module.impl.combat.Velocity;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.module.impl.movement.LongJump;
+import com.alan.clients.module.impl.movement.Speed;
+import com.alan.clients.module.impl.player.Scaffold;
+import com.alan.clients.module.impl.render.chat.Chat;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.util.player.PlayerUtil;
+import com.alan.clients.util.render.ColorUtil;
+import com.alan.clients.util.render.RenderUtil;
+import com.alan.clients.util.vector.Vector2d;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.NumberValue;
+import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.init.Blocks;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.Vec3;
+import org.lwjgl.opengl.GL11;
+
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+
+
+public final class WatchdogVelocity extends Mode&lt;Velocity&gt; {
+
+    public WatchdogVelocity(String name, Velocity parent) {
+        super(name, parent);
+    }
+    private long active2StartTime = -1; // Tracks when active2 was set to true
+    boolean active2 = false;
+    boolean send = false;
+    public final BooleanValue stack = new BooleanValue("Stack", this, true);
+
+    public final BooleanValue spoof = new BooleanValue("Ping Spoof", this, true);
+
+    public final BooleanValue spoof2 = new BooleanValue("Watchdog Backtrack", this, false);
+
+    public final BooleanValue boost = new BooleanValue("Damage Boost (not for hypixel)", this, false);
+
+    private final NumberValue speed = new NumberValue("Damage Boost Speed", this, 1, 1, 10, .01);
+    private boolean active, receiving, buffer;
+    private Vec3 realPosition = new Vec3(0, 0, 0);
+    public Entity targetEntity;
+    private int amount;
+    private final ArrayList&lt;Packet&lt;?&gt;&gt; packets = new ArrayList&lt;&gt;();
+    private boolean isSpoof2Packet(Packet&lt;?&gt; packet) {
+        return packet instanceof S14PacketEntity.S16PacketEntityLook ||
+                packet instanceof S14PacketEntity.S15PacketEntityRelMove ||
+                packet instanceof S14PacketEntity.S17PacketEntityLookMove ||
+                packet instanceof S19PacketEntityHeadLook ||
+                packet instanceof S18PacketEntityTeleport;
+    }
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceive = event -&gt; {
+
+        if (receiving || getModule(LongJump.class).isEnabled() &amp;&amp; mc.thePlayer.offGroundTicks&lt;29 || getModule(Flight.class).isEnabled()) return;
+
+        switch (event.getPacket()) {
+            case S12PacketEntityVelocity velocity -&gt; {
+
+                if (velocity.getEntityID() == mc.thePlayer.getEntityId()) {
+                    if (stack.getValue() &amp;&amp; amount &lt; 1 &amp;&amp; (!mc.thePlayer.onGround) &amp;&amp; Math.random() &lt; 0.73 &amp;&amp; !(mc.thePlayer.offGroundTicks &gt; 13) || mc.thePlayer.inWater  || (getModule(Scaffold.class).isEnabled() )) {
+                        amount++;
+                        buffer = true;
+                        //   ChatUtil.display("stack");
+                        event.setCancelled();
+                        buffer = false;
+
+                    }
+                    if (!event.isCancelled() &amp;&amp; (!getModule(Scaffold.class).isEnabled() ) &amp;&amp; !(mc.thePlayer.offGroundTicks &gt; 11) &amp;&amp; ((!mc.thePlayer.onGround ) || (mc.thePlayer.onGround &amp;&amp; !MoveUtil.isMoving())) &amp;&amp;  !(velocity.getMotionY()/800D &lt; .08 &amp;&amp; !(getModule(Speed.class).isEnabled() || mc.thePlayer.inWater || !mc.thePlayer.isInLava()) )) {
+                        amount = 0;
+                        active = true;
+                        //  ChatUtil.display("Set Active");
+                        packets.add(velocity);
+
+                        event.setCancelled();
+
+                    } else if (!event.isCancelled() ) {
+                        if((!getModule(Scaffold.class).isEnabled() )){
+                            mc.thePlayer.motionY = velocity.getMotionY() / 8000.0D;
+                        }
+
+                        //      ChatUtil.display("normal");
+                        event.setCancelled();
+                    }
+
+
+                }
+
+            }
+
+            case S32PacketConfirmTransaction transaction -&gt; {
+                if (active &amp;&amp; spoof.getValue()) {
+                    packets.add(transaction);
+                    event.setCancelled();
+                    // PingSpoofComponent.spoof(50, true, false, false, false, false, false);
+                }
+
+            }
+
+            case S00PacketKeepAlive keepAlive -&gt; {
+                if (active &amp;&amp; spoof.getValue()) {
+                    //   packets.add(keepAlive);
+                        event.setCancelled();
+                }
+            }
+
+
+            case S14PacketEntity.S16PacketEntityLook s16PacketEntityLook -&gt; {
+                if ((active2 || active)  &amp;&amp; spoof2.getValue() &amp;&amp; !send) {
+                    packets.add(s16PacketEntityLook);
+                    event.setCancelled();
+                }
+            }
+            case S14PacketEntity.S15PacketEntityRelMove s15PacketEntityRelMove -&gt; {
+                if ((active2 || active)  &amp;&amp; spoof2.getValue()  &amp;&amp; !send) {
+                    packets.add(s15PacketEntityRelMove);
+                    event.setCancelled();
+                }
+            }
+            case S14PacketEntity.S17PacketEntityLookMove s17PacketEntityLookMove -&gt; {
+                if ((active2 || active)  &amp;&amp; spoof2.getValue()  &amp;&amp; !send) {
+                    packets.add(s17PacketEntityLookMove);
+                    event.setCancelled();
+                }
+            }
+
+
+
+            case S19PacketEntityHeadLook s19PacketEntityHeadLook -&gt; {
+                if ((active2 || active)  &amp;&amp; spoof2.getValue()  &amp;&amp; !send) {
+                    packets.add(s19PacketEntityHeadLook);
+                    event.setCancelled();
+                }
+            }
+
+
+
+            default -&gt; {
+            }
+
+        }
+        List&lt;EntityLivingBase&gt; targets = TargetComponent.getTargets(12);
+        targets.sort(Comparator.comparingDouble(entity -&gt; entity.hurtTime));
+        if (targets.isEmpty()) {
+            targetEntity = null;
+            // Add logic here to reset or flush your spoof2 states.
+            // For example:
+            if (spoof2.getValue()) {
+                receiving = true;
+                packets.stream().filter(this::isSpoof2Packet).forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+                active2 = false;
+                send = false;
+            }
+            return;
+        }
+        Entity entity = targets.get(0);
+
+
+
+
+        if (spoof2.getValue()) {
+
+
+
+
+
+
+
+
+            if (entity != targetEntity) {
+                targetEntity = entity;
+
+                realPosition.xCoord = entity.posX;
+                realPosition.yCoord = entity.posY;
+                realPosition.zCoord = entity.posZ;
+            }
+
+
+
+
+
+            Vec3 playerEyesPos = mc.thePlayer.getPositionEyes(1.0F);
+            Vec3 targetEyesPos = new Vec3(realPosition.xCoord, realPosition.yCoord, realPosition.zCoord);
+            double distance = playerEyesPos.distanceTo(targetEyesPos);
+
+            if ((distance &gt; 4.5) &amp;&amp; active || mc.thePlayer.offGroundTicks&gt;9 &amp;&amp; active) {
+                send = true;
+            } else if(active){
+                send = false;
+            }
+//ChatUtil.display(distance);
+            active2 = distance &lt; 4.5;
+if( mc.thePlayer.isSwingInProgress &amp;&amp; distance&gt;3.1&amp;&amp; distance&lt;4.5 &amp;&amp; getModule(KillAura.class).isEnabled()){
+  // ChatUtil.display("reach:" + distance);
+}
+
+
+
+
+            if (active2) {
+                // Check if this is the first frame where active2 is true
+                if (active2StartTime == -1) {
+                    active2StartTime = System.currentTimeMillis(); // Record the starting time
+                }
+
+                // Check if 200ms has passed
+                if (System.currentTimeMillis() - active2StartTime &gt;= Math.round((Math.random()*150))+100) {
+                    receiving = true;
+                    packets.stream()
+                            .filter(this::isSpoof2Packet)
+                            .forEach(PacketUtil::receive);
+                    packets.clear();
+                    receiving = false;
+
+               //     ChatUtil.display(mc.thePlayer.ticksExisted);
+
+                    // Reset active2 and timer
+                    active2 = false;
+                    active2StartTime = -1;
+                }
+            } else {
+                // Reset the timer if active2 is false
+                active2StartTime = -1;
+            }
+
+            if (send &amp;&amp; active) {
+               // ChatUtil.display(send);
+                active2 = false; // If active2 is set to false, reset the timer
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+
+            if(mc.thePlayer.ticksExisted&lt;100){
+                active2 = false; // If active2 is set to false, reset the timer
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+
+            if (mc.thePlayer.hurtTime == 9) {
+               // ChatUtil.display(send);
+                active2 = false;
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+            if ((distance &lt; 2.5)) {
+                active2 = false;
+                //  ChatUtil.display(send);
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+
+            if ((distance &gt; 4.5)) {
+                active2 = false;
+              //  ChatUtil.display(send);
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+            final Packet&lt;?&gt; packet = event.getPacket();
+            if (packet instanceof S14PacketEntity) {
+                S14PacketEntity s14PacketEntity = ((S14PacketEntity) packet);
+
+                if (s14PacketEntity.entityId == targetEntity.getEntityId()) {
+                    realPosition.xCoord += s14PacketEntity.getPosX() / 32D;
+                    realPosition.yCoord += s14PacketEntity.getPosY() / 32D;
+                    realPosition.zCoord += s14PacketEntity.getPosZ() / 32D;
+                }
+            } else if (packet instanceof S18PacketEntityTeleport) {
+                S18PacketEntityTeleport s18PacketEntityTeleport = ((S18PacketEntityTeleport) packet);
+
+                if (s18PacketEntityTeleport.getEntityId() == targetEntity.getEntityId()) {
+                    realPosition = new Vec3(s18PacketEntityTeleport.getX() / 32D, s18PacketEntityTeleport.getY() / 32D, s18PacketEntityTeleport.getZ() / 32D);
+                }
+            }
+        }
+
+
+    };
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;JumpEvent&gt; onJump = event -&gt; {
+        if (mc.thePlayer.onGround &amp;&amp; active) {
+            active = false;
+            //  ChatUtil.display("Set Active");
+            receiving = true;
+            send = false;
+            //  MoveUtil.strafe(MovdeUtil.getbaseMoveSpeed() + Math.random() / 10);
+            //   mc.thePlayer.jump();
+            Vector2d motion = new Vector2d(mc.thePlayer.motionX, mc.thePlayer.motionZ);
+            packets.forEach(PacketUtil::receive);
+            // ChatUtil.display("jump");
+            packets.clear();
+
+            if (!boost.getValue()) {
+                mc.thePlayer.motionX = motion.getX();
+                mc.thePlayer.motionZ = motion.getY();
+            } else {
+                MoveUtil.strafe();
+                mc.thePlayer.motionX *= speed.getValue().doubleValue();
+                mc.thePlayer.motionZ *= speed.getValue().doubleValue();
+
+            }
+
+            receiving = false;
+        }
+    };
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;PreUpdateEvent&gt; onPreUpdate = event -&gt; {
+        if(active2 &amp;&amp; !active &amp;&amp; spoof2.getValue()){
+            PingSpoofComponent.spoof(50, true, false, false, false, true, false);
+        }
+    };
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+
+
+
+        if (mc.thePlayer.onGround &amp;&amp; active &amp;&amp; !mc.thePlayer.isJumping) {
+            active = false;
+
+            receiving = true;
+            send = false;
+            //   MoveUtil.strafe(MoveUtil.WALK_SPEED);
+            Vector2d motion = new Vector2d(mc.thePlayer.motionX, mc.thePlayer.motionZ);
+            double motiony = mc.thePlayer.motionY;
+         //   PingSpoofComponent.dispatch();
+            packets.forEach(PacketUtil::receive);
+            // ChatUtil.display("jump");
+            packets.clear();
+            mc.thePlayer.jump();
+            //  PingSpoofComponent.dispatch();
+            mc.thePlayer.motionX = motion.getX();
+            mc.thePlayer.motionZ = motion.getY();
+
+            //  active = false;
+            receiving = false;
+            // receiving = true;
+            //   Vector2d motion = new Vector2d(mc.thePlayer.motionX, mc.thePlayer.motionZ);
+            // packets.forEach(PacketUtil::receive);
+            //  ChatUtil.display("normal");
+            // packets.clear();
+            //  mc.thePlayer.motionX = motion.getX();
+            //  mc.thePlayer.motionZ = motion.getY();
+            //   receiving = false;
+        }
+
+    };
+
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;PostStrafeEvent&gt; onPostStrafe = event -&gt; {
+
+        if (mc.thePlayer.offGroundTicks &gt; 12 &amp;&amp; active) {
+            active = false;
+
+            receiving = true;
+            //  MoveUtil.strafe(MoveUtil.getbaseMoveSpeed() + Math.random() / 10);
+            //   mc.thePlayer.jump();
+            Vector2d motion = new Vector2d(mc.thePlayer.motionX, mc.thePlayer.motionZ);
+            double motiony = mc.thePlayer.motionY;
+         //   PingSpoofComponent.dispatch();
+            packets.forEach(PacketUtil::receive);
+            // ChatUtil.display("jump");
+            packets.clear();
+            //  PingSpoofComponent.dispatch();
+            mc.thePlayer.motionX = motion.getX();
+            mc.thePlayer.motionZ = motion.getY();
+            //  mc.thePlayer.motionY = motiony;
+            receiving = false;
+        }
+    };
+    @EventLink()
+    public final Listener&lt;Render3DEvent&gt; onRender3D = event -&gt; {
+        if (targetEntity == null || !spoof2.getValue() || (!active2 &amp;&amp; !active)) {
+            return;
+        }
+
+
+        GlStateManager.pushMatrix();
+        GlStateManager.pushAttrib();
+        GlStateManager.enableBlend();
+        GlStateManager.disableTexture2D();
+        GlStateManager.disableLighting();
+        GL11.glDepthMask(false);
+
+        double expand = -0.14;
+        RenderUtil.color(Color.red, 45);
+
+        RenderUtil.drawBoundingBox(mc.thePlayer.getEntityBoundingBox()
+                .offset(-mc.thePlayer.posX, -mc.thePlayer.posY, -mc.thePlayer.posZ)
+                .offset(realPosition.xCoord, realPosition.yCoord, realPosition.zCoord)
+                .expand(expand, -.3, expand));
+
+
+        GlStateManager.enableTexture2D();
+        GlStateManager.enableLighting();
+        GlStateManager.disableBlend();
+        GL11.glDepthMask(true);
+        GlStateManager.popAttrib();
+        GlStateManager.popMatrix();
+        GlStateManager.resetColor();
+    };
+
+}
+
+// NOTE (AI): The Watchdog Backtrack path cancels the S14 subclasses plus S19PacketEntityHeadLook and
+// NOTE (AI): S18PacketEntityTeleport for the nearest target and replays them through PacketUtil.receive
+// NOTE (AI): after 100-250 ms or when the distance to the tracked realPosition crosses the 4.5/2.5
+// NOTE (AI): thresholds. Buffering clientbound packets is invisible to the server, which is why the
+// NOTE (AI): module can hold the target's movement state without raising flags.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Clientbound buffering is invisible server-side. The delayed head-look replay is exactly what produces the frozen-head visual when the target's head snaps late.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 has no WatchdogVelocity hit for S19; the packet reaches 6.1.30 only through the components and NetworkAPI.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Tracers</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoofComponent</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Track entity head rotations for visual indicators.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Classify S19PacketEntityHeadLook as player traffic so it is parked with the rest of the entity stream while ping spoofing is active.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The players tuple lists S19PacketEntityHeadLook next to the S14 subclasses, S18PacketEntityTeleport, S20PacketEntityProperties and S13PacketDestroyEntities. While the component is enabled, every packet whose class matches an enabled tuple is cancelled on send/receive and parked as a TimedPacket, then flushed via PacketUtil.queue on PostMotion when the delay elapses or on world change.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/PingSpoofComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/PingSpoofComponent.java =====
+package com.alan.clients.component.impl.player;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.CancellableEvent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PostMotionEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.util.packet.PacketUtil;
+import net.minecraft.client.gui.GuiDownloadTerrain;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.Tuple;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+public final class PingSpoofComponent extends Component {
+    public static ConcurrentLinkedQueue&lt;PacketUtil.TimedPacket&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+    static StopWatch enabledTimer = new StopWatch();
+    public static boolean enabled;
+    static long amount;
+    static Tuple&lt;Class[], Boolean&gt; regular = new Tuple&lt;&gt;(new Class[]{C0FPacketConfirmTransaction.class, C00PacketKeepAlive.class, S1CPacketEntityMetadata.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; velocity = new Tuple&lt;&gt;(new Class[]{S12PacketEntityVelocity.class, S27PacketExplosion.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; teleports = new Tuple&lt;&gt;(new Class[]{S08PacketPlayerPosLook.class, S39PacketPlayerAbilities.class, S09PacketHeldItemChange.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; players = new Tuple&lt;&gt;(new Class[]{S13PacketDestroyEntities.class, S14PacketEntity.class, S14PacketEntity.S16PacketEntityLook.class, S14PacketEntity.S15PacketEntityRelMove.class, S14PacketEntity.S17PacketEntityLookMove.class, S18PacketEntityTeleport.class, S20PacketEntityProperties.class, S19PacketEntityHeadLook.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; blink = new Tuple&lt;&gt;(new Class[]{C02PacketUseEntity.class, C0DPacketCloseWindow.class, C0EPacketClickWindow.class, C0CPacketInput.class, C0BPacketEntityAction.class, C08PacketPlayerBlockPlacement.class, C07PacketPlayerDigging.class, C09PacketHeldItemChange.class, C13PacketPlayerAbilities.class, C15PacketClientSettings.class, C16PacketClientStatus.class, C17PacketCustomPayload.class, C18PacketSpectate.class, C19PacketResourcePackStatus.class, C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class, C0APacketAnimation.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; movement = new Tuple&lt;&gt;(new Class[]{C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class}, false);
+
+    public static Tuple&lt;Class[], Boolean&gt;[] types = new Tuple[]{regular, velocity, teleports, players, blink, movement};
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; send = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; receive = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    public CancellableEvent onPacket(Packet&lt;?&gt; packet, CancellableEvent event) {
+        if (!event.isCancelled() &amp;&amp; enabled &amp;&amp; Arrays.stream(types).anyMatch(tuple -&gt; tuple.getSecond() &amp;&amp; Arrays.stream(tuple.getFirst()).anyMatch(regularpacket -&gt; regularpacket == packet.getClass()))) {
+            event.setCancelled();
+            packets.add(new PacketUtil.TimedPacket(packet));
+        }
+
+        return event;
+    }
+
+    public static void dispatch() {
+        if (!packets.isEmpty()) {
+            // Stops the packets from being called twice
+            boolean enabled = PingSpoofComponent.enabled;
+            PingSpoofComponent.enabled = false;
+            packets.forEach(timedPacket -&gt; PacketUtil.queue(timedPacket.getPacket()));
+            PingSpoofComponent.enabled = enabled;
+            packets.clear();
+        }
+    }
+
+    public static void disable() {
+        enabled = false;
+        enabledTimer.setMillis(enabledTimer.millis - 999999999);
+    }
+
+    @EventLink
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; dispatch();
+
+    @EventLink
+    public final Listener&lt;PostMotionEvent&gt; onPostMotion = event -&gt; {
+        if (!(enabled = !enabledTimer.finished(100) &amp;&amp; !(mc.currentScreen instanceof GuiDownloadTerrain))) {
+            dispatch();
+        } else {
+            // Stops the packets from being called twice
+            enabled = false;
+
+            packets.forEach(packet -&gt; {
+                if (packet.getTime() + amount &lt; System.currentTimeMillis()) {
+                    PacketUtil.queue(packet.getPacket());
+                    packets.remove(packet);
+                }
+            });
+
+            enabled = true;
+        }
+    };
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players) {
+        spoof(amount, regular, velocity, teleports, players, false);
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink, boolean movement) {
+        enabledTimer.reset();
+
+        PingSpoofComponent.regular.setSecond(regular);
+        PingSpoofComponent.velocity.setSecond(velocity);
+        PingSpoofComponent.teleports.setSecond(teleports);
+        PingSpoofComponent.players.setSecond(players);
+        PingSpoofComponent.blink.setSecond(blink);
+        PingSpoofComponent.movement.setSecond(movement);
+        PingSpoofComponent.amount = amount;
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink) {
+        spoof(amount, regular, velocity, teleports, players, blink, false);
+    }
+
+    public static void blink() {
+        spoof(9999999, true, false, false, false, true);
+    }
+}
+
+// NOTE (AI): The players tuple is the classification table that decides which clientbound packets are
+// NOTE (AI): parked while ping spoofing. S19PacketEntityHeadLook sits in it next to the S14 subclasses,
+// NOTE (AI): S18PacketEntityTeleport and S20PacketEntityProperties, so a head-look update for any entity
+// NOTE (AI): is delayed with the rest of the entity stream and flushed by PacketUtil.queue on dispatch.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent and PacketReceiveEvent, PostMotionEvent, WorldChangeEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Delaying clientbound state is not detectable from the packet stream. The side effect is the same stutter that any ping spoof produces on the entity render.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical tuple in Rise 6.1.30 and 6.2.4; the 6.2.4 corpus path carries the Client-release2 prefix.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiAim</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PacketType (translation component)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Track entity head rotations for visual indicators.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Write the decoded head yaw into the per-entity position cache used by the translation system.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">ENTITY_HEAD_LOOK decodes headYaw as getYaw() * 360 / 256.0F, looks up the entity's cached Position and stores new Position(posX, posY, posZ, headYaw, currentPitch). It returns null when no entry exists, so head-look updates for entities that never spawned through the cache (no S0F/S0C seen) are silently dropped.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/translation/PacketType.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/translation/PacketType.java =====
+package com.alan.clients.component.impl.player.translation;
+
+import lombok.Getter;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.*;
+
+import java.util.Map;
+import java.util.function.BiFunction;
+
+public enum PacketType {
+    SPAWN_MOB(S0FPacketSpawnMob.class, (packet, entityPositions) -&gt; {
+        S0FPacketSpawnMob spawnMobPacket = (S0FPacketSpawnMob) packet;
+        int entityId = spawnMobPacket.getEntityID();
+        double posX = spawnMobPacket.getX() / 32.0;
+        double posY = spawnMobPacket.getY() / 32.0;
+        double posZ = spawnMobPacket.getZ() / 32.0;
+        float yaw = (spawnMobPacket.getYaw() * 360) / 256.0F;
+        float pitch = (spawnMobPacket.getPitch() * 360) / 256.0F;
+
+        Position newPosition = new Position(posX, posY, posZ, yaw, pitch);
+        entityPositions.put(entityId, newPosition);
+        return entityPositions;
+    }),
+
+    ENTITY_TELEPORT(S18PacketEntityTeleport.class, (packet, entityPositions) -&gt; {
+        S18PacketEntityTeleport teleportPacket = (S18PacketEntityTeleport) packet;
+        int entityId = teleportPacket.getEntityId();
+        double posX = teleportPacket.getX() / 32.0;
+        double posY = teleportPacket.getY() / 32.0;
+        double posZ = teleportPacket.getZ() / 32.0;
+        float yaw = (teleportPacket.getYaw() * 360) / 256.0F;
+        float pitch = (teleportPacket.getPitch() * 360) / 256.0F;
+
+        Position newPosition = new Position(posX, posY, posZ, yaw, pitch);
+        entityPositions.put(entityId, newPosition);
+        return entityPositions;
+    }),
+
+    ENTITY_REL_MOVE(S14PacketEntity.S15PacketEntityRelMove.class, (packet, entityPositions) -&gt; {
+        S14PacketEntity.S15PacketEntityRelMove relMovePacket = (S14PacketEntity.S15PacketEntityRelMove) packet;
+        int entityId = relMovePacket.entityId;
+
+        Position currentPosition = entityPositions.get(entityId);
+
+        if (currentPosition != null) {
+            double newPosX = currentPosition.posX + relMovePacket.getPosX() / 32.0;
+            double newPosY = currentPosition.posY + relMovePacket.getPosY() / 32.0;
+            double newPosZ = currentPosition.posZ + relMovePacket.getPosZ() / 32.0;
+            float yaw = currentPosition.yaw;
+            float pitch = currentPosition.pitch;
+
+            Position newPosition = new Position(newPosX, newPosY, newPosZ, yaw, pitch);
+            entityPositions.put(entityId, newPosition);
+            return entityPositions;
+        }
+
+        return null;
+    }),
+
+    ENTITY_LOOK_MOVE(S14PacketEntity.S17PacketEntityLookMove.class, (packet, entityPositions) -&gt; {
+        S14PacketEntity.S17PacketEntityLookMove lookMovePacket = (S14PacketEntity.S17PacketEntityLookMove) packet;
+        int entityId = lookMovePacket.getEntityId();
+        double deltaX = lookMovePacket.getPosX() / 32.0;
+        double deltaY = lookMovePacket.getPosY() / 32.0;
+        double deltaZ = lookMovePacket.getPosZ() / 32.0;
+        float yaw = (lookMovePacket.getYaw() * 360) / 256.0F;
+        float pitch = (lookMovePacket.getPitch() * 360) / 256.0F;
+
+        Position currentPosition = entityPositions.get(entityId);
+
+        if (currentPosition != null) {
+            double newPosX = currentPosition.posX + deltaX;
+            double newPosY = currentPosition.posY + deltaY;
+            double newPosZ = currentPosition.posZ + deltaZ;
+
+            // Ensure yaw and pitch are updated
+            Position newPosition = new Position(newPosX, newPosY, newPosZ, yaw, pitch);
+            entityPositions.put(entityId, newPosition);
+            return entityPositions;
+        }
+
+        return null;
+    }),
+
+    ENTITY_LOOK(S14PacketEntity.S16PacketEntityLook.class, (packet, entityPositions) -&gt; {
+        S14PacketEntity.S16PacketEntityLook lookPacket = (S14PacketEntity.S16PacketEntityLook) packet;
+        int entityId = lookPacket.getEntityId();
+        float yaw = (lookPacket.getYaw() * 360) / 256.0F;
+        float pitch = (lookPacket.getPitch() * 360) / 256.0F;
+
+        Position currentPosition = entityPositions.get(entityId);
+
+        if (currentPosition != null) {
+            Position newPosition = new Position(currentPosition.posX, currentPosition.posY, currentPosition.posZ, yaw, pitch);
+            entityPositions.put(entityId, newPosition);
+            return entityPositions;
+        }
+
+        return null;
+    }),
+
+    DESTROY_ENTITY(S13PacketDestroyEntities.class, (packet, entityPositions) -&gt; {
+        S13PacketDestroyEntities destroyEntitiesPacket = (S13PacketDestroyEntities) packet;
+        int[] entityIds = destroyEntitiesPacket.getEntityIDs();
+
+        for (int entityId : entityIds) {
+            entityPositions.remove(entityId);
+        }
+
+        return entityPositions;
+    }),
+
+    ENTITY_HEAD_LOOK(S19PacketEntityHeadLook.class, (packet, entityPositions) -&gt; {
+        S19PacketEntityHeadLook headLookPacket = (S19PacketEntityHeadLook) packet;
+        int entityId = headLookPacket.getEntityId();
+        float headYaw = (headLookPacket.getYaw() * 360) / 256.0F;
+
+        Position currentPosition = entityPositions.get(entityId);
+
+        if (currentPosition != null) {
+            Position newPosition = new Position(currentPosition.posX, currentPosition.posY, currentPosition.posZ, headYaw, currentPosition.pitch);
+            entityPositions.put(entityId, newPosition);
+            return entityPositions;
+        }
+
+        return null;
+    });
+
+    @Getter
+    private final Class&lt;? extends Packet&lt;?&gt;&gt; packetClass;
+    private final BiFunction&lt;Packet&lt;?&gt;, Map&lt;Integer, Position&gt;, Map&lt;Integer, Position&gt;&gt; handler;
+
+    PacketType(Class&lt;? extends Packet&lt;?&gt;&gt; packetClass, BiFunction&lt;Packet&lt;?&gt;, Map&lt;Integer, Position&gt;, Map&lt;Integer, Position&gt;&gt; handler) {
+        this.packetClass = packetClass;
+        this.handler = handler;
+    }
+
+    public Map&lt;Integer, Position&gt; handle(Packet&lt;?&gt; packet, Map&lt;Integer, Position&gt; positions) {
+        return handler.apply(packet, positions);
+    }
+}
+
+// NOTE (AI): The translation component maintains a per-entity Position cache that mirrors server state
+// NOTE (AI): independently of the vanilla renderer interpolation. ENTITY_REL_MOVE accumulates deltas,
+// NOTE (AI): ENTITY_LOOK_MOVE and ENTITY_LOOK update yaw/pitch only when an entry already exists, and
+// NOTE (AI): ENTITY_TELEPORT replaces the entry with absolute coordinates. The look-only handlers return
+// NOTE (AI): null when the entity was never spawned into the cache (S0F/S0C never seen).
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> Invoked from the translation component's packet receive path.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>No server interaction. The yaw-slot overwrite is a fidelity bug relative to vanilla (head yaw and body yaw are separate there), and downstream consumers inherit it until the next look packet.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical in Rise 6.1.30 and 6.2.4.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent in Rise 6.x; no other client in the corpus registers any hook for S19PacketEntityHeadLook.</div>
+<div class="impl-clients">The packet appears in Memeware, Nekoware, Sigma, Spicy and Tenacity only via the vanilla NetHandlerPlayClient handler; the entire non-vanilla surface is Rise 6.x components and the script API NetworkAPI whitelist.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S14PacketEntity/">S14PacketEntity</a>
+<a class="related-chip" href="../S18PacketEntityTeleport/">S18PacketEntityTeleport</a>
+<a class="related-chip" href="../S0CPacketSpawnPlayer/">S0CPacketSpawnPlayer</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

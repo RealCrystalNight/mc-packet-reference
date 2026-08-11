@@ -70,29 +70,49 @@
   ],
   "handler": "INetHandlerPlayClient",
   "implementation": {
-    "modules": [
+    "writeup": [
       {
-        "name": "Title",
-        "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
-        ],
-        "purpose": "Cancel or modify title/subtitle messages.",
-        "how_it_works": "",
-        "detailed_code": "if (event.getPacket() instanceof S45PacketTitle) event.setCancelled(true);",
-        "vanilla_hook": "EventReceivePacket"
+        "h": "Role in the protocol",
+        "p": "Screen title display with five actions: TITLE, SUBTITLE, TIMES, CLEAR and RESET. The vanilla server produces it from the /title command (CommandTitle), and plugins use it for game announcements. TITLE and SUBTITLE carry an IChatComponent, TIMES carries three ints (fade-in, stay, fade-out in ticks), and CLEAR and RESET carry no text. The client handler routes everything into GuiIngame.displayTitle, which owns the fade state machine."
       },
       {
-        "name": "AntiTitle",
-        "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
-        ],
-        "purpose": "Cancel or modify title/subtitle messages.",
-        "how_it_works": "",
-        "detailed_code": "if (event.getPacket() instanceof S45PacketTitle) event.setCancelled(true);",
-        "vanilla_hook": "EventReceivePacket"
+        "h": "Vanilla handling",
+        "p": "handleTitle reads the type, formats the component text, and calls ingameGUI.displayTitle(title, subtitle, fadeIn, displayTime, fadeOut). GuiIngame stores the strings plus the three timings and animates alpha over ticks. RESET clears both text slots and restores default timings (10/70/20); CLEAR hides immediately. The packet is clientbound-only and stateless server-side: the server tracks nothing about what the client currently displays."
+      },
+      {
+        "h": "Why clients touch it",
+        "p": "Two Rise builds ship the only module hit: RueSessionStats (Rise 6.1.30 and 6.2.4), a SessionStats HUD mode that listens on PacketReceiveEvent, strips control codes from the title message, and increments its wins counter when the text equals 'VICTORY!' (Hypixel game-win detection). Anti-title modules that suppress or rewrite titles are common in other clients, but none of the 8 reference clients has one: the corpus shows no cancel-based title handling."
+      },
+      {
+        "h": "Exploit surface",
+        "p": "The text is a full IChatComponent parsed client-side, so it shares the component-parsing attack surface of S02PacketChat, including formatting codes and arbitrarily nested JSON. The handler calls getFormattedText() with no length limit beyond the component parser's own. For module authors the useful property is that titles are a timing-accurate game-state signal: Hypixel sends VICTORY! exactly once per win, which is why the win counter keys off it rather than chat."
       }
+    ],
+    "overview": "Screen title state machine fed by /title and plugin announcements. Only Rise's RueSessionStats HUD mode hooks it, using the VICTORY! title as a win signal for its session stats counter. No anti-title module exists in the 8 clients.",
+    "server_handling": "CommandTitle constructs the packet per /title syntax: TIMES from three parsed ints, TITLE and SUBTITLE with a ChatComponentProcessor-processed component, CLEAR and RESET with a null component. The server keeps no per-client title state; each packet is fire-and-forget. Plugins such as Hypixel send titles directly with their own timing sequences, typically TIMES followed by TITLE.",
+    "protocol_notes": "Type is a VarInt enum. TITLE and SUBTITLE append an IChatComponent (JSON); TIMES appends three ints; CLEAR and RESET append nothing. readPacketData reads the component only for TITLE and SUBTITLE and the three ints only for TIMES. The component is null on the wire for TIMES, CLEAR and RESET, and handlers must tolerate that; RueSessionStats does so with an explicit null check.",
+    "anticheat_landscape": "No anti-cheat involvement: titles are cosmetic, clientbound and unacknowledged. Suppressing or rewriting them cannot affect server-side validation. The only measurable behaviour is client rendering, which is invisible to the server.",
+    "modules": [
+      {
+        "name": "RueSessionStats",
+        "found_in": [
+          "Rise 6.1.30",
+          "Rise 6.2.4"
+        ],
+        "purpose": "Session stats HUD overlay that counts kills and wins; uses S45PacketTitle to detect Hypixel game wins.",
+        "how_it_works": "A Mode<SessionStats> render module. onPreMotionEvent refreshes the elapsed-time string every 20 ticks; onKill increments the kill counter; onPacketReceiveEvent checks each S45PacketTitle, strips control codes from getMessage().getUnformattedText(), and increments wins on an exact 'VICTORY!' match. onServerJoin resets the session; the overlay draws through the client's layered render system with a draggable position.",
+        "detailed_code": "// ===== FILE: Rise 6.1.30 — com/alan/clients/module/impl/render/sessioninfo/RueSessionStats.java =====\npackage com.alan.clients.module.impl.render.sessioninfo;\n\nimport com.alan.clients.event.Listener;\nimport com.alan.clients.event.annotations.EventLink;\nimport com.alan.clients.event.impl.motion.PreMotionEvent;\nimport com.alan.clients.event.impl.other.KillEvent;\nimport com.alan.clients.event.impl.other.ServerJoinEvent;\nimport com.alan.clients.event.impl.packet.PacketReceiveEvent;\nimport com.alan.clients.event.impl.render.Render2DEvent;\nimport com.alan.clients.font.Fonts;\nimport com.alan.clients.font.Weight;\nimport com.alan.clients.module.impl.render.SessionStats;\nimport com.alan.clients.util.localization.Localization;\nimport com.alan.clients.util.render.ColorUtil;\nimport com.alan.clients.util.render.RenderUtil;\nimport com.alan.clients.util.vector.Vector2d;\nimport com.alan.clients.value.Mode;\nimport com.alan.clients.value.impl.DragValue;\nimport lombok.AllArgsConstructor;\nimport net.minecraft.network.play.server.S45PacketTitle;\nimport net.minecraft.util.StringUtils;\n\nimport java.awt.*;\nimport java.util.concurrent.TimeUnit;\n\nimport static com.alan.clients.layer.Layers.BLUR;\nimport static com.alan.clients.layer.Layers.REGULAR;\n\npublic final class RueSessionStats extends Mode<SessionStats> {\n    private final DragValue position = this.getParent().getPosition();\n\n    public RueSessionStats(String name, SessionStats parent) {\n        super(name, parent);\n    }\n\n    private Session session = new Session(0, 0, 0, 0, 0, 0);\n    private String time = \"0 seconds\";\n\n    @EventLink\n    public final Listener<PreMotionEvent> onPreMotionEvent = event -> {\n        // Don't do this awful shit every frame\n        if (mc.thePlayer.ticksExisted % 20 == 0) {\n            long elapsed = System.currentTimeMillis() - this.session.startTime;\n            long hours = TimeUnit.MILLISECONDS.toHours(elapsed);\n            long minutes = TimeUnit.MILLISECONDS.toMinutes(elapsed) % 60;\n            long seconds = TimeUnit.MILLISECONDS.toSeconds(elapsed) % 60;\n\n            String base = \"\";\n            if (hours > 0)\n                base += hours + \" \" + (hours == 1 ? Localization.get(\"ui.sessionstats.hour\") : Localization.get(\"ui.sessionstats.hours\")) + ((minutes == 0 ? \"\" : \" \"));\n            if (minutes > 0)\n                base += minutes + \" \" + (minutes == 1 ? Localization.get(\"ui.sessionstats.minute\") : Localization.get(\"ui.sessionstats.minutes\")) + (seconds == 0 || hours > 0 ? \"\" : \" \");\n            if (seconds > 0 && hours == 0)\n                base += seconds + \" \" + (seconds == 1 ? Localization.get(\"ui.sessionstats.second\") : Localization.get(\"ui.sessionstats.seconds\"));\n\n            this.time = base;\n        }\n    };\n\n    @EventLink\n    public final Listener<Render2DEvent> onRender2D = event -> {\n        double padding = 8;\n        position.scale = new Vector2d(200 - 70, 100 - 45);\n\n        // Don't draw if the F3 menu is open\n        if (mc.gameSettings.showDebugInfo) return;\n\n        getLayer(BLUR).add(() -> {\n            RenderUtil.roundedRectangle(position.position.x, position.position.y, position.scale.x, position.scale.y, 11, Color.BLACK);\n        });\n\n        // Draw all the text itself\n        getLayer(REGULAR, 1).add(() -> {\n            RenderUtil.roundedRectangle(position.position.x, position.position.y, position.scale.x, position.scale.y, 11, ColorUtil.withAlpha(Color.black, 100));\n            RenderUtil.roundedOutlineGradientRectangle(position.position.x, position.position.y, position.scale.x, position.scale.y, 11, 0.5, ColorUtil.withAlpha(getTheme().getFirstColor(), 200), ColorUtil.withAlpha(getTheme().getSecondColor(), 200));\n\n            // Format the walking/flying distance in meters/km\n\n            Fonts.MAIN.get(24, Weight.REGULAR).drawCentered(Localization.get(\"ui.sessionstats.name\"), position.position.x + position.scale.x / 2f, position.position.y + padding, getTheme().getAccentColor().getRGB());\n            Fonts.MAIN.get(18, Weight.REGULAR).drawCentered(time, position.position.x + position.scale.x / 2f, position.position.y + padding + 19, new Color(255, 255, 255, 200).getRGB());\n            Fonts.MAIN.get(18, Weight.REGULAR).drawCentered(Localization.get(\"ui.sessionstats.kills\").toLowerCase() + \" \" + session.kills, position.position.x + 35, position.position.y + padding + 32, new Color(255, 255, 255, 200).getRGB());\n            Fonts.MAIN.get(18, Weight.REGULAR).drawWithShadow(Localization.get(\"ui.sessionstats.wins\").toLowerCase() + \" \" + session.wins, position.position.x + 75, position.position.y + padding + 32, new Color(255, 255, 255, 200).getRGB());\n        });\n    };\n\n    @EventLink\n    public final Listener<KillEvent> onKill = event -> {\n        this.session.kills++;\n    };\n\n    @EventLink\n    public final Listener<PacketReceiveEvent> onPacketReceiveEvent = event -> {\n        if (event.getPacket() instanceof S45PacketTitle) {\n            S45PacketTitle s45 = (S45PacketTitle) event.getPacket();\n            if (s45.getMessage() == null) return;\n\n            if (StringUtils.stripControlCodes(s45.getMessage().getUnformattedText()).equals(\"VICTORY!\")) {\n                this.session.wins++;\n            }\n        }\n    };\n\n    @EventLink\n    public final Listener<ServerJoinEvent> onServerJoin = event -> {\n        this.session = new Session(0, 0, 0, 0, 0, 0);\n    };\n\n    @AllArgsConstructor\n    private static class Session {\n        int kills, wins;\n        int userBans, globalBans;\n        double distanceWalked, distanceFlown;\n        final long startTime = System.currentTimeMillis();\n    }\n\n}\n// NOTE (AI): The S45 hook is the wins counter: every PacketReceiveEvent is checked for S45PacketTitle, control codes are stripped from the unformatted message, and an exact match on 'VICTORY!' increments the session win count. The null check on getMessage() matters because TIMES, CLEAR and RESET actions carry no component. The kill counter comes from the client's own KillEvent instead of S42PacketCombatEvent, which the vanilla server never sends for deaths. Rise 6.2.4 ships the identical file under Client-release2/Client/src/main/java.",
+        "code_source": "Rise 6.1.30 — com/alan/clients/module/impl/render/sessioninfo/RueSessionStats.java",
+        "vanilla_hook": "PacketReceiveEvent (com.alan.clients.event.impl.packet.PacketReceiveEvent).",
+        "anti_cheat_notes": "None. The module only reads clientbound state and draws HUD text; nothing serverbound is altered, so there is no flag surface. A false-positive win count is a client-side cosmetic issue, not a detection risk.",
+        "variations": "Rise 6.2.4 ships the identical file under Client-release2/Client/src/main/java with the same package path. Rise 5.99 has no S45 reference at all; the module exists only in the 6.x component-based module tree."
+      }
+    ],
+    "general_hooks": "PacketReceiveEvent with an instanceof check and a null-message guard is the pattern RueSessionStats uses; no client in the corpus cancels or rewrites the packet.",
+    "related": [
+      "S02PacketChat",
+      "S47PacketPlayerListHeaderFooter",
+      "S2BPacketChangeGameState"
     ]
   }
 }

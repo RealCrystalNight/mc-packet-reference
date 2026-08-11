@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S23PacketBlockChange (0x23): Updates a single block in the world — position and new block state (combined ID+metadata).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="XRay, Search, ChestESP">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="WatchdogJumpSprint">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S23PacketBlockChange — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S23PacketBlockChange — Minecraft 1.8.9 Packet Reference","description":"The server's authoritative one-block correction. In this corpus it is used by exactly one module, Rise 6.2.4's WatchdogJumpSprint, which reads S23 arrivals as placement acknowledgements to pace a Watchdog-targeted ice-block C08 exploit. Everything else in the 8 clients lets the vanilla handler write","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -70,23 +70,374 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayClient.handleBlockChange()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S23 is the server's single-block state correction. The server sends it whenever one block in a loaded chunk changes and the change is cheap to express, with the alternative S21PacketChunkData / S22PacketMultiBlockChange reserved for bulk edits. The block state is encoded as a VarInt into the Block.BLOCK_STATE_IDS registry, not as the old blockId | (meta &lt;&lt; 12) split; every block in 1.8.9 has a unique registry ID. NetHandlerPlayServer pushes it from the block-breaking path (line 481), the block-placement path (line 535), ItemInWorldManager.tryHarvestBlock (line 254) and PlayerManager's chunk watcher broadcast (line 436).</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleBlockChange calls PacketThreadUtil.func_180031_a for main-thread dispatch, then clientWorldController.func_180503_b(pos, state), which is WorldClient.setBlockState: it replaces the local block, updates the lightmap, and re-renders the region. That is the entire effect; there is no server round trip. Because the handler writes straight into the world, any module that reads world state after the event bus gets the correction for free, which is why so few clients intercept S23 directly.</p>
+<h4>Why clients touch it</h4>
+<p>Only one module in the 8-client corpus references S23PacketBlockChange: Rise 6.2.4's WatchdogJumpSprint, a Scaffold sprint mode. It treats every S23 as proof the server accepted a placed block: the PacketReceiveEvent handler sets start3 = true and increments a block counter, and the pre-motion handler then uses start3 to fire a spoofed C08PacketPlayerBlockPlacement with an ice ItemStack against the player's own position (line 116), which is the Watchdog anti-cheat block-placement trigger used to keep the player's on-ground state consistent while sprint-jumping. The counter also feeds previousBlockValue / previousTick logic that paces how often the exploit packet is sent.</p>
+<h4>Exploit surface</h4>
+<p>S23 is clientbound and carries no player identity, so there is nothing to spoof server-side; the abuse is entirely on the receiving end. Ghost-block clients that locally predict block state must reconcile against S23 when the server disagrees, and scaffold / nuker modules can use the arrival timing of S23 as a cheap ping-free ack. Anti-cheats watch the reverse direction: they validate that a C08PacketPlayerBlockPlacement is followed by a matching S23 echo and check the placed block against the client's claimed reach, which is exactly the surface WatchdogJumpSprint's ice-placement trick plays on.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>NetHandlerPlayServer sends S23 on block break (processPlayerDigging, ~line 481), on placement and its neighbor update (~line 535), plus a second packet for the offset block when the placed block has a block-on-use neighbor. ItemInWorldManager sends it after a successful harvest, and PlayerManager.sendToAllPlayersWatchingChunk broadcasts to every player with the chunk loaded. In 1.8.9 there is no server-side validation of the client's C08 beyond reach and interval checks in the digging/placement handlers.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Wire format: BlockPos as a packed long (readBlockPos) followed by a VarInt block state registry ID. The state is resolved at construction time from the world, so the server always sends what it believes is current, and a stale S23 can overwrite a newer client-side prediction. In PLAY state only. Frequency is bounded by player block interactions, which is what makes it a usable ack channel.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>S23 itself is never flagged; it is server-originated truth. Anti-cheats use it to detect ghost blocks and reach abuse: a placed block whose S23 echo position lies outside the client's valid reach, or a C08 that gets no echo, feeds reach and scaffold checks. Clients that spoof block placement need the echo to keep their internal state honest, and the timing between C08 and S23 is a latency signal that modules like WatchdogJumpSprint fold into their pacing.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">XRay</span>
+<p class="impl-pattern">The server's authoritative one-block correction. In this corpus it is used by exactly one module, Rise 6.2.4's WatchdogJumpSprint, which reads S23 arrivals as placement acknowledgements to pace a Watchdog-targeted ice-block C08 exploit. Everything else in the 8 clients lets the vanilla handler write the state into WorldClient and reads the world afterwards.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WatchdogJumpSprint</span>
+<span class="impl-module-clients">(Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Track single block changes.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Use S23 block-change arrivals as placement acks to pace a Watchdog-targeted ice-block placement exploit inside Scaffold.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PacketReceiveEvent listener checks for S23PacketBlockChange, sets start3 = true and increments the block counter. The PreMotionEvent handler then uses start3 to send a spoofed C08PacketPlayerBlockPlacement aimed at the player's own position with an ice ItemStack and randomized hit vectors, one-shotting start3 per ack so the exploit packet only fires after the server confirms a placement.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/player/scaffold/sprint/WatchdogJumpSprint.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/player/scaffold/sprint/WatchdogJumpSprint.java =====
+package com.alan.clients.module.impl.player.scaffold.sprint;
+
+import com.alan.clients.Client;
+import com.alan.clients.component.impl.player.BadPacketsComponent;
+import com.alan.clients.component.impl.player.PingSpoofComponent;
+import com.alan.clients.component.impl.player.RotationComponent;
+import com.alan.clients.component.impl.player.Slot;
+import com.alan.clients.component.impl.player.rotationcomponent.MovementFix;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.motion.PreUpdateEvent;
+import com.alan.clients.event.impl.motion.StrafeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.module.impl.movement.LongJump;
+import com.alan.clients.module.impl.movement.Speed;
+import com.alan.clients.module.impl.player.Scaffold;
+import com.alan.clients.module.impl.player.scaffold.tower.WatchdogTower;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.util.player.PlayerUtil;
+import com.alan.clients.util.player.SlotUtil;
+import com.alan.clients.util.vector.Vector2f;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.BooleanValue;
+import net.minecraft.block.BlockAir;
+import net.minecraft.init.Blocks;
+import net.minecraft.init.Items;
+import net.minecraft.item.ItemBlock;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+import net.minecraft.network.play.server.S23PacketBlockChange;
+import net.minecraft.potion.Potion;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.Vec3i;
+
+import java.util.Objects;
+import java.util.Random;
+
+public class WatchdogJumpSprint extends Mode&lt;Scaffold&gt; {
+
+    public WatchdogJumpSprint(String name, Scaffold parent) {
+        super(name, parent);
+    }
+
+    int previousBlockValue = -1;
+    private boolean jump = false;
+    private boolean jumpHandled = false;
+    int previousTick = -1;
+    int ongroundticks;
+    int time;
+    double speed;
+    public Vec3i offset = new Vec3i(0, 0, 0);
+    public static boolean hasC08Packet = false;
+    public static boolean start2 = false;
+    public static boolean start3 = false;
+    public static boolean start4 = false;
+    int startTriggerCount = 0;
+    private int block;
+    public final BooleanValue extraBlocks = new BooleanValue("Place Extra blocks", this, false);
+
+    @EventLink(value = Priorities.HIGH)
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+
+if(event.isOnGround()){
+    ongroundticks++;
+} else{
+    ongroundticks = 0;
+}
+
+
+        getParent().recursions = 1;
+        if (mc.thePlayer.onGroundTicks &gt; 2 &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; !Client.INSTANCE.getModuleManager().get(Speed.class).isEnabled() &amp;&amp; !mc.thePlayer.isPotionActive(Potion.moveSpeed)) {
+            MoveUtil.strafe();
+
+            mc.thePlayer.motionZ *= 1.129;
+            mc.thePlayer.motionX *= 1.129;
+        } else if (mc.thePlayer.onGroundTicks &gt; 2 &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; !Client.INSTANCE.getModuleManager().get(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.isPotionActive(Potion.moveSpeed) &amp;&amp; mc.thePlayer.getActivePotionEffect(Potion.moveSpeed).amplifier + 1 &gt;= 2) {
+            MoveUtil.strafe();
+            mc.thePlayer.motionZ *= 1.143;
+            mc.thePlayer.motionX *= 1.143;
+        } else if (mc.thePlayer.onGroundTicks &gt; 2 &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; !Client.INSTANCE.getModuleManager().get(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.isPotionActive(Potion.moveSpeed) &amp;&amp; mc.thePlayer.getActivePotionEffect(Potion.moveSpeed).amplifier + 1 == 1) {
+            MoveUtil.strafe();
+            mc.thePlayer.motionZ *= 1.131;
+            mc.thePlayer.motionX *= 1.131;
+        }
+        if(Math.abs(mc.thePlayer.motionY) &lt; 0.1 &amp;&amp; mc.thePlayer.offGroundTicks&lt;2){
+        //    mc.thePlayer.onGround = true;
+        }
+
+
+       // ChatUtil.display(mc.thePlayer.motionY);
+
+        if (mc.gameSettings.keyBindSneak.isKeyDown()) {
+            return;
+        }
+
+        int currentTick = mc.thePlayer.ticksExisted;
+        int currentBlockValue = block;
+        if ( !getModule(Flight.class).isEnabled() &amp;&amp;  !getModule(LongJump.class).isEnabled()) {
+            if (!BadPacketsComponent.bad(true, true, false, true, false) &amp;&amp; Math.random()&gt;0.5 &amp;&amp; start3 &amp;&amp; MoveUtil.isMoving()) {
+//ChatUtil.display("ice on my wrist");
+
+                Random random = new Random();
+                float hitX = random.nextFloat();
+                float hitZ = random.nextFloat();
+
+                PacketUtil.send(new C08PacketPlayerBlockPlacement(
+                        new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ),
+                        EnumFacing.UP.getIndex(),
+                        new ItemStack(Blocks.ice),
+                        hitX,
+                        1.0F,
+                        hitZ
+                ));
+                start3 = false;
+            }
+        }
+
+
+
+        if (previousTick != -1 &amp;&amp; currentTick - previousTick &gt;= 4) {
+
+            previousBlockValue = currentBlockValue;
+        } else if (previousTick == -1) {
+
+            previousTick = currentTick;
+            previousBlockValue = currentBlockValue;
+        }
+
+
+        if (mc.thePlayer.onGround) {
+
+            MoveUtil.strafe();
+        }
+
+
+
+        if (mc.thePlayer.onGround) {
+            event.setPosY(event.getPosY() + 0.0001);
+        }
+
+        if (jump &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown()) {
+            if (mc.thePlayer.motionY &gt; .331 &amp;&amp; mc.thePlayer.motionY &lt; .34) {
+
+
+            } else if (mc.thePlayer.motionY &gt; .15) {
+
+
+            }
+            WatchdogTower.angle = mc.thePlayer.rotationYaw;
+            WatchdogTower.tickCounter = 17;
+            WatchdogTower.ticks = 0;
+
+            MoveUtil.stop();
+
+            jump = false;
+
+            RotationComponent.setRotations(new Vector2f((float) (mc.thePlayer.rotationYaw + (Math.random() - 0.5) * 3), (float) (90)), 10, MovementFix.NORMAL);// Store the BlockPos in a variable
+
+            if (!(PlayerUtil.block(mc.thePlayer.posX, mc.thePlayer.lastGroundY - 2, mc.thePlayer.posY) instanceof BlockAir)) {
+                getParent().startY = mc.thePlayer.lastGroundY - 1;
+            }
+        }
+
+        if (mc.gameSettings.keyBindJump.isKeyDown()) {
+            jump = true;
+        }
+    };
+
+    @Override
+    public void onEnable() {
+        start3 = false;
+        start4 = false;
+        if (!(getModule(Scaffold.class).sameY.getValue().getName().equals("Auto Jump"))) {
+            if (mc.thePlayer.onGroundTicks &gt; 9) {
+                hasC08Packet = true;
+                jumpHandled = true;
+
+            }
+        } else {
+            mc.thePlayer.safeWalk = false;
+        }
+
+
+        start2 = true;
+
+
+        jump = false;
+
+        if (!mc.thePlayer.onGround &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown()) {
+            mc.thePlayer.motionX *= 0;
+            mc.thePlayer.motionZ *= 0;
+        }
+
+        previousBlockValue = -1;
+        previousTick = -1;
+        block = 0;
+        start2 = true;
+    }
+
+    @Override
+    public void onDisable() {
+        start3 = false;
+        start3 = false;
+        mc.thePlayer.safeWalk = false;
+        hasC08Packet = false;
+        jumpHandled = false;
+        if (mc.thePlayer.ticksSinceTeleport &lt; 20) {
+            MoveUtil.stop();
+        }
+        start2 = false;
+        if (jump) {
+            MoveUtil.stop();
+        }
+
+        PingSpoofComponent.dispatch();
+    }
+
+    @EventLink(value = Priorities.MEDIUM)
+    public final Listener&lt;PreUpdateEvent&gt; onPreUpdate = event -&gt; {
+        boolean start = mc.thePlayer.lastGroundY == getParent().startY;
+
+        if (!extraBlocks.getValue()) {
+            start = true;
+        }
+        if (getComponent(Slot.class).getItemStack() != null &amp;&amp;
+                mc.thePlayer.posY &gt; getParent().startY &amp;&amp;
+                mc.thePlayer.posY + MoveUtil.predictedMotion(mc.thePlayer.motionY, 2) &lt;
+                        getParent().startY + 1 &amp;&amp; ((!jumpHandled || hasC08Packet) &amp;&amp; Client.INSTANCE.getModuleManager().get(Speed.class).isEnabled()) &amp;&amp; !(getModule(Scaffold.class).sameY.getValue().getName().equals("Auto Jump")) || getComponent(Slot.class).getItemStack() != null &amp;&amp;
+                mc.thePlayer.posY &gt; getParent().startY &amp;&amp;
+                mc.thePlayer.posY + MoveUtil.predictedMotion(mc.thePlayer.motionY, 2) &lt;
+                        getParent().startY + 1 &amp;&amp; getModule(Scaffold.class).sameY.getValue().getName().equals("Auto Jump")) {
+
+            getComponent(Slot.class).setSlot(SlotUtil.findBlock());
+        }
+
+
+        if (Client.INSTANCE.getModuleManager().get(Speed.class).isEnabled()) {
+            start = false;
+        }
+        if (jumpHandled) {
+            start = true;
+
+
+        }
+
+        if (mc.thePlayer.offGroundTicks &gt; 8) {
+            jumpHandled = false;
+        }
+
+        if (!start &amp;&amp; mc.thePlayer.onGround &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown()) {
+            MoveUtil.strafe(MoveUtil.getAllowedHorizontalDistance() - .01);
+            mc.thePlayer.jump();
+
+
+        }
+
+        if (!(PlayerUtil.isBlockUnder(2) || PlayerUtil.isBlockUnder(1) || PlayerUtil.isBlockUnder(0) || PlayerUtil.isBlockUnder(3)) &amp;&amp; !mc.gameSettings.keyBindJump.isPressed() &amp;&amp; !mc.thePlayer.isPotionActive(Potion.moveSpeed) &amp;&amp; !jump) {
+        } else if (mc.thePlayer.onGroundTicks &lt; 1) {
+            mc.thePlayer.safeWalk = false;
+        }
+
+
+        if (mc.gameSettings.keyBindJump.isPressed() &amp;&amp; mc.thePlayer.onGround &amp;&amp; !jump &amp;&amp; (start2 || getModule(Scaffold.class).sameY.getValue().getName().equals("Auto Jump")) &amp;&amp; !Client.INSTANCE.getModuleManager().get(Speed.class).isEnabled()) {
+            start2 = false;
+            MoveUtil.strafe(MoveUtil.getbaseMoveSpeed() * .9);
+            if ((getModule(Scaffold.class).sameY.getValue().getName().equals("Auto Jump"))) {
+                MoveUtil.strafe(MoveUtil.getAllowedHorizontalDistance() - .001);
+            }
+        }
+
+
+        if (mc.thePlayer.offGroundTicks == 4 &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; !Client.INSTANCE.getModuleManager().get(Speed.class).isEnabled() &amp;&amp; !start &amp;&amp; getModule(Scaffold.class).sameY.getValue().getName().equals("Auto Jump")) {
+            mc.thePlayer.motionY = mc.thePlayer.motionY - .19;
+        }
+
+        if (mc.thePlayer.offGroundTicks == 1 &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown()) {
+            MoveUtil.strafe();
+        }
+
+        if (PlayerUtil.blockRelativeToPlayer(0, mc.thePlayer.motionY, 0) != Blocks.air &amp;&amp; mc.thePlayer.offGroundTicks &gt; 2) {
+            MoveUtil.strafe();
+        }
+
+
+        if (start &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; !mc.thePlayer.onGround &amp;&amp; !getModule(Speed.class).isEnabled() &amp;&amp; extraBlocks.getValue()) {
+            MoveUtil.stop();
+        } else if (start &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; !mc.thePlayer.onGround &amp;&amp; extraBlocks.getValue()) {
+            MoveUtil.stop();
+        }
+
+
+        if (start &amp;&amp; mc.thePlayer.onGround &amp;&amp; !mc.gameSettings.keyBindJump.isKeyDown()) {
+            startTriggerCount++;
+        }
+
+        if (!start) {
+            startTriggerCount = 0;
+        }
+    };
+
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceive = event -&gt; {
+        if (event.getPacket() instanceof S23PacketBlockChange) {
+
+            start3 = true;
+            block++;
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+
+
+
+
+        if (!(getModule(Scaffold.class).sameY.getValue().getName().equals("Auto Jump"))) {
+            if (mc.thePlayer.onGround &amp;&amp; jumpHandled &amp;&amp; hasC08Packet &amp;&amp; !Client.INSTANCE.getModuleManager().get(Speed.class).isEnabled()) {
+                mc.thePlayer.motionY = .42;
+                hasC08Packet = false;
+            }
+        }
+    };
+}
+// NOTE (AI): The S23 hook is the small onPacketReceive listener at the bottom: every received block change sets start3 and bumps the block counter. start3 gates the ice-placement C08 in onPreMotionEvent (line ~109), and the block counter feeds the previousBlockValue/previousTick pacing. The ice C08 is the actual Watchdog exploit; S23 only supplies the acknowledgement signal. Note the same mode exists in Rise 6.1.30's tree without the S23 reference, which is why found_in lists only 6.2.4.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (S23PacketBlockChange instanceof check).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Reading S23 is passive and undetectable; the flag surface is the ice C08 itself, which is why the module only sends it after a genuine server ack and randomizes hitX/hitZ per send.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30's WatchdogJumpSprint does not reference S23 (only the script NetworkAPI does); the 6.2.4 variant is the only module in the corpus touching this packet.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Search</span>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent on every client; the vanilla handler is the only consumer for most clients.</div>
+<div class="impl-clients">All 8 clients ship the vanilla NetHandlerPlayClient.handleBlockChange untouched. The only divergence is Rise 6.2.4's scaffold mode intercepting the packet on its own event bus; Rise 6.x also exposes S23 to its scripting API (NetworkAPI.java).</div>
 </div>
-<p class="impl-pattern">Track single block changes.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ChestESP</span>
-</div>
-<p class="impl-pattern">Track single block changes.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S21PacketChunkData/">S21PacketChunkData</a>
+<a class="related-chip" href="../S22PacketMultiBlockChange/">S22PacketMultiBlockChange</a>
+<a class="related-chip" href="../C08PacketPlayerBlockPlacement/">C08PacketPlayerBlockPlacement</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

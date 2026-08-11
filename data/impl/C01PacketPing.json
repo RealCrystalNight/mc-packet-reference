@@ -1,0 +1,48 @@
+{
+  "writeup": [
+    {
+      "h": "Role in the protocol",
+      "p": "C01PacketPing is the STATUS-state latency probe. After S00PacketServerInfo arrives, OldServerPinger sends it with a single long field, and the server echoes the exact value back in S01PacketPong. The client computes the row latency as receiveTime minus sentTime, averages it over the last few samples, and displays it in the server list. RealmsServerStatusPinger sends the same packet with Realms.currentTimeMillis() on realm connections. This is the only ping in the protocol that exists outside the PLAY state; the tab-list ping later comes from the C00/S00 keepalive pair."
+    },
+    {
+      "h": "Vanilla handling",
+      "p": "NetHandlerStatusServer.processPing is a pure echo: it sends S01PacketPong(packetIn.getClientTime()) with no transformation and no state change. OldServerPinger tracks a counter (field_175092_e) incremented per ping cycle and sends C01PacketPing with it; the pong handler then computes the round-trip against the stored send time. The packet's long value is opaque to the server: it never reads it beyond echoing, which is why the value can be any client-chosen timestamp."
+    },
+    {
+      "h": "Why clients touch it",
+      "p": "Only Rise 6.1.30 and 6.2.4 BlinkComponent reference C01PacketPing, in the same pre-play exemption list as the other handshake packets. No ping-spoof module in the 8 clients targets it: every PingSpoof implementation operates on C00PacketKeepAlive in the PLAY state, where the server folds the round-trip into the tab-list ping EMA. Spoofing the STATUS ping would only fake the user's own server-list readout, which is a purely local number, so no module bothers. The corpus confirms the packet is otherwise untouched vanilla plumbing."
+    },
+    {
+      "h": "Exploit surface",
+      "p": "There is no meaningful exploit surface. The value is client-chosen and server-echoed, so a client could lie about its own latency, but the result is displayed only to itself on the multiplayer screen and vanishes on join. Server scanners could skip the ping to save a round-trip per host, but none of the 8 clients implements one. The only code interaction is defensive: BlinkComponent must not buffer this packet, or the pinger's latency sample would stall and the server row would show a stale or zero ping."
+    }
+  ],
+  "overview": "The STATUS-state latency probe: client sends an arbitrary long, server echoes it, client measures the round-trip for the server list. No module spoofs it, because the result is a local display value; the sole corpus hit is BlinkComponent's exemption list.",
+  "server_handling": "NetHandlerStatusServer.processPing sends S01PacketPong with the same long value, no validation, no rate limiting, no state change. The status handler is stateless by design: it answers queries and pings and expects the client to close the connection.",
+  "protocol_notes": "STATUS state, id 0x01, one 8-byte long. Must follow C00PacketServerQuery and S00PacketServerInfo. The server never interprets the value; it is a client-chosen timestamp (OldServerPinger uses a counter, RealmsServerStatusPinger uses currentTimeMillis). The same field name family (C01) collides with the LOGIN-state C01PacketEncryptionResponse and the PLAY-state C01PacketChatMessage, so id-based dispatch depends entirely on the connection state.",
+  "anticheat_landscape": "No anti-cheat measures the STATUS ping: it carries no player identity, no timing that persists, and no gameplay state. Anti-cheat plugins only ever see PLAY-state traffic. The only consumers are the server-list UI and reflection tools, neither of which is a flagging surface.",
+  "modules": [
+    {
+      "name": "BlinkComponent",
+      "found_in": [
+        "Rise 6.1.30",
+        "Rise 6.2.4"
+      ],
+      "purpose": "Exempt C01PacketPing from blink buffering so the server-list latency sample completes while blink is armed.",
+      "how_it_works": "The hard-coded pre-play exemption list includes C01PacketPing alongside C00Handshake, C00PacketLoginStart, C00PacketServerQuery and C01PacketEncryptionResponse; the PacketSendEvent listener returns before the blink queue logic, so the ping always reaches the wire.",
+      "detailed_code": "// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BlinkComponent.java =====\npackage com.alan.clients.component.impl.player;\n\nimport com.alan.clients.component.Component;\nimport com.alan.clients.event.Listener;\nimport com.alan.clients.event.Priorities;\nimport com.alan.clients.event.annotations.EventLink;\nimport com.alan.clients.event.impl.other.ServerJoinEvent;\nimport com.alan.clients.event.impl.other.WorldChangeEvent;\nimport com.alan.clients.event.impl.packet.PacketSendEvent;\nimport com.alan.clients.util.packet.PacketUtil;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.handshake.client.C00Handshake;\nimport net.minecraft.network.login.client.C00PacketLoginStart;\nimport net.minecraft.network.login.client.C01PacketEncryptionResponse;\nimport net.minecraft.network.play.client.C03PacketPlayer;\nimport net.minecraft.network.status.client.C00PacketServerQuery;\nimport net.minecraft.network.status.client.C01PacketPing;\nimport rip.vantage.commons.util.time.StopWatch;\n\nimport java.util.ArrayList;\nimport java.util.Arrays;\nimport java.util.concurrent.ConcurrentLinkedQueue;\n\npublic final class BlinkComponent extends Component {\n\n    public static final ConcurrentLinkedQueue<Packet<?>> packets = new ConcurrentLinkedQueue<>();\n    public static boolean blinking, dispatch;\n    public static ArrayList<Class<?>> exemptedPackets = new ArrayList<>();\n    public static StopWatch exemptionWatch = new StopWatch();\n\n    public static void setExempt(Class<?>... packets) {\n        exemptedPackets = new ArrayList<>(Arrays.asList(packets));\n        exemptionWatch.reset();\n    }\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<PacketSendEvent> onPacketSend = event -> {\n        if (mc.thePlayer == null) {\n            packets.clear();\n            exemptedPackets.clear();\n            return;\n        }\n\n        if (mc.thePlayer.isDead || mc.isSingleplayer() || !mc.getNetHandler().doneLoadingTerrain) {\n            packets.forEach(PacketUtil::sendNoEvent);\n            packets.clear();\n            blinking = false;\n            exemptedPackets.clear();\n            return;\n        }\n\n        final Packet<?> packet = event.getPacket();\n\n        if (packet instanceof C00Handshake || packet instanceof C00PacketLoginStart ||\n                packet instanceof C00PacketServerQuery || packet instanceof C01PacketPing ||\n                packet instanceof C01PacketEncryptionResponse) {\n            return;\n        }\n\n        if (blinking && !dispatch) {\n            if (exemptionWatch.finished(100)) {\n                exemptionWatch.reset();\n                exemptedPackets.clear();\n            }\n\n//            PingSpoofComponent.spoofing = false;\n\n            if (!event.isCancelled() && exemptedPackets.stream().noneMatch(packetClass ->\n                    packetClass == packet.getClass())) {\n                packets.add(packet);\n                event.setCancelled();\n            }\n        } else if (packet instanceof C03PacketPlayer) {\n            packets.forEach(PacketUtil::sendNoEvent);\n            packets.clear();\n            dispatch = false;\n        }\n    };\n\n    public static void dispatch() {\n        dispatch = true;\n    }\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<WorldChangeEvent> onWorldChange = event -> {\n        packets.clear();\n        BlinkComponent.blinking = false;\n    };\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<ServerJoinEvent> onServerJoin = event -> {\n        packets.clear();\n        BlinkComponent.blinking = false;\n    };\n\n}\n\n\n// NOTE (AI): C01PacketPing is the only packet in the exemption list that carries a timing value, but the component never touches it: the exemption simply guarantees the pinger's sample round-trip finishes. Spoofing the STATUS ping would be pointless anyway, since the measured latency is rendered only in the client's own server list.",
+      "code_source": "Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BlinkComponent.java",
+      "vanilla_hook": "PacketSendEvent",
+      "anti_cheat_notes": "None: passed through unmodified; the STATUS exchange is invisible to anti-cheats by construction.",
+      "variations": "Rise 6.1.30 is byte-identical. No other client in the corpus has a module-level reference."
+    }
+  ],
+  "general_hooks": "PacketSendEvent in Rise 6.x BlinkComponent only.",
+  "client_variations": "All other clients use the bundled vanilla OldServerPinger/RealmsServerStatusPinger, which send C01PacketPing directly on the status NetworkManager with no module involvement.",
+  "related": [
+    "C00Handshake",
+    "C00PacketServerQuery",
+    "S00PacketServerInfo",
+    "S01PacketPong"
+  ]
+}

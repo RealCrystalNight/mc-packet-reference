@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S29PacketSoundEffect (0x29): Plays a named sound at a world position with volume and pitch.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ESP, SoundLocator">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Disabler (HypixelSlime sound cancel), LoggerRCECheck (security)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S29PacketSoundEffect — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S29PacketSoundEffect — Minecraft 1.8.9 Packet Reference","description":"A pure world-effect broadcast: named sound, x8 fixed-point position, volume, pitch byte. The 8 clients barely touch it. The only module-grade hit is Rise 5.99's Disabler cancelling the Hypixel slime jump sound; Rise 6.x handles it as a Log4j RCE scan surface rather than as audio.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -76,20 +76,817 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayClient.handleSoundEffect()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>Server-to-client broadcast of a named sound at a fixed-point position. The server computes a delivery radius of 16 blocks, scaled by volume when volume exceeds 1.0, and fans the packet out through ConfigurationManager.sendToAllNear. The client handler converts the x8 fixed-point ints back to doubles and hands the call to World.playSound. Because the sound name is an arbitrary server-controlled string, the field is both a gameplay input and a data-injection surface for anything downstream that logs or parses it.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleSoundEffect does PacketThreadUtil.func_180031_a (main-thread marshalling) then World.playSound(name, x/8, y/8, z/8, volume, pitch/63, false). The pitch arrives as an unsigned byte with 63 meaning normal pitch; the client divides by 63.0F. Server side the packet is created by WorldManager.playSound and playSoundAtEntity, and by /playsound (CommandPlaySound), which converts double coordinates to the x8 int encoding. Netty reads the name with a 256-char cap via readStringFromBuffer(256).</p>
+<h4>Why clients touch it</h4>
+<p>Only two real handlers exist across the 8 clients, and neither is a sound-ESP. Rise 5.99's Disabler, in its HypixelSlime mode, cancels the mob.slime.big sound to strip the Hypixel double-jump slime indicator. Rise 6.1.30 and 6.2.4 route the packet through LoggerRCECheck, a security feature that matches the sound name against a ${...} pattern to catch Log4j RCE attempts (CVE-2021-44228): sound names are logged by the client logger, so a crafted name is an injection vector. No client in the corpus tracks sounds for ESP purposes.</p>
+<h4>Exploit surface</h4>
+<p>The sound name string is the interesting field. It passes through String formatting and logger calls on both ends, which is exactly the Log4j RCE chain that LoggerRCECheck defends. Volume has no clamp on the wire, so a malicious server can send volume values far above 1.0 and inflate the client-side audio range beyond the 16-block visibility radius. The pitch byte is unsigned, so values above 127 encode negative pitches when interpreted as signed, a quirk modules rarely bother with.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>WorldManager.playSound sends to all players within 16 blocks, or 16*volume when volume &gt; 1.0F, on the same dimension. CommandPlaySound builds the packet from parsed coordinates (x*8, y*8, z*8) and clamps pitch to 0..255 before writing. The client handler marshals to the main thread, then plays the sound with pitch = raw byte / 63.0F. No server-side rate limit exists; sound spam is only bounded by the 256-char name cap and the per-packet cost.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Encoding order: String name (max 256), int x*8, int y*8, int z*8, float volume, unsigned byte pitch. The y field is initialized to Integer.MAX_VALUE in the no-arg constructor as a sentinel for the client-side y-clamping fallback (field_149218_c). In 1.8.9 MCP this packet predates the generic Packet&lt;T&gt; signature, so it implements raw Packet and does a double dispatch through processPacket.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats do not flag sound packets; they are cosmetic. The abuse surface is the name string, and the relevant defense is client-side: Rise's LoggerRCECheck pattern-matches ${...} in the name to block Log4j RCE payloads that would otherwise execute through the client's logging pipeline. Because the packet is clientbound and server-trusted, there is no bypass trade-off: a compromised server can always send it, so the check is a pure filter.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ESP</span>
-<span class="impl-module-clients">(Gugustus)</span>
+<p class="impl-pattern">A pure world-effect broadcast: named sound, x8 fixed-point position, volume, pitch byte. The 8 clients barely touch it. The only module-grade hit is Rise 5.99's Disabler cancelling the Hypixel slime jump sound; Rise 6.x handles it as a Log4j RCE scan surface rather than as audio.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler (HypixelSlime sound cancel)</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Track named sounds for ESP — locate players by footsteps, chest opens, etc.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Cancel the mob.slime.big sound on Hypixel so the double-jump slime indicator never plays.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">In the HypixelSlime mode branch of the packet receive handler, every S29 is type-checked; if the sound name equals mob.slime.big the event is cancelled. The same mode also cancels SLIME-type S2APacketParticles and S1FPacketSetExperience, so the whole Hypixel double-jump visual cluster is stripped together.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/Disabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/Disabler.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.other;
+
+import de.gerrygames.viarewind.utils.ChatUtil;
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.motion.TeleportEvent;
+import dev.rise.event.impl.other.AttackEvent;
+import dev.rise.event.impl.other.StrafeEvent;
+import dev.rise.event.impl.other.WorldChangedEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.event.impl.packet.PacketSendEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.module.impl.movement.Fly;
+import dev.rise.module.impl.movement.LongJump;
+import dev.rise.module.impl.player.Scaffold;
+import dev.rise.notifications.NotificationType;
+import dev.rise.setting.Setting;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.NoteSetting;
+import dev.rise.util.math.MathUtil;
+import dev.rise.util.math.TimeUtil;
+import dev.rise.util.pathfinding.MainPathFinder;
+import dev.rise.util.player.MoveUtil;
+import dev.rise.util.player.PacketUtil;
+import dev.rise.util.player.PlayerUtil;
+import io.netty.buffer.Unpooled;
+import net.minecraft.client.entity.EntityPlayerSP;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.Packet;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.*;
+import org.apache.commons.lang3.RandomUtils;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+/**
+ * This module is designed to disable an anticheat or some of its checks
+ * in order to make bypassing easier/having extreme bypasses.
+ */
+@ModuleInfo(name = "Disabler", description = "Disables some servers AntiCheats", category = Category.OTHER)
+public final class Disabler extends Module {
+
+    private final NoteSetting modeSettings = new NoteSetting("Mode Settings", this);
+    private final BooleanSetting hypixel = new BooleanSetting("Hypixel", this, false);
+    private final BooleanSetting mineland = new BooleanSetting("Mineland", this, false);
+    private final BooleanSetting mmcKeepSprint = new BooleanSetting("Minemenclub Keepsprint Check", this, false);
+    private final BooleanSetting mmcReach = new BooleanSetting("Minemenclub Reach Semi", this, false);
+    private final BooleanSetting hypixelSlime = new BooleanSetting("Hypixel Slime", this, false);
+    private final BooleanSetting dynamicPvP = new BooleanSetting("Dynamic PvP", this, false);
+    private final BooleanSetting ghostlyCombat = new BooleanSetting("Ghostly Combat", this, false);
+    private final BooleanSetting ghostly = new BooleanSetting("Ghostly", this, false);
+    private final BooleanSetting lunar = new BooleanSetting("Lunar", this, false);
+    private final BooleanSetting position = new BooleanSetting("Position Edit", this, false);
+    private final BooleanSetting vulcanCombat = new BooleanSetting("Vulcan Reach A", this, false);
+    private final BooleanSetting verusCombat = new BooleanSetting("Verus Combat", this, false);
+    private final BooleanSetting verus = new BooleanSetting("Verus", this, false);
+    private final BooleanSetting blocksMC = new BooleanSetting("BlocksMC", this, false);
+    private final BooleanSetting sentinel = new BooleanSetting("Sentinel", this, false);
+    private final BooleanSetting shartemis = new BooleanSetting("Shartemis Movement", this, false);
+
+    //Any disabler after this line will be hidden if this is true
+    private final BooleanSetting hideOldDisablers = new BooleanSetting("Hide Old Disablers", this, true);
+
+    private final NoteSetting oldModeSettings = new NoteSetting("Old Mode Settings", this);
+
+    private final BooleanSetting verusOld = new BooleanSetting("Verus Old", this, false);
+    private final BooleanSetting spartan = new BooleanSetting("Spartan", this, false);
+    private final BooleanSetting voidTp = new BooleanSetting("Void TP", this, false);
+    private final BooleanSetting clip = new BooleanSetting("Clip", this, false);
+    private final BooleanSetting tecnioRaper = new BooleanSetting("Tecnio AC Disabler", this, false);
+    private final BooleanSetting convertMovingPackets = new BooleanSetting("Covert Moving Packets", this, false);
+    private final BooleanSetting reverseConvertMovingPackets = new BooleanSetting("Reverse Covert Moving Packets", this, false);
+    private final BooleanSetting funnyCraft = new BooleanSetting("Funcraft", this, false);
+    private final BooleanSetting oxygen = new BooleanSetting("Oxygen", this, false);
+
+    private final NoteSetting packetSettings = new NoteSetting("Packet Settings", this);
+
+    private final BooleanSetting coc = new BooleanSetting("PacketInput", this, false);
+    private final BooleanSetting c0f = new BooleanSetting("ConfirmTransaction", this, false);
+    private final BooleanSetting c00 = new BooleanSetting("PacketKeepAlive", this, false);
+    private final BooleanSetting c08 = new BooleanSetting("PacketPlayerBlockPlacement", this, false);
+    private final BooleanSetting c13 = new BooleanSetting("PacketPlayerAbilities", this, false);
+    private final BooleanSetting c16 = new BooleanSetting("PacketClientStatus", this, false);
+    private final BooleanSetting c18 = new BooleanSetting("PacketSpectate", this, false);
+    private final BooleanSetting c19 = new BooleanSetting("PacketResourcePacketStatus", this, false);
+
+    private final ConcurrentLinkedQueue&lt;Packet&lt;?&gt;&gt; packetList = new ConcurrentLinkedQueue&lt;&gt;();
+    private final ConcurrentLinkedQueue&lt;Packet&lt;?&gt;&gt; packetList2 = new ConcurrentLinkedQueue&lt;&gt;();
+    private final ConcurrentHashMap&lt;Packet&lt;?&gt;, Long&gt; packetHashMap = new ConcurrentHashMap&lt;&gt;();
+    private final ConcurrentLinkedQueue&lt;Packet&lt;?&gt;&gt; transactions = new ConcurrentLinkedQueue&lt;&gt;();
+    private final ConcurrentLinkedQueue&lt;Packet&lt;?&gt;&gt; keepAlives = new ConcurrentLinkedQueue&lt;&gt;();
+
+    public static final ConcurrentLinkedQueue&lt;PacketUtil.TimedPacket&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+    public static boolean spoofing;
+    private int ticksSinceTeleport;
+    private long currentDelay;
+    private final TimeUtil timer = new TimeUtil();
+
+    private long nextSend;
+    private boolean teleported;
+    private boolean exempt;
+    private float previousYaw, previousPitch;
+
+    @Override
+    public void onAttackEvent(final AttackEvent event) {
+        if (event.getTarget() != null) {
+            if (ghostlyCombat.isEnabled()) {
+                final double distance = mc.thePlayer.getDistanceToEntity(event.getTarget()) - 0.5657;
+                if (distance &gt; 2.9) {
+                    if (mc.thePlayer.canEntityBeSeen(event.getTarget()))
+                        PacketUtil.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition(event.getTarget().posX, event.getTarget().posY, event.getTarget().posZ, false));
+                    else
+                        event.setCancelled(true);
+                }
+            }
+        }
+    }
+
+    @Override
+    public void onUpdateAlwaysInGui() {
+        boolean hideAllAfter = false;
+        for (final Setting setting : getSettings()) {
+            setting.hidden = hideAllAfter;
+
+            if (hideOldDisablers == setting &amp;&amp; hideOldDisablers.isEnabled()) {
+                hideAllAfter = true;
+            }
+        }
+    }
+
+    @Override
+    protected void onEnable() {
+        if (mc.isIntegratedServerRunning())
+            return;
+
+        if (hypixel.isEnabled()) {
+            final ChatComponentText chatcomponenttext = new ChatComponentText("Rejoin");
+            mc.getNetHandler().getNetworkManager().closeChannel(chatcomponenttext);
+        }
+
+        if (mmcReach.isEnabled()) {
+            Rise.INSTANCE.getNotificationManager().registerNotification("You need low ping for this disabler to not kick.", NotificationType.WARNING);
+        }
+
+        transactions.clear();
+        keepAlives.clear();
+        teleported = false;
+        timer.reset();
+    }
+
+    @Override
+    protected void onDisable() {
+        packetList.forEach(PacketUtil::sendPacketWithoutEvent);
+        packetList.clear();
+        spoofing = false;
+
+        packetList2.forEach(PacketUtil::sendPacketWithoutEvent);
+        packetList2.clear();
+
+        transactions.clear();
+        keepAlives.clear();
+
+        packetHashMap.clear();
+
+        mc.timer.timerSpeed = 1;
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        if (mc.isIntegratedServerRunning())
+            return;
+
+        if (hypixel.isEnabled() &amp;&amp; PlayerUtil.isOnServer("Hypixel")) {
+            spoofing = true;
+            for (final PacketUtil.TimedPacket p : packets) {
+                if (System.currentTimeMillis() &gt; p.getTime() + currentDelay) {
+                    PacketUtil.sendPacketWithoutEvent(p.getPacket());
+                    packets.remove(p);
+                    this.currentDelay = Math.round(MathUtil.getRandom(200,250));
+                }
+            }
+        }
+
+
+        if (verusOld.isEnabled()) {
+            PacketUtil.sendPacketWithoutEvent(new C0CPacketInput());
+            PacketUtil.sendPacketWithoutEvent(new C18PacketSpectate(UUID.randomUUID()));
+        }
+
+        if (blocksMC.isEnabled()) {
+            if (mc.thePlayer.ticksExisted % 100 == 0) {
+                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, mc.thePlayer.onGround));
+                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, -0.015625, mc.thePlayer.posZ, false));
+                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, mc.thePlayer.onGround));
+
+                teleported = true;
+            }
+
+            if (timer.hasReached(500L) &amp;&amp; !transactions.isEmpty()) {
+                PacketUtil.sendPacketWithoutEvent(transactions.poll());
+
+                timer.reset();
+            }
+
+            if (timer.hasReached(400L) &amp;&amp; !keepAlives.isEmpty()) {
+                PacketUtil.sendPacketWithoutEvent(keepAlives.poll());
+
+                timer.reset();
+            }
+        }
+
+        if (hypixelSlime.isEnabled() &amp;&amp; mc.thePlayer.capabilities.allowFlying) {
+            if (PlayerUtil.isOnServer("Hypixel")) {
+                final PlayerCapabilities playerCapabilities = new PlayerCapabilities();
+                playerCapabilities.isFlying = true;
+                PacketUtil.sendPacket(new C13PacketPlayerAbilities(playerCapabilities));
+            } else
+                PacketUtil.sendPacket(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.RIDING_JUMP));
+        }
+
+        if (vulcanCombat.isEnabled()) {
+            if (timer.hasReached((long) (5000 + (Math.random() * 1000)))) {
+                packetList2.forEach(PacketUtil::sendPacketWithoutEvent);
+                packetList2.clear();
+                timer.reset();
+            }
+        }
+
+        if (sentinel.isEnabled()) {
+            for (final Iterator&lt;Map.Entry&lt;Packet&lt;?&gt;, Long&gt;&gt; iterator = packetHashMap.entrySet().iterator(); iterator.hasNext(); ) {
+                final Map.Entry&lt;Packet&lt;?&gt;, Long&gt; entry = iterator.next();
+
+                if (entry.getValue() &lt; System.currentTimeMillis()) {
+                    PacketUtil.sendPacket(entry.getKey());
+                    iterator.remove();
+                }
+            }
+        }
+
+        if (mmcReach.isEnabled()) {
+            if (timer.hasReached((long) (500 + (Math.random() * 600)))) {
+                packetList.forEach(PacketUtil::sendPacketWithoutEvent);
+                packetList.clear();
+                timer.reset();
+            }
+        }
+
+        if (oxygen.isEnabled() &amp;&amp; mc.thePlayer.onGround) {
+            event.setY(event.getY() + 0.42F);
+            event.setGround(false);
+        }
+
+        if (voidTp.isEnabled() &amp;&amp; mc.thePlayer.ticksExisted % 20 == 0)
+            event.setY(event.getY() - 20 - Math.random());
+
+        if (clip.isEnabled()) {
+            if (mc.thePlayer.ticksExisted % 20 == 0) {
+                event.setY(event.getY() - 0.42);
+                event.setGround(false);
+            }
+        }
+
+        if (coc.isEnabled()) {
+            PacketUtil.sendPacketWithoutEvent(new C0CPacketInput(0.98F, 0.0F, false, false));
+        }
+
+        if (c08.isEnabled()) {
+            PacketUtil.sendPacketWithoutEvent(new C08PacketPlayerBlockPlacement(mc.thePlayer.getHeldItem()));
+        }
+
+        if (c13.isEnabled() || shartemis.isEnabled()) {
+            final C13PacketPlayerAbilities abilities = new C13PacketPlayerAbilities();
+
+            abilities.setAllowFlying(true);
+            abilities.setFlying(true);
+
+            PacketUtil.sendPacketWithoutEvent(abilities);
+        }
+
+        if (c16.isEnabled() || shartemis.isEnabled()) {
+            PacketUtil.sendPacketWithoutEvent(new C16PacketClientStatus(C16PacketClientStatus.EnumState.PERFORM_RESPAWN));
+        }
+
+        if (c18.isEnabled() || shartemis.isEnabled()) {
+            PacketUtil.sendPacketWithoutEvent(new C18PacketSpectate(mc.thePlayer.getUniqueID()));
+        }
+
+        if (c19.isEnabled()) {
+            PacketUtil.sendPacketWithoutEvent(new C19PacketResourcePackStatus("", C19PacketResourcePackStatus.Action.ACCEPTED));
+        }
+
+        if (tecnioRaper.isEnabled()) {
+            for (int i = 0; i &lt; 10; i++) {
+                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C06PacketPlayerPosLook(
+                        mc.thePlayer.posX, mc.thePlayer.posY, Double.MAX_VALUE, 0.0F, 0.0F, true
+                ));
+            }
+
+            for (int i = 0; i &lt; 40; i++) {
+                PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C06PacketPlayerPosLook(
+                        Double.MAX_VALUE, mc.thePlayer.posY, mc.thePlayer.posZ, 0.0F, 0.0F, true
+                ));
+            }
+
+            PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer(true));
+            PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer(true));
+
+            tecnioRaper.setEnabled(false);
+        }
+
+        if (funnyCraft.isEnabled()) {
+            if (mc.thePlayer.ticksExisted % 4 == 0) {
+                PacketUtil.sendPacketWithoutEvent(new C0CPacketInput(Float.MAX_VALUE, Float.MAX_VALUE, false, false));
+            }
+        }
+    }
+
+    @Override
+    public void onTeleportEvent(final TeleportEvent event) {
+        if (blocksMC.isEnabled()) {
+            if (teleported) {
+                event.setCancelled(true);
+            }
+
+            teleported = false;
+        }
+        if(hypixel.isEnabled() &amp;&amp; PlayerUtil.isOnServer("Hypixel")){
+            if (mc.thePlayer.ticksExisted &lt; 100) {
+                event.setCancelled(true);
+                return;
+            }
+
+            this.ticksSinceTeleport = 0;
+        }
+
+//        if (mc.thePlayer.getDistance(event.getPosX(), event.getPosY(), event.getPosZ()) &lt;= 9.5) {
+//            PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C06PacketPlayerPosLook(event.getPosX(), event.getPosY(), event.getPosZ(), event.getYaw(), event.getPitch(), false));
+//            event.setCancelled(true);
+//        }
+//        teleported = false;
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        if (mc.isIntegratedServerRunning()) return;
+
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (hypixel.isEnabled()) {
+            final Packet&lt;?&gt; packet = event.getPacket();
+
+            if (packet instanceof S08PacketPlayerPosLook) {
+                nextSend = 0;
+            }
+        }
+
+        if (hypixelSlime.isEnabled()) {
+            if (p instanceof S02PacketChat) {
+                final S02PacketChat chatMessage = (S02PacketChat) event.getPacket();
+                if (chatMessage.getType() == 2 &amp;&amp; chatMessage.getChatComponent().getUnformattedText().contains("UNAVAILABLE")) {
+                    chatMessage.chatComponent = new ChatComponentText("§aDOUBLE JUMP AVAILABLE§r");
+                }
+            }
+
+            if (p instanceof S29PacketSoundEffect) {
+                final S29PacketSoundEffect packetSoundEffect = (S29PacketSoundEffect) event.getPacket();
+                if (packetSoundEffect.getSoundName().equals("mob.slime.big")) {
+                    event.setCancelled(true);
+                }
+            }
+
+            if (p instanceof S2APacketParticles) {
+                final S2APacketParticles particle = (S2APacketParticles) event.getPacket();
+                if (particle.getParticleType() == EnumParticleTypes.SLIME) {
+                    event.setCancelled(true);
+                }
+            }
+
+            if (p instanceof S1FPacketSetExperience) {
+                event.setCancelled(true);
+            }
+        }
+
+        if (verus.isEnabled()) {
+            if (p instanceof S08PacketPlayerPosLook &amp;&amp; timer.hasReached(1000)) {
+                final S08PacketPlayerPosLook packet = (S08PacketPlayerPosLook) p;
+                if (mc.thePlayer.getDistanceSq(packet.x, packet.y, packet.z) &lt;= 9.5) {
+                    PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C06PacketPlayerPosLook(packet.x, packet.y, packet.z, packet.yaw, packet.pitch, false));
+                    event.setCancelled(true);
+                }
+                teleported = false;
+                timer.reset();
+            }
+        }
+    }
+
+    @Override
+    public void onPacketSend(final PacketSendEvent event) {
+        if (mc.isIntegratedServerRunning())
+            return;
+
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (hypixel.isEnabled() &amp;&amp; PlayerUtil.isOnServer("Hypixel")) {
+
+            if (packet instanceof C03PacketPlayer) {
+                final C03PacketPlayer wrapper = (C03PacketPlayer) packet;
+
+                if (wrapper instanceof C03PacketPlayer.C06PacketPlayerPosLook &amp;&amp; ticksSinceTeleport &lt;= 50 &amp;&amp; mc.thePlayer.sendQueue.doneLoadingTerrain) {
+                    event.setPacket(new C03PacketPlayer.C04PacketPlayerPosition(wrapper.x + Double.MIN_NORMAL, wrapper.y, wrapper.z - Double.MIN_NORMAL, ((C03PacketPlayer.C06PacketPlayerPosLook) wrapper).isOnGround()));
+                }
+            }
+
+            ticksSinceTeleport++;
+            if (mc.thePlayer == null || !mc.thePlayer.sendQueue.doneLoadingTerrain) {
+                packets.clear();
+                return;
+            }
+
+            if (mc.thePlayer.isDead || mc.isSingleplayer()) {
+                packets.forEach(p -&gt; PacketUtil.sendPacketWithoutEvent(p.getPacket()));
+                packets.clear();
+                return;
+            }
+
+
+            if (spoofing) {
+                if (packet instanceof C0FPacketConfirmTransaction || packet instanceof C00PacketKeepAlive) {
+                    packets.add(new PacketUtil.TimedPacket(packet, System.currentTimeMillis()));
+                    event.setCancelled(true);
+                }
+            } else if (packet instanceof C03PacketPlayer) {
+                packets.forEach(p -&gt; PacketUtil.sendPacketWithoutEvent(p.getPacket()));
+                packets.clear();
+            }
+        }
+
+        if (vulcanCombat.isEnabled() &amp;&amp; packet instanceof C0FPacketConfirmTransaction) {
+            packetList2.add(packet);
+            event.setCancelled(true);
+        }
+
+        if (mineland.isEnabled()) {
+            if (event.getPacket() instanceof C03PacketPlayer &amp;&amp; !mc.thePlayer.isSwingInProgress &amp;&amp; !mc.thePlayer.isUsingItem() &amp;&amp; !((C03PacketPlayer) event.getPacket()).isMoving()) {
+                event.setCancelled(true);
+            }
+        }
+
+        if (blocksMC.isEnabled()) {
+
+            if (packet instanceof C0FPacketConfirmTransaction) {
+                transactions.add(packet);
+                event.setCancelled(true);
+
+                if (transactions.size() &gt; 300) {
+                    PacketUtil.sendPacketWithoutEvent(transactions.poll());
+                }
+            }
+
+            if (packet instanceof C00PacketKeepAlive) {
+                final C00PacketKeepAlive c00 = (C00PacketKeepAlive) packet;
+
+                c00.key -= 30;
+                keepAlives.add(c00);
+                event.setCancelled(true);
+            }
+
+            if (packet instanceof C0BPacketEntityAction) {
+                final C0BPacketEntityAction c0B = (C0BPacketEntityAction) packet;
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
+                    if (mc.thePlayer.serverSprintState) {
+                        PacketUtil.sendPacketWithoutEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                        mc.thePlayer.serverSprintState = false;
+                    }
+
+                    event.setCancelled(true);
+                }
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.STOP_SPRINTING)) {
+                    event.setCancelled(true);
+                }
+            }
+
+            if (packet instanceof C03PacketPlayer &amp;&amp; !mc.thePlayer.isSwingInProgress &amp;&amp;
+                    !mc.thePlayer.isUsingItem() &amp;&amp; !((C03PacketPlayer) packet).isMoving()) {
+                event.setCancelled(true);
+            }
+        }
+
+        if (verus.isEnabled()) {
+            if (packet instanceof C0BPacketEntityAction) {
+                final C0BPacketEntityAction c0B = (C0BPacketEntityAction) packet;
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
+                    if (EntityPlayerSP.serverSprintState) {
+                        PacketUtil.sendPacketWithoutEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                        EntityPlayerSP.serverSprintState = false;
+                    }
+                    event.setCancelled(true);
+                }
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.STOP_SPRINTING)) {
+                    event.setCancelled(true);
+                }
+            }
+
+            if (packet instanceof C00PacketKeepAlive) {
+                final C00PacketKeepAlive c00 = (C00PacketKeepAlive) packet;
+                c00.key = -c00.key;
+            }
+
+            if (packet instanceof C03PacketPlayer) {
+                final C03PacketPlayer c03 = (C03PacketPlayer) packet;
+
+                mc.timer.timerSpeed = 0.75F;
+
+                if (c03.y % 0.015625 == 0)
+                    c03.setOnGround(true);
+
+                if (timer.hasReached(1000) &amp;&amp; !teleported) {
+                    PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition());
+                    teleported = true;
+                }
+
+                if (mc.thePlayer.ticksExisted % 100 == 0)
+                    teleported = false;
+            }
+        }
+
+        if (verusCombat.isEnabled() &amp;&amp; mc.thePlayer.ticksExisted &gt; 20 &amp;&amp; !mc.thePlayer.capabilities.allowFlying) {
+            if (packet instanceof C0FPacketConfirmTransaction)
+                event.setCancelled(true);
+        }
+
+        if (position.isEnabled() &amp;&amp; packet instanceof C03PacketPlayer) {
+            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
+            c03.setY(c03.getY() + 0.015625);
+        }
+
+        if (ghostly.isEnabled()) {
+            if (packet instanceof C03PacketPlayer) {
+                PacketUtil.sendPacketWithoutEvent(new C0CPacketInput());
+
+                C03PacketPlayer c03PacketPlayer = ((C03PacketPlayer) packet);
+                double mathGround = Math.round(c03PacketPlayer.y / 0.015625) * 0.015625;
+
+                c03PacketPlayer.y = mathGround;
+                c03PacketPlayer.setOnGround(true);
+                event.setPacket(c03PacketPlayer);
+            }
+
+            if (packet instanceof C0BPacketEntityAction) {
+                final C0BPacketEntityAction c0B = (C0BPacketEntityAction) packet;
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
+                    if (EntityPlayerSP.serverSprintState) {
+                        PacketUtil.sendPacketWithoutEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                        EntityPlayerSP.serverSprintState = false;
+                    }
+                    event.setCancelled(true);
+                }
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.STOP_SPRINTING)) {
+                    event.setCancelled(true);
+                }
+            }
+        }
+
+        if (dynamicPvP.isEnabled()) {
+            if (packet instanceof C03PacketPlayer) {
+                if (mc.thePlayer.ticksExisted % 3 == 0)
+                    event.setCancelled(true);
+
+                final C03PacketPlayer packetPlayer = (C03PacketPlayer) event.getPacket();
+                double x = mc.thePlayer.posX, y = mc.thePlayer.posY, z = mc.thePlayer.posZ;
+
+                if (packetPlayer.isMoving()) {
+                    x = packetPlayer.getPositionX();
+                    y = packetPlayer.getPositionY();
+                    z = packetPlayer.getPositionZ();
+                }
+
+                if (mc.thePlayer.ticksExisted % 20 == 0)
+                    PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y, z, packetPlayer.isOnGround()));
+
+                event.setPacket(new C03PacketPlayer.C06PacketPlayerPosLook(x, y, z, mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch, packetPlayer.isOnGround()));
+            }
+
+            if (packet instanceof C0FPacketConfirmTransaction || packet instanceof C00PacketKeepAlive)
+                event.setCancelled(true);
+
+            if (packet instanceof C0BPacketEntityAction) {
+                final C0BPacketEntityAction c0B = (C0BPacketEntityAction) packet;
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
+                    if (EntityPlayerSP.serverSprintState) {
+                        PacketUtil.sendPacketWithoutEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                        EntityPlayerSP.serverSprintState = false;
+                    }
+                    event.setCancelled(true);
+                }
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.STOP_SPRINTING)) {
+                    event.setCancelled(true);
+                }
+            }
+        }
+
+        if (spartan.isEnabled()) {
+            PacketUtil.sendPacketWithoutEvent(new C03PacketPlayer.C06PacketPlayerPosLook(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, mc.thePlayer.rotationYaw, 91, mc.thePlayer.onGround));
+        }
+
+        if (sentinel.isEnabled()) {
+            if (packet instanceof C0FPacketConfirmTransaction || packet instanceof C00PacketKeepAlive) {
+//                packetHashMap.put(p, System.currentTimeMillis() + RandomUtils.nextLong(15000, 25000));
+                event.setCancelled(true);
+            }
+
+            if (packet instanceof C03PacketPlayer.C04PacketPlayerPosition) {
+                final C03PacketPlayer.C04PacketPlayerPosition packetPlayerPosition = (C03PacketPlayer.C04PacketPlayerPosition) packet;
+                event.setPacket(new C03PacketPlayer.C06PacketPlayerPosLook(packetPlayerPosition.getX(), packetPlayerPosition.getY(), packetPlayerPosition.getZ(), mc.thePlayer.rotationYaw + (mc.thePlayer.ticksExisted % 2 == 0 ? RandomUtils.nextFloat(0.05F, 0.1F) : -RandomUtils.nextFloat(0.05F, 0.1F)), mc.thePlayer.rotationPitch, packetPlayerPosition.isOnGround()));
+            }
+        }
+
+        if (c0f.isEnabled() || shartemis.isEnabled()) {
+            if (packet instanceof C0FPacketConfirmTransaction)
+                event.setCancelled(true);
+        }
+
+        if (c00.isEnabled()) {
+            if (packet instanceof C00PacketKeepAlive)
+                event.setCancelled(true);
+        }
+
+        if (lunar.isEnabled()) {
+            if (packet instanceof C0FPacketConfirmTransaction || packet instanceof C00PacketKeepAlive)
+                event.setCancelled(true);
+
+            if (packet instanceof C0BPacketEntityAction) {
+                final C0BPacketEntityAction c0B = (C0BPacketEntityAction) packet;
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
+                    if (EntityPlayerSP.serverSprintState) {
+                        PacketUtil.sendPacketWithoutEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                        EntityPlayerSP.serverSprintState = false;
+                    }
+                    event.setCancelled(true);
+                }
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.STOP_SPRINTING)) {
+                    event.setCancelled(true);
+                }
+            }
+
+            if (packet instanceof C03PacketPlayer.C04PacketPlayerPosition) {
+                final C03PacketPlayer.C04PacketPlayerPosition packetPlayerPosition = (C03PacketPlayer.C04PacketPlayerPosition) packet;
+                event.setPacket(new C03PacketPlayer.C06PacketPlayerPosLook(packetPlayerPosition.getX(), packetPlayerPosition.getY(), packetPlayerPosition.getZ(), mc.thePlayer.rotationYaw + (mc.thePlayer.ticksExisted % 2 == 0 ? RandomUtils.nextFloat(0.05F, 0.1F) : -RandomUtils.nextFloat(0.05F, 0.1F)), mc.thePlayer.rotationPitch, packetPlayerPosition.isOnGround()));
+            }
+        }
+
+        if (reverseConvertMovingPackets.isEnabled()) {
+            if (packet instanceof C03PacketPlayer.C06PacketPlayerPosLook) {
+                final C03PacketPlayer.C06PacketPlayerPosLook packetPlayerPosition = (C03PacketPlayer.C06PacketPlayerPosLook) packet;
+                event.setPacket(new C03PacketPlayer.C04PacketPlayerPosition(packetPlayerPosition.getX(), packetPlayerPosition.getY(), packetPlayerPosition.getZ(), packetPlayerPosition.isOnGround()));
+            }
+        }
+
+        if (convertMovingPackets.isEnabled()) {
+            if (packet instanceof C03PacketPlayer.C04PacketPlayerPosition) {
+                final C03PacketPlayer.C04PacketPlayerPosition packetPlayerPosition = (C03PacketPlayer.C04PacketPlayerPosition) packet;
+                event.setPacket(new C03PacketPlayer.C06PacketPlayerPosLook(packetPlayerPosition.getX(), packetPlayerPosition.getY(), packetPlayerPosition.getZ(), mc.thePlayer.rotationYaw + (mc.thePlayer.ticksExisted % 2 == 0 ? RandomUtils.nextFloat(0.05F, 0.1F) : -RandomUtils.nextFloat(0.05F, 0.1F)), mc.thePlayer.rotationPitch, packetPlayerPosition.isOnGround()));
+            }
+        }
+
+        if (mmcKeepSprint.isEnabled()) {
+            if (packet instanceof C0BPacketEntityAction) {
+                final C0BPacketEntityAction c0B = (C0BPacketEntityAction) packet;
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
+                    if (EntityPlayerSP.serverSprintState) {
+                        PacketUtil.sendPacketWithoutEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+                        EntityPlayerSP.serverSprintState = false;
+                    }
+                    event.setCancelled(true);
+                }
+
+                if (c0B.getAction().equals(C0BPacketEntityAction.Action.STOP_SPRINTING)) {
+                    event.setCancelled(true);
+                }
+            }
+        }
+
+        if (mmcReach.isEnabled() &amp;&amp; (PlayerUtil.isOnServer("minemen") || PlayerUtil.isOnServer("mineman"))) {
+            if (packet instanceof C0FPacketConfirmTransaction) {
+                event.setCancelled(true);
+            }
+        }
+    }
+
+    @Override
+    public void onStrafe(final StrafeEvent event) {
+        if (mineland.isEnabled()) {
+            PacketUtil.sendPacket(new C18PacketSpectate(UUID.randomUUID()));
+        }
+    }
+
+    @Override
+    public void onWorldChanged(final WorldChangedEvent event) {
+    }
+
+}
+
+// NOTE (AI): The S29 branch is inside the HypixelSlime mode block (lines ~377-383). The module is a large multi-mode disabler; the S29 handling is incidental cleanup of a server-side visual cue, not the module's core purpose.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Zero detection risk: cancelling a clientbound sound is invisible to the server. The only observable effect is the missing slime sound on the local client.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 and 6.2.4 do not carry this mode; their only S29 reference is LoggerRCECheck in the security pipeline.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">SoundLocator</span>
-<span class="impl-module-clients">(Gugustus)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">LoggerRCECheck (security)</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Track named sounds for ESP — locate players by footsteps, chest opens, etc.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Block Log4j RCE payloads carried in the sound name string.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A SecurityFeature registered in Rise's packet security chain. On every packet it checks the S29 sound name against the regex .*\$\{[^}]*}.*. A match returns true, which drops the packet before it reaches the game logic or any logging path. The same check also guards S02PacketChat text. It is a security component, not a toggleable user module.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/security/impl/LoggerRCECheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/security/impl/LoggerRCECheck.java =====
+package com.alan.clients.security.impl;
+
+import com.alan.clients.security.SecurityFeature;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.network.play.server.S29PacketSoundEffect;
+import net.minecraft.util.IChatComponent;
+
+import java.util.regex.Pattern;
+
+public final class LoggerRCECheck extends SecurityFeature {
+
+    private static final Pattern PATTERN = Pattern.compile(".*\\$\\{[^}]*}.*");
+
+    public LoggerRCECheck() {
+        super("Log4J RCE Check", "Someone attempted to utilize the Log4J exploit");
+    }
+
+    @Override
+    public boolean handle(final Packet&lt;?&gt; packet) {
+        if (packet instanceof S29PacketSoundEffect) {
+            final S29PacketSoundEffect wrapper = (S29PacketSoundEffect) packet;
+            final String name = wrapper.getSoundName();
+
+            return PATTERN.matcher(name).matches();
+        }
+
+        if (packet instanceof S02PacketChat) {
+            final S02PacketChat wrapper = ((S02PacketChat) packet);
+            final IChatComponent component = wrapper.getChatComponent();
+
+            return PATTERN.matcher(component.getUnformattedText()).matches()
+                    || PATTERN.matcher(component.getFormattedText()).matches();
+        }
+
+        return false;
+    }
+}
+
+// NOTE (AI): Security features run before module handlers, so the RCE string never reaches the world sound code. The regex only matches the literal ${...} JNDI payload shape used by CVE-2021-44228.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> Security pipeline handle(Packet) invoked per received packet.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Not anti-cheat related. It defends the client against malicious servers; the cost is a regex match on every S29 and S02, which is negligible at server tick rates.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical file in Rise 6.1.30 (com/alan/clients/security/impl/LoggerRCECheck.java). The packet class is also listed in Rise's NetworkAPI script bridge, which exposes it to JavaScript scripts but adds no game logic.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Both handlers sit on the packet receive path: Rise 5.99 uses PacketReceiveEvent, Rise 6.x uses the security chain that pre-filters every inbound packet before module dispatch.</div>
+<div class="impl-clients">Rise 5.99 mutates/cancels via event.setCancelled on PacketReceiveEvent. Rise 6.1.30/6.2.4 moved packet filtering into the SecurityFeature abstraction, which returns a boolean from handle(Packet) and lets the pipeline decide whether to drop.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S2APacketParticles/">S2APacketParticles</a>
+<a class="related-chip" href="../S28PacketEffect/">S28PacketEffect</a>
+<a class="related-chip" href="../S2BPacketChangeGameState/">S2BPacketChangeGameState</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

@@ -70,40 +70,64 @@
   "handler": "INetHandlerPlayClient",
   "notes": "Inventory types: minecraft:chest, crafting_table, furnace, dispenser, enchanting_table, brewing_stand, villager, beacon, anvil, hopper, dropper, EntityHorse. RektSky B5 ChestStealer intercepts this packet for silent chest handling — it cancels the vanilla open, stores the window data, and manages the chest entirely via packet-level manipulation.",
   "implementation": {
+    "writeup": [
+      {
+        "h": "Role in the protocol",
+        "p": "Opens an inventory window on the client. The server assigns a windowId (incrementing per player, wrapping at 256), picks a GUI type string, sends the title as a chat component, the slot count, and for EntityHorse windows the horse's entityId. The client switches on the type string: minecraft:container becomes a chest GUI, minecraft:villager a trade GUI, EntityHorse a horse inventory, anything else a LocalBlockIntercommunication GUI. The windowId must then be echoed back on every C0E click and C0D close."
+      },
+      {
+        "h": "Vanilla handling",
+        "p": "NetHandlerPlayClient.handleOpenWindow matches the type string and calls the matching display method (displayGUIChest, displayVillagerTradeGui, displayGUIHorse, displayGui), then stamps the windowId onto the player's openContainer. The horse branch looks up the entity by id and silently does nothing if the entity is missing. Server-side, EntityPlayerMP.displayGUIChest and openGui build the packet with the player's currentWindowId, which increments on every open."
+      },
+      {
+        "h": "Why clients touch it",
+        "p": "Two Rise 6.x modules, both cancelling the packet for combat-adjacent reasons. WorldGuardRegen suppresses S2D while its regen burst is active (ticks <= 1) so a server-initiated window cannot interrupt the position-desync regen sequence. GodMode cancels every S2D unconditionally, which keeps the server's window state desynced from the client as part of the godmode attack-desync. The context's ChestStealer/AutoArmor/ServerCrasher open-window usage does not exist in this corpus; the 8 clients contain no inventory-stealing S2D consumer."
+      },
+      {
+        "h": "Exploit surface",
+        "p": "The windowId protocol is a state machine: the client must mirror every S2D with an open container and echo the id in later clicks. Cancelling S2D (Rise 6.x) leaves the server believing a window is open while the client never shows it, which is exactly the desync GodMode and WorldGuardRegen exploit. Server-side open-window spam (ServerCrasher style) is a client DoS: each S2D forces a GUI construction, and rapid-fire opens desync the container state. The EntityHorse branch's entity lookup is also a soft spot: a stale id silently drops the window."
+      }
+    ],
+    "overview": "The window-open packet, and the desync hinge for two Rise 6.x combat modules: WorldGuardRegen suppresses it during regen bursts, GodMode cancels it permanently to keep the server-client container state split. No chest-stealing or shop-detection module exists in the corpus; the windowId echo contract is what makes cancellation useful.",
+    "server_handling": "EntityPlayerMP.displayGUIChest/openGui increments currentWindowId, opens the container server-side, and sends S2D with the id, GUI type, display name, and slot count (plus entityId for horses). The client must echo the windowId in C0E clicks and C0D closes or the server container stays open with stale state. Vanilla performs no validation that the client actually opened the window, which is the desync window both Rise 6.x modules rely on.",
+    "protocol_notes": "Encoding: unsigned byte windowId, String guiId (minecraft:container, minecraft:villager, EntityHorse, or a block interaction id), IChatComponent title, unsigned byte slotCount, then int entityId only when guiId is EntityHorse. windowId wraps at 256 and the client stamps it on openContainer.windowId. The type string is the discriminator; there is no numeric window-type enum on the wire in 1.8.9.",
+    "anticheat_landscape": "Anti-cheats track window state through the C0E/C0D echo trail, not through S2D itself. The Rise 6.x cancels create a server-side phantom container: the server keeps sending window updates (S2F, S30) to a window the client never opened, which is detectable if an anti-cheat correlates window items with click packets. The trade-off is why WorldGuardRegen only cancels during the short regen burst (ticks <= 1) while GodMode accepts the permanent desync.",
     "modules": [
       {
-        "name": "ChestStealer",
+        "name": "WorldGuardRegen (window suppress)",
         "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
+          "Rise 6.2.4",
+          "Rise 6.1.30"
         ],
-        "purpose": "Detect window opening (chest, crafting table, etc.). ChestStealer triggers on GuiChest open.",
-        "how_it_works": "",
-        "detailed_code": "if (event.getPacket() instanceof S2DPacketOpenWindow) {\n  S2DPacketOpenWindow s2d = (S2DPacketOpenWindow) event.getPacket();\n  if (s2d.getGuiId().equals(\"minecraft:chest\")) chestStealer.enable();\n}",
-        "vanilla_hook": "EventReceivePacket"
+        "purpose": "Prevent a server-initiated window from interrupting the regen position-desync sequence.",
+        "how_it_works": "A Regen mode. Its PreMotionEvent handler drops the player y by 0.05 and holds yaw/pitch while health is below the threshold; the PacketSendEvent handler wraps attacks in a C04-teleport/attack/C04-return sandwich. The PacketReceiveEvent handler cancels any S2D while ticks <= 1, i.e. during the active regen burst, so the server cannot open a container mid-sequence and break the state machine.",
+        "detailed_code": "// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/regen/WorldGuardRegen.java =====\npackage com.alan.clients.module.impl.combat.regen;\n\nimport com.alan.clients.event.Listener;\nimport com.alan.clients.event.annotations.EventLink;\nimport com.alan.clients.event.impl.input.MoveInputEvent;\nimport com.alan.clients.event.impl.motion.PreMotionEvent;\nimport com.alan.clients.event.impl.motion.StrafeEvent;\nimport com.alan.clients.event.impl.packet.PacketReceiveEvent;\nimport com.alan.clients.event.impl.packet.PacketSendEvent;\nimport com.alan.clients.module.impl.combat.Regen;\nimport com.alan.clients.util.packet.PacketUtil;\nimport com.alan.clients.value.Mode;\nimport com.alan.clients.value.impl.NumberValue;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.play.client.C02PacketUseEntity;\nimport net.minecraft.network.play.client.C03PacketPlayer;\nimport net.minecraft.network.play.server.S2DPacketOpenWindow;\n\npublic final class WorldGuardRegen extends Mode<Regen> {\n\n    private final NumberValue health = new NumberValue(\"Minimum Health\", this, 15, 1, 20, 1);\n\n    private int ticks;\n\n    private float yaw;\n    private float pitch;\n\n    public WorldGuardRegen(String name, Regen parent) {\n        super(name, parent);\n    }\n\n    @EventLink\n    public final Listener<PreMotionEvent> onPreMotionEvent = event -> {\n        if (mc.thePlayer.onGround && mc.thePlayer.getHealth() < this.health.getValue().floatValue()) {\n            if (ticks <= 1) {\n                event.setPosY(event.getPosY() - 0.05);\n                event.setYaw(yaw);\n                event.setPitch(pitch);\n                ticks++;\n            }\n        } else {\n            yaw = event.getYaw();\n            pitch = event.getPitch();\n            ticks = 0;\n        }\n    };\n\n    @EventLink\n    public final Listener<PacketSendEvent> onPacketSend = event -> {\n        final Packet<?> p = event.getPacket();\n\n        if (p instanceof C02PacketUseEntity && mc.thePlayer.onGround && mc.thePlayer.getHealth() < this.health.getValue().floatValue() && ticks <= 1) {\n            final C02PacketUseEntity wrapper = (C02PacketUseEntity) p;\n\n            if (wrapper.getAction().equals(C02PacketUseEntity.Action.ATTACK)) {\n                event.setCancelled();\n\n                PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, true));\n                PacketUtil.sendNoEvent(wrapper);\n                PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY - 0.05, mc.thePlayer.posZ, false));\n            }\n        }\n    };\n\n    @EventLink\n    public final Listener<PacketReceiveEvent> onPacketReceiveEvent = event -> {\n        if (event.getPacket() instanceof S2DPacketOpenWindow && ticks <= 1) {\n            event.setCancelled();\n        }\n    };\n\n    @EventLink\n    public final Listener<StrafeEvent> onStrafe = event -> {\n        if (mc.thePlayer.onGround && mc.thePlayer.getHealth() < this.health.getValue().floatValue() && ticks <= 1) {\n            event.setSpeed(0);\n        }\n    };\n\n    @EventLink\n    public final Listener<MoveInputEvent> onMove = event -> {\n        if (mc.thePlayer.onGround && mc.thePlayer.getHealth() < this.health.getValue().floatValue() && ticks <= 1) {\n            event.setJump(false);\n        }\n    };\n}\n\n// NOTE (AI): The S2D cancel (lines ~67-69) is gated on ticks <= 1, the same guard as the position drop and attack sandwich, so the window suppression only lasts for the regen burst.",
+        "code_source": "Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/regen/WorldGuardRegen.java",
+        "vanilla_hook": "PreMotionEvent, PacketSendEvent, PacketReceiveEvent, StrafeEvent, MoveInputEvent.",
+        "anti_cheat_notes": "The cancel is brief and purposeful: a phantom window for one or two ticks is below most anti-cheat window-state checks, which expect C0D echoes after a delay. Long cancels would desync window items.",
+        "variations": "Identical file in Rise 6.1.30 under com/alan/clients/module/impl/combat/regen/."
       },
       {
-        "name": "InvManager",
+        "name": "GodMode (window desync)",
         "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
+          "Rise 6.2.4",
+          "Rise 6.1.30"
         ],
-        "purpose": "Detect window opening (chest, crafting table, etc.). ChestStealer triggers on GuiChest open.",
-        "how_it_works": "",
-        "detailed_code": "if (event.getPacket() instanceof S2DPacketOpenWindow) {\n  S2DPacketOpenWindow s2d = (S2DPacketOpenWindow) event.getPacket();\n  if (s2d.getGuiId().equals(\"minecraft:chest\")) chestStealer.enable();\n}",
-        "vanilla_hook": "EventReceivePacket"
-      },
-      {
-        "name": "AutoArmor",
-        "found_in": [
-          "Gugustus",
-          "Tenacity 6.0"
-        ],
-        "purpose": "Detect window opening (chest, crafting table, etc.). ChestStealer triggers on GuiChest open.",
-        "how_it_works": "",
-        "detailed_code": "if (event.getPacket() instanceof S2DPacketOpenWindow) {\n  S2DPacketOpenWindow s2d = (S2DPacketOpenWindow) event.getPacket();\n  if (s2d.getGuiId().equals(\"minecraft:chest\")) chestStealer.enable();\n}",
-        "vanilla_hook": "EventReceivePacket"
+        "purpose": "Cancel every open-window packet so the server's container state permanently diverges from the client's.",
+        "how_it_works": "Cancels all S2D in PacketReceiveEvent. Combined with the module's core trick (drop y by 0.05 every pre-motion, wrap attacks in a position sandwich via PacketUtil.sendNoEvent), the server keeps an open phantom container while the client stays in normal movement. onEnable snapshots yaw/pitch for the desync frames.",
+        "detailed_code": "// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/GodMode.java =====\npackage com.alan.clients.module.impl.exploit;\n\nimport com.alan.clients.event.Listener;\nimport com.alan.clients.event.annotations.EventLink;\nimport com.alan.clients.event.impl.input.MoveInputEvent;\nimport com.alan.clients.event.impl.motion.PreMotionEvent;\nimport com.alan.clients.event.impl.motion.StrafeEvent;\nimport com.alan.clients.event.impl.packet.PacketReceiveEvent;\nimport com.alan.clients.event.impl.packet.PacketSendEvent;\nimport com.alan.clients.module.Module;\nimport com.alan.clients.module.api.Category;\nimport com.alan.clients.module.api.ModuleInfo;\nimport com.alan.clients.util.packet.PacketUtil;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.play.client.C02PacketUseEntity;\nimport net.minecraft.network.play.client.C03PacketPlayer;\nimport net.minecraft.network.play.server.S2DPacketOpenWindow;\n\n@ModuleInfo(aliases = {\"module.combat.godmode.name\"}, description = \"module.exploit.godmode.description\", category = Category.EXPLOIT)\npublic class GodMode extends Module {\n\n    private float yaw;\n    private float pitch;\n\n    @EventLink\n    public final Listener<PreMotionEvent> onPreMotionEvent = event -> {\n        event.setPosY(event.getPosY() - 0.05);\n        event.setYaw(yaw);\n        event.setPitch(pitch);\n    };\n\n    @EventLink\n    public final Listener<PacketSendEvent> onPacketSend = event -> {\n        final Packet<?> p = event.getPacket();\n\n        if (p instanceof C02PacketUseEntity) {\n            final C02PacketUseEntity wrapper = (C02PacketUseEntity) p;\n\n            if (wrapper.getAction().equals(C02PacketUseEntity.Action.ATTACK)) {\n                event.setCancelled();\n\n                PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, true));\n                PacketUtil.sendNoEvent(wrapper);\n                PacketUtil.sendNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY - 0.05, mc.thePlayer.posZ, false));\n            }\n        }\n    };\n\n    @EventLink\n    public final Listener<PacketReceiveEvent> onPacketReceiveEvent = event -> {\n        if (event.getPacket() instanceof S2DPacketOpenWindow) {\n            event.setCancelled();\n        }\n    };\n\n    @EventLink\n    public final Listener<StrafeEvent> onStrafe = event -> {\n        event.setSpeed(0);\n    };\n\n    @EventLink\n    public final Listener<MoveInputEvent> onMove = event -> {\n        event.setJump(false);\n    };\n\n    @Override\n    public void onEnable() {\n        yaw = mc.thePlayer.rotationYaw;\n        pitch = mc.thePlayer.rotationPitch;\n    }\n}\n\n// NOTE (AI): The S2D cancel (lines ~51-53) is unconditional, unlike WorldGuardRegen's tick-gated version. The y-drop and attack sandwich above it are the actual godmode mechanism; the window cancel keeps the server-side state desynced.",
+        "code_source": "Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/GodMode.java",
+        "vanilla_hook": "PreMotionEvent, PacketSendEvent, PacketReceiveEvent, StrafeEvent, MoveInputEvent.",
+        "anti_cheat_notes": "High detection risk by design: permanent window desync plus position desync is a classic godmode signature. Modern anti-cheats correlate C0E/C0D history with window ids and flag clicks against windows the client never opened.",
+        "variations": "Identical file in Rise 6.1.30. Rise 5.99 has no S2D reference in any module."
       }
+    ],
+    "general_hooks": "Both Rise 6.x modules filter S2D on PacketReceiveEvent; the surrounding exploit logic lives in PreMotionEvent and PacketSendEvent.",
+    "client_variations": "Rise 6.1.30 and 6.2.4 ship identical GodMode and WorldGuardRegen files. Memeware, Nekoware, Sigma, Spicy and Tenacity reference S2D only in vanilla sources. No client uses S2D for chest stealing or shop detection.",
+    "related": [
+      "S2EPacketCloseWindow",
+      "S2FPacketSetSlot",
+      "S30PacketWindowItems"
     ]
   }
 }

@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S00PacketDisconnect (0x00): Kicks the client during the login phase with a JSON chat component reason message (e.g. 'You are banned', 'Server is ful">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="LOGIN">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="AutoReconnect, AntiKick">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Speed / Timer (balance reset), Disabler (buffer flush on kick)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S00PacketDisconnect — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"LOGIN Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S00PacketDisconnect — Minecraft 1.8.9 Packet Reference","description":"The LOGIN-state kick carrying the JSON reason. No module cancels it, because the server closes the channel anyway; Rise 5.99 Speed/Timer and Spicy's Disabler instead use it as a reliable connection-death signal to reset timer balance and flush buffered transactions before the next join.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"LOGIN Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -68,28 +68,295 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerLoginClient.handleDisconnect()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerLoginClient</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S00PacketDisconnect is the LOGIN-state kick: the server sends it with a JSON IChatComponent reason whenever the handshake fails before the player exists. NetHandlerHandshakeTCP uses it for protocol version mismatches, NetHandlerLoginServer for banned, full, whitelisted or unverified players, and any plugin that rejects a join during login. The client's NetHandlerLoginClient.handleDisconnect closes the channel with the reason, which surfaces as the GuiDisconnected screen. Its PLAY-state sibling is S40PacketDisconnect, used for kicks after the world loads.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerLoginClient.handleDisconnect calls field_147393_d.closeChannel(packetIn.func_149603_c()), which tears down the NetworkManager and shows the disconnect screen with the JSON reason rendered. The server side has no symmetric handler because this packet is server-to-client only; the server closes the connection after sending it. Because the client handler runs on the login thread path, a module hooking PacketReceiveEvent sees the packet before the channel close, which is the window the 8 clients use to clean up state.</p>
+<h4>Why clients touch it</h4>
+<p>Two families in the 8 clients use this packet as a state-hygiene signal. Rise 5.99 Speed (line 1917) and Timer (line 81) reset their balance accumulators on S00PacketDisconnect so the MMC timer-balance state starts clean on the next join attempt. Spicy Disabler clears its C0FPacketConfirmTransaction buffer on the packet so stale transactions are never flushed into a fresh connection. No true AutoReconnect module hooks it in this corpus: the auto-rejoin features of these clients key off the play-state disconnect path or onDisconnect, not the login kick, which is why the packet sees no reconnect logic.</p>
+<h4>Exploit surface</h4>
+<p>Cancelling the packet would suppress the kick screen, but the channel close is driven by the server's own side, so the client gains nothing. The useful behavior is the reverse: treat the packet as a reliable 'connection died' notification. Clearing buffered transactions on disconnect matters because a stale C0FPacketConfirmTransaction replayed after relog desyncs the new window/uid sequence and can trip transaction-based anti-cheats. Timer's balance reset is defensive in the same spirit: a leftover negative balance would gate timerSpeed to 1 on the next join for no reason.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>Sent by NetHandlerHandshakeTCP for protocol mismatch (lines 35/39), by NetHandlerLoginServer for banned/full/whitelist and auth failures (line 79), and by plugins during login. The server closes the connection after sending; the client's handleDisconnect closes the channel with the reason, showing GuiDisconnected.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>LOGIN state, id 0x00, one IChatComponent serialized as a JSON string with a VarInt length prefix. Clientbound only. Distinguished from the PLAY-state S40PacketDisconnect by connection state; the two share a name but are different classes. Because it arrives before the world exists, module event buses that only fire post-join never see it, which is why only receive-side state cleanup hooks it.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Not an anti-cheat surface: the packet is server-initiated and carries no client-controlled data. Its relevance to anti-cheats is indirect, in what clients do in response: flushing buffered C0F transactions on disconnect keeps the exploit state machine clean, and a client that fails to do so can carry stale transaction state into the next session, which transaction-tracking anti-cheats (Verus-style) would flag.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoReconnect</span>
-<span class="impl-module-clients">(Tenacity 5.1, Gugustus)</span>
+<p class="impl-pattern">The LOGIN-state kick carrying the JSON reason. No module cancels it, because the server closes the channel anyway; Rise 5.99 Speed/Timer and Spicy's Disabler instead use it as a reliable connection-death signal to reset timer balance and flush buffered transactions before the next join.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Speed / Timer (balance reset)</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Detect kick/disconnect, cancel or auto-rejoin.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S00PacketDisconnect) {
-  event.setCancelled(true);
-  AutoReconnect.reconnect();
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Reset the timer-balance accumulator when the server kills a login, so the MMC timer exploit restarts from zero on the next join attempt.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PacketReceiveEvent handler checks instanceof S00PacketDisconnect. Timer.java zeroes balance, sentMessage and lastPreMotion; Speed.java zeroes balance at line 1917. Timer's MMC mode otherwise maintains a balance of 50ms per game tick minus real elapsed time, and only allows timerSpeed above 1 when the balance drops below -1000, so a stale balance would silently disable the exploit after a failed join.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/Timer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/Timer.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.other;
+
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.other.WorldChangedEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.event.impl.render.Render2DEvent;
+import dev.rise.font.CustomFont;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.setting.impl.NumberSetting;
+import net.minecraft.client.gui.ScaledResolution;
+import net.minecraft.network.login.server.S00PacketDisconnect;
+
+import java.awt.*;
+
+@ModuleInfo(name = "Timer", description = "Changes the game tick speed", category = Category.OTHER)
+public final class Timer extends Module {
+
+    private final NumberSetting timerSpeed = new NumberSetting("Timer Speed", this, 1.0, 0.1, 10.0, 0.1);
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Vanilla", "Vanilla", "MMC");
+    private final BooleanSetting disableOnWorldChange = new BooleanSetting("Disable on World Change", this, false);
+
+    private long balance;
+    private boolean sentMessage;
+    private long lastPreMotion;
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        if (mode.is("Vanilla"))
+            mc.timer.timerSpeed = (float) timerSpeed.getValue();
+        else {
+
+            final long lastPreMotion = this.lastPreMotion;
+            this.lastPreMotion = System.currentTimeMillis();
+
+            if (lastPreMotion != 0) {
+                final long difference = System.currentTimeMillis() - lastPreMotion;
+
+                balance += 50;
+                balance -= difference;
+            }
+
+            if (balance &lt; -1000) {
+                //Allow timer :)
+
+                mc.timer.timerSpeed = (float) timerSpeed.getValue();
+
+
+            } else {
+                if (timerSpeed.getValue() &gt; 1 &amp;&amp; !sentMessage) {
+                    Rise.addChatMessage("Please set timer speed value below 1 to decrease balance");
+                    sentMessage = true;
+
+                }
+                mc.timer.timerSpeed = 1;
+            }
+
+            if (timerSpeed.getValue() &lt; 1) {
+                mc.timer.timerSpeed = (float) timerSpeed.getValue();
+            }
+        }
+    }
+
+    @Override
+    protected void onDisable() {
+        mc.timer.timerSpeed = 1.0F;
+        balance = 0;
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        if (event.getPacket() instanceof S00PacketDisconnect) {
+            balance = 0;
+            sentMessage = false;
+            lastPreMotion = 0;
+        }
+    }
+    @Override
+    public void onWorldChanged(final WorldChangedEvent event) {
+        if (disableOnWorldChange.isEnabled()) {
+            this.toggleModule();
+        }
+    }
+
+    @Override
+    public void onRender2DEvent(final Render2DEvent event) {
+        final ScaledResolution sr = new ScaledResolution(mc);
+
+        if (mode.is("MMC"))
+            CustomFont.drawCenteredString("Balance: " + balance, sr.getScaledWidth() / 2d, sr.getScaledHeight() - 60, Color.WHITE.getRGB());
+    }
+}
+
+
+// NOTE (AI): S00PacketDisconnect only exists in the LOGIN state, so this hook fires exactly when a join attempt dies, before any world exists. The MMC balance accounting adds 50ms per tick and subtracts real elapsed time; zeroing it here guarantees a failed login cannot poison the next session's timer gating. Speed.java uses the identical balance = 0 reset in its own receive handler.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None: the reset only changes client-side state and never touches the wire. The server sees a normal S00 then connection close.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Speed.java (dev/rise/module/impl/movement/Speed.java) performs the same balance reset at line 1917 in its packet handler, alongside its S08PacketPlayerPosLook flag logic. Both are Rise 5.99; Rise 6.x drops the pattern in favor of its component-based timer.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiKick</span>
-<span class="impl-module-clients">(Tenacity 5.1, Gugustus)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler (buffer flush on kick)</span>
+<span class="impl-module-clients">(Spicy)</span>
 </div>
-<p class="impl-pattern">Detect kick/disconnect, cancel or auto-rejoin.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S00PacketDisconnect) {
-  event.setCancelled(true);
-  AutoReconnect.reconnect();
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Drop the buffered C0FPacketConfirmTransaction queue when the connection dies, so no stale transaction is replayed into the next session.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">EventPacket pre handler checks instanceof S00PacketDisconnect and clears C0FPackets. The same queue is cleared on C00Handshake (new connection) and otherwise drained at 500-1250ms intervals via sendPacketNoEvent while the disabler is active. The module also flushes the remainder on disable.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy — info/spicyclient/modules/player/Disabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/player/Disabler.java =====
+package info.spicyclient.modules.player;
+
+import java.util.ArrayList;
+import java.util.Random;
+
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.SpicyClient;
+import info.spicyclient.chatCommands.Command;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventPacket;
+import info.spicyclient.events.listeners.EventSendPacket;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.notifications.Color;
+import info.spicyclient.notifications.NotificationManager;
+import info.spicyclient.notifications.Type;
+import info.spicyclient.util.MovementUtils;
+import info.spicyclient.util.Timer;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.Packet;
+import net.minecraft.network.handshake.client.C00Handshake;
+import net.minecraft.network.login.server.S00PacketDisconnect;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0CPacketInput;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C13PacketPlayerAbilities;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
+
+public class Disabler extends Module {
+	public Disabler() {
+		super("Disabler", Keyboard.KEY_NONE, Category.PLAYER);
+	}
+	
+	public static transient boolean watchdog = false;
+	public static transient ArrayList&lt;C0FPacketConfirmTransaction&gt; C0FPackets = new ArrayList&lt;C0FPacketConfirmTransaction&gt;();
+	public static transient Timer ping = new Timer();
+	
+	@Override
+	public void onEnable() {
+		NotificationManager.getNotificationManager().createNotification("Relog for the disabler to take effect", "", true, 5000, Type.INFO, Color.PINK);
+		watchdog = false;
+	}
+	
+	@Override
+	public void onDisable() {
+		watchdog = false;
+		
+		for (C0FPacketConfirmTransaction p : C0FPackets) {
+			
+			mc.getNetHandler().getNetworkManager().sendPacketNoEvent(p);
+			
+		}
+		
+		C0FPackets.clear();
+		
+	}
+	
+	@Override
+	public void onEvent(Event e) {
+		
+		if (e instanceof EventUpdate &amp;&amp; e.isPre()) {
+			
+			this.additionalInformation = "Hypixel";
+			
+            PlayerCapabilities playerCapabilities = new PlayerCapabilities();
+            playerCapabilities.isFlying = true;
+            playerCapabilities.allowFlying = true;
+            //playerCapabilities.setFlySpeed((float) ((Math.random() * (9.0 - 0.1)) + 0.1));
+            playerCapabilities.setFlySpeed((float) ((Math.random() * (9.0 - 0.1)) + 0.1));
+            playerCapabilities.isCreativeMode = true;
+            mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C13PacketPlayerAbilities(playerCapabilities));
+            
+            // Added this
+            if (SpicyClient.config.fly.isEnabled()) {
+            	mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C13PacketPlayerAbilities(playerCapabilities));
+            }
+            
+            if (ping.hasTimeElapsed(500 + (new Random()).nextInt(750), true) &amp;&amp; C0FPackets.size() &gt; 0) {
+            	mc.getNetHandler().getNetworkManager().sendPacketNoEvent(C0FPackets.get(0));
+            	C0FPackets.remove(0);
+            }
+            
+		}
+		
+		if (e instanceof EventPacket &amp;&amp; e.isPre()) {
+			
+			if (((EventPacket)e).packet instanceof S00PacketDisconnect) {
+				C0FPackets.clear();
+			}
+			
+		}
+		
+		if (e instanceof EventSendPacket &amp;&amp; e.isPre()) {
+			
+			EventSendPacket event = (EventSendPacket) e;
+			
+			if (event.packet instanceof C00Handshake) {
+				C0FPackets.clear();
+			}
+			
+            if (event.packet instanceof C0FPacketConfirmTransaction) {
+            	
+                C0FPacketConfirmTransaction packetConfirmTransaction = (C0FPacketConfirmTransaction)event.packet;
+                
+                //mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C0FPacketConfirmTransaction(2147483647, packetConfirmTransaction.getUid(), false));
+                //mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C0FPacketConfirmTransaction(1147483647, packetConfirmTransaction.getUid(), false));
+                
+                
+                //packetConfirmTransaction.setAccepted(new Random().nextBoolean());
+                //packetConfirmTransaction.setWindowId(Integer.MIN_VALUE + new Random().nextInt(1000));
+                //packetConfirmTransaction.setUid(Short.MAX_VALUE);
+            	//mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C0FPacketConfirmTransaction(Integer.MIN_VALUE, Short.MAX_VALUE, true));
+                
+                C0FPackets.add(packetConfirmTransaction);
+                e.setCanceled(true);
+            }
+
+            if (event.packet instanceof C00PacketKeepAlive) {
+            	
+            	//mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C00PacketKeepAlive(-2147483648 + (new Random()).nextInt(100)));
+                //e.setCanceled(true);
+                
+            }
+            
+			if (event.packet instanceof C0CPacketInput) {
+				e.setCanceled(true);
+			}
+            
+		}
+		
+	}
+	
+}
+
+
+// NOTE (AI): The receive-side hook clears the C0F buffer the moment the server drops the handshake; the buffer is otherwise drained one packet every 500-1250ms via sendPacketNoEvent. Keeping stale transactions out of the next connection preserves the window/uid sequence the Hypixel Watchdog bypass depends on. The keepalive branch next to it is commented out, showing the mode was tuned for transaction-based disabling only.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (receive side)</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Replaying a buffered C0F after relog would desync the fresh connection's transaction sequence and trip transaction checks; the flush-on-disconnect is what keeps the exploit state machine consistent across joins.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other client in the corpus clears state on S00PacketDisconnect. Tenacity 6.0's AdvancedDisablerModule and Sigma's Disabler do not reference this packet in their mined files.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent (Rise 5.99) and EventPacket receive (Spicy). Both fire before the vanilla handleDisconnect closes the channel.</div>
+<div class="impl-clients">Rise 5.99 uses per-module onPacketReceive overrides; Spicy uses a central onEvent dispatcher with instanceof casts. Neither client's auto-reconnect logic references this packet, so the hook is purely state cleanup.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S02PacketLoginSuccess/">S02PacketLoginSuccess</a>
+<a class="related-chip" href="../S40PacketDisconnect/">S40PacketDisconnect</a>
+<a class="related-chip" href="../C00Handshake/">C00Handshake</a>
+<a class="related-chip" href="../C00PacketLoginStart/">C00PacketLoginStart</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

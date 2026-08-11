@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C0FPacketConfirmTransaction (0x0F): Client confirms receipt of a S32PacketConfirmTransaction (server inventory transaction).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Disabler, PingSpoof, Velocity, InvManager">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Disabler, PingSpoof, Velocity (transaction spoof), Timer (transaction parking), NoVoid / AntiVoid">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C0FPacketConfirmTransaction — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C0FPacketConfirmTransaction — Minecraft 1.8.9 Packet Reference","description":"The transaction echo that disablers live on. Cancel it to stall container logic, delay it to spoof ping, forge it to break velocity checks, or park it to freeze timer-based anti-cheats. Vanilla barely validates it, so the entire game is timing and uid correctness.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -72,326 +72,890 @@
 <div class="mcp-row"><span class="mcp-label">MCP</span><code>NetHandlerPlayServer.processConfirmTransaction()</code></div>
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>C0F is the client's acknowledgement of a server transaction: windowId, action number (uid), and accepted boolean. It exists to keep container actions and the server's movement/state checks in sync. Because the server sends S32PacketConfirmTransaction after inventory actions and certain checks, the client's C0F echo is the server's clock for latency and state. That makes C0F the backbone of disablers (break the transaction stream), ping spoofers (delay the echo), and velocity filters (spoof the echo to desync the check).</p>
+<h4>Vanilla handling</h4>
+<p>processConfirmTransaction is tiny: it looks up the pending action number for the open window and only re-enables crafting if the uid matches and the window matches. Vanilla itself does not time out or penalize missing confirmations; the NetHandlerPlayClient normally echoes S32 back as C0F automatically. This leniency is what disablers exploit: cancel C0F and the server-side container logic stalls without kicking.</p>
+<h4>Why clients touch it</h4>
+<p>Every client in the corpus has a Disabler that cancels, delays, or forges C0F (Memeware, Nekoware, Rise 5.99, Rise 6.x suite, Sigma, Spicy, Tenacity). PingSpoof (Rise 5.99, Rise 6.x PingSpoofComponent) parks C0F together with C00 and releases them late. Velocity modules (Rise 5.99 Velocity, Rise 6.2.4 VulcanVelocity) cancel the S32 trigger and answer with a forged C0F so the server believes the transaction completed while the velocity was removed. Rise 6.2.4 Timer parks C0F on the ground to freeze watchdog's transaction clock, and NoVoid/AntiVoid modules cancel C0F while falling.</p>
+<h4>Exploit surface</h4>
+<p>The accepted boolean and uid are forgeable. Memeware sends C0F(Integer.MIN_VALUE, Short.MAX_VALUE, true) to poison the server's transaction map; Spicy swaps the uid to desync; VulcanVelocity alternates uid 1/-1 to break Vulcan's velocity transaction tracking. The detection surface is the timing: a server that tracks C0F gaps (Verus, Watchdog) flags when the echo arrives outside the expected window, which is why disabler modes pair C0F with C00 delays and flush them together.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processConfirmTransaction: look up the pending action for openContainer.windowId; if the uid matches and crafting was disabled, re-enable crafting. No timeout, no kick, no penalty for a missing or wrong C0F in vanilla. The client handler echoes S32 automatically, and modules hook PacketSendEvent to cancel or mutate that echo.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Fields: windowId byte, actionNumber short, accepted boolean. Window 0 (inventory) transactions are sent frequently during normal play. The uid counter is per-container; S32PacketConfirmTransaction carries the same windowId/uid the server expects echoed. Clients that cancel C0F must still answer S32 for window clicks or the container desyncs.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Verus and Watchdog use C0F (and C00) gaps as a latency reference for timer and fly checks. The Rise 6.x disabler suite (TransactionDisabler, DynamicPVPDisabler, Verus2Disabler, WatchdogDisabler, LunarDisabler, UniversoCraftDisabler, MMCReachDisabler, ExperimentalDisabler, TestDisabler, ConvertMovingPacketsDisabler) is one mode per AC family. The trade-off: forging uids breaks the container logic visibly (items snap back), delaying keeps containers working but is detectable as a constant lag offset.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
+<p class="impl-pattern">The transaction echo that disablers live on. Cancel it to stall container logic, delay it to spoof ping, forge it to break velocity checks, or park it to freeze timer-based anti-cheats. Vanilla barely validates it, so the entire game is timing and uid correctness.</p>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Lycoris 2.0, November 0.2, Memeware 7.3, Raze v1.5b)</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">Delay/cancel/replace transaction confirmations. Disabler buffers C0F+C00 and releases after delay. Velocity cancels C0F when hurt to negate knockback. PingSpoof queues C0F for delayed release.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>package dev.tenacity.module.impl.exploit;
-
-import dev.tenacity.Tenacity;
-import dev.tenacity.event.impl.game.WorldEvent;
-import dev.tenacity.event.impl.network.PacketReceiveEvent;
-import dev.tenacity.event.impl.network.PacketSendEvent;
-import dev.tenacity.event.impl.player.MotionEvent;
-import dev.tenacity.module.Category;
-import dev.tenacity.module.Module;
-import dev.tenacity.module.impl.movement.Speed;
-import dev.tenacity.module.settings.impl.BooleanSetting;
-import dev.tenacity.module.settings.impl.MultipleBoolSetting;
-import dev.tenacity.module.settings.impl.NumberSetting;
-import dev.tenacity.ui.mainmenu.CustomMainMenu;
-import dev.tenacity.utils.misc.MathUtils;
-import dev.tenacity.utils.player.ChatUtil;
-import dev.tenacity.utils.player.MovementUtils;
-import dev.tenacity.utils.player.RotationUtils;
-import dev.tenacity.utils.server.PacketUtils;
-import dev.tenacity.utils.server.ServerUtils;
-import dev.tenacity.utils.time.TimerUtil;
-import net.minecraft.client.entity.EntityPlayerSP;
-import net.minecraft.client.gui.inventory.GuiInventory;
-import net.minecraft.client.multiplayer.GuiConnecting;
-import net.minecraft.entity.player.PlayerCapabilities;
-import net.minecraft.network.Packet;
-import net.minecraft.network.play.client.*;
-import net.minecraft.network.play.server.S07PacketRespawn;
-import net.minecraft.network.play.server.S08PacketPlayerPosLook;
-import net.minecraft.potion.Potion;
-import net.minecraft.util.AxisAlignedBB;
-import net.minecraft.util.ChatComponentText;
+<p class="impl-pattern">Cancel, delay, or forge C0F to break anti-cheat transaction-based checks.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Mode-dependent. Memeware's Transaction/Latest Verus modes cancel C0F and periodically re-send forged ones (C0F(Integer.MIN_VALUE, Short.MAX_VALUE, true) for the autoban channel); Sigma's SagePvP/ColdNetwork modes cancel C0F when id==0 and accepted; Rise 5.99's Disabler has a dozen modes (vulcanCombat, ncp, verus, etc.) that cancel C0F in specific packet windows; Rise 6.x splits this into per-AC disabler modules; Tenacity AdvancedDisablerModule cancels C0F in specific states.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/other/Disabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/other/Disabler.java =====
+package info.sigmaclient.module.impl.other;
 
 import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.stream.Collectors;
+import java.util.Collections;
+import java.util.Comparator;
 
-public final class Disabler extends Module {
+import info.sigmaclient.Client;
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.event.impl.EventUpdate;
+import info.sigmaclient.management.MoveUtils;
+import info.sigmaclient.management.notifications.Notifications;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.module.data.Options;
+import info.sigmaclient.module.data.Setting;
+import info.sigmaclient.module.impl.movement.Phase;
+import info.sigmaclient.util.Timer;
+import info.sigmaclient.util.misc.ChatUtil;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemBook;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.Packet;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.C00PacketKeepAlive;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
+import net.minecraft.network.play.server.S00PacketKeepAlive;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
 
-    private final MultipleBoolSetting disablers = new MultipleBoolSetting("Disablers",
-            new BooleanSetting("Watchdog Strafe", false),
-            new BooleanSetting("Watchdog Timer", false),
-            new BooleanSetting("MMC", false),
-            new BooleanSetting("C06-&gt;C04", false),
-            new BooleanSetting("C04-&gt;C06", false),
-            new BooleanSetting("Hover", false),
-            new BooleanSetting("Spoof Ground", false),
-            new BooleanSetting("C0B Cancel", false),
-            new BooleanSetting("C0C Spam", false),
-            new BooleanSetting("Verus", false),
-            new BooleanSetting("Omni Sprint", false),
-            new BooleanSetting("Void TP", false),
-            new BooleanSetting("Silent S08", false));
 
-    private final NumberSetting hoverHeight = new NumberSetting("Hover Height", 0.1, 5, 0.01, 0.01);
+public class Disabler extends Module {
+    String MODE = "MODE";
+    boolean faithful = false, watchdog = false, erisium = false;
+    Timer timer = new Timer();
+    int lastKey;
+    String mode;
 
-    private final BooleanSetting onGround = new BooleanSetting("On Ground", true);
-
-    private final NumberSetting TPDelay = new NumberSetting("TP Delay", 20, 100, 5, 1);
-
-    private final TimerUtil timer = new TimerUtil(), joinTimer = new TimerUtil();
-
-    private boolean synced;
-
-    private final CopyOnWriteArrayList&lt;Packet&gt; watchdogPlayerPackets = new CopyOnWriteArrayList&lt;&gt;(), watchdogC0FC00Packets = new CopyOnWriteArrayList&lt;&gt;(), watchdogInvPackets = new CopyOnWriteArrayList&lt;&gt;();
-
-    private final CopyOnWriteArrayList&lt;Packet&gt; packets = new CopyOnWriteArrayList&lt;&gt;();
-
-    private double s08Y;
-
-    public static boolean spiking;
-    public static final TimerUtil spikeTimer = new TimerUtil();
-
-    private int airTicks;
-
-    public Disabler() {
-        super("Disabler", Category.EXPLOIT, "Disables some anticheats");
-        TPDelay.addParent(disablers, voidTPDisabler -&gt; voidTPDisabler.getSetting("Void TP").isEnabled());
-        hoverHeight.addParent(disablers, hoverDisabler -&gt; hoverDisabler.getSetting("Hover").isEnabled());
-        onGround.addParent(disablers, spoofGroundDisabler -&gt; spoofGroundDisabler.getSetting("Spoof Ground").isEnabled());
-        this.addSettings(disablers, TPDelay, onGround, hoverHeight);
+    public Disabler(ModuleData data) {
+        super(data);
+        settings.put(MODE, new Setting&lt;&gt;(MODE, new Options("Mode", "Hypixel", new String[]{"Hypixel", "Faithful", "Erisium", "SagePvP", "ColdNetwork"}), "Disabler method."));
     }
 
     @Override
-    public void onMotionEvent(MotionEvent event) {
-        final List&lt;BooleanSetting&gt; enabledBooleanSettings = disablers.getBoolSettings().stream().filter(BooleanSetting::isEnabled).collect(Collectors.toList());
-
-
-        if(enabledBooleanSettings.size() == 1) {
-            setSuffix(enabledBooleanSettings.get(0).name);
-        } else if(enabledBooleanSettings.size() &gt; 1) {
-            setSuffix(enabledBooleanSettings.size() + " Enabled");
-        } else {
-            setSuffix("None");
-        }
-
-        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
-            if(booleanSetting.isEnabled()) {
-                switch(booleanSetting.name) {
-                    case "MMC":
-                        if (timer.hasTimeElapsed(MathUtils.getRandomInRange(1000, 1500), true)) {
-                            packets.forEach(PacketUtils::sendPacketNoEvent);
-                            packets.clear();
-                        }
-                        break;
-                    case "Watchdog Timer":
-                        if(spikeTimer.hasTimeElapsed(700, true)) {
-                            timer.reset();
-                        }
-                        break;
-                    case "C0C Spam":
-                        PacketUtils.sendPacketNoEvent(new C0CPacketInput());
-                        break;
-                }
-            }
-        }
-    }
-
-    @Override
-    public void onPacketSendEvent(PacketSendEvent event) {
-        if(mc.thePlayer == null) return;
-        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
-            if(booleanSetting.isEnabled()) {
-                switch(booleanSetting.name) {
-                    case "Watchdog Strafe":
-                        if(ServerUtils.isOnHypixel()) {
-                            if(event.getPacket() instanceof C03PacketPlayer &amp;&amp; !mc.thePlayer.isPotionActive(Potion.jump)) {
-                                final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                                if(Tenacity.INSTANCE.getModuleCollection().getModule(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.fallDistance &lt; 1)
-                                    c03.setOnGround(true);
-
-                                if(Tenacity.INSTANCE.getModuleCollection().getModule(Speed.class).isEnabled() &amp;&amp; mc.thePlayer.ticksExisted % 4 != 0 &amp;&amp; mc.thePlayer.fallDistance &lt; 1) {
-                                    event.cancel();
-                                    watchdogPlayerPackets.add(event.getPacket());
-                                } else if (!watchdogPlayerPackets.isEmpty()) {
-                                    watchdogPlayerPackets.forEach(PacketUtils::sendPacketNoEvent);
-                                    watchdogPlayerPackets.clear();
-                                }
-                            }
-                        }
-                        break;
-                    case "Watchdog Timer":
-                        if(ServerUtils.isOnHypixel()) {
-                            if(event.getPacket() instanceof C03PacketPlayer) {
-                                final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                                if(!c03.isMoving() &amp;&amp; !c03.getRotating()) {
-                                    event.cancel();
-                                    break;
-                                }
-                            }
-                            if(!timer.hasTimeElapsed(350)) {
-                                if(event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) {
-                                    event.cancel();
-                                    watchdogC0FC00Packets.add(event.getPacket());
-                                }
-                            } else if(!watchdogC0FC00Packets.isEmpty()) {
-                                watchdogC0FC00Packets.forEach(PacketUtils::sendPacketNoEvent);
-                                watchdogC0FC00Packets.clear();
-                            }
-                        }
-                        break;
-                    case "Void TP":
-                        if(event.getPacket() instanceof C03PacketPlayer) {
-                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                            if(mc.thePlayer.ticksExisted % TPDelay.getValue() == 0) {
-                                c03.setY(c03.getPositionY() - 1000);
-                            }
-                        }
-                        break;
-                    case "MMC":
-                        if (event.getPacket() instanceof C0BPacketEntityAction) {
-                            final C0BPacketEntityAction c0b = (C0BPacketEntityAction) event.getPacket();
-                            if (c0b.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
-                                if (EntityPlayerSP.serverSprintState) {
-                                    PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
-                                    EntityPlayerSP.serverSprintState = false;
-                                }
-                            }
-                            event.cancel();
-                        }
-
-                        if (event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) {
-                            event.cancel();
-                            packets.add(event.getPacket());
-                        }
-                        break;
-                    case "C06-&gt;C04":
-                        if (event.getPacket() instanceof C03PacketPlayer.C06PacketPlayerPosLook) {
-                            final C03PacketPlayer.C06PacketPlayerPosLook c06 = (C03PacketPlayer.C06PacketPlayerPosLook) event.getPacket();
-                            event.setPacket(new C03PacketPlayer.C04PacketPlayerPosition(c06.getPositionX(), c06.getPositionY(), c06.getPositionZ(), c06.isOnGround()));
-                        }
-                        break;
-                    case "C04-&gt;C06":
-                        if (event.getPacket() instanceof C03PacketPlayer.C04PacketPlayerPosition) {
-                            final C03PacketPlayer.C04PacketPlayerPosition c04 = (C03PacketPlayer.C04PacketPlayerPosition) event.getPacket();
-                            event.setPacket(new C03PacketPlayer.C06PacketPlayerPosLook(c04.getPositionX(), c04.getPositionY(), c04.getPositionZ(), mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch, c04.isOnGround()));
-                        }
-                        break;
-                    case "Hover":
-                        if (event.getPacket() instanceof C03PacketPlayer) {
-                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                            c03.setY(mc.thePlayer.posY + hoverHeight.getValue());
-                        }
-                        break;
-                    case "Spoof Ground":
-                        if (event.getPacket() instanceof C03PacketPlayer) {
-                            final C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
-                            c03.setOnGround(onGround.isEnabled());
-                        }
-                        break;
-                    case "C0B Cancel":
-                        if (event.getPacket() instanceof C0BPacketEntityAction) event.cancel();
-                        break;
-                    case "Verus":
-                        if(event.getPacket() instanceof C0FPacketConfirmTransaction || event.getPacket() instanceof C00PacketKeepAlive) event.cancel();
-                        break;
-                    case "Omni Sprint":
-                        if (event.getPacket() instanceof C0BPacketEntityAction) {
-                            final C0BPacketEntityAction c0b = (C0BPacketEntityAction) event.getPacket();
-                            if (c0b.getAction().equals(C0BPacketEntityAction.Action.START_SPRINTING)) {
-                                if (EntityPlayerSP.serverSprintState) {
-                                    PacketUtils.sendPacketNoEvent(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
-                                    EntityPlayerSP.serverSprintState = false;
-                                }
-                            }
-                            event.cancel();
-                        }
-                        break;
-                }
-            }
-        }
-    }
-
-    @Override
-    public void onPacketReceiveEvent(PacketReceiveEvent event) {
-        for(BooleanSetting booleanSetting : disablers.getBoolSettings()) {
-            if (booleanSetting.isEnabled()) {
-                switch (booleanSetting.name) {
-                    case "Silent S08":
-                        if(event.getPacket() instanceof S08PacketPlayerPosLook) {
-                            final S08PacketPlayerPosLook s08 = (S08PacketPlayerPosLook) event.getPacket();
-                            event.cancel();
-                            PacketUtils.sendPacketNoEvent(new C03PacketPlayer.C06PacketPlayerPosLook(s08.getX(), s08.getY(), s08.getZ(), s08.getYaw(), s08.getPitch(), false));
-                        }
-                        break;
-                }
-            }
-        }
-    }
-
-    private boolean isBlockUnder() {
-        if (mc.thePlayer.posY &lt; 0) return false;
-        for (int offset = 0; offset &lt; (int) mc.thePlayer.posY + 2; offset += 2) {
-            AxisAlignedBB bb = mc.thePlayer.getEntityBoundingBox().offset(0, -offset, 0);
-            if (!mc.theWorld.getCollidingBoundingBoxes(mc.thePlayer, bb).isEmpty()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    @Override
-    public void onWorldEvent(WorldEvent event) {
-        watchdogC0FC00Packets.clear();
+    public void onEnable() {
+        if (mc.theWorld == null)
+            return;
+        erisium = false;
         timer.reset();
+        mode = ((Options) settings.get(MODE).getValue()).getSelected();
+        if (mode.equalsIgnoreCase("ViperMC")) {
+            if (!MoveUtils.isOnGround(0.0001)) {
+                this.toggle();
+                Notifications.getManager().post("Disabler", "Try again on ground !", Notifications.Type.WARNING);
+            }
+        }
+        if (mode.equalsIgnoreCase("Hypixel")) {
+            if (MoveUtils.isOnGround(0.001) &amp;&amp; mc.thePlayer.isCollidedVertically) {
+                double x = mc.thePlayer.posX;
+                double y = mc.thePlayer.posY;
+                double z = mc.thePlayer.posZ;
+                mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.16, z, true));
+                mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.07, z, true));
+                watchdog = true;
+                Notifications.getManager().post("Disabler", "Wait 5s.", Notifications.Type.INFO);
+            } else {
+                watchdog = false;
+            }
+        } else if (mode.equalsIgnoreCase("Faithful")) {
+            Notifications.getManager().post("Disabler", "Relog to disable Area 51.", Notifications.Type.INFO);
+        }
+    }
+
+    @Override
+    @RegisterEvent(events = {EventUpdate.class, EventPacket.class})
+    public void onEvent(Event event) {
+        if (mode == null) {
+            mode = ((Options) settings.get(MODE).getValue()).getSelected();
+        }
+        if (!mode.equalsIgnoreCase(((Options) settings.get(MODE).getValue()).getSelected())) {
+
+            mode = ((Options) settings.get(MODE).getValue()).getSelected();
+            if (mode.equalsIgnoreCase("Faithful")) {
+                Notifications.getManager().post("Disabler", "Relog to disable Area 51.", Notifications.Type.INFO);
+            }
+        }
+        this.setSuffix(mode);
+        if (event instanceof EventUpdate) {
+            EventUpdate em = (EventUpdate) event;
+            if (em.isPre()) {
+                if (mc.thePlayer.ticksExisted &lt;= 1) {
+                    erisium = false;
+                }
+                if (mode.equalsIgnoreCase("ViperMC")) {
+                    if (timer.delay(3000)) {
+                        em.setY(mc.thePlayer.posY + 0.4);
+                        return;
+                    }
+                    for (int i = 0; i &lt; 10; ++i) {
+                        boolean i2 = i &gt; 2 &amp;&amp; i &lt; 8;
+                        double x = i2 ? 0.2 : -0.2D;
+                        C03PacketPlayer.C04PacketPlayerPosition packet = new C03PacketPlayer.C04PacketPlayerPosition(
+                                mc.thePlayer.posX, mc.thePlayer.posY + x, mc.thePlayer.posZ, true);
+                        mc.thePlayer.sendQueue.addToSendQueue(packet);
+                    }
+                }
+                if (mode.equalsIgnoreCase("Hypixel"))
+                    if (!watchdog) {
+                        if (MoveUtils.isOnGround(0.001) &amp;&amp; mc.thePlayer.isCollidedVertically) {
+                            double x = mc.thePlayer.posX;
+                            double y = mc.thePlayer.posY;
+                            double z = mc.thePlayer.posZ;
+                            mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y, z, true));
+                            mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.16, z, true));
+                            mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(x, y + 0.07, z, true));
+                            watchdog = true;
+                            Notifications.getManager().post("Disabler", "Please wait 5s.", Notifications.Type.INFO);
+                        }
+                    } else {
+                        mc.thePlayer.motionX = 0;
+                        mc.thePlayer.motionY = 0;
+                        mc.thePlayer.motionZ = 0;
+                        mc.thePlayer.jumpMovementFactor = 0;
+                        mc.thePlayer.noClip = true;
+                        mc.thePlayer.onGround = false;
+                    }
+                if (mode.equalsIgnoreCase("Erisium")) {
+                    if (erisium &amp;&amp; timer.delay(1500)) {
+                        erisium = !erisium;
+                        mc.thePlayer.sendQueue.getNetworkManager().sendPacketNoEvent(new C00PacketKeepAlive(lastKey));
+                    }
+                }
+
+            }
+        } else if (event instanceof EventPacket) {
+            EventPacket ep = (EventPacket) event;
+            Packet p = ep.getPacket();
+            if (ep.isPre()) {
+                if (p instanceof C03PacketPlayer) {
+                    if (mode.equalsIgnoreCase("Hypixel") &amp;&amp; watchdog) {
+                        ep.setCancelled(true);
+                    }
+                }
+                if (p instanceof S08PacketPlayerPosLook) {
+                    S08PacketPlayerPosLook pac = (S08PacketPlayerPosLook) ep.getPacket();
+                    pac.yaw = mc.thePlayer.rotationYaw;
+                    pac.pitch = mc.thePlayer.rotationPitch;
+                    if (watchdog &amp;&amp; mode.equalsIgnoreCase("Hypixel")) {
+                        Notifications.getManager().post("Disabler", "You can do what you want for 5s !", Notifications.Type.INFO);
+                        this.toggle();
+                    }
+                }
+                if (p instanceof S00PacketKeepAlive) {
+                    S00PacketKeepAlive packet = (S00PacketKeepAlive) p;
+                    int KEY = packet.func_149134_c();
+                    if (mode.equalsIgnoreCase("Erisium")) {
+                        timer.reset();
+                        erisium = true;
+                        lastKey = KEY;
+                    }
+                }
+                if (p instanceof C00PacketKeepAlive) {
+                    C00PacketKeepAlive packet = (C00PacketKeepAlive) p;
+                    if (mode.equalsIgnoreCase("Faithful") || mode.equalsIgnoreCase("Erisium") || mode.equalsIgnoreCase("SagePvP") || mode.equalsIgnoreCase("ColdNetwork")) {
+                        ep.setCancelled(true);
+                    }
+                }
+                if (p instanceof C0FPacketConfirmTransaction) {
+                    C0FPacketConfirmTransaction packet = (C0FPacketConfirmTransaction) p;
+                    int id = packet.getId();
+                    boolean accepted = packet.isAccepted();
+                    int uid = packet.getUid();
+                    if (id == 0 &amp;&amp; accepted)
+                        if (mode.equalsIgnoreCase("SagePvP") || mode.equalsIgnoreCase("ColdNetwork")) {
+                            ep.setCancelled(true);
+                        }
+
+                }
+            }
+        }
     }
 }
 
+// NOTE (AI): Sigma 4.11 Disabler: complete file. Lines ~174-182 cancel C0F when id==0 and accepted for SagePvP/ColdNetwork, and cancel C00 for Faithful/Erisium modes. Shows the mode-switch structure.
 </code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket send/receive; event.setCancelled(true) on the C0F.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancelling C0F for window 0 freezes the player's inventory transactions visibly; the modes pair it with C00 cancellation so the anti-cheat's latency reference is also broken. Verus-based modes in Rise 6.x (Verus2Disabler) also send C0B sneak/sprint to shape the state.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware Disabler (forged uids, queue-based), Nekoware Disabler, Rise 5.99 Disabler (mode matrix), Rise 6.2.4/6.1.30 per-AC suite (TransactionDisabler, WatchdogDisabler, LunarDisabler, DynamicPVPDisabler, UniversoCraftDisabler, MMCReachDisabler, ExperimentalDisabler, TestDisabler, ConvertMovingPacketsDisabler), Spicy Disabler (C0F packet buffer), Tenacity DisablerModule/AdvancedDisablerModule.</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoof</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Lycoris 2.0, November 0.2, Memeware 7.3, Raze v1.5b)</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Delay/cancel/replace transaction confirmations. Disabler buffers C0F+C00 and releases after delay. Velocity cancels C0F when hurt to negate knockback. PingSpoof queues C0F for delayed release.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Disabler — buffer + release
-if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
-  event.setCancelled(true);
-  transactionQueue.add(event.getPacket());
+<p class="impl-pattern">Inflate measured ping by delaying the C0F (and C00) echo.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 6.2.4 PingSpoofComponent cancels C0F and C00 on the send event, parks them in a queue with a timestamp, and flushes them from PostMotionEvent once the delay elapses. The component API (spoof/blink) lets other modules request the delay for specific packet classes.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/PingSpoofComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/PingSpoofComponent.java =====
+package com.alan.clients.component.impl.player;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.CancellableEvent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PostMotionEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.util.packet.PacketUtil;
+import net.minecraft.client.gui.GuiDownloadTerrain;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.Tuple;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+public final class PingSpoofComponent extends Component {
+    public static ConcurrentLinkedQueue&lt;PacketUtil.TimedPacket&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+    static StopWatch enabledTimer = new StopWatch();
+    public static boolean enabled;
+    static long amount;
+    static Tuple&lt;Class[], Boolean&gt; regular = new Tuple&lt;&gt;(new Class[]{C0FPacketConfirmTransaction.class, C00PacketKeepAlive.class, S1CPacketEntityMetadata.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; velocity = new Tuple&lt;&gt;(new Class[]{S12PacketEntityVelocity.class, S27PacketExplosion.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; teleports = new Tuple&lt;&gt;(new Class[]{S08PacketPlayerPosLook.class, S39PacketPlayerAbilities.class, S09PacketHeldItemChange.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; players = new Tuple&lt;&gt;(new Class[]{S13PacketDestroyEntities.class, S14PacketEntity.class, S14PacketEntity.S16PacketEntityLook.class, S14PacketEntity.S15PacketEntityRelMove.class, S14PacketEntity.S17PacketEntityLookMove.class, S18PacketEntityTeleport.class, S20PacketEntityProperties.class, S19PacketEntityHeadLook.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; blink = new Tuple&lt;&gt;(new Class[]{C02PacketUseEntity.class, C0DPacketCloseWindow.class, C0EPacketClickWindow.class, C0CPacketInput.class, C0BPacketEntityAction.class, C08PacketPlayerBlockPlacement.class, C07PacketPlayerDigging.class, C09PacketHeldItemChange.class, C13PacketPlayerAbilities.class, C15PacketClientSettings.class, C16PacketClientStatus.class, C17PacketCustomPayload.class, C18PacketSpectate.class, C19PacketResourcePackStatus.class, C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class, C0APacketAnimation.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; movement = new Tuple&lt;&gt;(new Class[]{C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class}, false);
+
+    public static Tuple&lt;Class[], Boolean&gt;[] types = new Tuple[]{regular, velocity, teleports, players, blink, movement};
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; send = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; receive = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    public CancellableEvent onPacket(Packet&lt;?&gt; packet, CancellableEvent event) {
+        if (!event.isCancelled() &amp;&amp; enabled &amp;&amp; Arrays.stream(types).anyMatch(tuple -&gt; tuple.getSecond() &amp;&amp; Arrays.stream(tuple.getFirst()).anyMatch(regularpacket -&gt; regularpacket == packet.getClass()))) {
+            event.setCancelled();
+            packets.add(new PacketUtil.TimedPacket(packet));
+        }
+
+        return event;
+    }
+
+    public static void dispatch() {
+        if (!packets.isEmpty()) {
+            // Stops the packets from being called twice
+            boolean enabled = PingSpoofComponent.enabled;
+            PingSpoofComponent.enabled = false;
+            packets.forEach(timedPacket -&gt; PacketUtil.queue(timedPacket.getPacket()));
+            PingSpoofComponent.enabled = enabled;
+            packets.clear();
+        }
+    }
+
+    public static void disable() {
+        enabled = false;
+        enabledTimer.setMillis(enabledTimer.millis - 999999999);
+    }
+
+    @EventLink
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; dispatch();
+
+    @EventLink
+    public final Listener&lt;PostMotionEvent&gt; onPostMotion = event -&gt; {
+        if (!(enabled = !enabledTimer.finished(100) &amp;&amp; !(mc.currentScreen instanceof GuiDownloadTerrain))) {
+            dispatch();
+        } else {
+            // Stops the packets from being called twice
+            enabled = false;
+
+            packets.forEach(packet -&gt; {
+                if (packet.getTime() + amount &lt; System.currentTimeMillis()) {
+                    PacketUtil.queue(packet.getPacket());
+                    packets.remove(packet);
+                }
+            });
+
+            enabled = true;
+        }
+    };
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players) {
+        spoof(amount, regular, velocity, teleports, players, false);
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink, boolean movement) {
+        enabledTimer.reset();
+
+        PingSpoofComponent.regular.setSecond(regular);
+        PingSpoofComponent.velocity.setSecond(velocity);
+        PingSpoofComponent.teleports.setSecond(teleports);
+        PingSpoofComponent.players.setSecond(players);
+        PingSpoofComponent.blink.setSecond(blink);
+        PingSpoofComponent.movement.setSecond(movement);
+        PingSpoofComponent.amount = amount;
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink) {
+        spoof(amount, regular, velocity, teleports, players, blink, false);
+    }
+
+    public static void blink() {
+        spoof(9999999, true, false, false, false, true);
+    }
 }
-// ... after delay, flush: transactionQueue.forEach(PacketUtils::sendPacketNoEvent);
-// Spoof transaction
-mc.getNetHandler().addToSendQueueSilent(new C0FPacketConfirmTransaction(Integer.MAX_VALUE, uid, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+
+// NOTE (AI): Rise 6.2.4 PingSpoofComponent: complete file. The 'regular' tuple (line ~28) parks C0F + C00 + S1C; onPacket cancels and queues (lines ~43-50), PostMotionEvent flushes after the delay (lines ~72-88).
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent (cancel), PostMotionEvent (flush), WorldChangeEvent (dispatch).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Delaying C0F+C00 together keeps the two gaps consistent, which is the tell Verus uses to separate lag from spoofing. A constant delay shows as a fixed ping offset; varying it looks like jitter.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 PingSpoof.java parks C0F+C00 in a ConcurrentHashMap with per-packet release times; Rise 6.1.30 uses the same component.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Velocity</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Lycoris 2.0, November 0.2, Memeware 7.3, Raze v1.5b)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Velocity (transaction spoof)</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Delay/cancel/replace transaction confirmations. Disabler buffers C0F+C00 and releases after delay. Velocity cancels C0F when hurt to negate knockback. PingSpoof queues C0F for delayed release.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Disabler — buffer + release
-if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
-  event.setCancelled(true);
-  transactionQueue.add(event.getPacket());
+<p class="impl-pattern">Remove knockback while keeping the server's transaction bookkeeping consistent.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 6.2.4 VulcanVelocity cancels S32PacketConfirmTransaction when hurtTime == 10 (the knockback window) and answers with a forged C0F alternating uid 1/-1, so Vulcan's velocity check believes the transaction completed and the knockback was legitimately absent. Rise 5.99 Velocity cancels C0F/S32 pairs in its own modes.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/VulcanVelocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/VulcanVelocity.java =====
+package com.alan.clients.module.impl.combat.velocity;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.impl.combat.Velocity;
+import com.alan.clients.module.impl.movement.Speed;
+import com.alan.clients.module.impl.movement.Sprint;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.NumberValue;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S27PacketExplosion;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
+
+public final class VulcanVelocity extends Mode&lt;Velocity&gt; {
+
+    private final NumberValue horizontal = new NumberValue("Horizontal", this, 0, 0, 100, 1);
+    private final NumberValue vertical = new NumberValue("Vertical", this, 0, 0, 100, 1);
+    private boolean transaction = false;
+
+    public VulcanVelocity(String name, Velocity parent) {
+        super(name, parent);
+    }
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        if (getParent().onSwing.getValue() &amp;&amp; !mc.thePlayer.isSwingInProgress || event.isCancelled()) return;
+
+        final Packet&lt;?&gt; p = event.getPacket();
+        final double horizontal = this.horizontal.getValue().doubleValue();
+        final double vertical = this.vertical.getValue().doubleValue();
+
+
+        if (p instanceof S12PacketEntityVelocity) {
+            final S12PacketEntityVelocity wrapper = (S12PacketEntityVelocity) p;
+
+            if (wrapper.getEntityID() == mc.thePlayer.getEntityId()) {
+                if (horizontal == 0 &amp;&amp; vertical == 0) {
+if(!(getModule(Speed.class).mode.getValue().getName()=="Vulcan") || !getModule(Speed.class).isEnabled() || !MoveUtil.isMoving()){
+    event.setCancelled();
+                    } else {
+
+    wrapper.motionX *= 1.9;
+    wrapper.motionY *= 1;
+    wrapper.motionZ *=1.9;
 }
-// ... after delay, flush: transactionQueue.forEach(PacketUtils::sendPacketNoEvent);
-// Spoof transaction
-mc.getNetHandler().addToSendQueueSilent(new C0FPacketConfirmTransaction(Integer.MAX_VALUE, uid, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InvManager</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Lycoris 2.0, November 0.2, Memeware 7.3, Raze v1.5b)</span>
-</div>
-<p class="impl-pattern">Delay/cancel/replace transaction confirmations. Disabler buffers C0F+C00 and releases after delay. Velocity cancels C0F when hurt to negate knockback. PingSpoof queues C0F for delayed release.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Disabler — buffer + release
-if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
-  event.setCancelled(true);
-  transactionQueue.add(event.getPacket());
+
+                    return;
+                }
+
+                wrapper.motionX *= 1;
+                wrapper.motionY *= 1;
+                wrapper.motionZ *=1;
+
+                event.setPacket(wrapper);
+            }
+        }
+
+
+        if (p instanceof S27PacketExplosion) {
+            final S27PacketExplosion wrapper = (S27PacketExplosion) p;
+
+            if (horizontal == 0 &amp;&amp; vertical == 0) {
+                event.setCancelled();
+                return;
+            }
+
+            wrapper.posX *= horizontal / 100;
+            wrapper.posY *= vertical / 100;
+            wrapper.posZ *= horizontal / 100;
+
+            event.setPacket(wrapper);
+        }
+
+
+        if (p instanceof S32PacketConfirmTransaction &amp;&amp; mc.thePlayer.hurtTime == 10) {
+            event.setCancelled(true);
+            PacketUtil.send(new C0FPacketConfirmTransaction((short) (transaction ? 1 : -1), (short) (transaction ? -1 : 1), transaction));
+            transaction = !transaction;
+
+
+        }
+    };
 }
-// ... after delay, flush: transactionQueue.forEach(PacketUtils::sendPacketNoEvent);
-// Spoof transaction
-mc.getNetHandler().addToSendQueueSilent(new C0FPacketConfirmTransaction(Integer.MAX_VALUE, uid, false));</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+
+// NOTE (AI): Rise 6.2.4 VulcanVelocity: complete file. Lines ~80-85 cancel S32 at hurtTime==10 and send a forged C0F with alternating uid 1/-1.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (S32 cancel), PacketUtil.send for the forged C0F.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The alternating uid keeps the server's transaction map from desyncing while the velocity check is fooled. Wrong uid parity causes the inventory to lock and the AC to flag a transaction mismatch.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 Velocity.java; Rise 6.1.30 VulcanVelocity.java; WatchdogVelocity/RedeskyVelocity in 6.2.4 use C0B sprint actions instead of C0F for their velocity modes.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Timer (transaction parking)</span>
+<span class="impl-module-clients">(Rise 6.2.4, Tenacity 6.0)</span>
 </div>
+<p class="impl-pattern">Freeze the server's transaction clock by parking S32/C0F on the ground so timer-speed movement is not caught.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 6.2.4 Timer, in watchdog mode, cancels S32PacketConfirmTransaction while on the ground and queues it for later replay, so the server's transaction-based timing reference lags behind the client's accelerated timer. Tenacity TimerModule imports C0F for the same purpose.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/other/Timer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/other/Timer.java =====
+package com.alan.clients.module.impl.other;
+
+import com.alan.clients.Client;
+import com.alan.clients.component.impl.player.BlinkComponent;
+import com.alan.clients.component.impl.player.PingSpoofComponent;
+import com.alan.clients.component.impl.render.NotificationComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.input.KeyboardInputEvent;
+import com.alan.clients.event.impl.input.MoveInputEvent;
+import com.alan.clients.event.impl.motion.JumpEvent;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.motion.PreUpdateEvent;
+import com.alan.clients.event.impl.motion.StrafeEvent;
+import com.alan.clients.event.impl.other.TeleportEvent;
+import com.alan.clients.event.impl.other.TickEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.Module;
+import com.alan.clients.module.api.Category;
+import com.alan.clients.module.api.ModuleInfo;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.module.impl.player.Scaffold;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.math.MathUtil;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.packet.custom.impl.PlayPongC2SPacket;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.util.player.PlayerUtil;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.BoundsNumberValue;
+import com.viaversion.viaversion.api.protocol.version.ProtocolVersion;
+import de.florianmichael.vialoadingbase.ViaLoadingBase;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.server.S00PacketKeepAlive;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
+import net.minecraft.util.Vec3;
+import org.apache.commons.compress.utils.Lists;
+
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ThreadLocalRandom;
+
+@ModuleInfo(aliases = {"module.other.timer.name"}, description = "module.other.timer.description", category = Category.MOVEMENT)
+public final class Timer extends Module {
+    private boolean attempt;
+
+    public static ConcurrentLinkedQueue&lt;PacketUtil.TimedPacket&gt; packetList = new ConcurrentLinkedQueue&lt;&gt;();
+    private int ticksSinceTeleport;
+
+    private long ticks2;
+    private boolean teleport;
+    private final BoundsNumberValue timer =
+            new BoundsNumberValue("Timer", this, 1, 2, 0.1, 20, 0.05);
+
+    public final BooleanValue watchdog = new BooleanValue("Watchdog", this, false);
+
+    @EventLink(value = Priorities.MEDIUM)
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if(!watchdog.getValue()) {
+
+
+            mc.timer.timerSpeed = (float) MathUtil.getRandom(timer.getValue().floatValue(), timer.getSecondValue().floatValue());
+        } else if (watchdog.getValue()){
+            event.setOnGround(true);
+
+            if(attempt &amp;&amp; System.currentTimeMillis() &gt; ticks2){
+                mc.thePlayer.motionX *= 0;
+                mc.thePlayer.motionZ *= 0;
+                ticks2 = 0;
+                getModule(Timer.class).toggle();
+
+
+            }
+
+
+
+
+        }
+    };
+
+    @EventLink(value = Priorities.HIGH)
+    public final Listener&lt;PreUpdateEvent&gt; onHighPreUpdate = event -&gt; {
+        if(watchdog.getValue()) {
+            PingSpoofComponent.spoof(9999999, false, false, false, false, true);
+            mc.thePlayer.safeWalk = true;
+        }
+    };
+
+
+    @EventLink
+    public final Listener&lt;TickEvent&gt; onTick = event -&gt; {
+        if(watchdog.getValue() &amp;&amp; !attempt) {
+            if (mc.thePlayer.onGround) {
+                ticksSinceTeleport++;
+
+                double x = mc.thePlayer.posX;
+                double y = mc.thePlayer.posY;
+                double z = mc.thePlayer.posZ;
+                float yaw = mc.thePlayer.rotationYaw;
+                float pitch = mc.thePlayer.rotationPitch;
+                PacketUtil.send(new C03PacketPlayer.C04PacketPlayerPosition(x, y, z,  true));
+                PacketUtil.send(new C03PacketPlayer.C04PacketPlayerPosition(x, y-0.0000000000000001, z,  true));
+                PacketUtil.send(new C03PacketPlayer.C04PacketPlayerPosition(x, y+ 0.07, z,  true));
+                PacketUtil.send(new C03PacketPlayer.C04PacketPlayerPosition(x, y, z,  true));
+                mc.timer.timerSpeed = (float)(timer.getValue().floatValue());
+                teleport = true;
+            } else if(watchdog.getValue()){
+             //   this.mc.timer.timerSpeed = 1;
+             //   MoveUtil.stop();
+
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;MoveInputEvent&gt; onMove = event -&gt; {
+        if(watchdog.getValue()) {
+            if (mc.thePlayer.onGround &amp;&amp; ticksSinceTeleport == 0) {
+                MoveUtil.stop();
+            }
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+        if(watchdog.getValue()) {
+
+            if (attempt) {
+                MoveUtil.stop();
+                this.mc.timer.timerSpeed = 1f;
+                if (mc.thePlayer.onGround) {
+                    packetList.forEach(timedPacket -&gt; PacketUtil.queue(timedPacket.getPacket()));
+                    packetList.clear();
+                    PingSpoofComponent.dispatch();
+                    // mc.thePlayer.jump();
+                }
+
+            }
+        }
+    };
+
+
+
+    @EventLink(value = Priorities.VERY_LOW)
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        if(watchdog.getValue()) {
+            if (mc.thePlayer.onGround) {
+                Packet&lt;?&gt; packet = event.getPacket();
+
+                if (packet instanceof S32PacketConfirmTransaction) {
+                    packetList.add(new PacketUtil.TimedPacket(packet));
+                    event.setCancelled();
+                }
+
+            } else {
+             //   packetList.forEach(timedPacket -&gt; PacketUtil.queue(timedPacket.getPacket()));
+             //   packetList.clear();
+            }
+        }
+
+    };
+    @EventLink()
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+
+if(watchdog.getValue()) {
+    final Packet&lt;?&gt; p = event.getPacket();
+    if (p instanceof S12PacketEntityVelocity) {
+        final S12PacketEntityVelocity wrapper = (S12PacketEntityVelocity) p;
+        event.setCancelled();
+    }
+    if (p instanceof S08PacketPlayerPosLook) {
+        event.setCancelled();
+    }
+}
+    };
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;TeleportEvent&gt; onTeleport = event -&gt; {
+
+    };
+
+
+    @EventLink
+    public final Listener&lt;JumpEvent&gt; onJump = event -&gt; {
+        if(watchdog.getValue()) {
+            event.setCancelled();
+        }
+
+    };
+    @Override
+    public void onEnable() {
+        if(watchdog.getValue()) {
+            mc.thePlayer.stepHeight = 0.0F;
+            attempt = false;
+            ticksSinceTeleport = 0;
+            teleport = false;
+            ticks2 = 0;
+        }
+    }
+
+    @Override
+    public void onDisable() {
+        if (this.mc.timer.timerSpeed != 1) {
+
+            this.mc.timer.timerSpeed = 1;
+
+        }
+
+        if(watchdog.getValue()){
+            mc.thePlayer.stepHeight = 0.6F;
+            mc.thePlayer.motionX *= 0;
+            mc.thePlayer.motionZ *= 0;
+
+
+        }
+
+    }
+
+    @EventLink
+    public final Listener&lt;KeyboardInputEvent&gt; onKey = event -&gt; {
+        if (watchdog.getValue() &amp;&amp; event.getKeyCode() == getModule(Timer.class).getKey() &amp;&amp; !attempt) {
+
+            ticks2 = System.currentTimeMillis() + 200;
+            attempt = true;
+            ChatUtil.display("sent");
+            event.setCancelled();
+
+
+
+        }
+
+        if (watchdog.getValue() &amp;&amp; attempt) {
+            event.setCancelled();
+            }
+
+
+    };
+}
+
+// NOTE (AI): Rise 6.2.4 Timer: complete file. The watchdog mode (lines ~150-165) parks S32 packets on the ground and cancels them, keeping the transaction clock frozen while timerSpeed runs ahead.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent (S32 park) + PacketReceiveEvent (velocity cancel); PacketUtil.TimedPacket queue.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Watchdog measures timer via transaction gaps; parking S32 on the ground only works while the player is grounded, which is why the module cancels the park in the air. Tenacity's TimerModule references C0F only at import level in this corpus.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Tenacity 6.0 TimerModule.java imports C0FPacketConfirmTransaction; Rise 6.1.30 Timer not present in corpus, 6.2.4 Timer is the representative.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoVoid / AntiVoid</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30)</span>
+</div>
+<p class="impl-pattern">Cancel C0F (and all non-movement packets) while falling into the void so the server never registers the fall.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 5.99 NoVoid cancels every packet except C03 and C0F while the player is falling below a threshold, keeping the movement stream alive but suppressing the confirmations and other state that would let the server finalize the death. Rise 6.2.4 BlinkAntiVoid/WatchdogAntiVoid buffer C0F with a blink component and release on ground contact.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/player/NoVoid.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/player/NoVoid.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.player;
+
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.packet.PacketSendEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.module.impl.movement.Fly;
+import dev.rise.module.impl.movement.HighJump;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.ModeSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.player.MoveUtil;
+import dev.rise.util.player.PacketUtil;
+import dev.rise.util.player.PlayerUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.util.Vec3;
+
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+@ModuleInfo(name = "NoVoid", description = "Prevents you from falling into the void", category = Category.PLAYER)
+public final class NoVoid extends Module {
+    private final ModeSetting mode = new ModeSetting("Mode", this, "Flag", "Flag", "Position", "Jump", "Ground", "Matrix", "Hypixel", "Boost", "Blink");
+    private final NumberSetting fallDistance = new NumberSetting("Fall Distance", this, 5, 1, 10, 0.1);
+    private final BooleanSetting voidCheck = new BooleanSetting("Void Check", this, true);
+    private final BooleanSetting showNotifications = new BooleanSetting("Show Notifications", this, false);
+
+    private Vec3 lastGround = new Vec3(0, 0, 0);
+    private boolean saved;
+    private boolean aBoolean, aBoolean2;
+
+    private static final ConcurrentLinkedQueue&lt;Packet&lt;?&gt;&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+    private Vec3 lastServerPosition = null;
+
+    @Override
+    protected void onDisable() {
+        saved = false;
+        lastServerPosition = null;
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        if (mc.thePlayer.onGround)
+            lastGround = new Vec3(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ);
+
+        final boolean isBlockUnder = PlayerUtil.isBlockUnder();
+
+        if ((!isBlockUnder || !voidCheck.isEnabled()) &amp;&amp; mc.thePlayer.fallDistance &gt; fallDistance.getValue() &amp;&amp; !mc.gameSettings.keyBindSneak.isKeyDown() &amp;&amp; !mc.thePlayer.capabilities.isFlying &amp;&amp; !this.getModule(Fly.class).isEnabled() &amp;&amp; !this.getModule(HighJump.class).isEnabled()) {
+            if (!saved) {
+                switch (mode.getMode()) {
+                    case "Flag":
+                        PacketUtil.sendPacket(new C03PacketPlayer.C04PacketPlayerPosition());
+                        break;
+
+                    case "Jump":
+                        mc.thePlayer.jump();
+                        break;
+
+                    case "Ground":
+                        event.setGround(true);
+                        break;
+
+                    case "Matrix":
+                        if ((mc.thePlayer.motionY + mc.thePlayer.posY) &lt; Math.floor(mc.thePlayer.posY)) {
+                            mc.thePlayer.motionY = Math.floor(mc.thePlayer.posY) - mc.thePlayer.posY;
+
+                            if (mc.thePlayer.motionY == 0)
+                                event.setGround(true);
+                        }
+                        break;
+
+                    case "Position":
+                        event.setY(event.getY() + mc.thePlayer.fallDistance);
+                        break;
+
+                    case "Boost":
+                        mc.thePlayer.motionY = 1;
+                        mc.thePlayer.fallDistance = 0;
+                        event.setGround(true);
+                        break;
+
+                    case "Blink":
+                        if (lastServerPosition == null)
+                            return;
+
+                        mc.thePlayer.setPosition(lastServerPosition.xCoord, lastServerPosition.yCoord, lastServerPosition.zCoord);
+                        mc.thePlayer.fallDistance = 0;
+                        mc.thePlayer.motionY = 0;
+                        MoveUtil.stop();
+
+                        aBoolean = true;
+                        break;
+
+                    case "Hypixel":
+
+                        break;
+                }
+
+                if (!saved) {
+                    if (showNotifications.isEnabled())
+                        this.registerNotification("Attempted to save you from the void.");
+
+                    Rise.amountOfVoidSaves++;
+                    saved = true;
+                }
+            } else
+                saved = false;
+        }
+    }
+
+    @Override
+    public void onPacketSend(final PacketSendEvent event) {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        switch (mode.getMode()) {
+            case "Blink": {
+                if (!(p instanceof C03PacketPlayer || p instanceof C0FPacketConfirmTransaction))
+                    return;
+
+                final boolean blink = mc.thePlayer.fallDistance &lt;= 6 &amp;&amp; !PlayerUtil.isBlockUnder() &amp;&amp; !this.getModule(Fly.class).isEnabled() &amp;&amp; !this.getModule(HighJump.class).isEnabled() &amp;&amp; !mc.gameSettings.keyBindSneak.isKeyDown();
+
+                if (blink) {
+                    if (lastServerPosition == null)
+                        lastServerPosition = new Vec3(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ);
+
+                    event.setCancelled(true);
+                    packets.add(p);
+                } else if (p instanceof C03PacketPlayer) {
+                    if (!(PlayerUtil.isBlockUnder() &amp;&amp; !aBoolean))
+                        packets.removeIf(packet -&gt; packet instanceof C03PacketPlayer);
+                    packets.forEach(PacketUtil::sendPacketWithoutEvent);
+                    packets.clear();
+                    lastServerPosition = null;
+                    aBoolean = false;
+                }
+                break;
+            }
+
+            case "Hypixel": {
+                if (p instanceof C03PacketPlayer &amp;&amp; (!PlayerUtil.isBlockUnder() ||
+                        !voidCheck.isEnabled()) &amp;&amp; mc.thePlayer.fallDistance &gt; fallDistance.getValue() &amp;&amp;
+                        !mc.gameSettings.keyBindSneak.isKeyDown() &amp;&amp; !mc.thePlayer.capabilities.isFlying &amp;&amp;
+                        !this.getModule(Fly.class).isEnabled() &amp;&amp; !this.getModule(HighJump.class).isEnabled()) {
+                    event.setPacket(new C03PacketPlayer(false));
+                }
+                break;
+            }
+        }
+    }
+}
+
+// NOTE (AI): Rise 5.99 NoVoid: complete file. Line ~125 cancels everything except C03 and C0F while falling (the anti-void window), then releases on ground.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent (cancel non-C03/C0F); motion check for the fall window.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancelling packets while falling is a classic anti-void that flags on servers with fall-check timers; the packet blacklist (keep C03+C0F) is what keeps the connection alive long enough for the client to place a block or land.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.2.4/6.1.30 BlinkAntiVoid and WatchdogAntiVoid implement the same idea with the blink queue instead of a whitelist.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent (cancel/mutate C0F), PacketReceiveEvent (S32 trigger), motion/tick events for release timing; Rise 6.x uses component-based parking (PingSpoofComponent, TransactionFixComponent).</div>
+<div class="impl-clients">Classic clients cancel or mutate the live packet in the event (Memeware, Sigma, Spicy, Tenacity). Rise 5.99 uses PacketUtil.sendPacketWithoutEvent to replay forged C0F. Rise 6.x routes through PacketUtil.send/sendNoEvent and its PingSpoofComponent/TimedPacket queue; TransactionFixComponent (6.2.4/6.1.30) repairs transaction state under ViaVersion.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S32PacketConfirmTransaction/">S32PacketConfirmTransaction</a>
+<a class="related-chip" href="../C00PacketKeepAlive/">C00PacketKeepAlive</a>
+<a class="related-chip" href="../C0EPacketClickWindow/">C0EPacketClickWindow</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

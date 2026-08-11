@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S18PacketEntityTeleport (0x18): Teleports an entity to an absolute position (fixed-point int × 32) and rotation.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ESP, Tracers, KillAura, Ranking">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="LegitReach, Ranking, NoClip / Phase, AntiExploit, WatchdogVelocity">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S18PacketEntityTeleport — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S18PacketEntityTeleport — Minecraft 1.8.9 Packet Reference","description":"The absolute teleport packet is the reset point of entity position state. Cheat clients re-anchor their reconstructed position caches on it (LegitReach, WatchdogVelocity, Rise 5.99 anticheat), Sigma uses it as an entity-left signal, Tenacity hardens against server-side coordinate abuse, and Spicy's ","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -78,48 +78,1171 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Unlike S14 (Entity Relative Move), S18 sets ABSOLUTE position — the entity moves to this exact location regardless of where it was. Used when players teleport (ender pearls, chorus fruit), mobs teleport (endermen), or when S14 cumulative errors need correction.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S18PacketEntityTeleport carries an absolute fixed-point position (ints x 32), rotation bytes and an onGround flag for one entity. It is the only entity-position packet with full coordinates, so it is both the correction mechanism for accumulated S14 error and the transport for genuine jumps: ender pearls, endermen, dimension changes and anything that moves more than 4 blocks in one tick. EntityTrackerEntry constructs it when the tracked entity's one-tick displacement exceeds the relative-move threshold (corpus line 222), and NetHandlerPlayServer sends it to a player on teleport (line 259).</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleEntityTeleport (Memeware 7.3 bundle, line 511) overwrites serverPosX/Y/Z with the absolute values, computes position as serverPos / 32.0 with y + 0.015625 (half a block in fixed point, the eye-height accommodation), decodes yaw/pitch as * 360 / 256, and calls setPositionAndRotation2 with interpolation 3 and the teleport flag. If the entity is already within 0.03125 blocks (x/z) and 0.015625 (y) of the target it keeps the current position and applies only rotation, which prevents micro-jitter on repeated teleports.</p>
+<h4>Why clients touch it</h4>
+<p>Five distinct consumers in the corpus. Rise 6.x: LegitReach snaps its realPosition to the absolute coordinates, WatchdogVelocity includes S18 in its spoof packet set and re-anchors on it, and PingSpoofComponent classifies it in the players tuple so teleports are delayed with the rest of the entity stream. Rise 5.99: PlayerData re-anchors serverPosX/Y/Z and zeroes ticksSinceLastTeleport so checks skip the teleport tick. Sigma 4.11: Ranking treats S18 as an entity-removal signal that finalizes kill/death records. Tenacity 6.0: AntiExploit cancels S18 with any coordinate beyond 30,000,000. Spicy: NoClip and Phase import the class but never branch on it, a leftover from their Sigma 2 lineage.</p>
+<h4>Exploit surface</h4>
+<p>S18 is clientbound and absolute, so the abuse direction is server to client: a malicious server can emit fixed-point coordinates that corrupt client-side position bookkeeping or trigger bounds bugs, which is exactly what Tenacity's AntiExploit threshold mitigates. For cheats, S18 is the epoch boundary of every position-based state machine: accumulated S14 error resets here, so reach and backtrack modules must re-anchor their reconstructed positions on it. The S08PacketPlayerPosLook + S18 pair is the server's complete teleport vocabulary, and disablers and reach modules watch both because a missed teleport poisons every later delta.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>The server side only emits S18, never validates it on receive. EntityTrackerEntry chooses it when the tracked entity moved 4+ blocks in a tick, and NetHandlerPlayServer sends it to a player being teleported. The client handler overwrites the entity's serverPosX/Y/Z, applies the +0.015625 y offset, keeps the current position when the entity is already within a 32nd of a block (rotation-only update), then interpolates with the teleport flag set. Because the client trusts the coordinates, a server can move an entity anywhere in the fixed-point range, which is the abuse AntiExploit guards against.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Three ints (x 32), two bytes (x 256/360) and a boolean follow the VarInt entityId. The y offset of 0.015625 (0.5 / 32) is applied only on the client and is not part of the wire value. S18 supersedes any pending S14 deltas for the same entity because it overwrites the accumulated serverPosX/Y/Z. The packet is also sent to a player on respawn and dimension change, which is why Ranking's S08 + S18 combination distinguishes death from mere teleport.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Server anticheats emit S18 as a correction and watch whether the client's later C03 positions rejoin the corrected location; a client that ignores the teleport or desyncs after it flags as position desync. The S08+S18 pair is the standard disabler/reach watch point: modules that delay clientbound traffic must flush on it or their position cache goes permanently stale. The client-side mirror (Rise 5.99 PlayerData) uses ticksSinceLastTeleport to suppress checks for a tick, an acknowledgment that even legitimate teleports produce movement anomalies.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ESP</span>
-<span class="impl-module-clients">(Tenacity 4.0, Sigma 3.9, Lycoris 2.0)</span>
+<p class="impl-pattern">The absolute teleport packet is the reset point of entity position state. Cheat clients re-anchor their reconstructed position caches on it (LegitReach, WatchdogVelocity, Rise 5.99 anticheat), Sigma uses it as an entity-left signal, Tenacity hardens against server-side coordinate abuse, and Spicy's movement modules carry it as a dead import.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">LegitReach</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Track entity teleports for ESP position sync and ranking detection.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S18PacketEntityTeleport) {
-  S18PacketEntityTeleport s18 = (S18PacketEntityTeleport) event.getPacket();
-  updateTargetPosition(s18.getEntityId(), s18.getX()/32.0, s18.getY()/32.0, s18.getZ()/32.0);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Tracers</span>
-<span class="impl-module-clients">(Tenacity 4.0, Sigma 3.9, Lycoris 2.0)</span>
-</div>
-<p class="impl-pattern">Track entity teleports for ESP position sync and ranking detection.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S18PacketEntityTeleport) {
-  S18PacketEntityTeleport s18 = (S18PacketEntityTeleport) event.getPacket();
-  updateTargetPosition(s18.getEntityId(), s18.getX()/32.0, s18.getY()/32.0, s18.getZ()/32.0);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
-</div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KillAura</span>
-<span class="impl-module-clients">(Tenacity 4.0, Sigma 3.9, Lycoris 2.0)</span>
-</div>
-<p class="impl-pattern">Track entity teleports for ESP position sync and ranking detection.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S18PacketEntityTeleport) {
-  S18PacketEntityTeleport s18 = (S18PacketEntityTeleport) event.getPacket();
-  updateTargetPosition(s18.getEntityId(), s18.getX()/32.0, s18.getY()/32.0, s18.getZ()/32.0);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Re-anchor the tracked target's server-truth position on the absolute teleport so the ping-spoof reach window keeps measuring the real distance.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">In the same PacketReceiveEvent handler that accumulates S14 deltas, an S18 for the tracked target replaces realPosition with new Vec3(getX() / 32D, getY() / 32D, getZ() / 32D). Without this branch, a teleported target would leave the accumulated position permanently wrong and the reach window would either never open or stay open against a ghost position.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/LegitReach.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/LegitReach.java =====
+package com.alan.clients.module.impl.combat;
+
+import com.alan.clients.component.impl.player.PingSpoofComponent;
+import com.alan.clients.component.impl.player.TargetComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PostMotionEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.render.Render3DEvent;
+import com.alan.clients.module.Module;
+import com.alan.clients.module.api.Category;
+import com.alan.clients.module.api.ModuleInfo;
+import com.alan.clients.util.animation.Animation;
+import com.alan.clients.util.animation.Easing;
+import com.alan.clients.util.render.ColorUtil;
+import com.alan.clients.util.render.RenderUtil;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.NumberValue;
+import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S14PacketEntity;
+import net.minecraft.network.play.server.S18PacketEntityTeleport;
+import net.minecraft.util.Vec3;
+import org.lwjgl.opengl.GL11;
+
+import java.util.List;
+
+@ModuleInfo(aliases = {"module.combat.legitreach.name", "Back Track"}, description = "module.combat.legitreach.description", category = Category.COMBAT)
+public final class LegitReach extends Module {
+
+    public NumberValue maxPingSpoof = new NumberValue("Max Ping Spoof", this, 1000, 50, 10000, 1);
+    public BooleanValue render = new BooleanValue("Render Real Location", this, true);
+    private Vec3 realPosition = new Vec3(0, 0, 0);
+    private final Animation animatedX = new Animation(Easing.LINEAR, 50);
+    private final Animation animatedY = new Animation(Easing.LINEAR, 50);
+    private final Animation animatedZ = new Animation(Easing.LINEAR, 50);
+    public Entity targetEntity;
+    public boolean isActive;
+    @EventLink()
+    public final Listener&lt;PostMotionEvent&gt; onPost = event -&gt; {
+        // Getting targets and selecting the nearest one
+        List&lt;EntityLivingBase&gt; targets = TargetComponent.getTargets(9);
+
+        if (targets.isEmpty()) {
+            isActive = true;
+            targetEntity = null;
+            return;
+        }
+
+        Entity entity = targets.get(0);
+        if (entity != targetEntity) {
+            targetEntity = entity;
+
+            realPosition.xCoord = entity.posX;
+            realPosition.yCoord = entity.posY;
+            realPosition.zCoord = entity.posZ;
+        }
+
+        if (targetEntity == null || !(mc.thePlayer.isSwingInProgress || getModule(KillAura.class).isEnabled())) {
+            return;
+        }
+
+        double realDistance = realPosition.distanceTo(mc.thePlayer);
+        double clientDistance = targetEntity.getDistanceToEntity(mc.thePlayer);
+
+        boolean on = realDistance &gt; clientDistance &amp;&amp; realDistance &gt; 2.3 &amp;&amp; realDistance &lt; 5.9;
+
+        if (on) {
+            PingSpoofComponent.spoof(maxPingSpoof.getValue().intValue(), true, true, true, true);
+        } else {
+            PingSpoofComponent.disable();
+            PingSpoofComponent.dispatch();
+        }
+    };
+
+    @EventLink()
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (targetEntity == null) {
+            return;
+        }
+
+        if (packet instanceof S14PacketEntity) {
+            S14PacketEntity s14PacketEntity = ((S14PacketEntity) packet);
+
+            if (s14PacketEntity.entityId == targetEntity.getEntityId()) {
+                realPosition.xCoord += s14PacketEntity.getPosX() / 32D;
+                realPosition.yCoord += s14PacketEntity.getPosY() / 32D;
+                realPosition.zCoord += s14PacketEntity.getPosZ() / 32D;
+            }
+        } else if (packet instanceof S18PacketEntityTeleport) {
+            S18PacketEntityTeleport s18PacketEntityTeleport = ((S18PacketEntityTeleport) packet);
+
+            if (s18PacketEntityTeleport.getEntityId() == targetEntity.getEntityId()) {
+                realPosition = new Vec3(s18PacketEntityTeleport.getX() / 32D, s18PacketEntityTeleport.getY() / 32D, s18PacketEntityTeleport.getZ() / 32D);
+            }
+        }
+    };
+
+    @EventLink()
+    public final Listener&lt;Render3DEvent&gt; onRender3D = event -&gt; {
+        if (targetEntity == null || !render.getValue()) {
+            return;
+        }
+
+        animatedX.setDuration(150);
+        animatedY.setDuration(150);
+        animatedZ.setDuration(150);
+
+        animatedX.run(realPosition.xCoord);
+        animatedY.run(realPosition.yCoord);
+        animatedZ.run(realPosition.zCoord);
+
+        GlStateManager.pushMatrix();
+        GlStateManager.pushAttrib();
+        GlStateManager.enableBlend();
+        GlStateManager.disableTexture2D();
+        GlStateManager.disableLighting();
+        GL11.glDepthMask(false);
+
+        double expand = 0.14;
+        RenderUtil.color(ColorUtil.withAlpha(getTheme().getFirstColor(), 50));
+
+        RenderUtil.drawBoundingBox(mc.thePlayer.getEntityBoundingBox().offset(-mc.thePlayer.posX, -mc.thePlayer.posY, -mc.thePlayer.posZ).
+                offset(animatedX.getValue(), animatedY.getValue(), animatedZ.getValue()).expand(expand, expand, expand));
+
+        GlStateManager.enableTexture2D();
+        GlStateManager.enableLighting();
+        GlStateManager.disableBlend();
+        GL11.glDepthMask(true);
+        GlStateManager.popAttrib();
+        GlStateManager.popMatrix();
+        GlStateManager.resetColor();
+    };
+}
+
+// NOTE (AI): realPosition is the server-truth position of the target, rebuilt from S14 deltas and S18
+// NOTE (AI): absolutes while the renderer entity interpolates normally. The reach window opens when the
+// NOTE (AI): real distance exceeds the client distance inside 2.3-5.9 blocks; PingSpoofComponent.spoof
+// NOTE (AI): then delays all incoming player-class packets for up to maxPingSpoof ms, which keeps the
+// NOTE (AI): server-side player position stale while the client hits from the closer interpolated spot.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Re-anchoring is a correctness requirement, not an exploit: a stale realPosition makes the module either inert or visibly wrong. The reach abuse itself lives in the ping-spoof half, not in the S18 handling.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical module in Rise 6.1.30 (path without the Client-release2 prefix).</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Ranking</span>
-<span class="impl-module-clients">(Tenacity 4.0, Sigma 3.9, Lycoris 2.0)</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Track entity teleports for ESP position sync and ranking detection.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof S18PacketEntityTeleport) {
-  S18PacketEntityTeleport s18 = (S18PacketEntityTeleport) event.getPacket();
-  updateTargetPosition(s18.getEntityId(), s18.getX()/32.0, s18.getY()/32.0, s18.getZ()/32.0);
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Track kills and deaths for the client's stats system; an S18 teleport for a tracked player finalizes the pending record because a teleporting opponent is out of reach context.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A hidden, always-on module registered for EventAttack, EventPacket and EventUpdate. On EventAttack it records HitEntity entries per player; S0B animations timestamp attacker candidates; on S18 it calls onEntityRemoved(entityId), which flips the HitEntity to removed and reports killed() or prosecuted() if a chat message already matched the name in the last 3 seconds. S08PacketPlayerPosLook resets all prosecutor records (death/respawn), S13 destroys remove entities, S40 with 'ban' in the text reports a ban stat.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/other/Ranking.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/other/Ranking.java =====
+package info.sigmaclient.module.impl.other;
+
+import info.sigmaclient.Client;
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventAttack;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.event.impl.EventUpdate;
+import info.sigmaclient.management.users.TTSystem;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.util.Timer;
+import info.sigmaclient.util.misc.ChatUtil;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.entity.EntityPlayerSP;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.*;
+
+import java.io.IOException;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ConcurrentModificationException;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.UUID;
+
+public class Ranking extends Module {
+    private HashMap&lt;Integer, HitEntity&gt; hitEntities = new HashMap&lt;&gt;();
+    private HashMap&lt;Integer, HitEntity&gt; prosecutorEntities = new HashMap&lt;&gt;();
+    private HashMap&lt;Integer, Long&gt; lastAnimationTimestamp = new HashMap&lt;&gt;();
+    private info.sigmaclient.util.Timer delay = new Timer();
+
+    public Ranking(ModuleData data) {
+        super(data);
+        setHidden(true);
+        if (!isEnabled()) {
+            toggle();
+        }
+    }
+
+    @Override
+    @RegisterEvent(events = {EventAttack.class, EventPacket.class, EventUpdate.class})
+    public void onEvent(Event e) {
+        if (e instanceof EventAttack) {
+            EventAttack ea = (EventAttack) e;
+            if (ea.getEntity() instanceof EntityPlayer) {
+                EntityPlayer ep = (EntityPlayer) ea.getEntity();
+                if (!ep.getName().isEmpty()) {
+                    if (!hitEntities.containsKey(ep.getEntityId())) {
+                        hitEntities.put(ep.getEntityId(), new HitEntity(ep));
+                    } else {
+                        hitEntities.get(ep.getEntityId()).refresh();
+                    }
+                }
+            }
+        } else if (e instanceof EventPacket) {
+            EventPacket ep = (EventPacket) e;
+            Packet packet = ep.getPacket();
+            if (packet instanceof S0BPacketAnimation) {
+                S0BPacketAnimation packetAnimation = (S0BPacketAnimation) packet;
+                lastAnimationTimestamp.put(packetAnimation.func_148978_c(), System.currentTimeMillis());
+            }
+            if (packet instanceof S06PacketUpdateHealth) {
+                S06PacketUpdateHealth packetUpdateHealth = (S06PacketUpdateHealth) packet;
+                if (packetUpdateHealth.getHealth() &lt;= Minecraft.getMinecraft().thePlayer.getHealth()) {
+                	try{
+                		for (Object o : mc.theWorld.getLoadedEntityList()) {
+                            if (o instanceof EntityPlayer) {
+                                EntityPlayer entityPlayer = (EntityPlayer) o;
+                                if (!(entityPlayer instanceof EntityPlayerSP) &amp;&amp; lastAnimationTimestamp.containsKey(entityPlayer.getEntityId())) {
+                                    if (lastAnimationTimestamp.get(entityPlayer.getEntityId()) &gt; System.currentTimeMillis() - 70 &amp;&amp; entityPlayer.getPositionVector().squareDistanceTo(Minecraft.getMinecraft().thePlayer.getPositionVector()) &lt; 9 * 9) {
+                                        if (!prosecutorEntities.containsKey(entityPlayer.getEntityId())) {
+                                            prosecutorEntities.put(entityPlayer.getEntityId(), new HitEntity(entityPlayer, true));
+                                        } else {
+                                            prosecutorEntities.get(entityPlayer.getEntityId()).refresh();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                	}catch(ConcurrentModificationException ee){};
+                    
+                }
+                if (packetUpdateHealth.getHealth() &lt;= 0) {
+                    onDeath();
+                }
+            }
+            if (packet instanceof S02PacketChat) {
+                S02PacketChat packetChat = (S02PacketChat) packet;
+                String message = packetChat.func_148915_c().getUnformattedText();
+
+                Iterator it = hitEntities.entrySet().iterator();
+                while (it.hasNext()) {
+                    HitEntity hitEntity = ((Map.Entry&lt;Integer, HitEntity&gt;) it.next()).getValue();
+                    if (hitEntity.getTime() &gt; System.currentTimeMillis() - 3000 &amp;&amp; message.contains(hitEntity.getName())) {
+                        if (hitEntity.onChatMessage()) {
+                            it.remove();
+                        }
+                    }
+                }
+
+                Iterator it2 = prosecutorEntities.entrySet().iterator();
+                while (it2.hasNext()) {
+                    HitEntity hitEntity = ((Map.Entry&lt;Integer, HitEntity&gt;) it2.next()).getValue();
+                    if (hitEntity.getTime() &gt; System.currentTimeMillis() - 3000 &amp;&amp; message.contains(hitEntity.getName()) &amp;&amp; message.contains(Minecraft.getMinecraft().thePlayer.getName())) {
+                        if (hitEntity.onChatMessage()) {
+                            it2.remove();
+                        }
+                    }
+                }
+            } else if (packet instanceof S18PacketEntityTeleport) {
+                S18PacketEntityTeleport packetTeleport = (S18PacketEntityTeleport) packet;
+                int entityId = packetTeleport.func_149451_c();
+
+                onEntityRemoved(entityId);
+            } else if (packet instanceof S08PacketPlayerPosLook) {
+                onDeath();
+            } else if (packet instanceof S13PacketDestroyEntities) {
+                S13PacketDestroyEntities packetDestroyEntities = (S13PacketDestroyEntities) packet;
+                for (int entityId : packetDestroyEntities.func_149098_c()) {
+                    onEntityRemoved(entityId);
+                }
+            } else if (packet instanceof S40PacketDisconnect) {
+                S40PacketDisconnect packetDisconnect = (S40PacketDisconnect) packet;
+                if (packetDisconnect.func_149165_c().getUnformattedText().toLowerCase().contains("ban") &amp;&amp; Minecraft.getMinecraft().thePlayer != null &amp;&amp; Minecraft.getMinecraft().thePlayer.ticksExisted &gt; 15 * 20) {
+                    sendStat("ban", "");
+                }
+            }
+        } else if (e instanceof EventUpdate) {
+            if (delay.delay(1000 * 60 * 10)) {
+                delay.reset();
+                sendStat("tick", "");
+            }
+        }
+    }
+
+    private void onDeath() {
+        Iterator it2 = prosecutorEntities.entrySet().iterator();
+        while (it2.hasNext()) {
+            HitEntity hitEntity = ((Map.Entry&lt;Integer, HitEntity&gt;) it2.next()).getValue();
+            if (hitEntity.getTime() &gt; System.currentTimeMillis() - 3000) {
+                if (hitEntity.onRemoved()) {
+                    it2.remove();
+                }
+            }
+        }
+    }
+
+    private void onEntityRemoved(int entityId) {
+        Iterator it = hitEntities.entrySet().iterator();
+        while (it.hasNext()) {
+            HitEntity hitEntity = ((Map.Entry&lt;Integer, HitEntity&gt;) it.next()).getValue();
+            if (hitEntity.getTime() &gt; System.currentTimeMillis() - 3000 &amp;&amp; entityId == hitEntity.getEntityId()) {
+                if (hitEntity.onRemoved()) {
+                    it.remove();
+                }
+            }
+        }
+    }
+
+    public void sendStat(String type, String data) {
+
+    }
+
+    private class HitEntity {
+        private long time = System.currentTimeMillis();
+        private UUID uuid;
+        private String name;
+        private int entityId;
+        private boolean removed = false;
+        private boolean chatMessage = false;
+        private boolean prosecutor = false;
+
+        public HitEntity(EntityPlayer ep) {
+            uuid = ep.getUniqueID();
+            name = ep.getName();
+            entityId = ep.getEntityId();
+        }
+
+        public HitEntity(EntityPlayer ep, boolean prosecutor) {
+            uuid = ep.getUniqueID();
+            name = ep.getName();
+            entityId = ep.getEntityId();
+            this.prosecutor = prosecutor;
+        }
+
+        public boolean onRemoved() {
+            removed = true;
+            if (chatMessage) {
+                if (prosecutor) {
+                    prosecuted();
+                } else {
+                    killed();
+                }
+                return true;
+            }
+            return false;
+        }
+
+        public boolean onChatMessage() {
+            chatMessage = true;
+            if (removed) {
+                if (prosecutor) {
+                    prosecuted();
+                } else {
+                    killed();
+                }
+                return true;
+            }
+            return false;
+        }
+
+        private void killed() {
+            //ChatUtil.printChat("Kill (" + name + ") " + uuid.toString());
+            sendStat("kill", "&amp;uuid=" + uuid.toString().replaceAll("-", ""));
+        }
+
+        public void refresh() {
+            time = System.currentTimeMillis();
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public long getTime() {
+            return time;
+        }
+
+        public int getEntityId() {
+            return entityId;
+        }
+
+        public void prosecuted() {
+            //ChatUtil.printChat("Prosecuted (" + name + ") " + uuid.toString());
+            sendStat("death", "&amp;uuid=" + uuid.toString().replaceAll("-", ""));
+        }
+    }
+}
+
+// NOTE (AI): S18PacketEntityTeleport is treated as an entity-removal signal: a player that teleports is
+// NOTE (AI): out of reach context, so the pending HitEntity record is finalized (killed or prosecuted)
+// NOTE (AI): if a matching chat kill message arrived in the last 3 seconds. S08PacketPlayerPosLook resets
+// NOTE (AI): prosecutor records on death/respawn, S13 destroys remove entities outright.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (receive side), EventAttack, EventUpdate.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Passive telemetry collection; the S18 branch is just an entity-lifetime heuristic. No packet is mutated or replayed, so there is no detection surface.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The sendStat methods are stubs in the shipped source; the kill/death reporting path is a framework for a stats backend that was never filled in.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoClip / Phase</span>
+<span class="impl-module-clients">(Spicy)</span>
 </div>
+<p class="impl-pattern">Corpus hit is an import only: both movement modules import S18PacketEntityTeleport but never branch on it.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">NoClip's onEvent sends C03PacketPlayer.C04PacketPlayerPosition through sendPacketNoEvent when collided horizontally, then teleports the local player by 3 blocks up to break free; Phase cancels block hitboxes (EventGetBlockHitbox) and nudges the player position in a 3-stage loop while sending C03PacketPlayer(true). NoClip's header comment credits Sigma 2's Phase as the source, which explains the vestigial S18 import in both files.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy — info/spicyclient/modules/movement/NoClip.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/movement/NoClip.java =====
+package info.spicyclient.modules.movement;
+
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventGetBlockHitbox;
+import info.spicyclient.events.listeners.EventMotion;
+import info.spicyclient.events.listeners.EventPacket;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.modules.Module.Category;
+import info.spicyclient.util.MovementUtils;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockAir;
+import net.minecraft.block.BlockHopper;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C13PacketPlayerAbilities;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S18PacketEntityTeleport;
+import net.minecraft.util.AxisAlignedBB;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.MathHelper;
+
+public class NoClip extends Module {
+	
+	/*
+	 * 
+	 * NOTICE: This module's code is taken from the sigma 2 code
+	 * here is the link to that https://gitlab.com/Arithmo/Sigma/-/blob/master/info/sigmaclient/module/impl/movement/Phase.java
+	 * 
+	 */
+	
+	public NoClip() {
+		super("NoClip", Keyboard.KEY_NONE, Category.BETA);
+	}
+
+	
+	public void onEnable() {
+		mc.thePlayer.setPosition(mc.thePlayer.posX, mc.thePlayer.posY + 0.0784001, mc.thePlayer.posZ);
+	}
+	
+	public void onDisable() {
+		
+	}
+	
+	public void onEvent(Event e) {
+		
+		if (e instanceof EventMotion &amp;&amp; e.isPre()) {
+			
+            double mx = Math.cos(Math.toRadians((double)(mc.thePlayer.rotationYaw + 90.0F)));
+            double mz = Math.sin(Math.toRadians((double)(mc.thePlayer.rotationYaw + 90.0F)));
+            double x = (double)mc.thePlayer.movementInput.moveForward * 0.4 * mx + (double)mc.thePlayer.movementInput.moveStrafe * 0.4 * mz;
+            double z = (double)mc.thePlayer.movementInput.moveForward * 0.4 * mz - (double)mc.thePlayer.movementInput.moveStrafe * 0.4 * mx;
+            if (mc.thePlayer.isCollidedHorizontally &amp;&amp; !mc.thePlayer.isOnLadder()) {
+                mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX + x, mc.thePlayer.posY, mc.thePlayer.posZ + z, false));
+                mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY + 3.0D, mc.thePlayer.posZ, false));
+                mc.thePlayer.setPosition(mc.thePlayer.posX + x, mc.thePlayer.posY, mc.thePlayer.posZ + z);
+            }
+        }
+		
+	}
+	
+    private boolean isInsideBlock() {
+        for (int x = MathHelper.floor_double(mc.thePlayer.boundingBox.minX); x &lt; MathHelper.floor_double(mc.thePlayer.boundingBox.maxX) + 1; x++) {
+            for (int y = MathHelper.floor_double(mc.thePlayer.boundingBox.minY); y &lt; MathHelper.floor_double(mc.thePlayer.boundingBox.maxY) + 1; y++) {
+                for (int z = MathHelper.floor_double(mc.thePlayer.boundingBox.minZ); z &lt; MathHelper.floor_double(mc.thePlayer.boundingBox.maxZ) + 1; z++) {
+                    Block block = mc.theWorld.getBlockState(new BlockPos(x, y, z)).getBlock();
+                    if ((block != null) &amp;&amp; (!(block instanceof BlockAir))) {
+                        AxisAlignedBB boundingBox = block.getCollisionBoundingBox(mc.theWorld, new BlockPos(x, y, z), mc.theWorld.getBlockState(new BlockPos(x, y, z)));
+                        if ((block instanceof BlockHopper)) {
+                            boundingBox = new AxisAlignedBB(x, y, z, x + 1, y + 1, z + 1);
+                        }
+                        if (boundingBox != null) {
+                            if (mc.thePlayer.boundingBox.intersectsWith(boundingBox)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+	
+}
+
+// NOTE (AI): The S18PacketEntityTeleport import is dead code: the shipped handlers never branch on the
+// NOTE (AI): packet. The header comment credits Sigma 2's Phase as the source of this module, which
+// NOTE (AI): explains the leftover import. The actual phase movement is driven by C03PacketPlayer
+// NOTE (AI): positions sent through sendPacketNoEvent while collided horizontally.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventMotion (pre), EventGetBlockHitbox; S18 import unused.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The movement abuse is in the C03 stream, which is what anti-cheats flag (vertical motion while inside blocks). The unused S18 import has no effect on detection.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Phase.java (Spicy) carries the same dead import and additionally imports EventSendPacket; its hitbox-cancel approach is the more aggressive variant.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiExploit</span>
+<span class="impl-module-clients">(Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Harden the client against server-side crash and grief exploits; the S18 branch blocks teleport coordinates beyond the world border.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketReceiveEvent, an S18 with any |getX()/getY()/getZ()| above 30,000,000 is cancelled and logged as 'Blocked Exploit: Teleport'. The same handler validates S48 resource pack URIs (http/https/level only, no path traversal), blocks S43 camera outside spectator, rejects particle floods, rate-limits S27 explosions and S11 experience orbs to 1 per millisecond, and caps total incoming packets at 100/second.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/module/impl/misc/AntiExploit.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/misc/AntiExploit.java =====
+package dev.tenacity.module.impl.misc;
+
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.packet.PacketReceiveEvent;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.ModuleCategory;
+import dev.tenacity.util.misc.ChatUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C19PacketResourcePackStatus;
+import net.minecraft.network.play.server.*;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+
+public class AntiExploit extends Module {
+
+
+
+    private long lastExplosion = 0, lastExperience = 0;
+    private int invalidExperience = 0;
+   final int PACKET_THRESHOLD = 100;
+    final long CHECK_INTERVAL = 1000;
+    int packetCount = 0;
+
+    public AntiExploit() {
+        super("AntiExploit", "Prevents server exploits", ModuleCategory.MISC);
+    }
+
+    private final IEventListener&lt;PacketReceiveEvent&gt; onReceivePacket = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+        handlePacketCount();
+        if(packet instanceof S48PacketResourcePackSend) {
+            S48PacketResourcePackSend resourcePack = (S48PacketResourcePackSend) packet;
+
+            try {
+                URI uri = new URI(resourcePack.getURL());
+                String scheme = uri.getScheme();
+
+                boolean isLevelProtocol = scheme.equalsIgnoreCase("level");
+                boolean isHttpProtocol = scheme.equalsIgnoreCase("http");
+                boolean isHttpsProtocol = scheme.equalsIgnoreCase("https");
+
+                if(!isHttpProtocol &amp;&amp; !isHttpsProtocol &amp;&amp; !isLevelProtocol) {
+                    ChatUtil.print("§cBlocked Exploit: Resource Pack");
+                    event.cancel();
+                } else if(isLevelProtocol &amp;&amp; (resourcePack.getURL().contains("..") || !((S48PacketResourcePackSend) packet).getURL().endsWith("/resources.zip"))) {
+                    ChatUtil.print("§cBlocked Exploit: File Access");
+                    event.cancel();
+                    mc.getNetHandler().addToSendQueue(new C19PacketResourcePackStatus(((S48PacketResourcePackSend) packet).getHash(), C19PacketResourcePackStatus.Action.FAILED_DOWNLOAD));
+                }
+            } catch (URISyntaxException exception) {
+                ChatUtil.print("§cBlocked Exploit: Resource Pack");
+                event.cancel();
+                mc.getNetHandler().addToSendQueue(new C19PacketResourcePackStatus(((S48PacketResourcePackSend) packet).getHash(), C19PacketResourcePackStatus.Action.FAILED_DOWNLOAD));
+            }
+        } else if(packet instanceof S43PacketCamera &amp;&amp; !mc.thePlayer.isSpectator()) {
+            ChatUtil.print("§cBlocked Exploit: Crash");
+            event.cancel();
+        } else if(packet instanceof S2APacketParticles) {
+            S2APacketParticles particles = (S2APacketParticles) packet;
+            if(Math.abs(particles.getParticleSpeed()) &gt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Particles");
+                event.cancel();
+            } else if(((S2APacketParticles) packet).getParticleCount() &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            }
+        } else if(packet instanceof S27PacketExplosion) {
+            S27PacketExplosion explosion = (S27PacketExplosion) packet;
+
+            if(Math.abs(explosion.getStrength()) &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            } else if(System.currentTimeMillis() - lastExplosion &lt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            } else if(packet instanceof S2APacketParticles) {
+            S2APacketParticles particles = (S2APacketParticles) packet;
+
+            if(Math.abs(particles.getParticleSpeed()) &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Particles");
+                event.cancel();
+            } else if(particles.getParticleCount() &gt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            }
+        }
+
+            lastExplosion = System.currentTimeMillis();
+        } else if(packet instanceof S18PacketEntityTeleport) {
+            S18PacketEntityTeleport teleport = (S18PacketEntityTeleport) packet;
+
+            double packetX = Math.abs(teleport.getX());
+            double packetY = Math.abs(teleport.getY());
+            double packetZ = Math.abs(teleport.getZ());
+
+            if(packetX &gt; 30000000 || packetY &gt; 30000000 || packetZ &gt; 30000000) {
+                ChatUtil.print("§cBlocked Exploit: Teleport");
+                event.cancel();
+            }
+        } else if(packet instanceof S11PacketSpawnExperienceOrb) {
+            if(System.currentTimeMillis() - lastExperience &lt;= 1) {
+                invalidExperience++;
+
+                if(invalidExperience &gt;= 2) {
+                    ChatUtil.print("§cBlocked Exploit: Crash");
+                    event.cancel();
+                }
+            } else {
+                invalidExperience = 0;
+            }
+            lastExperience = System.currentTimeMillis();
+        }
+
+    };
+
+    private void triggerKick() {
+        ChatUtil.print("§cAbnormal packet activity detected. Kicking player...");
+    }
+        private void handlePacketCount() {
+            long currentTime = System.currentTimeMillis();
+
+            long lastPacketCheckTime = 0;
+            if (currentTime - lastPacketCheckTime &gt; CHECK_INTERVAL) {
+                packetCount = 0;
+                lastPacketCheckTime = currentTime;
+            }
+            packetCount++;
+            if (packetCount &gt; PACKET_THRESHOLD) {
+                triggerKick();
+                packetCount = 0;
+        }
+
+    }
+
+}
+
+// NOTE (AI): The S18 branch sanity-checks the absolute fixed-point coordinates and cancels the packet
+// NOTE (AI): when any |coordinate| exceeds 30,000,000, the vanilla world border. The same handler blocks
+// NOTE (AI): non-http resource pack URIs (level:// traversal), S43 camera outside spectator, particle
+// NOTE (AI): floods, S27 explosion spam and S11 experience orb spam, plus a 100 packets/second cap.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancelling clientbound packets is invisible to the server and cannot be flagged. The 30,000,000 bound matches the vanilla world border at which the server itself clamps movement.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Tenacity 6.0 is the only one of the 8 clients with a crash-exploit hardening module touching S18.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WatchdogVelocity</span>
+<span class="impl-module-clients">(Rise 6.2.4)</span>
+</div>
+<p class="impl-pattern">Include the teleport in the backtrack packet set and use it to re-anchor the tracked target's realPosition.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">isSpoof2Packet returns true for S18PacketEntityTeleport, so it is cancelled and queued with the S14 subclasses and S19 head look while the backtrack is active, and replayed through PacketUtil.receive on the flush conditions. Separately, an S18 for the target re-anchors realPosition to the absolute coordinates, keeping the distance gating (4.5/2.5 block thresholds) honest across teleports.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/WatchdogVelocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/WatchdogVelocity.java =====
+package com.alan.clients.module.impl.combat.velocity;
+
+import com.alan.clients.component.impl.player.PingSpoofComponent;
+import com.alan.clients.component.impl.player.TargetComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.*;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.event.impl.render.Render3DEvent;
+import com.alan.clients.module.impl.combat.Criticals;
+import com.alan.clients.module.impl.combat.KillAura;
+import com.alan.clients.module.impl.combat.Velocity;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.module.impl.movement.LongJump;
+import com.alan.clients.module.impl.movement.Speed;
+import com.alan.clients.module.impl.player.Scaffold;
+import com.alan.clients.module.impl.render.chat.Chat;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.util.player.PlayerUtil;
+import com.alan.clients.util.render.ColorUtil;
+import com.alan.clients.util.render.RenderUtil;
+import com.alan.clients.util.vector.Vector2d;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.NumberValue;
+import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.init.Blocks;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.Vec3;
+import org.lwjgl.opengl.GL11;
+
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+
+
+public final class WatchdogVelocity extends Mode&lt;Velocity&gt; {
+
+    public WatchdogVelocity(String name, Velocity parent) {
+        super(name, parent);
+    }
+    private long active2StartTime = -1; // Tracks when active2 was set to true
+    boolean active2 = false;
+    boolean send = false;
+    public final BooleanValue stack = new BooleanValue("Stack", this, true);
+
+    public final BooleanValue spoof = new BooleanValue("Ping Spoof", this, true);
+
+    public final BooleanValue spoof2 = new BooleanValue("Watchdog Backtrack", this, false);
+
+    public final BooleanValue boost = new BooleanValue("Damage Boost (not for hypixel)", this, false);
+
+    private final NumberValue speed = new NumberValue("Damage Boost Speed", this, 1, 1, 10, .01);
+    private boolean active, receiving, buffer;
+    private Vec3 realPosition = new Vec3(0, 0, 0);
+    public Entity targetEntity;
+    private int amount;
+    private final ArrayList&lt;Packet&lt;?&gt;&gt; packets = new ArrayList&lt;&gt;();
+    private boolean isSpoof2Packet(Packet&lt;?&gt; packet) {
+        return packet instanceof S14PacketEntity.S16PacketEntityLook ||
+                packet instanceof S14PacketEntity.S15PacketEntityRelMove ||
+                packet instanceof S14PacketEntity.S17PacketEntityLookMove ||
+                packet instanceof S19PacketEntityHeadLook ||
+                packet instanceof S18PacketEntityTeleport;
+    }
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceive = event -&gt; {
+
+        if (receiving || getModule(LongJump.class).isEnabled() &amp;&amp; mc.thePlayer.offGroundTicks&lt;29 || getModule(Flight.class).isEnabled()) return;
+
+        switch (event.getPacket()) {
+            case S12PacketEntityVelocity velocity -&gt; {
+
+                if (velocity.getEntityID() == mc.thePlayer.getEntityId()) {
+                    if (stack.getValue() &amp;&amp; amount &lt; 1 &amp;&amp; (!mc.thePlayer.onGround) &amp;&amp; Math.random() &lt; 0.73 &amp;&amp; !(mc.thePlayer.offGroundTicks &gt; 13) || mc.thePlayer.inWater  || (getModule(Scaffold.class).isEnabled() )) {
+                        amount++;
+                        buffer = true;
+                        //   ChatUtil.display("stack");
+                        event.setCancelled();
+                        buffer = false;
+
+                    }
+                    if (!event.isCancelled() &amp;&amp; (!getModule(Scaffold.class).isEnabled() ) &amp;&amp; !(mc.thePlayer.offGroundTicks &gt; 11) &amp;&amp; ((!mc.thePlayer.onGround ) || (mc.thePlayer.onGround &amp;&amp; !MoveUtil.isMoving())) &amp;&amp;  !(velocity.getMotionY()/800D &lt; .08 &amp;&amp; !(getModule(Speed.class).isEnabled() || mc.thePlayer.inWater || !mc.thePlayer.isInLava()) )) {
+                        amount = 0;
+                        active = true;
+                        //  ChatUtil.display("Set Active");
+                        packets.add(velocity);
+
+                        event.setCancelled();
+
+                    } else if (!event.isCancelled() ) {
+                        if((!getModule(Scaffold.class).isEnabled() )){
+                            mc.thePlayer.motionY = velocity.getMotionY() / 8000.0D;
+                        }
+
+                        //      ChatUtil.display("normal");
+                        event.setCancelled();
+                    }
+
+
+                }
+
+            }
+
+            case S32PacketConfirmTransaction transaction -&gt; {
+                if (active &amp;&amp; spoof.getValue()) {
+                    packets.add(transaction);
+                    event.setCancelled();
+                    // PingSpoofComponent.spoof(50, true, false, false, false, false, false);
+                }
+
+            }
+
+            case S00PacketKeepAlive keepAlive -&gt; {
+                if (active &amp;&amp; spoof.getValue()) {
+                    //   packets.add(keepAlive);
+                        event.setCancelled();
+                }
+            }
+
+
+            case S14PacketEntity.S16PacketEntityLook s16PacketEntityLook -&gt; {
+                if ((active2 || active)  &amp;&amp; spoof2.getValue() &amp;&amp; !send) {
+                    packets.add(s16PacketEntityLook);
+                    event.setCancelled();
+                }
+            }
+            case S14PacketEntity.S15PacketEntityRelMove s15PacketEntityRelMove -&gt; {
+                if ((active2 || active)  &amp;&amp; spoof2.getValue()  &amp;&amp; !send) {
+                    packets.add(s15PacketEntityRelMove);
+                    event.setCancelled();
+                }
+            }
+            case S14PacketEntity.S17PacketEntityLookMove s17PacketEntityLookMove -&gt; {
+                if ((active2 || active)  &amp;&amp; spoof2.getValue()  &amp;&amp; !send) {
+                    packets.add(s17PacketEntityLookMove);
+                    event.setCancelled();
+                }
+            }
+
+
+
+            case S19PacketEntityHeadLook s19PacketEntityHeadLook -&gt; {
+                if ((active2 || active)  &amp;&amp; spoof2.getValue()  &amp;&amp; !send) {
+                    packets.add(s19PacketEntityHeadLook);
+                    event.setCancelled();
+                }
+            }
+
+
+
+            default -&gt; {
+            }
+
+        }
+        List&lt;EntityLivingBase&gt; targets = TargetComponent.getTargets(12);
+        targets.sort(Comparator.comparingDouble(entity -&gt; entity.hurtTime));
+        if (targets.isEmpty()) {
+            targetEntity = null;
+            // Add logic here to reset or flush your spoof2 states.
+            // For example:
+            if (spoof2.getValue()) {
+                receiving = true;
+                packets.stream().filter(this::isSpoof2Packet).forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+                active2 = false;
+                send = false;
+            }
+            return;
+        }
+        Entity entity = targets.get(0);
+
+
+
+
+        if (spoof2.getValue()) {
+
+
+
+
+
+
+
+
+            if (entity != targetEntity) {
+                targetEntity = entity;
+
+                realPosition.xCoord = entity.posX;
+                realPosition.yCoord = entity.posY;
+                realPosition.zCoord = entity.posZ;
+            }
+
+
+
+
+
+            Vec3 playerEyesPos = mc.thePlayer.getPositionEyes(1.0F);
+            Vec3 targetEyesPos = new Vec3(realPosition.xCoord, realPosition.yCoord, realPosition.zCoord);
+            double distance = playerEyesPos.distanceTo(targetEyesPos);
+
+            if ((distance &gt; 4.5) &amp;&amp; active || mc.thePlayer.offGroundTicks&gt;9 &amp;&amp; active) {
+                send = true;
+            } else if(active){
+                send = false;
+            }
+//ChatUtil.display(distance);
+            active2 = distance &lt; 4.5;
+if( mc.thePlayer.isSwingInProgress &amp;&amp; distance&gt;3.1&amp;&amp; distance&lt;4.5 &amp;&amp; getModule(KillAura.class).isEnabled()){
+  // ChatUtil.display("reach:" + distance);
+}
+
+
+
+
+            if (active2) {
+                // Check if this is the first frame where active2 is true
+                if (active2StartTime == -1) {
+                    active2StartTime = System.currentTimeMillis(); // Record the starting time
+                }
+
+                // Check if 200ms has passed
+                if (System.currentTimeMillis() - active2StartTime &gt;= Math.round((Math.random()*150))+100) {
+                    receiving = true;
+                    packets.stream()
+                            .filter(this::isSpoof2Packet)
+                            .forEach(PacketUtil::receive);
+                    packets.clear();
+                    receiving = false;
+
+               //     ChatUtil.display(mc.thePlayer.ticksExisted);
+
+                    // Reset active2 and timer
+                    active2 = false;
+                    active2StartTime = -1;
+                }
+            } else {
+                // Reset the timer if active2 is false
+                active2StartTime = -1;
+            }
+
+            if (send &amp;&amp; active) {
+               // ChatUtil.display(send);
+                active2 = false; // If active2 is set to false, reset the timer
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+
+            if(mc.thePlayer.ticksExisted&lt;100){
+                active2 = false; // If active2 is set to false, reset the timer
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+
+            if (mc.thePlayer.hurtTime == 9) {
+               // ChatUtil.display(send);
+                active2 = false;
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+            if ((distance &lt; 2.5)) {
+                active2 = false;
+                //  ChatUtil.display(send);
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+
+            if ((distance &gt; 4.5)) {
+                active2 = false;
+              //  ChatUtil.display(send);
+                receiving = true;
+                packets.stream()
+                        .filter(this::isSpoof2Packet)
+                        .forEach(PacketUtil::receive);
+                packets.clear();
+                receiving = false;
+            }
+            final Packet&lt;?&gt; packet = event.getPacket();
+            if (packet instanceof S14PacketEntity) {
+                S14PacketEntity s14PacketEntity = ((S14PacketEntity) packet);
+
+                if (s14PacketEntity.entityId == targetEntity.getEntityId()) {
+                    realPosition.xCoord += s14PacketEntity.getPosX() / 32D;
+                    realPosition.yCoord += s14PacketEntity.getPosY() / 32D;
+                    realPosition.zCoord += s14PacketEntity.getPosZ() / 32D;
+                }
+            } else if (packet instanceof S18PacketEntityTeleport) {
+                S18PacketEntityTeleport s18PacketEntityTeleport = ((S18PacketEntityTeleport) packet);
+
+                if (s18PacketEntityTeleport.getEntityId() == targetEntity.getEntityId()) {
+                    realPosition = new Vec3(s18PacketEntityTeleport.getX() / 32D, s18PacketEntityTeleport.getY() / 32D, s18PacketEntityTeleport.getZ() / 32D);
+                }
+            }
+        }
+
+
+    };
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;JumpEvent&gt; onJump = event -&gt; {
+        if (mc.thePlayer.onGround &amp;&amp; active) {
+            active = false;
+            //  ChatUtil.display("Set Active");
+            receiving = true;
+            send = false;
+            //  MoveUtil.strafe(MovdeUtil.getbaseMoveSpeed() + Math.random() / 10);
+            //   mc.thePlayer.jump();
+            Vector2d motion = new Vector2d(mc.thePlayer.motionX, mc.thePlayer.motionZ);
+            packets.forEach(PacketUtil::receive);
+            // ChatUtil.display("jump");
+            packets.clear();
+
+            if (!boost.getValue()) {
+                mc.thePlayer.motionX = motion.getX();
+                mc.thePlayer.motionZ = motion.getY();
+            } else {
+                MoveUtil.strafe();
+                mc.thePlayer.motionX *= speed.getValue().doubleValue();
+                mc.thePlayer.motionZ *= speed.getValue().doubleValue();
+
+            }
+
+            receiving = false;
+        }
+    };
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;PreUpdateEvent&gt; onPreUpdate = event -&gt; {
+        if(active2 &amp;&amp; !active &amp;&amp; spoof2.getValue()){
+            PingSpoofComponent.spoof(50, true, false, false, false, true, false);
+        }
+    };
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;StrafeEvent&gt; onStrafe = event -&gt; {
+
+
+
+        if (mc.thePlayer.onGround &amp;&amp; active &amp;&amp; !mc.thePlayer.isJumping) {
+            active = false;
+
+            receiving = true;
+            send = false;
+            //   MoveUtil.strafe(MoveUtil.WALK_SPEED);
+            Vector2d motion = new Vector2d(mc.thePlayer.motionX, mc.thePlayer.motionZ);
+            double motiony = mc.thePlayer.motionY;
+         //   PingSpoofComponent.dispatch();
+            packets.forEach(PacketUtil::receive);
+            // ChatUtil.display("jump");
+            packets.clear();
+            mc.thePlayer.jump();
+            //  PingSpoofComponent.dispatch();
+            mc.thePlayer.motionX = motion.getX();
+            mc.thePlayer.motionZ = motion.getY();
+
+            //  active = false;
+            receiving = false;
+            // receiving = true;
+            //   Vector2d motion = new Vector2d(mc.thePlayer.motionX, mc.thePlayer.motionZ);
+            // packets.forEach(PacketUtil::receive);
+            //  ChatUtil.display("normal");
+            // packets.clear();
+            //  mc.thePlayer.motionX = motion.getX();
+            //  mc.thePlayer.motionZ = motion.getY();
+            //   receiving = false;
+        }
+
+    };
+
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;PostStrafeEvent&gt; onPostStrafe = event -&gt; {
+
+        if (mc.thePlayer.offGroundTicks &gt; 12 &amp;&amp; active) {
+            active = false;
+
+            receiving = true;
+            //  MoveUtil.strafe(MoveUtil.getbaseMoveSpeed() + Math.random() / 10);
+            //   mc.thePlayer.jump();
+            Vector2d motion = new Vector2d(mc.thePlayer.motionX, mc.thePlayer.motionZ);
+            double motiony = mc.thePlayer.motionY;
+         //   PingSpoofComponent.dispatch();
+            packets.forEach(PacketUtil::receive);
+            // ChatUtil.display("jump");
+            packets.clear();
+            //  PingSpoofComponent.dispatch();
+            mc.thePlayer.motionX = motion.getX();
+            mc.thePlayer.motionZ = motion.getY();
+            //  mc.thePlayer.motionY = motiony;
+            receiving = false;
+        }
+    };
+    @EventLink()
+    public final Listener&lt;Render3DEvent&gt; onRender3D = event -&gt; {
+        if (targetEntity == null || !spoof2.getValue() || (!active2 &amp;&amp; !active)) {
+            return;
+        }
+
+
+        GlStateManager.pushMatrix();
+        GlStateManager.pushAttrib();
+        GlStateManager.enableBlend();
+        GlStateManager.disableTexture2D();
+        GlStateManager.disableLighting();
+        GL11.glDepthMask(false);
+
+        double expand = -0.14;
+        RenderUtil.color(Color.red, 45);
+
+        RenderUtil.drawBoundingBox(mc.thePlayer.getEntityBoundingBox()
+                .offset(-mc.thePlayer.posX, -mc.thePlayer.posY, -mc.thePlayer.posZ)
+                .offset(realPosition.xCoord, realPosition.yCoord, realPosition.zCoord)
+                .expand(expand, -.3, expand));
+
+
+        GlStateManager.enableTexture2D();
+        GlStateManager.enableLighting();
+        GlStateManager.disableBlend();
+        GL11.glDepthMask(true);
+        GlStateManager.popAttrib();
+        GlStateManager.popMatrix();
+        GlStateManager.resetColor();
+    };
+
+}
+
+// NOTE (AI): The Watchdog Backtrack path cancels the S14 subclasses plus S19PacketEntityHeadLook and
+// NOTE (AI): S18PacketEntityTeleport for the nearest target and replays them through PacketUtil.receive
+// NOTE (AI): after 100-250 ms or when the distance to the tracked realPosition crosses the 4.5/2.5
+// NOTE (AI): thresholds. Buffering clientbound packets is invisible to the server, which is why the
+// NOTE (AI): module can hold the target's movement state without raising flags.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Holding a teleport client-side only delays the visual snap; the server state is unaffected. Flushing on hurtTime == 9 keeps the replay aligned with the player's damage timeline.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Not present in Rise 6.1.30's WatchdogVelocity corpus hit.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent across all consumers; the Rise 5.99 anticheat consumes S18 inside PlayerData.handle.</div>
+<div class="impl-clients">Rise 6.x uses getX()/getY()/getZ() double accessors and divides by 32.0; Rise 5.99 and Sigma use the MCP-style func_149449_d/func_149451_c accessors; Tenacity reads getX() directly on the fixed-point ints (no /32), which is fine for the magnitude check. Only Rise 5.99 tracks ticksSinceLastTeleport as state.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S14PacketEntity/">S14PacketEntity</a>
+<a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
+<a class="related-chip" href="../S19PacketEntityHeadLook/">S19PacketEntityHeadLook</a>
+<a class="related-chip" href="../S12PacketEntityVelocity/">S12PacketEntityVelocity</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

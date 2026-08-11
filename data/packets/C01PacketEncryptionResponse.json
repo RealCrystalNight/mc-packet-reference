@@ -51,17 +51,51 @@
   ],
   "handler": "INetHandlerLoginServer",
   "implementation": {
+    "writeup": [
+      {
+        "h": "Role in the protocol",
+        "p": "C01PacketEncryptionResponse is the second LOGIN-state packet and the last plaintext packet on the connection. The client generates a random AES secret, RSA-encrypts it together with the verify token from S01PacketEncryptionRequest using the server's public key, and sends both byte arrays. The server decrypts with its private key, checks the nonce, and enables symmetric AES encryption on the channel from that point on. In 1.8.9 this is where the session service join happens: the server hashes server id, public key and secret, and calls hasJoinedServer to resolve the profile UUID."
+      },
+      {
+        "h": "Vanilla handling",
+        "p": "NetHandlerLoginServer.processEncryptionResponse validates the state is KEY, decrypts the verify token with the private key, and throws IllegalStateException('Invalid nonce!') unless it matches the stored field_147330_e. It then stores the secret key, enables encryption on the NetworkManager, and spawns a 'User Authenticator' thread that computes the server-id hash and calls getMinecraftSessionService().hasJoinedServer. A null profile closes with 'Failed to verify username!'; a success moves to READY_TO_ACCEPT and sends S02PacketLoginSuccess."
+      },
+      {
+        "h": "Why clients touch it",
+        "p": "Only Rise 6.1.30 and 6.2.4 BlinkComponent reference this packet, again as a buffering exemption. No module in the 8 clients cancels, mutates, or replays it. Cancelling it would kill the login outright, and there is no field worth spoofing: the nonce is server-issued and RSA-protected, so a tampered secret simply fails the nonce check or produces garbage decryption server-side. The 8 clients treat encryption as untouchable infrastructure; their disablers and ping spoofers all operate in the PLAY state where the stream is already encrypted."
+      },
+      {
+        "h": "Exploit surface",
+        "p": "The genuine abuse vector lives on the other side of the exchange: a malicious server can present its own RSA key in S01PacketEncryptionRequest and the client will happily encrypt the session to it, enabling MITM for session hijacking. That is a phishing problem, not a packet-level one, and no module in the corpus touches either side. The only client-side interaction is defensive: blink must not buffer this packet, because holding it would leave the server waiting in KEY state until the login timeout."
+      }
+    ],
+    "overview": "The RSA handshake closer: client sends encrypted AES secret plus verify token, server nonce-checks and enables symmetric encryption. The only corpus hit is BlinkComponent's exemption list; no module cancels or spoofs it because there is nothing to gain and everything to lose.",
+    "server_handling": "processEncryptionResponse: Validate.validState(KEY), decrypt verify token with the private key and compare against the stored nonce (throw on mismatch), store the AES secret, enable encryption on the channel, then authenticate asynchronously via hasJoinedServer with the server-id hash. Failures close the connection with 'Failed to verify username!'.",
+    "protocol_notes": "LOGIN state, id 0x01. Two VarInt-length-prefixed byte arrays: the RSA-encrypted AES secret and the RSA-encrypted verify token, both PKCS1-padded by CryptManager. Must follow S01PacketEncryptionRequest; sending it without a pending KEY state throws. Immediately after this packet the entire stream switches to AES/CFB8, so every later packet is opaque on the wire.",
+    "anticheat_landscape": "Not an anti-cheat surface at all: no gameplay data, no timing hooks, and the exchange is protected by the server's own nonce. Proxy setups (BungeeCord with forced hosts) use the secret to key their own encryption layer, but nothing in the 8 clients interacts with that. The practical flagging surface is zero, which is why only BlinkComponent's defensive exemption appears in the corpus.",
     "modules": [
       {
-        "name": "CrackedBypass",
+        "name": "BlinkComponent",
         "found_in": [
-          "Jigsaw 0.26"
+          "Rise 6.1.30",
+          "Rise 6.2.4"
         ],
-        "purpose": "Cancel encryption response to skip premium authentication.",
-        "how_it_works": "",
-        "detailed_code": "if (event.getPacket() instanceof C01PacketEncryptionResponse) event.setCancelled(true);",
-        "vanilla_hook": "EventSendPacket"
+        "purpose": "Exempt C01PacketEncryptionResponse from blink buffering so the encryption exchange always completes and the connection actually becomes encrypted.",
+        "how_it_works": "The PacketSendEvent listener's hard-coded pre-play exemption list includes C01PacketEncryptionResponse; the packet returns untouched and is never parked in the blink queue, so the login continues to the READY_TO_ACCEPT state normally.",
+        "detailed_code": "// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BlinkComponent.java =====\npackage com.alan.clients.component.impl.player;\n\nimport com.alan.clients.component.Component;\nimport com.alan.clients.event.Listener;\nimport com.alan.clients.event.Priorities;\nimport com.alan.clients.event.annotations.EventLink;\nimport com.alan.clients.event.impl.other.ServerJoinEvent;\nimport com.alan.clients.event.impl.other.WorldChangeEvent;\nimport com.alan.clients.event.impl.packet.PacketSendEvent;\nimport com.alan.clients.util.packet.PacketUtil;\nimport net.minecraft.network.Packet;\nimport net.minecraft.network.handshake.client.C00Handshake;\nimport net.minecraft.network.login.client.C00PacketLoginStart;\nimport net.minecraft.network.login.client.C01PacketEncryptionResponse;\nimport net.minecraft.network.play.client.C03PacketPlayer;\nimport net.minecraft.network.status.client.C00PacketServerQuery;\nimport net.minecraft.network.status.client.C01PacketPing;\nimport rip.vantage.commons.util.time.StopWatch;\n\nimport java.util.ArrayList;\nimport java.util.Arrays;\nimport java.util.concurrent.ConcurrentLinkedQueue;\n\npublic final class BlinkComponent extends Component {\n\n    public static final ConcurrentLinkedQueue<Packet<?>> packets = new ConcurrentLinkedQueue<>();\n    public static boolean blinking, dispatch;\n    public static ArrayList<Class<?>> exemptedPackets = new ArrayList<>();\n    public static StopWatch exemptionWatch = new StopWatch();\n\n    public static void setExempt(Class<?>... packets) {\n        exemptedPackets = new ArrayList<>(Arrays.asList(packets));\n        exemptionWatch.reset();\n    }\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<PacketSendEvent> onPacketSend = event -> {\n        if (mc.thePlayer == null) {\n            packets.clear();\n            exemptedPackets.clear();\n            return;\n        }\n\n        if (mc.thePlayer.isDead || mc.isSingleplayer() || !mc.getNetHandler().doneLoadingTerrain) {\n            packets.forEach(PacketUtil::sendNoEvent);\n            packets.clear();\n            blinking = false;\n            exemptedPackets.clear();\n            return;\n        }\n\n        final Packet<?> packet = event.getPacket();\n\n        if (packet instanceof C00Handshake || packet instanceof C00PacketLoginStart ||\n                packet instanceof C00PacketServerQuery || packet instanceof C01PacketPing ||\n                packet instanceof C01PacketEncryptionResponse) {\n            return;\n        }\n\n        if (blinking && !dispatch) {\n            if (exemptionWatch.finished(100)) {\n                exemptionWatch.reset();\n                exemptedPackets.clear();\n            }\n\n//            PingSpoofComponent.spoofing = false;\n\n            if (!event.isCancelled() && exemptedPackets.stream().noneMatch(packetClass ->\n                    packetClass == packet.getClass())) {\n                packets.add(packet);\n                event.setCancelled();\n            }\n        } else if (packet instanceof C03PacketPlayer) {\n            packets.forEach(PacketUtil::sendNoEvent);\n            packets.clear();\n            dispatch = false;\n        }\n    };\n\n    public static void dispatch() {\n        dispatch = true;\n    }\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<WorldChangeEvent> onWorldChange = event -> {\n        packets.clear();\n        BlinkComponent.blinking = false;\n    };\n\n    @EventLink(value = Priorities.VERY_LOW)\n    public final Listener<ServerJoinEvent> onServerJoin = event -> {\n        packets.clear();\n        BlinkComponent.blinking = false;\n    };\n\n}\n\n\n// NOTE (AI): This is the most safety-critical entry in the exemption list: buffering the encryption response would leave the server blocked in KEY state waiting for the nonce, and the client would never enable its own AES side. The exemption guarantees the crypto handshake is never delayed, not even by 100ms exemption windows elsewhere in the component.",
+        "code_source": "Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BlinkComponent.java",
+        "vanilla_hook": "PacketSendEvent",
+        "anti_cheat_notes": "None: the packet is untouched. The exemption is structural, keeping blink out of the login state machine entirely.",
+        "variations": "Rise 6.1.30 is byte-identical. No other client in the corpus references this packet from module code."
       }
+    ],
+    "general_hooks": "PacketSendEvent in Rise 6.x BlinkComponent only.",
+    "client_variations": "All other clients leave C01PacketEncryptionResponse entirely to the bundled vanilla NetHandlerLoginClient, which sends it inside a GenericFutureListener callback after the secret key generation.",
+    "related": [
+      "C00Handshake",
+      "C00PacketLoginStart",
+      "S01PacketEncryptionRequest",
+      "S02PacketLoginSuccess"
     ]
   }
 }

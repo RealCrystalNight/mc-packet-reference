@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C0DPacketCloseWindow (0x0D): Player closes an inventory window (chest, crafting table, furnace, etc).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="CancelInventoryMove / InvMove / InventoryWalk, InvManager / Manager / InventoryManager, WatchdogDisabler, NoSlowModule">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C0DPacketCloseWindow — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C0DPacketCloseWindow — Minecraft 1.8.9 Packet Reference","description":"The window-close packet. Inventory move modules cancel it to keep the server-side window open while walking, managers and stealers send C0D(0) to force-close after click batches, NoSlowModule pairs it with a click to ghost-swap items, and WatchdogDisabler fires it through the unregistered send path ","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -69,8 +69,924 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Rise 6.0 CancelInventoryMove cancels C0D to keep the inventory 'open' and allow WASD movement. RektSky B5 ChestStealer sends C0D after stealing. Jigsaw 0.26 InventoryPlus cancels C0D. Sigma 4.11 InventoryWalk cancels C0D.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>Closes an inventory window. One unsigned byte windowId, where 0 is the player inventory. The vanilla client sends it from EntityPlayerSP.closeScreen() with the currently open container's id; the server calls closeContainer(), which drops or returns the carried item and switches the player back to the inventory container. It is the bookend to S2DPacketOpenWindow and pairs with the C0EPacketClickWindow clicks that mutate the container.</p>
+<h4>Vanilla handling</h4>
+<p>processCloseWindow calls this.playerEntity.closeContainer() unconditionally: the server does not verify the windowId against the player's open container. That makes C0D(0) and C0D(inventoryContainer.windowId) interchangeable in module code, and a C0D with a stale id still closes whatever container is open. The client side is EntityPlayerSP.closeScreen(), which also fires when the GUI closes for any other reason.</p>
+<h4>Why clients touch it</h4>
+<p>Inventory-movement modules cancel C0D so the server-side window stays open while the player walks (Rise 5.99 InvMove, Rise 6.x CancelInventoryMove, Sigma InventoryWalk). Sort and steal managers send C0D(0) to force the server-side close after a batch of clicks (Rise 5.99 InvManager, Rise 6.x Manager, Spicy InventoryManager). Tenacity NoSlowModule sends C0D(0) plus a shift-click C0E to ghost-swap the held item while eating. Rise 6.x WatchdogDisabler emits C0D through sendUnregisteredPacket during its blink window.</p>
+<h4>Exploit surface</h4>
+<p>Cancelling C0D while moving leaves the server convinced the inventory is open; servers and anti-cheats that tie container state to movement flag this. Sending C0D(0) at the wrong moment desyncs the container: clicks after the close are answered with S2FPacketSetSlot updates for a closed window. The NoSlow trick exploits the fact that a close plus a click on window 0 re-syncs the server's view of the held slot without cancelling the item use.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processCloseWindow unconditionally runs closeContainer(): the carried item is dropped or returned, the open container is detached, and the player inventory container becomes active. No windowId validation, no cooldown. A C0D with no open container is ignored. Ordering against C0EPacketClickWindow matters: a C0D mid-batch ends the transaction window, and later C0E packets get S2FPacketSetSlot failure responses.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>One unsigned byte (writeByte(windowId)). Window 0 is the player inventory; S2DPacketOpenWindow assigns ids from 1 upward. Because the server ignores the id, module code freely alternates between C0D(0) and C0D(inventoryContainer.windowId). The packet is sent on the main thread from closeScreen(), so module-injected copies use raw send paths to avoid GUI state.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>NCP and similar treat container state as server truth: closing a window while C03 movement continues is normal, so cancelling C0D is itself the flag surface, not the movement. Anti-cheats also correlate the NoSlow ghost pattern (C0D(0) plus C0E(0, 36+slot, 6)) with item-use state. Blink-based disablers (Rise 6.x) buffer C0D inside the blink queue so its arrival timing is controlled rather than cancelled.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
+<p class="impl-pattern">The window-close packet. Inventory move modules cancel it to keep the server-side window open while walking, managers and stealers send C0D(0) to force-close after click batches, NoSlowModule pairs it with a click to ghost-swap items, and WatchdogDisabler fires it through the unregistered send path during blink.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">CancelInventoryMove / InvMove / InventoryWalk</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11)</span>
 </div>
+<p class="impl-pattern">Keep the server-side inventory open while walking by cancelling the open and close packets, then force-pressing movement keys so the client moves with the GUI up.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">CancelInventoryMove cancels C16PacketClientStatus OPEN_INVENTORY_ACHIEVEMENT, C0BPacketEntityAction OPEN_INVENTORY and every C0DPacketCloseWindow on PacketSendEvent, and re-presses the movement keybindings on PreUpdateEvent. Rise 5.99 InvMove Packet mode additionally cancels C0E and re-sends it wrapped as C16 open + C0E + C0D(inventoryContainer.windowId) through PacketUtil.sendPacketWithoutEvent. Sigma InventoryWalk cancels C0D only when the CARRY setting is enabled.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/movement/inventorymove/CancelInventoryMove.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/movement/inventorymove/CancelInventoryMove.java =====
+package com.alan.clients.module.impl.movement.inventorymove;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreUpdateEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.impl.movement.InventoryMove;
+import com.alan.clients.value.Mode;
+import net.minecraft.client.gui.GuiChat;
+import net.minecraft.client.settings.GameSettings;
+import net.minecraft.client.settings.KeyBinding;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+import net.minecraft.network.play.client.C0DPacketCloseWindow;
+import net.minecraft.network.play.client.C16PacketClientStatus;
+
+public class CancelInventoryMove extends Mode&lt;InventoryMove&gt; {
+
+    public CancelInventoryMove(String name, InventoryMove parent) {
+        super(name, parent);
+    }
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        if (p instanceof C16PacketClientStatus) {
+            final C16PacketClientStatus wrapper = (C16PacketClientStatus) p;
+
+            if (wrapper.getStatus() == C16PacketClientStatus.EnumState.OPEN_INVENTORY_ACHIEVEMENT) {
+                event.setCancelled();
+            }
+        }
+
+        if (p instanceof C0BPacketEntityAction) {
+            final C0BPacketEntityAction wrapper = (C0BPacketEntityAction) p;
+
+            if (wrapper.getAction() == C0BPacketEntityAction.Action.OPEN_INVENTORY) {
+                event.setCancelled();
+            }
+        }
+
+        if (p instanceof C0DPacketCloseWindow) {
+            event.setCancelled();
+        }
+    };
+
+    private final KeyBinding[] AFFECTED_BINDINGS = new KeyBinding[]{
+            mc.gameSettings.keyBindForward,
+            mc.gameSettings.keyBindBack,
+            mc.gameSettings.keyBindRight,
+            mc.gameSettings.keyBindLeft,
+            mc.gameSettings.keyBindJump
+    };
+
+    @EventLink
+    public final Listener&lt;PreUpdateEvent&gt; onPreUpdate = event -&gt; {
+        if (mc.currentScreen instanceof GuiChat || mc.currentScreen == this.getClickGUI()) {
+            return;
+        }
+
+        for (final KeyBinding bind : AFFECTED_BINDINGS) {
+            bind.setPressed(GameSettings.isKeyDown(bind));
+        }
+    };
+}
+// NOTE (AI): The C0D cancel is one of three; without it the server would close the window the moment the client walks, defeating the module. The keybinding re-press in PreUpdate is what lets the client move at all while a GUI is up.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent (cancel) and PreUpdateEvent (key state).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancelling C0D is detectable server-side if the anti-cheat tracks the open-window state; the movement itself is legitimate, so this is a state-consistency flag, not a motion flag.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99's InvMove gates the behavior behind a Packet setting and re-sends rewrapped clicks. Sigma's InventoryWalk cancels C0D only under CARRY and adds per-mode sprint handling (AACP, Cubecraft) with C0B and C16 cancels.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InvManager / Manager / InventoryManager</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30, Spicy)</span>
+</div>
+<p class="impl-pattern">Drive a server-side inventory session for auto-sort and steal: open with C0B OPEN_INVENTORY, click via C0E, close with C0D(0), all without a visible GUI.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rise 5.99 InvManager tracks invOpen: openInvServerSide sends C0BPacketEntityAction OPEN_INVENTORY, closeInvServerSide sends C0DPacketCloseWindow(0). Spicy InventoryManager tracks isInventoryOpen from the packet stream (C0D sets closed, C16 OPEN_INVENTORY sets open) and closeInv() sends C0D(inventoryContainer.windowId).</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/player/InvManager.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/player/InvManager.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.player;
+
+import dev.rise.Rise;
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.math.TimeUtil;
+import net.minecraft.block.BlockCarpet;
+import net.minecraft.block.BlockDoor;
+import net.minecraft.block.BlockFlower;
+import net.minecraft.client.gui.inventory.GuiChest;
+import net.minecraft.client.gui.inventory.GuiInventory;
+import net.minecraft.enchantment.Enchantment;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.init.Blocks;
+import net.minecraft.item.*;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
+import net.minecraft.network.play.client.C0DPacketCloseWindow;
+import net.minecraft.util.DamageSource;
+
+import java.util.*;
+
+// This is an old version of InvManager, Manager is the new InvManager.
+
+@ModuleInfo(name = "InvManager", description = "Manages your inventory for you", category = Category.PLAYER)
+public final class InvManager extends Module {
+
+    private static int bestSwordSlot, bestPickaxeSlot, bestBowSlot, bestBlockSlot, bestGapSlot;
+    private static int[] bestArmorDamageReducment, bestArmorSlot;
+
+    //Lists
+    private final List&lt;Integer&gt; allSwords = new ArrayList&lt;&gt;();
+    private final List&lt;Integer&gt; allBows = new ArrayList&lt;&gt;();
+    private final List&lt;Integer&gt; allPickaxes = new ArrayList&lt;&gt;();
+    private final List&lt;Integer&gt;[] allArmors = new List[4];
+    private final List&lt;Integer&gt; allBlocks = new ArrayList&lt;&gt;();
+    private final List&lt;Integer&gt; trash = new ArrayList&lt;&gt;();
+
+    //Timers
+    private final TimeUtil delayTimer = new TimeUtil();
+    private final TimeUtil startDelayTimer = new TimeUtil();
+
+    //Settings
+    public NumberSetting minDelay = new NumberSetting("Min Delay", this, 10, 0, 100, 5);
+    public NumberSetting maxDelay = new NumberSetting("Max Delay", this, 20, 0, 100, 5);
+    public NumberSetting startDelay = new NumberSetting("Start Delay", this, 20, 0, 100, 1);
+    public NumberSetting maxBlocks = new NumberSetting("Maximum Block Stacks", this, 2, 0, 8, 1);
+    public BooleanSetting sort = new BooleanSetting("Sort", this, true);
+    public BooleanSetting autoArmor = new BooleanSetting("Auto Armor", this, true);
+    public BooleanSetting random = new BooleanSetting("Random", this, true);
+    public BooleanSetting openInv = new BooleanSetting("Open Inv", this, true);
+    public BooleanSetting keepArmor = new BooleanSetting("Keep Armor", this, false);
+    public BooleanSetting onlyStill = new BooleanSetting("Only When Standing Still", this, false);
+
+    private boolean invOpen;
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        closeInvServerSide();
+
+        if (Objects.requireNonNull(Rise.INSTANCE.getModuleManager().getModule("Scaffold")).isEnabled() || mc.currentScreen instanceof GuiChest)
+            return;
+
+        if (onlyStill.isEnabled() &amp;&amp; (mc.gameSettings.keyBindJump.isKeyDown() || mc.gameSettings.keyBindForward.isKeyDown() || mc.gameSettings.keyBindLeft.isKeyDown() || mc.gameSettings.keyBindBack.isKeyDown() || mc.gameSettings.keyBindRight.isKeyDown()))
+            return;
+
+        searchForItems();
+        searchForBestArmor();
+        searchForTrash();
+
+        //Drop Trash
+        if (!keepArmor.isEnabled()) {
+            for (final int slot : trash) {
+                if (hasNoDelay())
+                    return;
+
+                try {
+                    openInvServerSide();
+                    mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, slot &lt; 9 ? slot + 36 : slot, 1, 4, mc.thePlayer); //windowID - slot to Drop - Mouse Button 4 for Item Drop - Player
+
+                } catch (final IndexOutOfBoundsException p) {
+                }
+
+                delayTimer.reset();
+            }
+        }
+
+        //AutoArmor
+        if (autoArmor.isEnabled()) {
+
+            for (int i = 0; i &lt; 4; i++) {
+                if (bestArmorSlot[i] != -1) {
+                    final int bestSlot = bestArmorSlot[i];
+                    final ItemStack oldArmor = mc.thePlayer.inventory.armorItemInSlot(i);
+
+                    if (hasNoDelay()) return;
+
+                    //Drop old Armor
+                    if (oldArmor != null &amp;&amp; oldArmor.getItem() != null &amp;&amp; !keepArmor.isEnabled()) {
+                        openInvServerSide();
+                        mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, 8 - i, 0, 4, mc.thePlayer);
+                        delayTimer.reset();
+                    }
+
+                    final int slot = bestSlot &lt; 9 ? bestSlot + 36 : bestSlot;
+
+                    if (hasNoDelay()) return;
+
+                    //Equip new armor
+                    openInvServerSide();
+                    mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, slot, 0, 1, mc.thePlayer);
+                    delayTimer.reset();
+                }
+            }
+        }
+
+        //Sort Inventory
+        if (sort.isEnabled()) {
+            final int switchSlotSword = 0;
+            final int switchSlotBow = 1;
+            final int switchSlotPickaxe = 2;
+            final int switchSlotBlock = 8;
+            final int switchGap = 7;
+
+            //Sword Switch
+            if (bestSwordSlot != -1 &amp;&amp; bestSwordSlot != switchSlotSword) {
+                final int slot = bestSwordSlot &lt; 9 ? bestSwordSlot + 36 : bestSwordSlot;
+                if (hasNoDelay() &amp;&amp; slot != switchSlotSword)
+                    return;
+                openInvServerSide();
+                try {
+                    mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, slot, switchSlotSword, 2, mc.thePlayer); //windowID - current Slot - destination Slot - Player
+                } catch (final Exception ignored) {
+                }
+                delayTimer.reset();
+            }
+
+            //Bow Switch
+            if (bestBowSlot != -1 &amp;&amp; bestBowSlot != switchSlotBow) {
+                final int slot = bestBowSlot &lt; 9 ? bestBowSlot + 36 : bestBowSlot;
+                if (hasNoDelay() &amp;&amp; slot != switchSlotBow)
+                    return;
+                openInvServerSide();
+                try {
+                    mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, slot, switchSlotBow, 2, mc.thePlayer); //windowID - current Slot - destination Slot - Player
+                } catch (final Exception ignored) {
+                }
+                delayTimer.reset();
+            }
+
+            //Pickaxe Switch
+            if (bestPickaxeSlot != -1 &amp;&amp; bestPickaxeSlot != switchSlotPickaxe) {
+                final int slot = bestPickaxeSlot &lt; 9 ? bestPickaxeSlot + 36 : bestPickaxeSlot;
+                if (hasNoDelay() &amp;&amp; slot != switchSlotPickaxe)
+                    return;
+                openInvServerSide();
+                try {
+                    mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, slot, switchSlotPickaxe, 2, mc.thePlayer); //windowID - current Slot - destination Slot - Player
+                } catch (final Exception ignored) {
+                }
+                delayTimer.reset();
+            }
+
+            //Block Switch
+            if (bestBlockSlot != -1 &amp;&amp; bestBlockSlot != switchSlotBlock) {
+                final int slot = bestBlockSlot &lt; 9 ? bestBlockSlot + 36 : bestBlockSlot;
+                if (mc.thePlayer.inventory.getStackInSlot(switchSlotBlock) != null &amp;&amp; mc.thePlayer.inventory.getStackInSlot(switchSlotBlock).getItem() instanceof ItemBlock)
+                    return;
+                if (hasNoDelay() &amp;&amp; slot != switchSlotBlock)
+                    return;
+                openInvServerSide();
+                try {
+                    mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, slot, switchSlotBlock, 2, mc.thePlayer); //windowID - current Slot - destination Slot - Player
+                } catch (final Exception ignored) {
+                }
+                delayTimer.reset();
+            }
+
+            //Gap Switch
+            if (bestGapSlot != -1 &amp;&amp; bestGapSlot != switchGap) {
+                final int slot = bestGapSlot &lt; 9 ? bestGapSlot + 36 : bestGapSlot;
+                if (hasNoDelay() &amp;&amp; slot != switchGap)
+                    return;
+                openInvServerSide();
+                try {
+                    mc.playerController.windowClick(mc.thePlayer.inventoryContainer.windowId, slot, switchGap, 2, mc.thePlayer); //windowID - current Slot - destination Slot - Player
+                } catch (final Exception ignored) {
+                }
+                delayTimer.reset();
+            }
+        }
+    }
+
+    private void openInvServerSide() {
+        if (!invOpen &amp;&amp; !openInv.isEnabled()) {
+            mc.thePlayer.sendQueue.addToSendQueue(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.OPEN_INVENTORY));
+            invOpen = true;
+        }
+    }
+
+    private void closeInvServerSide() {
+        if (invOpen &amp;&amp; !openInv.isEnabled()) {
+            mc.thePlayer.sendQueue.addToSendQueue(new C0DPacketCloseWindow(0));
+            invOpen = false;
+        }
+    }
+
+    private boolean hasNoDelay() {
+        return !startDelayTimer.hasReached((long) ((long) startDelay.getValue() * 10 + Math.random() * 2)) || !delayTimer.hasReached((long) (Math.random() * (maxDelay.getValue() * 10 - minDelay.getValue() * 10 + 1) + minDelay.getValue() * 10)) || (!(mc.currentScreen instanceof GuiInventory)) &amp;&amp; openInv.isEnabled();
+    }
+
+    private void searchForTrash() {
+        //Clear the Trash List
+        trash.clear();
+
+        //Filter the best Armor
+        for (int i = 0; i &lt; allArmors.length; i++) {
+            final List&lt;Integer&gt; armorItem = allArmors[i];
+            if (armorItem != null) {
+                final int finalI = i;
+                armorItem.stream().filter(slot -&gt; slot != bestArmorSlot[finalI]).forEach(trash::add);
+            }
+        }
+
+        //Filter the best Items
+        allBows.stream().filter(slot -&gt; slot != bestBowSlot).forEach(trash::add);
+        allSwords.stream().filter(slot -&gt; slot != bestSwordSlot).forEach(trash::add);
+        allPickaxes.stream().filter(slot -&gt; slot != bestPickaxeSlot).forEach(trash::add);
+
+        // Throw blocks after the limit is reached.
+        int blockStacks = allBlocks.size();
+
+        for (final int slot : allBlocks) {
+            if (blockStacks &lt;= Math.round(maxBlocks.getValue() + 1)) break;
+
+            trash.add(slot);
+            blockStacks -= 1;
+        }
+
+        //Random Option
+        if (random.isEnabled()) Collections.shuffle(trash);
+        else Collections.sort(trash);
+    }
+
+    private void searchForBestArmor() {
+        //Reset all Stats and Slots
+        bestArmorDamageReducment = new int[4];
+        bestArmorSlot = new int[4];
+
+        //Fill Arrays
+        Arrays.fill(bestArmorDamageReducment, -1);
+        Arrays.fill(bestArmorSlot, -1);
+
+        //Fill Array with current Armor
+        for (int i = 0; i &lt; bestArmorSlot.length; i++) {
+            final ItemStack itemStack = mc.thePlayer.inventory.armorItemInSlot(i);
+            allArmors[i] = new ArrayList&lt;&gt;();
+
+            if (itemStack != null &amp;&amp; itemStack.getItem() != null) {
+                if (itemStack.getItem() instanceof ItemArmor) {
+                    final ItemArmor armor = (ItemArmor) itemStack.getItem();
+                    final int currentProtection = armor.damageReduceAmount + EnchantmentHelper.getEnchantmentModifierDamage(new ItemStack[]{itemStack}, DamageSource.generic); //Get the Reduce amount of the ArmorType and Protection Level
+                    bestArmorDamageReducment[i] = currentProtection;
+                }
+            }
+        }
+
+        //Search for better Armor in Inventory
+        for (int i = 0; i &lt; 9 * 4; i++) {
+            final ItemStack itemStack = mc.thePlayer.inventory.getStackInSlot(i);
+            if (itemStack == null || itemStack.getItem() == null) continue;
+
+            if (itemStack.getItem() instanceof ItemArmor) {
+                final ItemArmor armor = (ItemArmor) itemStack.getItem();
+
+                final int armorType = 3 - armor.armorType; //Slots reversed for some reason
+                allArmors[armorType].add(i);
+                final int slotProtectionLevel = armor.damageReduceAmount + EnchantmentHelper.getEnchantmentModifierDamage(new ItemStack[]{itemStack}, DamageSource.generic); //Get the Reduce amount of the ArmorType and Protection Level
+
+                if (bestArmorDamageReducment[armorType] &lt; slotProtectionLevel) {
+                    bestArmorDamageReducment[armorType] = slotProtectionLevel;
+                    bestArmorSlot[armorType] = i;
+                }
+
+            }
+        }
+    }
+
+
+    private void searchForItems() {
+        //Reset all Slots
+        bestSwordSlot = -1;
+        bestBowSlot = -1;
+        bestPickaxeSlot = -1;
+        bestBlockSlot = -1;
+        bestGapSlot = -1;
+
+        allSwords.clear();
+        allBows.clear();
+        allPickaxes.clear();
+        allBlocks.clear();
+
+        //Other Stats
+        float bestSwordDamage = -1, bestSwordDurability = -1, bestPickaxeEfficiency = -1, bestPickaxeDurability = -1, bestBowDurability = -1;
+        int bestBowDamage = -1, bestBlockSize = -1;
+        int gapStackSize = -1;
+
+        for (int i = 0; i &lt; 9 * 4; i++) {
+            final ItemStack itemStack = mc.thePlayer.inventory.getStackInSlot(i);
+            if (itemStack == null || itemStack.getItem() == null) continue;
+
+            //Search for best Sword
+            if (itemStack.getItem() instanceof ItemSword) {
+                final ItemSword sword = (ItemSword) itemStack.getItem();
+                final int level = EnchantmentHelper.getEnchantmentLevel(Enchantment.sharpness.effectId, itemStack);
+                final float damageLevel = (float) (sword.getDamageVsEntity() + level * 1.25); //Enchantment Multiplier
+
+                allSwords.add(i);
+
+                if (bestSwordDamage &lt; damageLevel) {
+                    bestSwordDamage = damageLevel;
+                    bestSwordDurability = sword.getDamageVsEntity();
+                    bestSwordSlot = i;
+                }
+
+                if ((damageLevel == bestSwordDamage) &amp;&amp; (sword.getDamageVsEntity() &lt; bestSwordDurability)) {
+                    bestSwordDurability = sword.getDamageVsEntity();
+                    bestSwordSlot = i;
+                }
+            }
+
+            //Search for best Pickaxe
+            if (itemStack.getItem() instanceof ItemPickaxe) {
+                final ItemPickaxe pickaxe = (ItemPickaxe) itemStack.getItem();
+                allPickaxes.add(i);
+
+                final float efficiencyLevel = getPickaxeEfficiency(pickaxe);
+
+                if (bestPickaxeEfficiency &lt; efficiencyLevel) {
+                    bestPickaxeEfficiency = efficiencyLevel;
+                    bestPickaxeDurability = pickaxe.getMaxDamage();
+                    bestPickaxeSlot = i;
+                }
+
+                if ((efficiencyLevel == bestPickaxeEfficiency) &amp;&amp; (pickaxe.getMaxDamage() &lt; bestPickaxeDurability)) {
+                    bestPickaxeDurability = pickaxe.getMaxDamage();
+                    bestPickaxeSlot = i;
+                }
+            }
+
+            //Search for best Bow
+            if (itemStack.getItem() instanceof ItemBow) {
+                final ItemBow bow = (ItemBow) itemStack.getItem();
+                final int level = EnchantmentHelper.getEnchantmentLevel(Enchantment.power.effectId, itemStack);
+                allBows.add(i);
+
+                if (bestBowDamage &lt; level || (bestBowDamage == -1 &amp;&amp; level == 0)) {
+                    bestBowDamage = level;
+                    bestBowDurability = bow.getMaxDamage();
+                    bestBowSlot = i;
+                }
+
+                if ((level == bestBowDamage) &amp;&amp; bow.getMaxDamage() &lt; bestBowDurability) {
+                    bestBowDurability = bow.getMaxDamage();
+                    bestBowSlot = i;
+                }
+            }
+
+            //Search for Blocks
+            if (itemStack.getItem() instanceof ItemBlock) {
+                final ItemBlock block = (ItemBlock) itemStack.getItem();
+
+                if (block.getBlock() == Blocks.web || block.getBlock() == Blocks.bed || block.getBlock() == Blocks.noteblock || block.getBlock() == Blocks.cactus || block.getBlock() == Blocks.cake || block.getBlock() == Blocks.anvil || block.getBlock() == Blocks.skull || block.getBlock() instanceof BlockDoor || block.getBlock() instanceof BlockFlower || block.getBlock() instanceof BlockCarpet)
+                    continue;
+
+                allBlocks.add(i);
+
+                if (bestBlockSize &lt; itemStack.stackSize) {
+                    bestBlockSize = itemStack.stackSize;
+                    bestBlockSlot = i;
+                }
+            }
+
+            // Search for Gaps.
+            if (itemStack.getItem() instanceof ItemAppleGold) {
+                if (gapStackSize &lt; itemStack.stackSize) {
+                    gapStackSize = itemStack.stackSize;
+                    bestGapSlot = i;
+                }
+            }
+        }
+    }
+
+    private float getPickaxeEfficiency(final ItemPickaxe pickaxe) {
+        int level = EnchantmentHelper.getEnchantmentLevel(Enchantment.efficiency.effectId, new ItemStack(pickaxe));
+
+        //Percentage of Efficiency per Level
+        switch (level) {
+            case 1:
+                level = 30;
+                break;
+            case 2:
+                level = 69;
+                break;
+            case 3:
+                level = 120;
+                break;
+            case 4:
+                level = 186;
+                break;
+            case 5:
+                level = 271;
+                break;
+
+            default:
+                level = 0;
+                break;
+        }
+
+        return pickaxe.getToolMaterial().getEfficiencyOnProperMaterial() + level;
+    }
+
+}
+// NOTE (AI): closeInvServerSide sends C0D(0) after the click batch; window 0 works because the server ignores the id. Spicy's InventoryManager instead derives its open state from incoming C0D packets and replies with the inventory container id.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> Module state methods; sends via addToSendQueue, not event interception.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>A server-side inventory that opens and closes rapidly looks like GUI spam; the click and close pattern is the measurable surface, not the C0D itself.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.x Manager sends C0D(inventoryContainer.windowId) after its open cycle. Spicy tracks open state passively in both onEvent and onEventWhenDisabled, and its autoArmor module resets its timer whenever a packet batch is sent.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WatchdogDisabler</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
+</div>
+<p class="impl-pattern">Emit C0D outside the event stream so the inventory close participates in a blink sequence without being cancellable or reorderable by other modules.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">With the Inventory toggle on, clicks on the player inventory are cancelled on PacketSendEvent and re-sent unregistered as C16 OPEN_INVENTORY plus the C0E; on the next PreUpdate a tick counter fires BlinkComponent.dispatch and sends C0D(inventoryContainer.windowId) via sendUnregisteredPacket on the raw NetworkManager.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/WatchdogDisabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/WatchdogDisabler.java =====
+package com.alan.clients.module.impl.exploit.disabler;
+
+import com.alan.clients.component.impl.player.*;
+import com.alan.clients.component.impl.player.rotationcomponent.MovementFix;
+import com.alan.clients.component.impl.render.NotificationComponent;
+import com.alan.clients.component.impl.render.espcomponent.api.ESP;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.input.MoveInputEvent;
+import com.alan.clients.event.impl.input.KeyboardInputEvent;
+import com.alan.clients.event.impl.input.MoveInputEvent;
+import com.alan.clients.event.impl.motion.PostStrafeEvent;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.motion.PreUpdateEvent;
+import com.alan.clients.event.impl.motion.StrafeEvent;
+import com.alan.clients.event.impl.other.MoveEvent;
+import com.alan.clients.event.impl.other.TeleportEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.event.impl.render.ViewBobbingEvent;
+import com.alan.clients.module.impl.exploit.Disabler;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.module.impl.movement.LongJump;
+import com.alan.clients.module.impl.movement.Speed;
+import com.alan.clients.module.impl.player.Scaffold;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.PlayerUtil;
+import com.alan.clients.util.rotation.RotationUtil;
+import com.alan.clients.util.vector.Vector2f;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.BooleanValue;
+import net.minecraft.client.gui.inventory.GuiInventory;
+import net.minecraft.init.Blocks;
+import net.minecraft.init.Items;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.S07PacketRespawn;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.Vec3;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+
+public class WatchdogDisabler extends Mode&lt;Disabler&gt; {
+    private float forward, strafe;
+    private boolean disabled;
+    private List&lt;Short&gt; actionNumbers;
+    private StopWatch transactionStopwatch;
+    private Queue&lt;Vec3&gt; positionQueue;
+    private Queue&lt;Packet&lt;?&gt;&gt; transactionQueue;
+    private Queue&lt;Packet&lt;?&gt;&gt; blinkQueue;
+    private StopWatch pingStopwatch;
+    private Integer tick;
+    private Integer ticks;
+    private boolean isSneaking;
+    private boolean set;
+    private boolean jump;
+    private double initialY = 0;
+    int time;
+    private int worldChange = 0;
+    private boolean checkedAfterTicks = false;
+    public WatchdogDisabler(String name, Disabler parent) {
+        super(name, parent);
+
+        this.positionQueue = new ArrayDeque&lt;&gt;();
+        this.transactionQueue = new ArrayDeque&lt;&gt;();
+        this.pingStopwatch = new StopWatch();
+        this.blinkQueue = new ArrayDeque&lt;&gt;();
+        this.actionNumbers = new ArrayList&lt;&gt;();
+        this.transactionStopwatch = new StopWatch();
+    }
+
+    public final BooleanValue scaffold = new BooleanValue("Strafe", this, true);
+    public final BooleanValue ban = new BooleanValue("Jump", this, true);
+    public final BooleanValue inventory = new BooleanValue("Inventory", this, false);
+
+    @EventLink
+    private final Listener&lt;TeleportEvent&gt; onTeleport = event -&gt; {
+    };
+    @EventLink(value = Priorities.HIGH)
+    Listener&lt;MoveInputEvent&gt; moveInput = event -&gt; {
+        forward = event.getForward();
+        strafe = event.getStrafe();
+    };
+
+
+
+    @EventLink
+    private final Listener&lt;PreMotionEvent&gt; PreMotionEvent = event -&gt; {
+        mc.gameSettings.ofDynamicFov = false;
+        time++;
+        if ((getModule(Flight.class).isEnabled() || getModule(LongJump.class).isEnabled())  &amp;&amp; mc.thePlayer.offGroundTicks&lt;5){
+            time = -4;
+            if(!mc.thePlayer.isSprinting()){
+                event.setSprinting(true);
+            }
+
+        }
+        switch (time) {
+
+            case 1:
+                event.setSprinting(true);
+                //    ChatUtil.display("start");
+                // Send the START_SPRINTING packet
+                //     PacketUtil.send(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.START_SPRINTING));
+                // Set time to 2 to send STOP_SPRINTING in the next call
+
+                break;
+
+            case 2:
+                event.setSprinting(false);
+                //   ChatUtil.display("stop");
+//ChatUtil.display("stop");
+                //   mc.thePlayer.setSprinting(false);
+                //       PacketUtil.send(new C0BPacketEntityAction(mc.thePlayer, C0BPacketEntityAction.Action.STOP_SPRINTING));
+
+                // Reset time to 1 for the next cycle
+                time = (int) Math.round(-(Math.random()+1));
+                //   ChatUtil.display(time);
+                break;
+
+        }
+        /*
+        if (ban.getValue()) {
+            if (!this.actionNumbers.isEmpty() &amp;&amp; this.transactionStopwatch.finished(1000L)) {
+                Collections.shuffle(this.actionNumbers);
+                this.actionNumbers.forEach(action -&gt; mc.getNetHandler().getNetworkManager().sendPacket(new C0FPacketConfirmTransaction(0, action, true)));
+                this.actionNumbers.clear();
+                this.disabled = true;
+            }
+        }
+
+         */
+
+
+        worldChange++;
+        if (ban.getValue() &amp;&amp; (mc.thePlayer.inventory.getStackInSlot(0) == null || mc.thePlayer.inventory.getStackInSlot(0).getItem() != Items.compass)) {
+
+            if (jump &amp;&amp; mc.thePlayer.onGround) {
+
+                mc.thePlayer.jump();
+
+                jump = false;
+                set = true;
+
+            } else if (mc.thePlayer.offGroundTicks &gt;= 10 &amp;&amp; set) {
+
+                if (!BadPacketsComponent.bad(true, true, true, true, true) &amp;&amp; !(getModule(Scaffold.class).isEnabled())) {
+                    Random random = new Random();
+                    float hitX = random.nextFloat();
+                    float hitZ = random.nextFloat();
+                PacketUtil.send(new C08PacketPlayerBlockPlacement(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ), EnumFacing.UP.getIndex(), new ItemStack(Items.water_bucket), hitX, 1.0F, hitZ));
+                }
+                if (mc.thePlayer.offGroundTicks % 2 == 0) {
+
+                    RotationComponent.setRotations(new Vector2f((float) (mc.thePlayer.rotationYaw - (10) + (Math.random() - 0.5) * 3), (float) (mc.thePlayer.rotationPitch)), 4, MovementFix.OFF);// Store the BlockPos in a variabl
+                    event.setPosX(event.getPosX() + 0.095+Math.random()/100);
+                }
+            }
+        }
+        if (scaffold.getValue()) {
+            if (Math.random()&lt;0.2 &amp;&amp;  !getModule(Scaffold.class).isEnabled() &amp;&amp;  !getModule(Flight.class).isEnabled() &amp;&amp;  !getModule(LongJump.class).isEnabled()) {
+                if (!BadPacketsComponent.bad(true, true, false, true, true) &amp;&amp; !(getModule(Scaffold.class).isEnabled())) {
+                    //   ChatUtil.display("send");s
+
+
+                    Random random = new Random();
+                    float hitX = random.nextFloat();
+                    float hitZ = random.nextFloat();
+
+                    PacketUtil.send(new C08PacketPlayerBlockPlacement(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ), EnumFacing.UP.getIndex(), new ItemStack(Items.water_bucket), hitX, 1.0F, hitZ));
+                }
+            }
+
+        }
+    };
+
+    @EventLink
+    private final Listener&lt;MoveEvent&gt; moveEventListener = event -&gt; {
+        if (ban.getValue() &amp;&amp; mc.thePlayer.offGroundTicks &gt;= 10 &amp;&amp; set) {
+            event.setPosX(0); event.setPosY(0); event.setPosZ(0);
+        }
+    };
+
+
+
+    @EventLink
+    private final Listener&lt;PacketReceiveEvent&gt; packetReceiveEventListener = event -&gt; {
+
+        if (event.getPacket() instanceof S08PacketPlayerPosLook) {
+            if (ticks != null) {
+                ticks++;
+                if (ticks == 25) {
+                    set = false;
+                    ticks = 0;
+                    NotificationComponent.post("Watchdog Jump Disabler", "Automatically disabled Watchdog Jump check", 1000);
+                }
+
+            }
+        }
+    };
+
+    @EventLink(value = Priorities.LOW)
+    public final Listener&lt;PreUpdateEvent&gt; onPreUpdate = event -&gt; {
+        if (inventory.getValue() &amp;&amp; !(getModule(Scaffold.class).isEnabled())) {
+            if ( tick &gt; 0) {
+                BlinkComponent.dispatch();
+                mc.getNetHandler().getNetworkManager().sendUnregisteredPacket(new C0DPacketCloseWindow(mc.thePlayer.inventoryContainer.windowId));
+                tick = 0;
+            } else  {
+                BlinkComponent.dispatch();
+            }
+        }
+        else{
+            BlinkComponent.dispatch();
+        }
+
+        if((MoveUtil.enoughMovementForSprinting() || getModule(Speed.class).isEnabled())  &amp;&amp; mc.gameSettings.keyBindBack.isKeyDown()){
+
+            RotationComponent.setRotations(new Vector2f((float) Math.toDegrees(MoveUtil.direction(forward, strafe) -(float) (Math.random() * 0.1f)), mc.thePlayer.rotationPitch),
+                    Math.random()*50, MovementFix.OFF);
+        }
+    };
+    @EventLink
+    private final Listener&lt;PacketSendEvent&gt; packetSendEventListener = event -&gt; {
+        if (inventory.getValue() &amp;&amp; !(getModule(Scaffold.class).isEnabled())) {
+            if (inventory.getValue()) {
+                if (event.getPacket() instanceof C0EPacketClickWindow &amp;&amp; ((C0EPacketClickWindow) event.getPacket()).getWindowId() == mc.thePlayer.inventoryContainer.windowId &amp;&amp; !(mc.currentScreen instanceof GuiInventory)) {
+                    BlinkComponent.blinking = true;
+                    tick++;
+                    event.setCancelled();
+                    mc.getNetHandler().getNetworkManager().sendUnregisteredPacket(new C16PacketClientStatus(C16PacketClientStatus.EnumState.OPEN_INVENTORY_ACHIEVEMENT));
+                    mc.getNetHandler().getNetworkManager().sendUnregisteredPacket(event.getPacket());
+
+
+                }
+            }
+
+        }
+
+
+
+
+
+
+    };
+
+    @Override
+    public void onDisable() {
+        NotificationComponent.post("Watchdog Disabler","DO NOT DISABLE IN GAME OR YOU WILL BAN");
+        if(time == 1){
+
+        }  else if(time == 2){
+
+        }
+    }
+
+    @EventLink
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; {
+        worldChange = 0;
+        if (ban.getValue() ) {
+            NotificationComponent.post("Watchdog Jump Disabler", "Disabling Jump check for Watchdog", 5000);
+            jump = true;
+            set = false;
+            ticks = 0;
+        }
+    };
+
+
+}
+// NOTE (AI): sendUnregisteredPacket bypasses the client's own event bus, so the C0D cannot be cancelled by another module and its position in the stream is exactly controlled. The mode is the Watchdog Jump disabler with an inventory sub-feature.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreUpdateEvent, PacketSendEvent; sendUnregisteredPacket for stealth.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The blink behavior is the risk: holding inventory packets and releasing them on a timer is a classic Watchdog flag; the C0D itself is incidental.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30's WatchdogDisabler has the same C0D send at its line ~101; 6.2.4 moved it to line ~217 inside the ticked inventory branch.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoSlowModule</span>
+<span class="impl-module-clients">(Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Cancel the server-side slowdown while eating or using items by ghost-swapping the held item: close window 0 and shift-click the current slot back.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">While using an item with no GUI open, sendBypass() pushes C0DPacketCloseWindow(0) then C0EPacketClickWindow(0, 36 + currentItem, 0, 6, null, nextTransactionID) into the send queue, setting isItemGhost. The S2FPacketSetSlot cancels on receive keep the ghost state invisible.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/module/impl/movement/NoSlowModule.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/movement/NoSlowModule.java =====
+package dev.tenacity.module.impl.movement;
+
+import dev.tenacity.event.Event;
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.packet.PacketReceiveEvent;
+import dev.tenacity.event.impl.player.MotionEvent;
+import dev.tenacity.event.impl.player.SlowDownEvent;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.ModuleCategory;
+import java.util.ArrayList;
+import java.util.Arrays;
+import dev.tenacity.setting.impl.ModeSetting;
+import net.minecraft.item.ItemSword;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0DPacketCloseWindow;
+import net.minecraft.network.play.client.C0EPacketClickWindow;
+import net.minecraft.network.play.server.S2FPacketSetSlot;
+import net.minecraft.world.gen.layer.GenLayerEdge;
+
+public final class NoSlowModule extends Module {
+
+    private boolean isItemGhost;
+
+    private final ModeSetting mode = new ModeSetting("Mode", "Vanilla", "Watchdog");
+
+    public NoSlowModule() {
+        super("NoSlow", "Makes you not take slow down", ModuleCategory.MOVEMENT);
+        initializeSettings(mode);
+    }
+
+    private final IEventListener&lt;SlowDownEvent&gt; onSlowDownEvent = Event::cancel;
+
+    private final IEventListener&lt;MotionEvent&gt; onMotionEvent = event -&gt; {
+        switch (mode.getCurrentMode()) {
+            case "Vanilla": {
+                if (event.isPre() &amp;&amp; mc.thePlayer != null) {
+                    if (!isItemGhost)
+                        sendBypass();
+                    if (!mc.thePlayer.isUsingItem())
+                        isItemGhost = false;
+                }
+            }
+            case "Watchdog": {
+                if (mc.thePlayer.isUsingItem()) {
+                    if (mc.currentScreen == null &amp;&amp; mc.thePlayer.getHeldItem() != null) {
+                    }
+                }
+                break;
+            }
+        }
+    };
+
+    private final IEventListener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        if (event.getPacket() instanceof S2FPacketSetSlot &amp;&amp; mc.thePlayer != null) {
+            final S2FPacketSetSlot s2f = (S2FPacketSetSlot) event.getPacket();
+            if (s2f.func_149175_c() == 0 &amp;&amp; mc.thePlayer.isUsingItem() &amp;&amp; mc.currentScreen == null &amp;&amp; mc.thePlayer.getHeldItem() != null &amp;&amp; !(mc.thePlayer.getHeldItem().getItem() instanceof ItemSword)) {
+                event.cancel();
+                //isItemGhost = false;
+            }
+        }
+    };
+
+    private void sendBypass() {
+        if (mc.thePlayer.isUsingItem() &amp;&amp; mc.currentScreen == null &amp;&amp; mc.thePlayer.getHeldItem() != null &amp;&amp; !(mc.thePlayer.getHeldItem().getItem() instanceof ItemSword)) {
+            mc.getNetHandler().addToSendQueue(new C0DPacketCloseWindow(0));
+            mc.getNetHandler().addToSendQueue(new C0EPacketClickWindow(0, 36 + mc.thePlayer.inventory.currentItem, 0, 6, null, mc.thePlayer.inventoryContainer.getNextTransactionID(mc.thePlayer.inventory)));
+            isItemGhost = true;
+        }
+    }
+}
+// NOTE (AI): The C0D(0) plus C0E shift-click (mode 6) re-syncs the server's held-slot view while the use continues, which is what cancels the slowdown. The mode switch also shows a Watchdog variant that does nothing in this file.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> MotionEvent pre and PacketReceiveEvent for S2FPacketSetSlot.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The close-click pair on window 0 is a recognized NoSlow signature; anti-cheats that correlate C0D(0) + C0E(0, slot, 6) with item use flag it.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus; Tenacity's PacketUtil also lists C0D among packet types that bypass its send queue.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent on all clients. Rise 6.x pairs it with BlinkComponent.dispatch and the sendUnregisteredPacket raw path. Tenacity's PacketUtil counts C0D among packet types that bypass the send queue filter.</div>
+<div class="impl-clients">Classic clients cancel via event.cancel() or setCancelled. Rise 5.99 re-sends rewrapped packets via PacketUtil.sendPacketWithoutEvent. Rise 6.x distinguishes send (event bus) from sendUnregisteredPacket (raw NetworkManager). Spicy tracks open state and emits C0D from module methods rather than event interception.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S2DPacketOpenWindow/">S2DPacketOpenWindow</a>
+<a class="related-chip" href="../C0EPacketClickWindow/">C0EPacketClickWindow</a>
+<a class="related-chip" href="../C16PacketClientStatus/">C16PacketClientStatus</a>
+<a class="related-chip" href="../S2FPacketSetSlot/">S2FPacketSetSlot</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

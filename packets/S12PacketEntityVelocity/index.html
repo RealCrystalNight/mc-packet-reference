@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S12PacketEntityVelocity (0x12): Sets an entity's velocity (e.g., from knockback, explosion, piston push).">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Velocity, AntiKnockback, Backtrack">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Velocity / AntiKnockback (cancel and scale), AntiVelocity (Sigma AAC modes), Velocity / Rise 6.x suite (per-anticheat modes), Flight / LongJump (movement boost), PingSpoofComponent (velocity buffer)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S12PacketEntityVelocity — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S12PacketEntityVelocity — Minecraft 1.8.9 Packet Reference","description":"The knockback packet: three shorts at x8000 written directly into entity motion. The most-handled clientbound packet in the 8-client corpus, spanning cancel-or-scale anti-knockback (Memeware, Nekoware, Spicy, Tenacity, Rise 5.99), per-anticheat timing suites (Sigma AAC modes, Rise 5.99 modes, the Ri","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -75,59 +75,639 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Velocities are encoded as (value * 8000). Real velocity = encoded / 8000.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>The velocity/knockback packet: entity id plus three motion shorts at x8000. The server emits it in three situations: EntityTrackerEntry broadcasts when a tracked entity's motion changes beyond a threshold (sendVelocityUpdates with lastTrackedEntityMotionX/Y/Z), EntityPlayer.attackEntityFrom sends it to the damaged player with the knockback vector, and explosions apply their push through S27. handleEntityVelocity overwrites the target entity's motion directly, which makes this the single most important clientbound packet for anti-knockback work.</p>
+<h4>Vanilla handling</h4>
+<p>EntityTrackerEntry compares the tracked entity's current motion to the last tracked values each tick and sends S12 when the delta crosses the threshold; EntityPlayer.attackEntityFrom sends the knockback vector straight to the damaged player's connection. On the client, handleEntityVelocity sets motionX/Y/Z = value / 8000.0 with no interpolation and no validation, so the packet is a direct write into the physics state that every movement check in the tick loop reads.</p>
+<h4>Why clients touch it</h4>
+<p>The most-handled clientbound packet in the corpus after S08. Four families: (1) cancel-or-scale anti-knockback (Memeware, Nekoware, Spicy, Tenacity, Rise 5.99 Custom); (2) per-anticheat timing games that cancel selectively or replay the knockback the way the anticheat expects (Rise 5.99 Vulcan/Tick Cancel/Stack/Follow First Tick/Ground, Sigma AACPush/AACFlag, the Rise 6.x ten-mode Velocity suite); (3) movement modules that consume S12 as a boost trigger (Rise 6.x GrimFlight TNT, WatchdogLongJump, WatchdogFireball, MatrixFlight, MineLandFlight, WatchdogBowLongJump; Rise 5.99 Fly Minemenclub and LongJump Hycraft/Vulcan; Sigma Fly; Tenacity FlightModule); (4) infrastructure: Rise's PingSpoofComponent buffers S12 in the velocity class, EntityTickComponent and ItemDamageComponent observe it, and Timer/Breaker/HurtCamera cancel it as collateral.</p>
+<h4>Exploit surface</h4>
+<p>The server recomputes knockback from attack packets and expects the resulting motion to appear in the player's reported positions over the next ticks. Cancelling S12 desyncs those reports, which is exactly what velocity checks measure, so the arms race is about timing: Tick Cancel and Stack modes cancel the first N velocity packets and let one through to satisfy the check, Sigma's AACFlag injects a NaN position to blind the check, and WatchdogVelocity modes apply the knockback client-side exactly as the server computes it. The companion S27PacketExplosion carries its own knockback and must be handled separately, which is why every serious module pairs S12 and S27. Rise 5.99 even ships an anticheat-side velocity recorder in dev/rise/anticheat/data/PlayerData.java and a dcOnVeloCheck disconnect in AutoHypixel that reacts to velocity-based server checks.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityTrackerEntry keeps lastTrackedEntityMotionX/Y/Z and sends S12 to tracked players when the entity's motion changes beyond a threshold (sendVelocityUpdates). EntityPlayer.attackEntityFrom sends S12 to the damaged player with the knockback vector from the attacker's motion. The client applies value / 8000.0 directly to motionX/Y/Z with no validation, so the packet is a trusted write into the physics state. Explosion knockback travels separately in S27 and is not covered by S12.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>VarInt entity id plus three shorts at x8000, no rotations, no metadata. Values are signed, so negative motion (pulled, pushed back) encodes naturally. The client divides by 8000.0 on apply; the short range limits motion to roughly -4.096 to 4.096 blocks/tick. Because the write is direct, packet order matters: an S12 arriving after the tick's movement code runs applies one tick late, which knockback-timing modules exploit.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Velocity checks reconcile the knockback vector with the player's reported position over the following ticks. Cancelling S12 is instantly measurable, so modern modes instead cancel selectively (first N packets, then pass one), reverse the vector (Sigma AACPush converts it into a strafe boost), or replay the exact server motion (WatchdogVelocity). Grim and Vulcan are sensitive to delayed application, which is why Rise 6.x splits the Velocity module into per-anticheat modes (GrimVelocity, VulcanVelocity, MMCVelocity, RedeskyVelocity, UniversoCraftVelocity, WatchdogPredictionVelocity) and why Rise 5.99's own anticheat records S12 in PlayerData.java for its checks.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Velocity</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Raze v1.5b, Gugustus, November 0.2, Nekoware v1, Memeware 7.3, Jigsaw 0.24, Helium B41420)</span>
+<p class="impl-pattern">The knockback packet: three shorts at x8000 written directly into entity motion. The most-handled clientbound packet in the 8-client corpus, spanning cancel-or-scale anti-knockback (Memeware, Nekoware, Spicy, Tenacity, Rise 5.99), per-anticheat timing suites (Sigma AAC modes, Rise 5.99 modes, the Rise 6.x ten-mode Velocity module), movement modules that use S12 as a boost trigger (GrimFlight TNT, WatchdogLongJump, WatchdogFireball, Sigma Fly), and component infrastructure (PingSpoofComponent buffers it as the velocity class).</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Velocity / AntiKnockback (cancel and scale)</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99, Spicy, Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">Cancel or scale velocity. Most common anti-knockback implementation. Cancel entirely (100% antiKB) or scale motionX/Y/Z by percentage. Backtrack buffers S12 for delayed processing.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Cancel
-if (event.getPacket() instanceof S12PacketEntityVelocity) {
-  S12PacketEntityVelocity s12 = (S12PacketEntityVelocity) event.getPacket();
-  if (s12.getEntityID() == mc.thePlayer.getEntityId()) event.setCancelled(true);
+<p class="impl-pattern">Remove or scale knockback by intercepting the S12 that targets the local player.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A packet-receive handler checks the entity id; if it matches the player, the packet is cancelled outright (Memeware, Nekoware, Rise 5.99 at 0% settings) or its motion fields are scaled by horizontal/vertical percentages (Spicy, Tenacity). S27PacketExplosion is cancelled or scaled in the same handler because explosion knockback bypasses S12.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/combat/Velocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/combat/Velocity.java =====
+
+package me.memewaredevs.client.module.combat;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.event.events.PacketInEvent;
+import me.memewaredevs.client.module.Module;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S27PacketExplosion;
+
+import java.util.function.Consumer;
+
+public class Velocity extends Module {
+    public Velocity(final String name, final int key, final Module.Category category) {
+        super(name, key, category);
+    }
+
+    @Override
+    public void onEnable() {
+    }
+
+    @Override
+    public void onDisable() {
+    }
+
+    @Handler
+    public Consumer&lt;PacketInEvent&gt; update = e -&gt; {
+        if (mc.thePlayer == null) {
+            return;
+        }
+        if (e.getPacket() instanceof S27PacketExplosion) {
+            e.cancel();
+        }
+        if (e.getPacket() instanceof S12PacketEntityVelocity) {
+            final S12PacketEntityVelocity packetEntityVelocity = (S12PacketEntityVelocity) e.getPacket();
+            if (packetEntityVelocity.func_149412_c() != mc.thePlayer.getEntityId()) {
+                return;
+            }
+            e.cancel();
+        }
+    };
 }
-// Scale
-if (s12.getEntityID() == mc.thePlayer.getEntityId()) {
-  s12.motionX *= horizontal / 100.0;
-  s12.motionY *= vertical / 100.0;
-  s12.motionZ *= horizontal / 100.0;
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+// NOTE (AI): Cancels S27PacketExplosion unconditionally and S12 only when the entity id matches the local player. The event bus delivers clientbound packets before the vanilla handler, so the cancel prevents NetHandlerPlayClient from applying the motion. Classic full anti-knockback: no scaling, no modes, no timing games.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketInEvent (Memeware/Nekoware), EventPacket pre (Spicy), PacketReceiveEvent (Tenacity, Rise 5.99).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Outright cancellation is the fastest flag on any velocity-check anticheat; scaling to a nonzero percentage passes on servers that only check for complete absence of motion. Rise 5.99's Custom mode layers timer and attack-time scaling to blur the cancel.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Memeware and Nekoware are byte-for-byte the same cancel logic. Spicy scales via settings and cancels S27 always. Tenacity scales via NumberSettings and cancels both packets at 0%. Rise 5.99 adds modes (Reverse, Ground, Stack, Follow First Tick) on top of the same Custom scale.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiKnockback</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Raze v1.5b, Gugustus, November 0.2, Nekoware v1, Memeware 7.3, Jigsaw 0.24, Helium B41420)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiVelocity (Sigma AAC modes)</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
 </div>
-<p class="impl-pattern">Cancel or scale velocity. Most common anti-knockback implementation. Cancel entirely (100% antiKB) or scale motionX/Y/Z by percentage. Backtrack buffers S12 for delayed processing.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Cancel
-if (event.getPacket() instanceof S12PacketEntityVelocity) {
-  S12PacketEntityVelocity s12 = (S12PacketEntityVelocity) event.getPacket();
-  if (s12.getEntityID() == mc.thePlayer.getEntityId()) event.setCancelled(true);
+<p class="impl-pattern">Defeat knockback with anticheat-specific tricks instead of a plain cancel.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Basic mode scales or cancels S12 and cancels S27. AACPush samples the knockback vector, cancels the packet and turns the stored motion into a decaying strafe boost over 10 ticks. AACFlag cancels the packet and injects a C04 with NaN Y while the player is in hurt time, desyncing the anticheat's position model.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/combat/AntiVelocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/combat/AntiVelocity.java =====
+package info.sigmaclient.module.impl.combat;
+
+import tv.twitch.chat.Chat;
+import info.sigmaclient.Client;
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.event.impl.EventUpdate;
+import info.sigmaclient.management.MoveUtils;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.module.data.Options;
+import info.sigmaclient.module.data.Setting;
+import info.sigmaclient.module.impl.movement.Fly;
+import info.sigmaclient.util.MathUtils;
+import info.sigmaclient.util.misc.ChatUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C03PacketPlayer.C04PacketPlayerPosition;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S27PacketExplosion;
+import net.minecraft.util.MathHelper;
+/*
+ * Made by LeakedPvP
+ */
+public class AntiVelocity extends Module {
+    private String VELOCITY = "MODE";
+    public AntiVelocity(ModuleData data) {
+        super(data);
+        settings.put(VELOCITY, new Setting&lt;&gt;(VELOCITY, new Options("Mode", "Basic", new String[]{"Basic", "AACPush", "AACFlag"}), "AntiVelocity method."));
+        settings.put(HORIZONTAL, new Setting&lt;&gt;(HORIZONTAL, 0, "Horizontal velocity factor.", 10, 0, 100));
+        settings.put(VERTICAL, new Setting&lt;&gt;(VERTICAL, 0, "Vertical velocity factor.", 10, 0, 100));
+    }
+    double count = 0;
+    public static String HORIZONTAL = "HORIZONTAL";
+    public static String VERTICAL = "VERTICAL";
+    double xmot, zmot, ymot = 0;
+    @Override
+    public void onEnable() {
+        super.onEnable();
+        count = 0;
+    }
+    @Override
+    @RegisterEvent(events = {EventPacket.class,EventUpdate.class})
+    public void onEvent(Event event) {
+    	String currentMode = ((Options) settings.get(VELOCITY).getValue()).getSelected();
+        setSuffix(currentMode);
+    	if(event instanceof EventPacket){
+        EventPacket ep = (EventPacket) event;
+        Packet p = ep.getPacket();
+        if (ep.isOutgoing()) {
+            if (p instanceof C03PacketPlayer)
+                return;
+        }    
+        if(p instanceof S08PacketPlayerPosLook){
+        	S08PacketPlayerPosLook pac = (S08PacketPlayerPosLook) ep.getPacket();
+        	if(currentMode.equalsIgnoreCase("AACFlag") &amp;&amp; mc.thePlayer.hurtResistantTime &gt; 0){
+        		pac.yaw = mc.thePlayer.rotationYaw;
+            	pac.pitch = mc.thePlayer.rotationPitch;
+        	}
+           
+        }
+        if (p instanceof S12PacketEntityVelocity) {
+        	
+            S12PacketEntityVelocity packet = (S12PacketEntityVelocity) p;
+        	int entId = packet.getEntityID();
+			int x = packet.getX();
+			int y = packet.getY();
+			int z = packet.getZ();
+            if (entId == mc.thePlayer.getEntityId() &amp;&amp; !(Client.getModuleManager().isEnabled(Fly.class) &amp;&amp; ((Options)Client.getModuleManager().get(Fly.class).getSetting("MODE").getValue()).getSelected().equalsIgnoreCase("BowFly"))) {
+            	switch(currentMode){
+            	case"AACPush":
+            		if(x != 0 &amp;&amp; z != 0){
+                		count = 10;
+                		xmot = x/1000;
+                		zmot = z/1000;	
+            		}
+            		break;
+            	case"Basic":
+                    int vertical = ((Number) settings.get(VERTICAL).getValue()).intValue();
+                    int horizontal = ((Number) settings.get(HORIZONTAL).getValue()).intValue();
+                    if (vertical != 0 || horizontal != 0) {
+                        packet.setMotX(horizontal * packet.getX() / 100);
+                        packet.setMotY(vertical * packet.getY() / 100);
+                        packet.setMotZ(horizontal * packet.getZ() / 100);
+                    } else {
+                        ep.setCancelled(true);
+                    }
+            		break;
+            	case"AACFlag":
+            		if(x != 0 &amp;&amp; z != 0){
+            			C04PacketPlayerPosition pack = new C04PacketPlayerPosition(mc.thePlayer.posX, Double.NaN, mc.thePlayer.posZ, true);
+        	   			mc.thePlayer.sendQueue.addToSendQueue(pack);
+        	   			ep.setCancelled(true);
+            		}
+            		break;
+            	}
+            } 
+        }
+        if (p instanceof S27PacketExplosion &amp;&amp; currentMode.equalsIgnoreCase("basic")) {
+        	if(ep.isPre()){
+                ep.setCancelled(true);
+        	}
+        
+        }
+    	}else if(event instanceof EventUpdate &amp;&amp; mc.thePlayer.hurtResistantTime &gt; 0 &amp;&amp; currentMode.equalsIgnoreCase("aacpush")){
+               
+    		if(count &gt; 0){
+    			double boost = 0.05 - count/200;
+    			count --;
+    			if(count &lt;=10){
+    				double speedcheck = Math.sqrt(xmot * xmot + zmot * zmot);
+    				
+    				MoveUtils.strafe(boost);
+    				double speed = Math.sqrt(mc.thePlayer.motionX * mc.thePlayer.motionX + mc.thePlayer.motionZ * mc.thePlayer.motionZ);
+    				if(speed &gt; 0.35){
+    					count = 0;
+    					mc.thePlayer.motionX *= 0;
+    					mc.thePlayer.motionZ *= 0;
+    					MoveUtils.strafe(0.2);
+    				}
+    				if(mc.thePlayer.moveForward == 0 &amp;&amp; mc.thePlayer.moveStrafing == 0){
+    					double value = 0.8-boost;
+    					mc.thePlayer.motionX *= value;
+    					mc.thePlayer.motionZ *= value;
+    				}			
+    			}
+    		}
+    	}
+    }
 }
-// Scale
-if (s12.getEntityID() == mc.thePlayer.getEntityId()) {
-  s12.motionX *= horizontal / 100.0;
-  s12.motionY *= vertical / 100.0;
-  s12.motionZ *= horizontal / 100.0;
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+// NOTE (AI): Three modes. Basic scales or cancels S12 and cancels S27. AACPush converts the knockback vector into a decaying strafe boost over 10 ticks. AACFlag sends a NaN-position C04 while the knockback is live to derail the anticheat's position tracking, then cancels the packet. The Fly BowFly check stops anti-knockback from eating the velocity a bow-boost fly depends on.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (registerEvent with EventUpdate), pre stage for clientbound.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The AACFlag NaN-position injection is a hostile desync that several 1.8 anti-cheats mis-handle; it is also the most detectable pattern in the module when the server sanity-checks NaN coordinates. AACPush keeps motion nonzero, which defeats simple knockback-absence checks.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The module also guards Sigma's own BowFly: when Fly is in BowFly mode the S12 for the player is left intact so the bow-boost velocity is preserved.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Backtrack</span>
-<span class="impl-module-clients">(Tenacity 5.1, Sigma 3.9, Raze v1.5b, Gugustus, November 0.2, Nekoware v1, Memeware 7.3, Jigsaw 0.24, Helium B41420)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Velocity / Rise 6.x suite (per-anticheat modes)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Cancel or scale velocity. Most common anti-knockback implementation. Cancel entirely (100% antiKB) or scale motionX/Y/Z by percentage. Backtrack buffers S12 for delayed processing.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// Cancel
-if (event.getPacket() instanceof S12PacketEntityVelocity) {
-  S12PacketEntityVelocity s12 = (S12PacketEntityVelocity) event.getPacket();
-  if (s12.getEntityID() == mc.thePlayer.getEntityId()) event.setCancelled(true);
+<p class="impl-pattern">Per-anticheat anti-knockback: ten modes in the Velocity module, each tuned to a specific server anticheat.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Each mode is a Mode subclass of the Velocity module handling PacketReceiveEvent: StandardVelocity scales/cancels and optionally copies the server's vertical motion into motionY; GrimVelocity, VulcanVelocity, MMCVelocity, RedeskyVelocity and UniversoCraftVelocity tune cancellation and replay timing per anticheat; WatchdogVelocity and WatchdogPredictionVelocity emulate the knockback the Watchdog check expects; BufferAbuseVelocity and LegitVelocity delay or minimize application. The onSwing gate skips handling unless the player is swinging, which hides the module's presence during combos.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/StandardVelocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/StandardVelocity.java =====
+package com.alan.clients.module.impl.combat.velocity;
+
+import com.alan.clients.Client;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.other.TeleportEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.impl.combat.Criticals;
+import com.alan.clients.module.impl.combat.Velocity;
+import com.alan.clients.module.impl.movement.Speed;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.BooleanValue;
+import com.alan.clients.value.impl.NumberValue;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S27PacketExplosion;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+
+public final class StandardVelocity extends Mode&lt;Velocity&gt; {
+    public Boolean disable2 = false;
+
+    private Integer time = 0;
+    private Speed speed = null;
+
+    private String mode = null;
+
+    private int amount;
+
+    private final NumberValue horizontal = new NumberValue("Horizontal", this, 0, 0, 100, 1);
+    private final NumberValue vertical = new NumberValue("Vertical", this, 0, 0, 100, 1);
+
+    private final BooleanValue onExplode = new BooleanValue("Explosion Ignore", this, false);
+
+
+    @Override
+    public void onEnable() {
+      time = 0;
+    setDisable2(false);
+    }
+
+    public StandardVelocity(String name, Velocity parent) {
+        super(name, parent);
+    }
+
+    @EventLink(value = Priorities.VERY_LOW)
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        if ((getParent().onSwing.getValue() &amp;&amp; !mc.thePlayer.isSwingInProgress) || event.isCancelled()) {
+            return;
+        }
+
+        final Packet&lt;?&gt; p = event.getPacket();
+
+        final double horizontal = this.horizontal.getValue().doubleValue();
+        final double vertical = this.vertical.getValue().doubleValue();
+        final boolean onExplode = this.onExplode.getValue();
+
+        if (p instanceof S12PacketEntityVelocity) {
+
+            final S12PacketEntityVelocity wrapper = (S12PacketEntityVelocity) p;
+
+            if (wrapper.getEntityID() == mc.thePlayer.getEntityId()) {
+
+
+    if (horizontal == 0) {
+        if (vertical != 0 &amp;&amp; !event.isCancelled()) {
+
+            mc.thePlayer.motionY = wrapper.getMotionY() / 8000.0D;
+        }
+
+
+        event.setCancelled();
+        return;
+    }
+
+    wrapper.motionX *= horizontal / 100;
+    wrapper.motionY *= vertical / 100;
+    wrapper.motionZ *= horizontal / 100;
+
+    event.setPacket(wrapper);
+
+
+            }
+        } else if (p instanceof S27PacketExplosion) {
+            final S27PacketExplosion wrapper = (S27PacketExplosion) p;
+
+            if (onExplode) {
+                event.setCancelled();
+                return;
+            }
+
+            wrapper.posX *= horizontal / 100;
+            wrapper.posY *= vertical / 100;
+            wrapper.posZ *= horizontal / 100;
+
+            event.setPacket(wrapper);
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (speed == null) {
+            speed = getModule(Speed.class);
+
+        }
+
+
+/*
+if(speed.isEnabled() &amp;&amp; Client.INSTANCE.getModuleManager().get(Speed.class).mode.getValue().getName().equals("Watchdog")) {
+
+        if (mc.thePlayer.hurtTime &gt; 9) {
+            mc.thePlayer.motionZ *= 0;
+            mc.thePlayer.motionX *= 0;
+            time++;
+
+            if (!MoveUtil.isMoving()) {
+                mc.thePlayer.motionZ *= 0;
+                mc.thePlayer.motionX *= 0;
+            }
+        }
+
+        if (mc.thePlayer.hurtTime == 9) {
+            if (MoveUtil.isMoving() &amp;&amp; !mc.thePlayer.onGround &amp;&amp; !( mc.thePlayer.offGroundTicks == 1)) {
+               // MoveUtil.partialStrafePercent(99);
+                double speed =1;
+                speed = Math.random()/50;
+                MoveUtil.strafe(.3);
+                  // mc.thePlayer.motionZ *= .95;
+                 //  mc.thePlayer.motionX *= .95;
+            } else {
+                mc.thePlayer.motionZ *= -.2;
+                mc.thePlayer.motionX *= -.2;
+            }
+
+
+        }
+    }
+
+ */
+
+    };
+
+    @EventLink
+    public final Listener&lt;TeleportEvent&gt; onTeleport = event -&gt; {
+        if (event.getPosY() &lt; mc.thePlayer.posY - 2);
+
+
+    };
+
+    public Boolean getDisable2() {
+        return disable2;
+    }
+
+    public void setDisable2(Boolean disable2) {
+        this.disable2 = disable2;
+    }
 }
-// Scale
-if (s12.getEntityID() == mc.thePlayer.getEntityId()) {
-  s12.motionX *= horizontal / 100.0;
-  s12.motionY *= vertical / 100.0;
-  s12.motionZ *= horizontal / 100.0;
-}</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+// NOTE (AI): Base mode of the Rise 6.x Velocity module. Cancels S12 outright when both sliders are 0, otherwise rescales and re-sets the packet on the event so the pipeline sees a modified packet. The vertical-only branch copies the server velocity into motionY directly, preserving the y-component anti-cheats expect while dropping horizontal drift. S27 explosion knockback is scaled or cancelled via the Explosion Ignore toggle.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, PreMotionEvent, TeleportEvent; packet replaced via event.setPacket.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The suite's core trick is not cancelling but reshaping: rescale the packet and re-set it so the pipeline delivers a modified but present velocity, then let one tick of real knockback through. The commented-out Watchdog strafe logic in StandardVelocity shows the iteration history of the mode.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> 6.2.4 adds WatchdogPredictionVelocity to the 6.1.30 lineup; the mode set otherwise matches (Grim, Legit, MMC, Redesky, Standard, UniversoCraft, Vulcan, Watchdog, BufferAbuse).</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Flight / LongJump (movement boost)</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.1.30, Rise 6.2.4, Sigma 4.11, Tenacity 6.0)</span>
 </div>
+<p class="impl-pattern">Use the player's own S12 as a trigger or fuel for flight and longjump acceleration.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Flight and longjump modes listen for S12 targeting the player and either flip a state flag that enables teleport-style flight (GrimFlight TNT), buffer the velocity for a follow-up boost (WatchdogLongJump, WatchdogFireball), or scale it into movement acceleration (Sigma Fly, Tenacity FlightModule). The packet is deliberately not cancelled, because the anti-cheat expects the knockback motion to exist.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/movement/flight/GrimFlight.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/movement/flight/GrimFlight.java =====
+package com.alan.clients.module.impl.movement.flight;
+
+import com.alan.clients.component.impl.player.Slot;
+import com.alan.clients.component.impl.render.NotificationComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.other.TeleportEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.module.impl.movement.Flight;
+import com.alan.clients.util.chat.ChatUtil;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.util.player.MoveUtil;
+import com.alan.clients.util.rotation.RotationUtil;
+import com.alan.clients.util.vector.Vector2f;
+import com.alan.clients.util.vector.Vector3d;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.ModeValue;
+import com.alan.clients.value.impl.SubMode;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.MovingObjectPosition;
+
+public class GrimFlight extends Mode&lt;Flight&gt; {
+
+    private final ModeValue Mode = new ModeValue("Sub-Mode", this)
+            .add(new SubMode("Block"))
+            .add(new SubMode("TNT"))
+            .setDefault("Block");
+
+    private Boolean Flight;
+
+    public GrimFlight(String name, Flight parent) {
+        super(name, parent);
+    }
+
+    @Override
+    public void onEnable() {
+        Flight = false;
+        if(Mode.getValue().getName().equals("Block")) {
+            ChatUtil.display("Any blocks you place will be ghost blocks. You have infinite range to place blocks.");
+        } else {
+            NotificationComponent.post("Grim TNT Fly","Get knock-back from a TNT to trigger the flight",2500);
+        }
+    }
+
+    
+
+    @EventLink
+    private final Listener&lt;PreMotionEvent&gt; preMotion = event -&gt; {
+        switch(Mode.getValue().getName()) {
+            case "Block":
+                if (mc.gameSettings.keyBindUseItem.isKeyDown()) {
+                    // Creating a variable that gets the block that the user is looking at and creating another variable with incremented Y position of the position so that the user teleports on top of the block.
+                    MovingObjectPosition movingObjectPosition = mc.thePlayer.rayTrace(999, 1);
+                    if (movingObjectPosition == null) return;
+
+                    final BlockPos pos = movingObjectPosition.getBlockPos();
+                    final BlockPos tpPos = pos.offset(movingObjectPosition.sideHit, 4);
+
+                    Vector2f rotations = RotationUtil.calculate(
+                            new Vector3d(tpPos.getX(), tpPos.getY(), tpPos.getZ()),
+                            new Vector3d(pos.getX(), pos.getY(), pos.getZ()));
+                    PacketUtil.send(new C03PacketPlayer.C06PacketPlayerPosLook(tpPos.getX(), tpPos.getY() - 1, tpPos.getZ(), rotations.x, rotations.y, false));
+
+                    mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, getComponent(Slot.class).getItemStack(),
+                            movingObjectPosition.getBlockPos(), movingObjectPosition.sideHit, movingObjectPosition.hitVec);
+                }
+                break;
+            case "TNT":
+                if(Flight) {
+                    final double yaw = Math.toRadians(MoveUtil.direction());
+
+                    event.setPosX(mc.thePlayer.posX - Math.sin(yaw) * 500);
+                    event.setPosY(MoveUtil.predictedMotion(mc.thePlayer.motionY));
+                    event.setPosZ(mc.thePlayer.posZ + Math.cos(yaw) * 500);
+                }
+                break;
+        }
+    };
+
+    @EventLink
+    private final Listener&lt;PacketReceiveEvent&gt; packetReceiveEventListener = event -&gt; {
+        if (Mode.getValue().getName().equals("TNT")) {
+            if (event.getPacket() instanceof S12PacketEntityVelocity) {
+                final S12PacketEntityVelocity packet = (S12PacketEntityVelocity) event.getPacket();
+
+                if (packet.getEntityID() != mc.thePlayer.getEntityId()) {
+                    return;
+                }
+
+                Flight = true;
+            }
+        }
+    };
+
+    @EventLink
+    private final Listener&lt;TeleportEvent&gt; teleport = event -&gt; {
+        if (Mode.getValue().getName().equals("Block") &amp;&amp; mc.gameSettings.keyBindUseItem.isKeyDown()) event.setCancelled();
+    };
+
+}
+// NOTE (AI): TNT sub-mode turns the player's own S12 into a flight trigger: the packet is not cancelled, it flips the Flight flag, and PreMotion then reports the player 500 blocks ahead along the move direction every tick. Letting the velocity packet through is deliberate, because Grim's knockback check expects the motion to be present.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, PreMotionEvent, TeleportEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>These modes are the flip side of anti-knockback: they need the S12 to arrive intact, so they must not conflict with the Velocity module, and they exploit the fact that the server cannot distinguish a knockback-boosted jump from a legitimate one when the packet was never tampered with.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 uses S12 in Fly Minemenclub and LongJump Hycraft/Vulcan; Rise 6.x spreads it across GrimFlight, MatrixFlight, MineLandFlight, WatchdogFlight, WatchdogJesus, WatchdogLongJump, WatchdogBowLongJump, WatchdogFireball, NCPSpeed and WatchdogSpeed; Sigma handles it inside Fly; Tenacity inside FlightModule.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">PingSpoofComponent (velocity buffer)</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
+</div>
+<p class="impl-pattern">Delay S12 alongside transactions and keepalives while ping spoofing, which delays knockback application as a side effect.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The component classifies packets into tuples: S12 is grouped with S27 in the velocity tuple. While a spoof is active, matching packets are cancelled from the event stream and parked in a timestamped queue; onPostMotion flushes entries whose delay elapsed via PacketUtil.queue, which bypasses the event bus. The players tuple holds S13 and the S14/S18/S19/S20 entity stream so entity ordering survives the buffering.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 — com/alan/clients/component/impl/player/PingSpoofComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/component/impl/player/PingSpoofComponent.java =====
+package com.alan.clients.component.impl.player;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.CancellableEvent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PostMotionEvent;
+import com.alan.clients.event.impl.other.WorldChangeEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.util.packet.PacketUtil;
+import net.minecraft.client.gui.GuiDownloadTerrain;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.*;
+import net.minecraft.util.Tuple;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+public final class PingSpoofComponent extends Component {
+    public static ConcurrentLinkedQueue&lt;PacketUtil.TimedPacket&gt; packets = new ConcurrentLinkedQueue&lt;&gt;();
+    static StopWatch enabledTimer = new StopWatch();
+    public static boolean enabled;
+    static long amount;
+    static Tuple&lt;Class[], Boolean&gt; regular = new Tuple&lt;&gt;(new Class[]{C0FPacketConfirmTransaction.class, C00PacketKeepAlive.class, S1CPacketEntityMetadata.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; velocity = new Tuple&lt;&gt;(new Class[]{S12PacketEntityVelocity.class, S27PacketExplosion.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; teleports = new Tuple&lt;&gt;(new Class[]{S08PacketPlayerPosLook.class, S39PacketPlayerAbilities.class, S09PacketHeldItemChange.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; players = new Tuple&lt;&gt;(new Class[]{S13PacketDestroyEntities.class, S14PacketEntity.class, S14PacketEntity.S16PacketEntityLook.class, S14PacketEntity.S15PacketEntityRelMove.class, S14PacketEntity.S17PacketEntityLookMove.class, S18PacketEntityTeleport.class, S20PacketEntityProperties.class, S19PacketEntityHeadLook.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; blink = new Tuple&lt;&gt;(new Class[]{C02PacketUseEntity.class, C0DPacketCloseWindow.class, C0EPacketClickWindow.class, C0CPacketInput.class, C0BPacketEntityAction.class, C08PacketPlayerBlockPlacement.class, C07PacketPlayerDigging.class, C09PacketHeldItemChange.class, C13PacketPlayerAbilities.class, C15PacketClientSettings.class, C16PacketClientStatus.class, C17PacketCustomPayload.class, C18PacketSpectate.class, C19PacketResourcePackStatus.class, C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class, C0APacketAnimation.class}, false);
+    static Tuple&lt;Class[], Boolean&gt; movement = new Tuple&lt;&gt;(new Class[]{C03PacketPlayer.class, C03PacketPlayer.C04PacketPlayerPosition.class, C03PacketPlayer.C05PacketPlayerLook.class, C03PacketPlayer.C06PacketPlayerPosLook.class}, false);
+
+    public static Tuple&lt;Class[], Boolean&gt;[] types = new Tuple[]{regular, velocity, teleports, players, blink, movement};
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; send = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; receive = event -&gt; event.setCancelled(onPacket(event.getPacket(), event).isCancelled());
+
+    public CancellableEvent onPacket(Packet&lt;?&gt; packet, CancellableEvent event) {
+        if (!event.isCancelled() &amp;&amp; enabled &amp;&amp; Arrays.stream(types).anyMatch(tuple -&gt; tuple.getSecond() &amp;&amp; Arrays.stream(tuple.getFirst()).anyMatch(regularpacket -&gt; regularpacket == packet.getClass()))) {
+            event.setCancelled();
+            packets.add(new PacketUtil.TimedPacket(packet));
+        }
+
+        return event;
+    }
+
+    public static void dispatch() {
+        if (!packets.isEmpty()) {
+            // Stops the packets from being called twice
+            boolean enabled = PingSpoofComponent.enabled;
+            PingSpoofComponent.enabled = false;
+            packets.forEach(timedPacket -&gt; PacketUtil.queue(timedPacket.getPacket()));
+            PingSpoofComponent.enabled = enabled;
+            packets.clear();
+        }
+    }
+
+    public static void disable() {
+        enabled = false;
+        enabledTimer.setMillis(enabledTimer.millis - 999999999);
+    }
+
+    @EventLink
+    public final Listener&lt;WorldChangeEvent&gt; onWorldChange = event -&gt; dispatch();
+
+    @EventLink
+    public final Listener&lt;PostMotionEvent&gt; onPostMotion = event -&gt; {
+        if (!(enabled = !enabledTimer.finished(100) &amp;&amp; !(mc.currentScreen instanceof GuiDownloadTerrain))) {
+            dispatch();
+        } else {
+            // Stops the packets from being called twice
+            enabled = false;
+
+            packets.forEach(packet -&gt; {
+                if (packet.getTime() + amount &lt; System.currentTimeMillis()) {
+                    PacketUtil.queue(packet.getPacket());
+                    packets.remove(packet);
+                }
+            });
+
+            enabled = true;
+        }
+    };
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players) {
+        spoof(amount, regular, velocity, teleports, players, false);
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink, boolean movement) {
+        enabledTimer.reset();
+
+        PingSpoofComponent.regular.setSecond(regular);
+        PingSpoofComponent.velocity.setSecond(velocity);
+        PingSpoofComponent.teleports.setSecond(teleports);
+        PingSpoofComponent.players.setSecond(players);
+        PingSpoofComponent.blink.setSecond(blink);
+        PingSpoofComponent.movement.setSecond(movement);
+        PingSpoofComponent.amount = amount;
+    }
+
+    public static void spoof(int amount, boolean regular, boolean velocity, boolean teleports, boolean players, boolean blink) {
+        spoof(amount, regular, velocity, teleports, players, blink, false);
+    }
+
+    public static void blink() {
+        spoof(9999999, true, false, false, false, true);
+    }
+}
+// NOTE (AI): Component shared by PingSpoof and the Timer module. S12 is grouped with S27 in the velocity tuple; while a spoof is active the packets are pulled out of the event stream, timestamped and replayed by dispatch(). Delaying S12 delays knockback application, so the component doubles as a soft anti-velocity. The players tuple (S13, S14 family, S18, S19, S20) keeps entity-stream ordering intact while entity packets are held.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent, PacketReceiveEvent, PostMotionEvent, WorldChangeEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Delayed S12 is safe against velocity checks that sample a single tick (the knockback still arrives), but dangerous against checks that measure the gap between the hit and the motion, which is why the component is paired with per-anticheat Velocity modes in the same client.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical component in 6.1.30 and 6.2.4; 6.2.4's PingSpoof and Timer modules both drive it via the static spoof() entry points.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent is universal; the packet is re-set on the event in Rise (event.setPacket) and mutated or cancelled in place on classic event buses (Memeware, Nekoware, Sigma, Spicy). Rise 6.x handles it through the component system and the Velocity module's Mode classes.</div>
+<div class="impl-clients">Memeware/Nekoware cancel inside PacketInEvent; Spicy mutates the packet object and cancels the event; Tenacity cancels or scales via IEventListener; Rise 5.99 replaces the packet on the event; Rise 6.x re-sets it and additionally buffers it in PingSpoofComponent; Sigma mutates or cancels and injects C04 for the AACFlag mode.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S27PacketExplosion/">S27PacketExplosion</a>
+<a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
+<a class="related-chip" href="../S0FPacketSpawnMob/">S0FPacketSpawnMob</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

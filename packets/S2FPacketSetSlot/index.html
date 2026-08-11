@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S2FPacketSetSlot (0x2F): Sets a single slot in an inventory window. Used for cursor updates, specific slot changes, and armor slot updates.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ChestStealer, InvManager, AutoArmor">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Auto, Scaffold, BlockFly, NoSlowModule, AdaptiveRefreshRateComponent">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S2FPacketSetSlot — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S2FPacketSetSlot — Minecraft 1.8.9 Packet Reference","description":"The single-slot sync packet and the cheapest inventory signal on the wire. Rise's Auto reads it to click captcha items, Scaffold and Spicy's BlockFly cancel it to freeze the hotbar, Tenacity's NoSlow cancels window-0 updates to preserve a ghost item, and Rise 6.x treats it as a HUD-significant packe","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -73,23 +73,689 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">windowId=-1 special case: updates the cursor item (the item held by the mouse cursor). windowId=0: updates player inventory. S2F is sent for EVERY slot change — armor equips, hotbar changes, cursor picks up/drops. Inventory modules track S2F to detect armor swaps and item pickups.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S2FPacketSetSlot is the single-slot inventory sync packet, the fine-grained counterpart to the S30 full-window dump. The server emits it for every slot mutation: EntityPlayerMP.updateCraftingInventory pushes windowId/slot/stack on each container change, the cursor is synced with the (-1, -1) variant after clicks settle (lines 760, 774, 805), NetHandlerPlayServer line 554 re-sends the held hotbar slot after a swap, and ItemEditableBook pushes the signed book back into slot 0. windowId -1 means the cursor, 0 means the player inventory, anything else the open container.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleSetSlot resolves the target container from the window id: -1 sets the player's cursor stack, 0 and the player inventory window id write into inventoryContainer, otherwise the open container receives the slot. The matching GuiScreen is notified so the renderer updates. There is no validation: the client trusts the server's slot content unconditionally, which is exactly the trust that cancel-based modules exploit. The vanilla client never sends S2F; it is strictly clientbound.</p>
+<h4>Why clients touch it</h4>
+<p>Four distinct uses in the 8 clients. Rise 5.99 Auto sniffs S2F for the Redesky captcha item and clicks it with a crafted C0E. Rise 5.99 Scaffold and Spicy BlockFly cancel every S2F so the server cannot correct the hotbar while they place blocks. Tenacity 6.0 NoSlowModule cancels window-0 slot updates while using a non-sword item, keeping the ghost-item no-slow state alive. Rise 6.x AdaptiveRefreshRateComponent treats S2F as a significant packet that forces a HUD cache redraw, and PacketUtil exposes a wrapper for the script API.</p>
+<h4>Exploit surface</h4>
+<p>Cancelling S2F is a local lie that only survives until the next window resync: the server owns slot state, and a rejected click (S32 accepted=false) triggers a full S30 dump that snaps the client back. That makes S2F cancellation a short-horizon trick, useful inside a single click loop, not a persistent desync. For inventory modules the packet is a cheap signal: an armor swap or a hotbar change arrives as one small packet, so AutoArmor-style logic can react without parsing a window. The trade-off is ordering: any module that cancels S2F upstream silently blinds every other module that reads it.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityPlayerMP.updateCraftingInventory sends S2F(windowId, slot, stack) per slot change and the cursor variant (-1, -1) after click processing (lines 760, 774, 805 in the bundled sources). NetHandlerPlayServer line 554 re-sends the held item slot after a hotbar swap; ItemEditableBook line 116 pushes the signed book into slot 0. There is no rate limit and no client-side validation: handleSetSlot writes the slot into the resolved container and notifies the open GUI.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Wire layout: byte windowId, short slot, then a Slot encoding (short item id, byte count, short damage, optional NBT; item id -1 encodes null). windowId -1 (0xFF) targets the cursor, 0 the player inventory, other values the open container. S2F is PLAY-state only and always carries exactly one slot, which is what makes it the cheapest way for a module to detect an armor equip or hotbar change. The cursor variant pairs slot -1 with windowId -1.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>No anti-cheat measures S2F: it is server-authoritative display state. The abuse is purely client-side view desync, and the detection surface is the eventual resync: a server that rejects a click re-sends S30, and any client that still behaves as if the old slot content exists is visibly desynced. Cancel-heavy movement modules (Scaffold, BlockFly) therefore risk inventory desync that manifests as phantom hotbar items rather than a flag.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ChestStealer</span>
+<p class="impl-pattern">The single-slot sync packet and the cheapest inventory signal on the wire. Rise's Auto reads it to click captcha items, Scaffold and Spicy's BlockFly cancel it to freeze the hotbar, Tenacity's NoSlow cancels window-0 updates to preserve a ghost item, and Rise 6.x treats it as a HUD-significant packet. The server always owns slot truth; cancelling only delays the client's view.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Auto</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Track individual slot updates for inventory management.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Automated Redesky captcha solving: detect a captcha item in a container slot via S2F and click it before the server times it out.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketReceiveEvent; on S2F, skip window 0 (player inventory), then check the item's display name case-insensitively for 'aqui'. On match, send C0EPacketClickWindow(windowId, slot, 0, 0, item, (short) 1919): button 0, mode 0, and an absurdly large action number the server ignores. Runs only while the redeskyAutoCaptcha setting is on.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/other/Auto.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/other/Auto.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.other;
+
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.BooleanSetting;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0EPacketClickWindow;
+import net.minecraft.network.play.server.S2FPacketSetSlot;
+
+@ModuleInfo(name = "Auto", description = "Automatically does things for you", category = Category.OTHER)
+public final class Auto extends Module {
+
+    private final BooleanSetting redeskyAutoCaptcha = new BooleanSetting("Redesky Auto Captcha", this, false);
+    private final BooleanSetting redeskyAutoRegister = new BooleanSetting("Redesky Auto Register", this, false);
+
+    boolean sentReg, sentLogin;
+    int ticks;
+    int amountFlagged;
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+
+        final Packet packet = event.getPacket();
+
+        if (redeskyAutoCaptcha.isEnabled()) {
+
+            if (packet instanceof S2FPacketSetSlot) {
+
+                final S2FPacketSetSlot S2F = (S2FPacketSetSlot) packet;
+
+                if (S2F.func_149175_c() == 0) {
+                    return;
+                }
+
+                final ItemStack item = S2F.func_149174_e();
+
+                if (item != null &amp;&amp; item.getDisplayName().toLowerCase().contains("aqui")) {
+
+                    mc.thePlayer.sendQueue.addToSendQueue(new C0EPacketClickWindow(S2F.func_149175_c(), S2F.func_149173_d(), 0, 0, item, (short) 1919));
+
+                }
+
+            }
+
+        }
+
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+
+        if (mc.thePlayer.ticksExisted % 20 == 0)
+            amountFlagged--;
+
+        if (amountFlagged &lt; 0)
+            amountFlagged = 0;
+
+        if (redeskyAutoRegister.isEnabled()) {
+
+            if (mc.thePlayer.ticksExisted == 1) {
+                sentLogin = sentReg = false;
+            }
+
+            if (mc.currentScreen == null) {
+                ticks++;
+                if (ticks &gt; 30) {
+
+                    if (!sentReg) {
+                        mc.thePlayer.sendChatMessage("/register Lolxd00 Lolxd00");
+                        sentReg = true;
+                    } else if (!sentLogin) {
+                        mc.thePlayer.sendChatMessage("/login Lolxd00");
+                        sentLogin = true;
+                    }
+
+                }
+
+
+            } else {
+                ticks = 0;
+            }
+
+        }
+
+    }
+
+
+}
+
+// NOTE (AI): The Redesky captcha item is matched case-insensitively against 'aqui' in the display name and clicked with action number 1919, a deliberately large value the server tolerates. Window 0 (player inventory) slots are skipped by the early return so only open-container slots are scanned.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Benign server automation; the fixed action number 1919 and the display-name scan are the only fingerprints, and no anti-cheat in the era flags them.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus; the captcha logic is Redesky-specific and the rest of the module (auto register/login) works through chat packets.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InvManager</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Track individual slot updates for inventory management.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Cancel all incoming slot sync so the server cannot correct the client's hotbar view during the block placement loop.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">onPacketReceive: if the packet is S2FPacketSetSlot, event.setCancelled(true). Every slot update is dropped while scaffolding, keeping the client's own view of the hotbar authoritative for the placement loop.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/player/Scaffold.java</span></p>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>No anti-cheat flags the cancellation itself; the risk is long-horizon inventory desync, which surfaces when a rejected click forces an S30 resync.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus; the file is 1042 lines of placement logic with this one receive-side cancel.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoArmor</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BlockFly</span>
+<span class="impl-module-clients">(Spicy)</span>
 </div>
-<p class="impl-pattern">Track individual slot updates for inventory management.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Block-fly movement that cancels S2F so the server cannot correct the fake block placement state.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">EventPacket pre-phase: if the packet is S2FPacketSetSlot, setCanceled(true), unless killaura has a target, in which case the handler returns early so weapon switching stays synced. The module also freezes yaw and pitch on C03 and EventMotion and places blocks below the player via onPlayerRightClick.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy — info/spicyclient/modules/movement/BlockFly.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/movement/BlockFly.java =====
+package info.spicyclient.modules.movement;
+
+import java.util.Comparator;
+import java.util.Random;
+
+import org.lwjgl.input.Keyboard;
+import org.newdawn.slick.tests.xml.ItemContainer;
+
+import info.spicyclient.SpicyClient;
+import info.spicyclient.chatCommands.Command;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventMotion;
+import info.spicyclient.events.listeners.EventPacket;
+import info.spicyclient.events.listeners.EventRender3D;
+import info.spicyclient.events.listeners.EventSendPacket;
+import info.spicyclient.events.listeners.EventSneaking;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.settings.BooleanSetting;
+import info.spicyclient.settings.ModeSetting;
+import info.spicyclient.settings.NumberSetting;
+import info.spicyclient.settings.SettingChangeEvent;
+import info.spicyclient.settings.SettingChangeEvent.type;
+import info.spicyclient.util.MovementUtils;
+import info.spicyclient.util.RenderUtils;
+import info.spicyclient.util.RotationUtils;
+import info.spicyclient.util.Timer;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockAir;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.entity.EntityPlayerSP;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.entity.player.InventoryPlayer;
+import net.minecraft.init.Blocks;
+import net.minecraft.init.Items;
+import net.minecraft.item.ItemBlock;
+import net.minecraft.item.ItemStack;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C09PacketHeldItemChange;
+import net.minecraft.network.play.server.S2FPacketSetSlot;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.MathHelper;
+import net.minecraft.util.Vec3;
+
+public class BlockFly extends Module {
+	
+	public BlockFly() {
+		super("Block Fly", Keyboard.KEY_NONE, Category.MOVEMENT);
+	}
+	
+	public void onEnable() {
+		
+		lastYaw = mc.thePlayer.rotationYaw;
+		lastPitch = mc.thePlayer.rotationPitch;
+		
+	}
+	
+	public void onDisable() {
+		
+	}
+	
+	public static transient float lastYaw = 0, lastPitch = 0;
+	public static transient Timer timer = new Timer();
+	
+	public void onEvent(Event e) {
+		
+		if (e instanceof EventSneaking) {
+			
+			if (e.isPre()) {
+				
+				if (SpicyClient.config.killaura.isEnabled() &amp;&amp; SpicyClient.config.killaura.target != null) {
+					return;
+				}
+				
+				EventSneaking sneak = (EventSneaking) e;
+				
+				if (sneak.entity.onGround &amp;&amp; sneak.entity instanceof EntityPlayer) {
+					sneak.sneaking = true;
+				}else {
+					sneak.sneaking = false;
+				}
+				sneak.offset = -1D;
+				sneak.revertFlagAfter = true;
+				
+			}
+			
+		}
+		
+		if (e instanceof EventPacket &amp;&amp; e.isPre()) {
+			
+			if (SpicyClient.config.killaura.isEnabled() &amp;&amp; SpicyClient.config.killaura.target != null) {
+				return;
+			}
+			
+			if (((EventPacket)e).packet instanceof S2FPacketSetSlot) {
+				e.setCanceled(true);
+			}
+			
+		}
+		
+		if (e instanceof EventSendPacket &amp; e.isPre()) {
+			
+			if (SpicyClient.config.killaura.isEnabled() &amp;&amp; SpicyClient.config.killaura.target != null) {
+				return;
+			}
+			
+			if (((EventSendPacket)e).packet instanceof C03PacketPlayer) {
+				((C03PacketPlayer)((EventSendPacket)e).packet).setYaw(lastYaw);
+				((C03PacketPlayer)((EventSendPacket)e).packet).setPitch(lastPitch);
+			}
+			
+		}
+		
+		if (e instanceof EventRender3D &amp;&amp; e.isPre()) {
+			
+			BlockPos below = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1D, mc.thePlayer.posZ);
+			
+			for (int i = 0; i &lt; 5; i++) {
+				
+				RenderUtils.drawLine(below.getX(), below.getY(), below.getZ(), below.getX() + 1, below.getY(), below.getZ());
+				RenderUtils.drawLine(below.getX(), below.getY() + 1, below.getZ(), below.getX() + 1, below.getY() + 1, below.getZ());
+				RenderUtils.drawLine(below.getX(), below.getY(), below.getZ(), below.getX(), below.getY(), below.getZ() + 1);
+				RenderUtils.drawLine(below.getX(), below.getY() + 1, below.getZ(), below.getX(), below.getY() + 1, below.getZ() + 1);
+				RenderUtils.drawLine(below.getX(), below.getY(), below.getZ(), below.getX(), below.getY() + 1, below.getZ());
+				RenderUtils.drawLine(below.getX(), below.getY() + 1, below.getZ(), below.getX(), below.getY() + 1, below.getZ());
+				RenderUtils.drawLine(below.getX() + 1, below.getY(), below.getZ(), below.getX() + 1, below.getY() + 1, below.getZ());
+				RenderUtils.drawLine(below.getX() + 1, below.getY() + 1, below.getZ(), below.getX() + 1, below.getY() + 1, below.getZ());
+				RenderUtils.drawLine(below.getX(), below.getY(), below.getZ() + 1, below.getX(), below.getY() + 1, below.getZ() + 1);
+				RenderUtils.drawLine(below.getX(), below.getY() + 1, below.getZ() + 1, below.getX(), below.getY() + 1, below.getZ() + 1);
+				RenderUtils.drawLine(below.getX() + 1, below.getY(), below.getZ() + 1, below.getX(), below.getY(), below.getZ() + 1);
+				RenderUtils.drawLine(below.getX() + 1, below.getY() + 1, below.getZ() + 1, below.getX(), below.getY() + 1, below.getZ() + 1);
+				RenderUtils.drawLine(below.getX() + 1, below.getY(), below.getZ() + 1, below.getX() + 1, below.getY() + 1, below.getZ() + 1);
+				RenderUtils.drawLine(below.getX() + 1, below.getY() + 1, below.getZ(), below.getX() + 1, below.getY() + 1, below.getZ() + 1);
+				RenderUtils.drawLine(below.getX() + 1, below.getY(), below.getZ(), below.getX() + 1, below.getY(), below.getZ() + 1);
+				
+			}
+			
+		}
+		
+		if (e instanceof EventUpdate &amp;&amp; e.isPre() &amp;&amp; MovementUtils.isOnGround(0.4)) {
+			
+			if (SpicyClient.config.killaura.isEnabled() &amp;&amp; SpicyClient.config.killaura.target != null) {
+				return;
+			}
+			
+			//mc.thePlayer.onGround = false;
+			
+			EventUpdate update = (EventUpdate)e;
+			
+			double motionX = mc.thePlayer.motionX, motionZ = mc.thePlayer.motionZ;
+			
+			if (motionX &lt; 0)
+				motionX *= -1;
+			
+			if (motionZ &lt; 0)
+				motionZ *= -1;
+			
+			if (motionX &lt; 0.05 &amp;&amp; motionZ &lt; 0.05 &amp;&amp; MovementUtils.isOnGround(0.3) &amp;&amp; mc.gameSettings.keyBindJump.isKeyDown()) {
+				if (mc.gameSettings.keyBindJump.isKeyDown() &amp;&amp; MovementUtils.isOnGround(0.25)) {
+					
+		            //mc.thePlayer.motionX = 0.0D;
+		            //mc.thePlayer.motionZ = 0.0D;
+		            //mc.thePlayer.motionY = 0.375;
+		            if (timer.hasTimeElapsed(1500, true)) {
+		               //mc.thePlayer.motionY = -0.28D;
+		            }
+					
+				}
+			}
+			
+			
+		}
+		
+		if (e instanceof EventMotion &amp;&amp; e.isPost()) {
+			
+			if (SpicyClient.config.killaura.isEnabled() &amp;&amp; SpicyClient.config.killaura.target != null) {
+				return;
+			}
+			
+			EventMotion event = (EventMotion) e;
+			
+			//mc.thePlayer.setSprinting(false);
+			
+			event.setYaw(lastYaw);
+			event.setYaw(lastPitch);
+			
+			ItemStack i = mc.thePlayer.getCurrentEquippedItem();
+			BlockPos below = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1D, mc.thePlayer.posZ);
+			
+			if (mc.theWorld.getBlockState(below).getBlock() == Blocks.air) {
+				
+				for (EnumFacing facing : EnumFacing.VALUES) {
+					
+					switch (facing) {
+					case UP:
+						
+						BlockPos underBelow = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 2D, mc.thePlayer.posZ);
+						
+						if (mc.theWorld.getBlockState(underBelow).getBlock() != Blocks.air) {
+							
+							ItemStack block = mc.thePlayer.getCurrentEquippedItem();
+							
+							for (int g = 0; g &lt; 9; g++) {
+								
+								if (mc.thePlayer.inventoryContainer.getSlot(g + 36).getHasStack() &amp;&amp; mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().getItem() instanceof ItemBlock &amp;&amp; mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().stackSize &gt; 0 &amp;&amp; !((ItemBlock)mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().getItem()).getBlock().getLocalizedName().toLowerCase().contains("chest") &amp;&amp; !((ItemBlock)mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().getItem()).getBlock().getLocalizedName().toLowerCase().contains("table")) {
+									
+									InventoryPlayer inventoryplayer = mc.thePlayer.inventory;
+									inventoryplayer.setCurrentItem(mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().getItem(), 0, false, true);
+									
+								}
+								
+							}
+							
+							if (mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, block, underBelow, EnumFacing.UP, RotationUtils.getVectorForRotation(getRotationsHypixel(underBelow, EnumFacing.UP)[1], getRotationsHypixel(underBelow, EnumFacing.UP)[1])) || true) {
+								
+								mc.thePlayer.swingItem();
+								event.setYaw(getRotationsHypixel(underBelow, facing)[0]);
+								event.setPitch(getRotationsHypixel(underBelow, facing)[1]);
+								lastYaw = event.yaw;
+								lastPitch = event.pitch;
+								return;
+								
+							}
+							return;
+							
+						}
+						
+						break;
+					case NORTH:
+					case EAST:
+					case SOUTH:
+					case WEST:
+						
+						BlockInfo defaultPos = findFacingAndBlockPosForBlock(new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1D, mc.thePlayer.posZ + mc.thePlayer.motionZ));
+						
+						if (defaultPos == null)
+							return;
+						
+						if (mc.theWorld.getBlockState(defaultPos.pos).getBlock() != Blocks.air) {
+							
+							ItemStack block = mc.thePlayer.getCurrentEquippedItem();
+							
+							for (int g = 0; g &lt; 9; g++) {
+								
+								if (mc.thePlayer.inventoryContainer.getSlot(g + 36).getHasStack() &amp;&amp; mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().getItem() instanceof ItemBlock &amp;&amp; mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().stackSize &gt; 0 &amp;&amp; !((ItemBlock)mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().getItem()).getBlock().getLocalizedName().toLowerCase().contains("chest") &amp;&amp; !((ItemBlock)mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().getItem()).getBlock().getLocalizedName().toLowerCase().contains("table")) {
+									
+									InventoryPlayer inventoryplayer = mc.thePlayer.inventory;
+									inventoryplayer.setCurrentItem(mc.thePlayer.inventoryContainer.getSlot(g + 36).getStack().getItem(), 0, false, true);
+									
+								}
+								
+							}
+							if (mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, block, defaultPos.pos, defaultPos.facing, RotationUtils.getVectorForRotation(getRotationsHypixel(defaultPos.targetPos, defaultPos.facing)[0], getRotationsHypixel(defaultPos.targetPos, defaultPos.facing)[1])) || true) {
+								
+								mc.thePlayer.swingItem();
+								event.setYaw(getRotationsHypixel(defaultPos.pos.offset(defaultPos.facing), defaultPos.facing)[0]);
+								event.setPitch(getRotationsHypixel(defaultPos.pos.offset(defaultPos.facing), defaultPos.facing)[1]);
+								lastYaw = event.yaw;
+								lastPitch = event.pitch;
+								return;
+								
+							}
+							return;
+							
+						}
+						
+						break;
+						
+					}
+					
+				}
+				
+			}
+			
+		}
+		
+	}
+	
+	private BlockInfo findFacingAndBlockPosForBlock(BlockPos input) {
+		
+		BlockInfo output = new BlockInfo();
+		output.pos = input;		
+		
+		for (EnumFacing face : EnumFacing.VALUES) {
+			
+			if (mc.theWorld.getBlockState(output.pos.offset(face)).getBlock() != Blocks.air) {
+				
+				output.pos = output.pos.offset(face);
+				output.facing = face.getOpposite();
+				output.targetPos = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 1D, mc.thePlayer.posZ);
+				return output;
+				
+			}
+			
+		}
+		
+		for (EnumFacing face : EnumFacing.VALUES) {
+			
+			if (mc.theWorld.getBlockState(output.pos.offset(face)).getBlock() == Blocks.air) {
+				
+				for (EnumFacing face1 : EnumFacing.VALUES) {
+					
+					if (mc.theWorld.getBlockState(output.pos.offset(face).offset(face1)).getBlock() != Blocks.air) {
+						
+						output.pos = output.pos.offset(face).offset(face1);
+						output.facing = face.getOpposite();
+						output.targetPos = output.pos.offset(face);
+						return output;
+						
+					}
+					
+				}
+				
+			}
+			
+		}
+		
+		return null;
+		
+	}
+	
+	public float[] getRotationsHypixel(BlockPos paramBlockPos, EnumFacing paramEnumFacing) {
+		double offset = 0.5;
+		offset = 1;
+        double d1 = (double)paramBlockPos.getX() + offset - mc.thePlayer.posX + (double)paramEnumFacing.getFrontOffsetX() / 2.0D;
+        double d2 = (double)paramBlockPos.getZ() + offset - mc.thePlayer.posZ + (double)paramEnumFacing.getFrontOffsetZ() / 2.0D;
+        double d3 = mc.thePlayer.posY + (double)mc.thePlayer.getEyeHeight() - ((double)paramBlockPos.getY() + 0.5D);
+        double d4 = (double)MathHelper.sqrt_double(d1 * d1 + d2 * d2);
+        float f1 = (float)(Math.atan2(d2, d1) * 180.0D / 3.141592653589793D) - 90.0F;
+        float f2 = (float)(Math.atan2(d3, d4) * 180.0D / 3.141592653589793D);
+        if (f1 &lt; 0.0F) {
+            f1 += 360.0F;
+        }
+        
+        //f1 += 180;
+        f1 = MathHelper.wrapAngleTo180_float(f1);
+        f2 += 30;
+        
+        if (f2 &gt; 90)
+        	f2 = 90;
+        
+        if (f2 &lt; -90)
+        	f2 = -90;
+        
+        //Command.sendPrivateChatMessage(f1 + " : " + f2);
+        
+        return new float[]{f1, f2};
+    }
+	
+	private class BlockInfo {
+		
+		BlockPos pos, targetPos;
+		EnumFacing facing;
+		
+	}
+	
+}
+
+// NOTE (AI): The S2F cancel only fires while killaura has no target; the early return exists because killaura needs accurate slot state for weapon switching. The module also freezes yaw and pitch on C03 and EventMotion while it places blocks below the player.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (receive path), EventSendPacket, EventMotion, EventUpdate, EventSneaking, EventRender3D.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Cancels all slot updates while flying; same desync trade-off as Scaffold, with the added killaura guard that keeps combat state accurate.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus; Spicy's other movement modules reference C00/C0F but only BlockFly touches S2F.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoSlowModule</span>
+<span class="impl-module-clients">(Tenacity 6.0)</span>
 </div>
+<p class="impl-pattern">No-slow that preserves a ghost item by cancelling window-0 slot updates while using a non-sword item.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Vanilla mode: on MotionEvent pre, if no ghost exists call sendBypass (C0D close window 0, then C0E shift-click of the held item into its own slot to create the ghost). Then on PacketReceiveEvent, cancel every S2F whose window id is 0 while the player is using a non-sword item with no screen open, so the server's slot corrections never remove the ghost. isItemGhost resets when the player stops using the item.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/module/impl/movement/NoSlowModule.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/movement/NoSlowModule.java =====
+package dev.tenacity.module.impl.movement;
+
+import dev.tenacity.event.Event;
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.packet.PacketReceiveEvent;
+import dev.tenacity.event.impl.player.MotionEvent;
+import dev.tenacity.event.impl.player.SlowDownEvent;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.ModuleCategory;
+import java.util.ArrayList;
+import java.util.Arrays;
+import dev.tenacity.setting.impl.ModeSetting;
+import net.minecraft.item.ItemSword;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0DPacketCloseWindow;
+import net.minecraft.network.play.client.C0EPacketClickWindow;
+import net.minecraft.network.play.server.S2FPacketSetSlot;
+import net.minecraft.world.gen.layer.GenLayerEdge;
+
+public final class NoSlowModule extends Module {
+
+    private boolean isItemGhost;
+
+    private final ModeSetting mode = new ModeSetting("Mode", "Vanilla", "Watchdog");
+
+    public NoSlowModule() {
+        super("NoSlow", "Makes you not take slow down", ModuleCategory.MOVEMENT);
+        initializeSettings(mode);
+    }
+
+    private final IEventListener&lt;SlowDownEvent&gt; onSlowDownEvent = Event::cancel;
+
+    private final IEventListener&lt;MotionEvent&gt; onMotionEvent = event -&gt; {
+        switch (mode.getCurrentMode()) {
+            case "Vanilla": {
+                if (event.isPre() &amp;&amp; mc.thePlayer != null) {
+                    if (!isItemGhost)
+                        sendBypass();
+                    if (!mc.thePlayer.isUsingItem())
+                        isItemGhost = false;
+                }
+            }
+            case "Watchdog": {
+                if (mc.thePlayer.isUsingItem()) {
+                    if (mc.currentScreen == null &amp;&amp; mc.thePlayer.getHeldItem() != null) {
+                    }
+                }
+                break;
+            }
+        }
+    };
+
+    private final IEventListener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        if (event.getPacket() instanceof S2FPacketSetSlot &amp;&amp; mc.thePlayer != null) {
+            final S2FPacketSetSlot s2f = (S2FPacketSetSlot) event.getPacket();
+            if (s2f.func_149175_c() == 0 &amp;&amp; mc.thePlayer.isUsingItem() &amp;&amp; mc.currentScreen == null &amp;&amp; mc.thePlayer.getHeldItem() != null &amp;&amp; !(mc.thePlayer.getHeldItem().getItem() instanceof ItemSword)) {
+                event.cancel();
+                //isItemGhost = false;
+            }
+        }
+    };
+
+    private void sendBypass() {
+        if (mc.thePlayer.isUsingItem() &amp;&amp; mc.currentScreen == null &amp;&amp; mc.thePlayer.getHeldItem() != null &amp;&amp; !(mc.thePlayer.getHeldItem().getItem() instanceof ItemSword)) {
+            mc.getNetHandler().addToSendQueue(new C0DPacketCloseWindow(0));
+            mc.getNetHandler().addToSendQueue(new C0EPacketClickWindow(0, 36 + mc.thePlayer.inventory.currentItem, 0, 6, null, mc.thePlayer.inventoryContainer.getNextTransactionID(mc.thePlayer.inventory)));
+            isItemGhost = true;
+        }
+    }
+}
+
+// NOTE (AI): The ghost item is created by sendBypass (C0D close window 0, then C0E shift-click of the held item); cancelling S2F for window 0 stops the server's slot corrections from removing it. The commented-out isItemGhost reset and the empty Watchdog branch show the module is unfinished.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, MotionEvent, SlowDownEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The ghost-item no-slow is a classic desync exploit; cancelling S2F is what keeps the ghost alive. It only survives until the next S30 or a transaction rejection.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The Watchdog mode branch is an empty stub; the corpus shows no other Tenacity module using S2F.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AdaptiveRefreshRateComponent</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
+</div>
+<p class="impl-pattern">HUD performance component: S2F (and S30, chat, collect-item) mark significant events that force a GuiIngameCache redraw.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketReceiveEvent: on S2F, reset the StopWatch and set the cache dirty so the next frame re-renders the HUD. PreMotionEvent re-evaluates dirty state every 100 ticks, on player-list/debug key changes, or while the component is disabled for a few ticks after health changes.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/hud/AdaptiveRefreshRateComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/hud/AdaptiveRefreshRateComponent.java =====
+package com.alan.clients.component.impl.hud;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.render.Render2DEvent;
+import com.alan.clients.ui.ingame.GuiIngameCache;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.network.play.server.S0DPacketCollectItem;
+import net.minecraft.network.play.server.S2FPacketSetSlot;
+import net.minecraft.network.play.server.S30PacketWindowItems;
+import rip.vantage.commons.util.time.StopWatch;
+
+public class AdaptiveRefreshRateComponent extends Component {
+
+    private boolean playerList, debugInfo;
+    private boolean setDirty;
+    private int disabledFor;
+    private float health;
+    public final StopWatch stopWatch = new StopWatch();
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (mc.thePlayer.ticksExisted % 100 == 0 || setDirty ||
+                mc.gameSettings.keyBindPlayerList.isKeyDown() != playerList || mc.gameSettings.showDebugInfo != debugInfo ||
+                mc.thePlayer.ticksExisted &lt;= 10 || disabledFor &gt; 0) {
+            GuiIngameCache.dirty = true;
+            playerList = mc.gameSettings.keyBindPlayerList.isKeyDown();
+            debugInfo = mc.gameSettings.showDebugInfo;
+            setDirty = false;
+        }
+
+        if (health != mc.thePlayer.getHealth()) {
+            disabledFor = 3;
+            health = mc.thePlayer.getHealth();
+        }
+
+        disabledFor--;
+    };
+
+    @EventLink
+    public final Listener&lt;Render2DEvent&gt; onRender2D = event -&gt; {
+        if (mc.currentScreen != null) {
+            setDirty = true;
+            GuiIngameCache.dirty = true;
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        Packet packet = event.getPacket();
+
+        if (packet instanceof S02PacketChat || packet instanceof S30PacketWindowItems || packet instanceof S2FPacketSetSlot) {
+            stopWatch.reset();
+            setDirty = true;
+        }
+
+        if (packet instanceof S0DPacketCollectItem) {
+            disabledFor = 5;
+        }
+    };
+}
+
+// NOTE (AI): S2F and S30 are grouped with S02PacketChat as significant packets that force a HUD cache redraw; S0D collect-item disables adaptive refresh for 5 ticks. The component is byte-identical in 6.1.30 under com/alan/clients.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, PreMotionEvent, Render2DEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None; the component is cosmetic and only observes the packet stream.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical file in 6.1.30 (path com/alan/clients/component/impl/hud/). No other client has an equivalent.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent is the universal surface for S2F across the 8 clients. Tenacity pairs it with MotionEvent and SlowDownEvent, Spicy uses its monolithic EventPacket receive path with setCanceled.</div>
+<div class="impl-clients">Rise 5.99 cancels via event.setCancelled on PacketReceiveEvent. Spicy cancels via setCanceled on EventPacket. Tenacity 6.0 cancels the event and toggles its own ghost-item state. Rise 6.x has no gameplay module for S2F; it reaches the packet through AdaptiveRefreshRateComponent and the PacketUtil wrapper used by scripts.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C0EPacketClickWindow/">C0EPacketClickWindow</a>
+<a class="related-chip" href="../S30PacketWindowItems/">S30PacketWindowItems</a>
+<a class="related-chip" href="../S32PacketConfirmTransaction/">S32PacketConfirmTransaction</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

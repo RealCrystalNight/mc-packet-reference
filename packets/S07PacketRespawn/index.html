@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S07PacketRespawn (0x07): Sends respawn or dimension change request. The client must reload the world (clear chunks, entities) and re-sync positio">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="DimensionDetector, WorldChange">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="WatchdogDisabler, UniversoCraftDisabler">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S07PacketRespawn — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S07PacketRespawn — Minecraft 1.8.9 Packet Reference","description":"The world-reload command: death respawn, portal transfer and gamemode change all arrive as S07, and the client tears down and rebuilds world state in response. In this corpus the packet is consumed by disabler state machines (Rise WatchdogDisabler flush, UniversoCraftDisabler corruption window) and ","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -75,20 +75,208 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">After receiving this, the client resets chunk loading, clears all entities, sends C00PacketKeepAlive to re-sync, and sends a C03/C06 position packet. The packet is used both for death respawn (same dimension) and portal dimension changes (dimension changes).</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>The respawn and dimension-change control. The server sends it on death respawn (ServerConfigurationManager line ~496), on portal dimension transfer (NetHandlerPlayServer line ~587, ServerConfigurationManager line ~473) and on gamemode changes; the payload is dimension id, difficulty, terrain type and gamemode. The client must treat it as a world-reload command: clear entities, rebuild chunk state, re-arm keepalive and re-sync position.</p>
+<h4>Vanilla handling</h4>
+<p>handleRespawn branches on the dimension: an equal dimension is a soft reset that rebuilds the player entity in place, a different dimension triggers a full world load with chunks unloaded, entities cleared and the player respawned. PacketThreadUtil special-cases S07 so the reload runs on the main thread and pre-processes the world transition before ordinary packet handling resumes. Every module that buffers per-world state (blink queues, transaction lists, teleport buffers, freecam position) must flush on this packet or carry stale state across the boundary.</p>
+<h4>Why clients touch it</h4>
+<p>The corpus reaction surface is exactly the flush pattern, and it lives in the disabler machinery. Rise 6.1.30 WatchdogDisabler clears its position, transaction and blink queues plus both stopwatches on S07; Rise 6.2.4 keeps only the import. UniversoCraftDisabler (both builds) uses S07 to arm a respawn-window transaction corruption. Tenacity 6.0 AdvancedDisablerModule carries a commented-out S07 import, evidence the reset was planned and disabled. No Freecam, AutoTool or inventory module hooks S07 in this corpus even though world reload visibly resets their state; those clients rely on vanilla world-load callbacks instead of the packet.</p>
+<h4>Exploit surface</h4>
+<p>The respawn window is the attack surface: after S07 the server re-arms the player's transaction stream, so replaying C0F uids from the previous world desynchronizes the server's bookkeeping. UniversoCraftDisabler weaponizes the window by overwriting C0F uids with Short.MIN_VALUE or Short.MAX_VALUE for the first 350 ticks after respawn, alternating on tick parity. Anti-cheats that key transaction continuity off confirm/transaction pairs are the target. S07 itself is server-authored and not client-spoofable in the vanilla protocol, so the client side is purely defensive: flush old state, then corrupt the new window.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>ServerConfigurationManager sends S07 on death respawn (line ~496) and on dimension transfer (line ~473), NetHandlerPlayServer sends it on its own dimension-change path (line ~587 in MCP builds), always with the player's current dimension, difficulty, terrain type and gamemode. After sending, the server waits for the client's position re-sync (C03/C06) before resuming normal tracking. The client never sends S07; the closest serverbound step is C16 PERFORM_RESPAWN from the death screen.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Fields in order: int dimension, unsigned byte difficulty, unsigned byte gamemode, String level type. PacketThreadUtil pre-processes S07 in Rise 6.1.30/6.2.4 and Tenacity (lines ~31 and ~40 respectively), forcing the world transition onto the main thread ahead of queued packets. The dimension field is the branch key: equal dimension means soft reset, different dimension means full reload, and modules keying state resets on S07 catch both cases in one hook.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Transaction-continuity anti-cheats (Watchdog, Verus) reset their per-player counters on respawn, which is why stale C0F uids replayed across the boundary flag. The UniversoCraft corruption window targets exactly this reset: uid values of Short.MIN_VALUE and Short.MAX_VALUE alternating on tick parity are chosen to break the server's expectation of monotonic actions without a visible cancel pattern. The flush side (WatchdogDisabler) is the defensive mirror and is invisible; the corruption side is the detectable one if the server validates uids.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">DimensionDetector</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<p class="impl-pattern">The world-reload command: death respawn, portal transfer and gamemode change all arrive as S07, and the client tears down and rebuilds world state in response. In this corpus the packet is consumed by disabler state machines (Rise WatchdogDisabler flush, UniversoCraftDisabler corruption window) and was planned-but-disabled in Tenacity's AdvancedDisablerModule.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WatchdogDisabler</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Detect dimension change for module state reset.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Hypixel Watchdog disabler mode that uses S07 as the hard reset point for its buffered packet state.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PacketReceiveEvent, S07 clears positionQueue, transactionQueue, blinkQueue and actionNumbers, resets pingStopwatch and transactionStopwatch and sets disabled=false. This is the defensive flush: after respawn or dimension change the old world's transaction stream is dead, so stale C0F uids and queued positions would desync the new world. The ping-spoof branch then restarts collecting negative-action S32 transactions, shuffling and replaying them a second later.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.1.30 — com/alan/clients/module/impl/exploit/disabler/WatchdogDisabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.1.30 — com/alan/clients/module/impl/exploit/disabler/WatchdogDisabler.java =====
+package com.alan.clients.module.impl.exploit.disabler;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.other.TeleportEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.impl.exploit.Disabler;
+import com.alan.clients.value.Mode;
+import com.alan.clients.value.impl.BooleanValue;
+import net.minecraft.client.gui.inventory.GuiInventory;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C0DPacketCloseWindow;
+import net.minecraft.network.play.client.C0EPacketClickWindow;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.client.C16PacketClientStatus;
+import net.minecraft.network.play.server.S07PacketRespawn;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
+import net.minecraft.util.Vec3;
+import rip.vantage.commons.util.time.StopWatch;
+
+import java.util.*;
+
+public class WatchdogDisabler extends Mode&lt;Disabler&gt; {
+
+    private boolean disabled;
+    private List&lt;Short&gt; actionNumbers;
+    private StopWatch transactionStopwatch;
+    private Queue&lt;Vec3&gt; positionQueue;
+    private Queue&lt;Packet&lt;?&gt;&gt; transactionQueue;
+    private Queue&lt;Packet&lt;?&gt;&gt; blinkQueue;
+    private StopWatch pingStopwatch;
+
+    public WatchdogDisabler(String name, Disabler parent) {
+        super(name, parent);
+
+        this.positionQueue = new ArrayDeque&lt;&gt;();
+        this.transactionQueue = new ArrayDeque&lt;&gt;();
+        this.pingStopwatch = new StopWatch();
+        this.blinkQueue = new ArrayDeque&lt;&gt;();
+        this.actionNumbers = new ArrayList&lt;&gt;();
+        this.transactionStopwatch = new StopWatch();
+    }
+
+    public final BooleanValue morePackets = new BooleanValue("More Packets", this, false);
+    public final BooleanValue ban = new BooleanValue("Ping Spoof", this, false);
+    public final BooleanValue inventory = new BooleanValue("Inventory", this, false);
+
+    @EventLink
+    private final Listener&lt;TeleportEvent&gt; onTeleport = event -&gt; {
+    };
+
+    @EventLink
+    private final Listener&lt;PreMotionEvent&gt; preMotionEventListener = event -&gt; {
+        if (ban.getValue()) {
+            if (!this.actionNumbers.isEmpty() &amp;&amp; this.transactionStopwatch.finished(1000L)) {
+                Collections.shuffle(this.actionNumbers);
+                this.actionNumbers.forEach(action -&gt; mc.getNetHandler().getNetworkManager().sendPacket(new C0FPacketConfirmTransaction(0, action, true)));
+                this.actionNumbers.clear();
+                this.disabled = true;
+            }
+        }
+    };
+
+    @EventLink
+    private final Listener&lt;PacketReceiveEvent&gt; packetReceiveEventListener = event -&gt; {
+        if (event.getPacket() instanceof S07PacketRespawn) {
+            this.positionQueue.clear();
+            this.transactionQueue.clear();
+            this.pingStopwatch.reset();
+            this.blinkQueue.clear();
+            this.transactionStopwatch.reset();
+            this.actionNumbers.clear();
+            this.disabled = false;
+        }
+
+        if (ban.getValue()) {
+            if (event.getPacket() instanceof S32PacketConfirmTransaction) {
+                final S32PacketConfirmTransaction transaction = (S32PacketConfirmTransaction) event.getPacket();
+
+                if (transaction.getActionNumber() &lt; 0) {
+                    if (!this.disabled) {
+                        this.actionNumbers.add(transaction.getActionNumber());
+                        transactionStopwatch.reset();
+
+                        event.setCancelled(true);
+                    }
+                }
+            }
+        }
+    };
+
+    @EventLink
+    private final Listener&lt;PacketSendEvent&gt; packetSendEventListener = event -&gt; {
+        if (inventory.getValue()) {
+            if (event.getPacket() instanceof C0EPacketClickWindow &amp;&amp; ((C0EPacketClickWindow) event.getPacket()).getWindowId() == mc.thePlayer.inventoryContainer.windowId &amp;&amp; !(mc.currentScreen instanceof GuiInventory)) {
+                event.setCancelled();
+                mc.getNetHandler().getNetworkManager().sendUnregisteredPacket(new C16PacketClientStatus(C16PacketClientStatus.EnumState.OPEN_INVENTORY_ACHIEVEMENT));
+                mc.getNetHandler().getNetworkManager().sendUnregisteredPacket(event.getPacket());
+                mc.getNetHandler().getNetworkManager().sendUnregisteredPacket(new C0DPacketCloseWindow(mc.thePlayer.inventoryContainer.windowId));
+            }
+        }
+    };
+}
+
+// NOTE (AI): This is the Rise 6.1.30 copy; the S07 handler at line 68 is live here. In
+// Rise 6.2.4 the S07PacketRespawn import remains (line 42) but the receive-side flush was
+// removed, so 6.2.4 no longer resets state on respawn. The module is a Mode of the Disabler
+// module and its S07 handling is purely defensive: it guarantees no buffered transaction or
+// position from the pre-respawn world leaks into the new world's stream.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (S07 flush, S32 collection), PreMotionEvent (replay), PacketSendEvent (inventory spoof).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The S07 flush itself is invisible; the flag risk is the replay behavior it protects. Without the flush, a queued C0F from before the respawn arrives after the server reset its transaction counter and registers as an unknown action, a classic Watchdog flag.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.2.4 drops the S07 receive handler entirely (import only at line 42), leaving the queue flush to the module's own lifecycle. The 6.1.30 and 6.2.4 files otherwise share the same structure.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">WorldChange</span>
-<span class="impl-module-clients">(Tenacity 6.0)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">UniversoCraftDisabler</span>
+<span class="impl-module-clients">(Rise 6.1.30, Rise 6.2.4)</span>
 </div>
-<p class="impl-pattern">Detect dimension change for module state reset.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">UniversoCraft disabler mode that arms a respawn-window transaction corruption from the S07 packet.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On the packet send listener, S07 sets disabling=true; C02PacketUseEntity clears it; C03PacketPlayer within the first 10 ticks sets it; and while disabling with ticksExisted below 350, every C0FPacketConfirmTransaction gets its uid overwritten with Short.MIN_VALUE or Short.MAX_VALUE alternating on tick parity. The S07 branch is redundant in practice because the C03-within-10-ticks branch arms the same flag, and its usefulness depends on the client's event wiring delivering clientbound packets to this listener.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/UniversoCraftDisabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/exploit/disabler/UniversoCraftDisabler.java =====
+package com.alan.clients.module.impl.exploit.disabler;
+
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import com.alan.clients.module.impl.exploit.Disabler;
+import com.alan.clients.value.Mode;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.server.S07PacketRespawn;
+
+public class UniversoCraftDisabler extends Mode&lt;Disabler&gt; {
+    private boolean disabling;
+
+    public UniversoCraftDisabler(String name, Disabler parent) {
+        super(name, parent);
+    }
+
+    @EventLink
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof S07PacketRespawn) {
+            disabling = true;
+        } else if (packet instanceof C02PacketUseEntity) {
+            disabling = false;
+        } else if (packet instanceof C03PacketPlayer &amp;&amp; mc.thePlayer.ticksExisted &lt;= 10) {
+            disabling = true;
+        } else if (packet instanceof C0FPacketConfirmTransaction &amp;&amp; disabling &amp;&amp; mc.thePlayer.ticksExisted &lt; 350) {
+            ((C0FPacketConfirmTransaction) event.getPacket()).setUid(
+                    mc.thePlayer.ticksExisted % 2 == 0 ? Short.MIN_VALUE : Short.MAX_VALUE);
+        }
+    };
+}
+
+// NOTE (AI): S07PacketRespawn is tested inside a PacketSendEvent listener even though it
+// is a clientbound packet; in Rise's event pipeline this branch only matters if clientbound
+// traffic reaches the send listener, otherwise the flag is armed exclusively by the C03
+// branch (first 10 ticks). The corruption window (ticksExisted &lt; 350, alternating
+// Short.MIN_VALUE / Short.MAX_VALUE uids) targets transaction-continuity checks on
+// UniversoCraft, and the disabling flag is cleared by any C02 attack.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent (S07/C02/C03/C0F dispatch).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Transaction uid corruption is the detectable surface: servers that validate C0F uids drop mismatches and can flag the alternating pattern. The respawn window matters because the server resets its transaction bookkeeping on S07, so corrupting uids during the first 350 ticks hits the anti-cheat before its counters warm up.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.1.30 ships the identical file; the S07 branch and the C03 branch coexist in both builds.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Both disabler modes consume S07 to manage a state machine: WatchdogDisabler flushes on PacketReceiveEvent, UniversoCraftDisabler arms a flag on its send-side listener. The packet is never modified, only observed.</div>
+<div class="impl-clients">Rise 6.x event model: @EventLink listener fields on Mode classes under the Disabler module. The 6.1.30 and 6.2.4 trees are structurally identical (com/alan/clients/...) with the 6.2.4 copy under Client-release2/Client/src/main/java.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C0FPacketConfirmTransaction/">C0FPacketConfirmTransaction</a>
+<a class="related-chip" href="../S32PacketConfirmTransaction/">S32PacketConfirmTransaction</a>
+<a class="related-chip" href="../C16PacketClientStatus/">C16PacketClientStatus</a>
+<a class="related-chip" href="../S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

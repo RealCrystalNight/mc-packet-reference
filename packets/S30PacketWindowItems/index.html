@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S30PacketWindowItems (0x30): Sends the full contents of an inventory window — all slots at once. Used for initial container opening and rejected tran">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ChestStealer, InvManager, AutoArmor">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Stealer, Aura, AdaptiveRefreshRateComponent">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S30PacketWindowItems — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S30PacketWindowItems — Minecraft 1.8.9 Packet Reference","description":"The full-window sync and the revert path for rejected clicks. Rise 5.99's Stealer uses it as the trigger to start clicking chests, Aura resets its block state on it, and Rise 6.x treats it as a HUD-significant packet. Every other client in the corpus reaches it only through the vanilla handler.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -72,26 +72,376 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">For windowId=0, this updates the entire player inventory (45 slots: 9 hotbar + 36 main). For chests, this is sent immediately after S2DPacketOpenWindow. When a C0E click is rejected (S32 accepted=false), the server re-sends S30 to force the client to revert its inventory.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>S30PacketWindowItems is the full-window sync packet: an unsigned byte window id, a short slot count, then every slot encoding in order. The server sends it when a container opens (right after S2D PacketOpenWindow), when the player joins or respawns, and as the recovery path when a click transaction is rejected (S32 accepted=false). It is the server's authoritative statement of window contents, and the client applies it wholesale, replacing the container's slot list.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleWindowItems maps windowId 0 and the player inventory window to inventoryContainer and everything else to the open container, then overwrites every slot via putStacksInSlots. EntityPlayerMP.updateCraftingInventory (line 773) builds the list from inventorySlots and sends S30 on every full sync. Because the client trusts the dump completely, S30 is both the sync primitive and the revert mechanism: any client-side inventory manipulation is undone the moment the server decides to re-send.</p>
+<h4>Why clients touch it</h4>
+<p>Only Rise uses S30 as a module surface in the corpus. Rise 5.99 Stealer treats it as the go signal: gotItems flips true when the chest contents land, and the steal loop only starts clicking after that flag, with a randomized per-click delay and auto-close. Rise 5.99 Aura resets its blocking flag on S30, since a full window sync invalidates the client's assumption that the sword is still blocking. Rise 6.x AdaptiveRefreshRateComponent counts S30 among the significant packets that dirty the HUD cache.</p>
+<h4>Exploit surface</h4>
+<p>S30 is the correction mechanism that makes S2F cancellation a short-horizon trick: one rejected transaction and the server pushes a full dump that reverts any ghost slot. For stealers the ordering constraint is the exploit surface: clicking before S30, or after a rejected click, races the resync and produces the visible pattern (clicking a slot whose content the server already changed) that chest-stealer heuristics flag. The packet is also the largest inventory packet on the wire, so a server that rejects transactions in a loop can force repeated full dumps, a bandwidth tax with no client-side mitigation in the corpus.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>EntityPlayerMP.updateCraftingInventory (line 773) serializes the container's inventorySlots into a List and sends S30(windowId, list) on open, respawn, and after rejected clicks. NetHandlerPlayServer.processClickWindow validates the action number; on mismatch it calls updateCraftingInventory so the client receives a corrected dump. The client handler resolves the window by id (0 and the player window map to inventoryContainer, otherwise the open container) and overwrites all slots.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Wire: unsigned byte windowId, short count, then count Slot encodings (short id, byte count, short damage, optional NBT). Slots are ordered container-first, then player inventory 9-35, then hotbar 0-8. The cursor is not included; it is synced separately by S2F(-1,-1). A chest open produces S2D then S30 back to back, which is why inventory modules gate on S30 instead of the GUI opening event: the screen renders before the server contents arrive.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>No anti-cheat measures S30 itself; it is authoritative recovery data. The heuristics that matter sit on the clicks around it: a stealer that fires before S30, or after a rejected transaction, clicks against stale content and produces the tell-tale sequence (C0E immediately followed by the server's S30 correction). Ghost-item exploits depend on S30 never arriving for the manipulated window, so cancel-happy modules trade durability: the longer the manipulation, the more likely a full dump reverts it.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ChestStealer</span>
-<span class="impl-module-clients">(Tenacity 6.0, Gugustus)</span>
+<p class="impl-pattern">The full-window sync and the revert path for rejected clicks. Rise 5.99's Stealer uses it as the trigger to start clicking chests, Aura resets its block state on it, and Rise 6.x treats it as a HUD-significant packet. Every other client in the corpus reaches it only through the vanilla handler.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Stealer</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Full inventory sync — trigger auto-steal on chest contents.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Chest stealer: use S30 as the sync gate, then click every whitelisted item with randomized delays and auto-close.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">onPacketReceive: if the packet is S30, set gotItems = true. onRender2DEvent: while GuiChest is open, wait a randomized decidedTimer (between min and max delay settings), then scan chest.inventorySlots and windowClick(chest.windowId, i, 0, 1, player) on the first whitelisted item, resetting the timer; auto-close via closeScreen once gotItems or ticksInChest > 10. gotItems resets whenever the player leaves the chest.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/player/Stealer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 5.99 — dev/rise/module/impl/player/Stealer.java =====
+/*
+ Copyright Alan Wood 2021
+ None of this code to be reused without my written permission
+ Intellectual Rights owned by Alan Wood
+ */
+package dev.rise.module.impl.player;
+
+import dev.rise.event.impl.motion.PreMotionEvent;
+import dev.rise.event.impl.other.WorldChangedEvent;
+import dev.rise.event.impl.packet.PacketReceiveEvent;
+import dev.rise.event.impl.render.Render2DEvent;
+import dev.rise.font.CustomFont;
+import dev.rise.font.fontrenderer.TTFFontRenderer;
+import dev.rise.module.Module;
+import dev.rise.module.api.ModuleInfo;
+import dev.rise.module.enums.Category;
+import dev.rise.setting.impl.BooleanSetting;
+import dev.rise.setting.impl.NumberSetting;
+import dev.rise.util.math.TimeUtil;
+import dev.rise.util.render.theme.ThemeType;
+import dev.rise.util.render.theme.ThemeUtil;
+import net.minecraft.block.BlockFalling;
+import net.minecraft.block.BlockSlime;
+import net.minecraft.block.BlockTNT;
+import net.minecraft.client.gui.ScaledResolution;
+import net.minecraft.client.gui.inventory.GuiChest;
+import net.minecraft.init.Items;
+import net.minecraft.inventory.ContainerChest;
+import net.minecraft.item.*;
+import net.minecraft.network.play.server.S30PacketWindowItems;
+import org.apache.commons.lang3.RandomUtils;
+import org.lwjgl.input.Keyboard;
+import org.lwjgl.opengl.Display;
+
+import java.util.ArrayList;
+
+@ModuleInfo(name = "Stealer", description = "Steals items from chests", category = Category.PLAYER)
+public final class Stealer extends Module {
+
+    private final TimeUtil timer = new TimeUtil();
+    private final TimeUtil startTimer = new TimeUtil();
+
+    private final NumberSetting minDelay = new NumberSetting("Min Delay", this, 5, 0, 1000, 25);
+    private final NumberSetting maxDelay = new NumberSetting("Max Delay", this, 5, 0, 1000, 25);
+    private final BooleanSetting stealTrashItems = new BooleanSetting("Steal trash items", this, false);
+    private final BooleanSetting autoClose = new BooleanSetting("Auto Close", this, true);
+    private final BooleanSetting hideGui = new BooleanSetting("Hide Gui", this, true);
+    private final BooleanSetting mouseInput = new BooleanSetting("Move head in chest", this, true);
+    private final BooleanSetting chestName = new BooleanSetting("Check chest name", this, false);
+    private final BooleanSetting disableOnWorldChange = new BooleanSetting("Disable on World Change", this, false);
+
+    private int decidedTimer = 0;
+
+    public static boolean hideChestGui, allowMouseInput, closeAfterContainer;
+
+    private boolean gotItems;
+    private final static TTFFontRenderer comfortaa = CustomFont.FONT_MANAGER.getFont("Comfortaa 18");
+    private int ticksInChest;
+
+    private boolean lastInChest;
+
+    @Override
+    protected void onDisable() {
+        closeAfterContainer = false;
+        allowMouseInput = false;
+        hideChestGui = false;
+        gotItems = false;
+    }
+
+    @Override
+    public void onPacketReceive(final PacketReceiveEvent event) {
+        if (mc.thePlayer.ticksExisted &lt;= 60) return;
+
+        if (event.getPacket() instanceof S30PacketWindowItems) {
+            gotItems = true;
+        }
+    }
+
+    @Override
+    public void onPreMotion(final PreMotionEvent event) {
+        if (mc.thePlayer.ticksExisted &lt;= 60) return;
+        if (mc.currentScreen instanceof GuiChest &amp;&amp; Display.isVisible() &amp;&amp; mouseInput.isEnabled() &amp;&amp; hideGui.isEnabled() &amp;&amp; (!chestName.isEnabled() || (((GuiChest) mc.currentScreen).lowerChestInventory.getDisplayName().getUnformattedText().contains("chest")))) {
+            mc.mouseHelper.centerMouse();
+            mc.mouseHelper.mouseGrab(false);
+            mc.mouseHelper.mouseGrab(true);
+        }
+
+        if (mc.currentScreen instanceof GuiChest) {
+            ticksInChest++;
+
+            if (ticksInChest * 50 &gt; 255) {
+                ticksInChest = 10;
+            }
+        } else {
+            ticksInChest--;
+            gotItems = false;
+            if (ticksInChest &lt; 0) {
+                ticksInChest = 0;
+            }
+        }
+    }
+
+    @Override
+    public void onRender2DEvent(final Render2DEvent event) {
+        if (mc.thePlayer.ticksExisted &lt;= 60) return;
+        if (!lastInChest) startTimer.reset();
+        lastInChest = mc.currentScreen instanceof GuiChest;
+
+        if (mc.currentScreen instanceof GuiChest) {
+            if (hideGui.isEnabled()) {
+                hideChestGui = true;
+            }
+
+            if (mouseInput.isEnabled()) {
+                allowMouseInput = true;
+            }
+
+            if (chestName.isEnabled()) {
+                final String name = ((GuiChest) mc.currentScreen).lowerChestInventory.getDisplayName().getUnformattedText();
+
+                if (!name.toLowerCase().contains("chest")) return;
+            }
+
+            if (hideGui.isEnabled()) {
+                final ScaledResolution SR = new ScaledResolution(mc);
+                final String t = "Stealing chest... Press " + Keyboard.getKeyName(mc.gameSettings.keyBindInventory.getKeyCode()) + " to close the chest";
+                int o;
+
+                o = ticksInChest * 50;
+
+                if (o &gt; 255)
+                    o = 255;
+
+                comfortaa.drawStringWithShadow(t, SR.getScaledWidth() / 2f - comfortaa.getWidth(t) / 2f, SR.getScaledHeight() - 80, ThemeUtil.getThemeColorInt(ThemeType.GENERAL));
+            }
+
+            if (decidedTimer == 0) {
+                final int delayFirst = (int) Math.floor(Math.min(minDelay.getValue(), maxDelay.getValue()));
+                final int delaySecond = (int) Math.ceil(Math.max(minDelay.getValue(), maxDelay.getValue()));
+                decidedTimer = RandomUtils.nextInt(delayFirst, delaySecond);
+            }
+
+            if (timer.hasReached(decidedTimer)) {
+                final ContainerChest chest = (ContainerChest) mc.thePlayer.openContainer;
+
+                for (int i = 0; i &lt; chest.inventorySlots.size(); i++) {
+                    final ItemStack stack = chest.getLowerChestInventory().getStackInSlot(i);
+                    if (stack != null &amp;&amp; (itemWhitelisted(stack) &amp;&amp; !stealTrashItems.isEnabled())) {
+                        mc.playerController.windowClick(chest.windowId, i, 0, 1, mc.thePlayer);
+                        timer.reset();
+
+                        final int delayFirst = (int) Math.floor(Math.min(minDelay.getValue(), maxDelay.getValue()));
+                        final int delaySecond = (int) Math.ceil(Math.max(minDelay.getValue(), maxDelay.getValue()));
+
+                        decidedTimer = RandomUtils.nextInt(delayFirst, delaySecond);
+
+                        gotItems = true;
+                        return;
+                    }
+                }
+
+                if (autoClose.isEnabled() &amp;&amp; (gotItems || ticksInChest &gt; 10)) {
+                    mc.thePlayer.closeScreen();
+                }
+            }
+        } else {
+            hideChestGui = false;
+            allowMouseInput = false;
+        }
+    }
+
+    @Override
+    public void onWorldChanged(final WorldChangedEvent event) {
+        if (disableOnWorldChange.isEnabled()) {
+            this.toggleModule();
+            this.registerNotification("Disabled " + this.getModuleInfo().name() + " due to world change.");
+        }
+    }
+    private boolean itemWhitelisted(final ItemStack itemStack) {
+        final ArrayList&lt;Item&gt; whitelistedItems = new ArrayList&lt;Item&gt;() {{
+            add(Items.ender_pearl);
+            add(Items.iron_ingot);
+            add(Items.gold_ingot);
+            add(Items.redstone);
+            add(Items.diamond);
+            add(Items.emerald);
+            add(Items.quartz);
+            add(Items.bow);
+            add(Items.arrow);
+            add(Items.fishing_rod);
+        }};
+
+        final Item item = itemStack.getItem();
+        final String itemName = itemStack.getDisplayName();
+
+        if (itemName.contains("Right Click") || itemName.contains("Click to Use") || itemName.contains("Players Finder"))
+            return true;
+
+        final ArrayList&lt;Integer&gt; whitelistedPotions = new ArrayList&lt;Integer&gt;() {{
+            add(6);
+            add(1);
+            add(5);
+            add(8);
+            add(14);
+            add(12);
+            add(10);
+            add(16);
+        }};
+
+        if (item instanceof ItemPotion) {
+            final int potionID = getPotionId(itemStack);
+            return whitelistedPotions.contains(potionID);
+        }
+
+        return (item instanceof ItemBlock
+                &amp;&amp; !(((ItemBlock) item).getBlock() instanceof BlockTNT)
+                &amp;&amp; !(((ItemBlock) item).getBlock() instanceof BlockSlime)
+                &amp;&amp; !(((ItemBlock) item).getBlock() instanceof BlockFalling))
+                || item instanceof ItemAnvilBlock
+                || item instanceof ItemSword
+                || item instanceof ItemArmor
+                || item instanceof ItemTool
+                || item instanceof ItemFood
+                || item instanceof ItemSkull
+                || itemName.contains("\247")
+                || whitelistedItems.contains(item)
+                &amp;&amp; !item.equals(Items.spider_eye);
+    }
+
+    private int getPotionId(final ItemStack potion) {
+        final Item item = potion.getItem();
+
+        try {
+            if (item instanceof ItemPotion) {
+                final ItemPotion p = (ItemPotion) item;
+                return p.getEffects(potion.getMetadata()).get(0).getPotionID();
+            }
+        } catch (final NullPointerException ignored) {
+        }
+
+        return 0;
+    }
+}
+
+// NOTE (AI): gotItems is the gate: the steal loop starts only after S30 lands, so clicks never race the initial dump. The randomized delay between clicks and the whitelist in itemWhitelisted define the steal pattern; auto-close fires once the chest is empty or 10+ ticks elapsed inside it.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, Render2DEvent, PreMotionEvent, WorldChangedEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The randomized per-click delay and whitelist are the anti-heuristic layer; the pattern (one click per delay, immediate close) is still the classic chest-stealer fingerprint.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus; Rise 6.x does not ship a chest stealer that touches S30, only the HUD component.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">InvManager</span>
-<span class="impl-module-clients">(Tenacity 6.0, Gugustus)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Aura</span>
+<span class="impl-module-clients">(Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Full inventory sync — trigger auto-steal on chest contents.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Reset the blocking state when a full window sync arrives.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">onPacketReceive: if the packet is S30PacketWindowItems, blocking = false. The Hypixel block mode keeps a blocking flag while the sword is held up; a full window sync means the server corrected the inventory, so the client must drop its assumption that the block is still active.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 5.99 — dev/rise/module/impl/combat/Aura.java</span></p>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Purely a state resync; prevents false block states after inventory corrections. No anti-cheat signal.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus; the file is 1145 lines of combat logic with this single S30 reference at line 190.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AutoArmor</span>
-<span class="impl-module-clients">(Tenacity 6.0, Gugustus)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AdaptiveRefreshRateComponent</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Full inventory sync — trigger auto-steal on chest contents.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">HUD performance component: S30 is one of the significant packets that force a GuiIngameCache redraw.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketReceiveEvent: on S30, reset the StopWatch and mark the cache dirty so the next frame re-renders. Same component as the S2F entry; both packets are treated as inventory-significant events.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/hud/AdaptiveRefreshRateComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/hud/AdaptiveRefreshRateComponent.java =====
+package com.alan.clients.component.impl.hud;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreMotionEvent;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import com.alan.clients.event.impl.render.Render2DEvent;
+import com.alan.clients.ui.ingame.GuiIngameCache;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S02PacketChat;
+import net.minecraft.network.play.server.S0DPacketCollectItem;
+import net.minecraft.network.play.server.S2FPacketSetSlot;
+import net.minecraft.network.play.server.S30PacketWindowItems;
+import rip.vantage.commons.util.time.StopWatch;
+
+public class AdaptiveRefreshRateComponent extends Component {
+
+    private boolean playerList, debugInfo;
+    private boolean setDirty;
+    private int disabledFor;
+    private float health;
+    public final StopWatch stopWatch = new StopWatch();
+
+    @EventLink
+    public final Listener&lt;PreMotionEvent&gt; onPreMotionEvent = event -&gt; {
+        if (mc.thePlayer.ticksExisted % 100 == 0 || setDirty ||
+                mc.gameSettings.keyBindPlayerList.isKeyDown() != playerList || mc.gameSettings.showDebugInfo != debugInfo ||
+                mc.thePlayer.ticksExisted &lt;= 10 || disabledFor &gt; 0) {
+            GuiIngameCache.dirty = true;
+            playerList = mc.gameSettings.keyBindPlayerList.isKeyDown();
+            debugInfo = mc.gameSettings.showDebugInfo;
+            setDirty = false;
+        }
+
+        if (health != mc.thePlayer.getHealth()) {
+            disabledFor = 3;
+            health = mc.thePlayer.getHealth();
+        }
+
+        disabledFor--;
+    };
+
+    @EventLink
+    public final Listener&lt;Render2DEvent&gt; onRender2D = event -&gt; {
+        if (mc.currentScreen != null) {
+            setDirty = true;
+            GuiIngameCache.dirty = true;
+        }
+    };
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        Packet packet = event.getPacket();
+
+        if (packet instanceof S02PacketChat || packet instanceof S30PacketWindowItems || packet instanceof S2FPacketSetSlot) {
+            stopWatch.reset();
+            setDirty = true;
+        }
+
+        if (packet instanceof S0DPacketCollectItem) {
+            disabledFor = 5;
+        }
+    };
+}
+
+// NOTE (AI): S2F and S30 are grouped with S02PacketChat as significant packets that force a HUD cache redraw; S0D collect-item disables adaptive refresh for 5 ticks. The component is byte-identical in 6.1.30 under com/alan/clients.
+</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent, PreMotionEvent, Render2DEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>None; the component only observes the packet stream.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical file in 6.1.30.</span></div>
 </div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketReceiveEvent everywhere. Stealer additionally hooks Render2DEvent for the click loop and auto-close; Aura only the receive event; the Rise 6.x component only the receive event plus PreMotion and Render2D for cache management.</div>
+<div class="impl-clients">Only Rise touches S30 outside vanilla in the corpus. Rise 5.99 has the gameplay modules (Stealer, Aura); Rise 6.x registers it in NetworkAPI for scripts and in AdaptiveRefreshRateComponent. Memeware, Nekoware, Sigma, Spicy and Tenacity 6.0 ship only the vanilla handler.</div>
 </div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S2DPacketOpenWindow/">S2DPacketOpenWindow</a>
+<a class="related-chip" href="../S2FPacketSetSlot/">S2FPacketSetSlot</a>
+<a class="related-chip" href="../C0EPacketClickWindow/">C0EPacketClickWindow</a>
+<a class="related-chip" href="../S32PacketConfirmTransaction/">S32PacketConfirmTransaction</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

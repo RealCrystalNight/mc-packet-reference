@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="S2APacketParticles (0x2A): Spawns particle effects at a position with offset, speed, and count.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Clientbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="ESP, ParticleMultiplier">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Disabler (particle cancel), ParticleDistanceComponent (performance), ParticleCheck (security), AntiExploit (particle flood), Criticals (packet skip)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"S2APacketParticles — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"S2APacketParticles — Minecraft 1.8.9 Packet Reference","description":"The particle broadcast packet, and the only one of the six where client defense depth actually shows: blanket cancel (Memeware), selective cancel (Rise 5.99 slime mode), distance culling (Rise 6.x performance component), flood rate limiting (Rise 6.x ParticleCheck), and crash heuristics (Tenacity An","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Clientbound"}
 </script>
 </head>
 <body>
@@ -79,18 +79,688 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">Particle names: barriar, blockcrack, blockdust, bubble, cloud, crit, damageindicator, depthSuspend, drippingLava, drippingWater, droplet, enchantmenttable, endRod, explode, fireworkSpark, flame, footstep, happyVillager, heart, hugeexplosion, iconcrack, instantSpell, largeSmoke, lava, magicCrit, mobAppearance, mobSpell, mobSpellAmbient, note, portal, reddust, slime, smokeSpelling, snowballpoof, snowshovel, spell, suspended, sweepAttack, take, totem, townaura, wake, witchMagic.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>Spawns a particle burst at a world position with random offset, speed, and count. The particle name is a String that the client maps to an EnumParticleTypes; a trailing varint array carries iconcrack/blockcrack item and block data. Server-side it is the workhorse of WorldServer.spawnParticle, which batches particles into a single packet and sends it with a long-distance flag when the emitter is far from the viewer. The client handler walks the count in a loop, so a large count is a direct CPU/GPU cost on the receiving machine.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerPlayClient.handleParticles marshals to the main thread, then calls clientWorldController.spawnParticle. When count is 0 the offset floats are treated as a single particle's velocity; otherwise the offsets are random spread and count particles are spawned. A Throwable around the spawn call logs 'Could not spawn particle effect' instead of crashing. The server path (WorldServer.spawnParticle) constructs one S2A per batch and uses sendToAllNear with a 512-block radius when longDistance is set.</p>
+<h4>Why clients touch it</h4>
+<p>Five distinct uses in the 8 clients. (1) Memeware 7.3 Disabler cancels every S2A unconditionally, an anti-lag/anti-crash blanket filter. (2) Rise 5.99 Disabler cancels only SLIME-type particles in its HypixelSlime mode. (3) Rise 6.x ParticleDistanceComponent, a performance component, drops any particle further than 6 blocks from the player. (4) Rise 6.x ParticleCheck, a security feature, token-buckets particle counts and drops floods. (5) Tenacity 6.0 AntiExploit cancels particles with extreme speed or count, and Sigma 4.11 Criticals skips S2A inside its own packet state machine so the crit-trigger logic is not disturbed.</p>
+<h4>Exploit surface</h4>
+<p>Particle floods are a classic client-crash vector: a server sends one S2A with a huge count or repeated packets, and the client spawns thousands of entities per tick. Anti-cheat servers also use particle bursts as visual flags for cheaters (crit particles on KillAura, etc.). Client defenses range from blanket cancellation (Memeware) to rate limiting (Rise ParticleCheck: accumulate count, drain 6 per packet, cap 150, drop over 100) to heuristic drops (Tenacity: speed &gt;= 1 or count &gt; 1). The trade-off is visibility: aggressive cancellation hides legitimate gameplay effects.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>WorldServer.spawnParticle builds one S2APacketParticles per batch with particle type, longDistance flag, x/y/z floats, three offset floats, speed, count, and a varint data array. It sends via ConfigurationManager.sendToAllNear (radius 512 when longDistance, else 32). NetHandlerPlayClient.handleParticles then loops count times through clientWorldController.spawnParticle, which is where a flood becomes a client-side hang. No server-side cap exists on count in vanilla 1.8.9.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Encoding: String particle name, boolean longDistance, float x, float y, float z, float offsetX, float offsetY, float offsetZ, float speed, int count, then a varint-length int array of particle arguments used only by iconcrack and blockcrack. The name is read with readStringFromBuffer(64). Count 0 is special: offsets become velocity for a single particle. The packet was introduced in 1.8 with the EnumParticleTypes refactor that replaced the older string-only effect packets.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Anti-cheats use particles as a side channel rather than flagging the packet itself: critical-hit particles around a target are evidence for killaura checks on servers that render them. The client-side countermeasures here are defensive, not evasive. The interesting tension is Rise ParticleCheck's accumulator: it treats particle arrival as a budget (drain 6 per packet, cap 150, drop when the bucket exceeds 100), which keeps normal combat particles while killing flood attempts. Blanket cancels (Memeware) trade all particle feedback for stability.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ESP</span>
+<p class="impl-pattern">The particle broadcast packet, and the only one of the six where client defense depth actually shows: blanket cancel (Memeware), selective cancel (Rise 5.99 slime mode), distance culling (Rise 6.x performance component), flood rate limiting (Rise 6.x ParticleCheck), and crash heuristics (Tenacity AntiExploit). Sigma's Criticals skips it inside its packet state machine.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Disabler (particle cancel)</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99)</span>
 </div>
-<p class="impl-pattern">Detect particles for ESP. Can multiply/enhance particle effects.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Remove particle traffic client-side: blanket in Memeware, selective slime-only in Rise 5.99.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Memeware's Disabler registers a PacketInEvent consumer that cancels every S2A it sees, unconditionally, regardless of mode. Rise 5.99's Disabler, in HypixelSlime mode, checks the particle type and cancels only EnumParticleTypes.SLIME. Nekoware's Disabler imports the class but ships no active particle handler in the file.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/exploit/Disabler.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/exploit/Disabler.java =====
+package me.memewaredevs.client.module.exploit;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.event.events.PacketInEvent;
+import me.memewaredevs.client.event.events.PacketOutEvent;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+import me.memewaredevs.client.util.ChatUtil;
+import me.memewaredevs.client.util.misc.Timer;
+import me.memewaredevs.client.util.packet.PacketUtil;
+import net.minecraft.entity.player.PlayerCapabilities;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S2APacketParticles;
+import org.apache.commons.lang3.RandomUtils;
+
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.function.Consumer;
+
+public class Disabler extends Module {
+
+    private static final int VERUS_DISABLE_AUTOBAN_CHANNEL = 65536;
+    private static final short VERUS_DISABLE_AUTOBAN_UID = 32767;
+    private final Queue&lt;Packet&gt; packetQueue = new ConcurrentLinkedQueue();
+    private final Timer timer = new Timer();
+    private final Timer timer1 = new Timer();
+
+    public Disabler(final String name, final int key, final Module.Category category) {
+        super(name, key, category);
+        this.addModes("Mineplex Combat", "Transaction", "Latest Verus", "PvPTemple", "OmegaCraft", "Timer", "AACv1.9.10", "Sloth", "Ghostly", "Watchdog", "Faithful Movement");
+    }
+
+    @Override
+    public void onDisable() {
+        packetQueue.clear();
+    }
+
+    @Override
+    public void onEnable() {
+        timer.reset();
+    }
+
+    @Handler
+    public Consumer&lt;PacketInEvent&gt; packetInEventConsumer = (event) -&gt; {
+        if (isMode("Sloth")) {
+            if (event.getPacket() instanceof S08PacketPlayerPosLook) {
+                S08PacketPlayerPosLook playerPosLook = (S08PacketPlayerPosLook) event.getPacket();
+                /**
+                 * Works alongside with the spigot exploit.
+                 * Exploit PlayerData bug (Player data gets set to null if the previous event is cancelled, and y difference &lt;= 1.0E-4)
+                 */
+                playerPosLook.y += 1.0E-4;
+            }
+        }
+    };
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer = (event) -&gt; {
+        if (isMode("Latest Verus")) {
+            if (timer.delay(490L)) {
+                if (!packetQueue.isEmpty()) {
+                    PacketUtil.sendPacketSilent(packetQueue.poll());
+                }
+                timer.reset();
+            }
+        }
+
+        if (isMode("OmegaCraft")) {
+            PacketUtil.sendPacketSilent(new C0FPacketConfirmTransaction(VERUS_DISABLE_AUTOBAN_CHANNEL, VERUS_DISABLE_AUTOBAN_UID, true));
+        }
+
+        if (isMode("PvPTemple")) { // Added by Auth
+            event.setGround(false);
+            event.setY(event.getY() + 0.42);
+            event.setYaw(0);
+            event.setPitch(0);
+        }
+
+        if (isMode("Watchdog")) {
+            if (timer.delay(15000L)) {
+                if (!packetQueue.isEmpty()) {
+                    PacketUtil.sendPacketSilent(packetQueue.poll());
+                }
+                timer.reset();
+            }
+        }
+
+    };
+
+    @Handler
+    public Consumer&lt;PacketInEvent&gt; eventConsumer0 = (event) -&gt; {
+        if (event.getPacket() instanceof S2APacketParticles) {
+            event.cancel();
+        }
+    };
+
+    @Handler
+    public Consumer&lt;PacketOutEvent&gt; eventConsumer1 = (event) -&gt; {
+
+        if (isMode("Mineplex Combat"))
+            if (event.getPacket() instanceof C00PacketKeepAlive) {
+                C00PacketKeepAlive packetKeepAlive = (C00PacketKeepAlive) event.getPacket();
+                packetKeepAlive.key -= RandomUtils.nextInt(3, 128);
+            }
+
+        if (isMode("OmegaCraft"))
+            if (event.getPacket() instanceof C0FPacketConfirmTransaction)
+                event.cancel();
+
+        if (isMode("Latest Verus")) {
+            if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
+                C0FPacketConfirmTransaction c0fPacketConfirmTransaction = (C0FPacketConfirmTransaction) event.getPacket();
+                packetQueue.add(c0fPacketConfirmTransaction);
+                event.cancel();
+            }
+
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                C03PacketPlayer c03 = (C03PacketPlayer) event.getPacket();
+                if (mc.thePlayer.ticksExisted % 33 == 0) {
+                    c03.y = -0.911;
+                    c03.onGround = false;
+                    c03.field_149480_h = false;
+                }
+            }
+
+            if (mc.thePlayer != null &amp;&amp; mc.thePlayer.ticksExisted &lt;= 7) {
+                timer.reset();
+                packetQueue.clear();
+            }
+        }
+
+        if (isMode("Timer") &amp;&amp; event.getPacket() instanceof C03PacketPlayer) {
+            if (mc.thePlayer.ticksExisted % 3 != 0) {
+                event.cancel();
+            }
+        }
+        if (isMode("AACv1.9.10")) {
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                PacketUtil.sendPacketSilent(new C0CPacketInput());
+                C03PacketPlayer packetPlayer = (C03PacketPlayer) event.getPacket();
+                /**
+                 * Resets all checks VL due to a bug in critical hit check
+                 */
+                packetPlayer.y += 7.0E-9D;
+            }
+        }
+
+        if (isMode("Sloth")) {
+            if (event.getPacket() instanceof C03PacketPlayer) {
+                C03PacketPlayer packetPlayer = (C03PacketPlayer) event.getPacket();
+                if (!timer.delay(1000L)) {
+                    for (int i = 0; i &lt; 10; ++i) {
+                        double y = i &gt; 2 &amp;&amp; i &lt; 8 ? 11 : 120;
+                        PacketUtil.sendPacketSilent(new C03PacketPlayer.C04PacketPlayerPosition(mc.thePlayer.posX, mc.thePlayer.posY - y, mc.thePlayer.posZ, true));
+                    }
+                } else {
+                    //set to default jump value so viper can stop fucking value patching it
+                    packetPlayer.y += 0.42F;
+                }
+            }
+        }
+        if (isMode("Faithful Movement")) {
+            if (mc.thePlayer != null &amp;&amp; event.getPacket() instanceof C00PacketKeepAlive) {
+                C00PacketKeepAlive packetKeepAlive = (C00PacketKeepAlive) event.getPacket();
+                packetKeepAlive.key -= 31;
+            }
+        }
+
+
+        if (isMode("Ghostly")) { // Ghostly Disabler added by Auth
+            if (event.getPacket() instanceof C03PacketPlayer)
+                PacketUtil.sendPacketSilent(new C0CPacketInput());
+            if (event.getPacket() instanceof C0FPacketConfirmTransaction)
+                event.cancel();
+        }
+        if (isMode("Watchdog")) {
+//            PacketUtil.sendPacketSilent(new C0EPacketClickWindow());
+            if (mc.getCurrentServerData().serverIP.contains("hypixel.net")) {
+                if (mc.thePlayer.ticksExisted % 30 == 0) {
+                    PlayerCapabilities pc = new PlayerCapabilities();
+                    pc.isFlying = true;
+                    pc.setFlySpeed(Float.NaN);
+                    PacketUtil.sendPacketSilent(new C13PacketPlayerAbilities(pc));
+                }
+                System.out.println(event.getPacket());
+                if (event.getPacket() instanceof C0FPacketConfirmTransaction) {
+                    event.setPacket(new C0FPacketConfirmTransaction(Integer.MIN_VALUE, Short.MAX_VALUE, true));
+                }
+            } else {
+                ChatUtil.printChat("You must be on Hypixel to use Watchdog Disabler!");
+                this.toggle();
+            }
+        }
+    };
+}
+
+// NOTE (AI): The S2A handler is a standalone PacketInEvent consumer (lines ~92-97) that cancels all particle packets. The rest of the module is the mode-switching keepalive/transaction disabler.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketInEvent (custom event bus).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Invisible server-side: cancelled clientbound packets are never acknowledged. The cost is losing all particle feedback, which some servers use as hit indicators.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 restricts the cancel to SLIME particles in the HypixelSlime mode. Nekoware v1 private imports S2APacketParticles in its Disabler but has no handler using it (dead import).</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ParticleMultiplier</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ParticleDistanceComponent (performance)</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
-<p class="impl-pattern">Detect particles for ESP. Can multiply/enhance particle effects.</p>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventReceivePacket</span></div>
+<p class="impl-pattern">Drop particle packets whose origin is more than 6 blocks away to save GPU work.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A Component (non-module system) listening on PacketReceiveEvent. For each S2A it computes the squared distance from the player to the packet origin and cancels the packet when distanceSq >= 36, i.e. 6 blocks. Particles closer than 6 blocks pass through untouched.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/performance/ParticleDistanceComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/performance/ParticleDistanceComponent.java =====
+package com.alan.clients.component.impl.performance;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.packet.PacketReceiveEvent;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S2APacketParticles;
+
+public class ParticleDistanceComponent extends Component {
+
+    @EventLink
+    public final Listener&lt;PacketReceiveEvent&gt; onPacketReceiveEvent = event -&gt; {
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof S2APacketParticles) {
+            final S2APacketParticles wrapper = ((S2APacketParticles) packet);
+
+            final double distance = mc.thePlayer.getDistanceSq(wrapper.getXCoordinate(), wrapper.getYCoordinate(), wrapper.getZCoordinate());
+
+            if (distance &gt;= 36) {
+                event.setCancelled();
+            }
+        }
+    };
+}
+
+// NOTE (AI): Components run in the same packet pipeline as modules but are always-on infrastructure. The 36 threshold is a squared-distance comparison, so the real cutoff is sqrt(36) = 6 blocks.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (EventLink listener).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>No anti-cheat exposure; it is a pure client-performance filter. Aggressive distance culling can hide distant particle cues like explosions or beacon effects.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical file in Rise 6.1.30 under com/alan/clients/component/impl/performance/.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">ParticleCheck (security)</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
 </div>
+<p class="impl-pattern">Rate-limit inbound particle volume so a malicious server cannot crash the client with a flood.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A SecurityFeature. For each S2A it adds the packet's particle count to an accumulator, drains 6 per packet, and clamps the bucket at 150. The packet is dropped when the bucket exceeds 100, or when count is < 1, |count| > 20, or speed is negative or above 1000. Normal combat particles pass because their per-packet counts are small.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/security/impl/ParticleCheck.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/security/impl/ParticleCheck.java =====
+package com.alan.clients.security.impl;
+
+import com.alan.clients.security.SecurityFeature;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S2APacketParticles;
+
+public final class ParticleCheck extends SecurityFeature {
+
+    private int particles;
+
+    public ParticleCheck() {
+        super("ParticleCheck", "Server attempted to crash the client with a large amount of particles");
+    }
+
+    @Override
+    public boolean handle(final Packet&lt;?&gt; packet) {
+        if (packet instanceof S2APacketParticles) {
+            final S2APacketParticles wrapper = ((S2APacketParticles) packet);
+
+            particles += wrapper.getParticleCount();
+            particles -= 6;
+            particles = Math.min(particles, 150);
+
+            return particles &gt; 100 || wrapper.getParticleCount() &lt; 1 || Math.abs(wrapper.getParticleCount()) &gt; 20 ||
+                    wrapper.getParticleSpeed() &lt; 0 || wrapper.getParticleSpeed() &gt; 1000;
+        }
+
+        return false;
+    }
+}
+
+// NOTE (AI): The bucket math (add count, drain 6, clamp 150, flag over 100) is a token-bucket rate limiter with generous headroom for legit gameplay particles.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> Security pipeline handle(Packet) on the receive path.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Defends the client against particle-crash exploits. The drain rate and 100-threshold are tuned so that even heavy combat (crit, sweep, potion particles) never trips it.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical file in Rise 6.1.30. Tenacity 6.0 AntiExploit implements the same idea with simpler heuristics (see its own entry).</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">AntiExploit (particle flood)</span>
+<span class="impl-module-clients">(Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Cancel particle packets that look like crash attempts while logging the block.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">A PacketReceiveEvent handler. For S2A it cancels and prints 'Blocked Exploit: Particles' when |particleSpeed| >= 1, or 'Blocked Exploit: Crash' when particleCount > 1. The module bundles several crash-vector filters (resource pack URLs, camera spectate, explosion strength) with a shared 100-packet-per-second counter.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/module/impl/misc/AntiExploit.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/misc/AntiExploit.java =====
+package dev.tenacity.module.impl.misc;
+
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.packet.PacketReceiveEvent;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.ModuleCategory;
+import dev.tenacity.util.misc.ChatUtil;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C19PacketResourcePackStatus;
+import net.minecraft.network.play.server.*;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+
+public class AntiExploit extends Module {
+
+
+
+    private long lastExplosion = 0, lastExperience = 0;
+    private int invalidExperience = 0;
+   final int PACKET_THRESHOLD = 100;
+    final long CHECK_INTERVAL = 1000;
+    int packetCount = 0;
+
+    public AntiExploit() {
+        super("AntiExploit", "Prevents server exploits", ModuleCategory.MISC);
+    }
+
+    private final IEventListener&lt;PacketReceiveEvent&gt; onReceivePacket = event -&gt; {
+        Packet&lt;?&gt; packet = event.getPacket();
+        handlePacketCount();
+        if(packet instanceof S48PacketResourcePackSend) {
+            S48PacketResourcePackSend resourcePack = (S48PacketResourcePackSend) packet;
+
+            try {
+                URI uri = new URI(resourcePack.getURL());
+                String scheme = uri.getScheme();
+
+                boolean isLevelProtocol = scheme.equalsIgnoreCase("level");
+                boolean isHttpProtocol = scheme.equalsIgnoreCase("http");
+                boolean isHttpsProtocol = scheme.equalsIgnoreCase("https");
+
+                if(!isHttpProtocol &amp;&amp; !isHttpsProtocol &amp;&amp; !isLevelProtocol) {
+                    ChatUtil.print("§cBlocked Exploit: Resource Pack");
+                    event.cancel();
+                } else if(isLevelProtocol &amp;&amp; (resourcePack.getURL().contains("..") || !((S48PacketResourcePackSend) packet).getURL().endsWith("/resources.zip"))) {
+                    ChatUtil.print("§cBlocked Exploit: File Access");
+                    event.cancel();
+                    mc.getNetHandler().addToSendQueue(new C19PacketResourcePackStatus(((S48PacketResourcePackSend) packet).getHash(), C19PacketResourcePackStatus.Action.FAILED_DOWNLOAD));
+                }
+            } catch (URISyntaxException exception) {
+                ChatUtil.print("§cBlocked Exploit: Resource Pack");
+                event.cancel();
+                mc.getNetHandler().addToSendQueue(new C19PacketResourcePackStatus(((S48PacketResourcePackSend) packet).getHash(), C19PacketResourcePackStatus.Action.FAILED_DOWNLOAD));
+            }
+        } else if(packet instanceof S43PacketCamera &amp;&amp; !mc.thePlayer.isSpectator()) {
+            ChatUtil.print("§cBlocked Exploit: Crash");
+            event.cancel();
+        } else if(packet instanceof S2APacketParticles) {
+            S2APacketParticles particles = (S2APacketParticles) packet;
+            if(Math.abs(particles.getParticleSpeed()) &gt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Particles");
+                event.cancel();
+            } else if(((S2APacketParticles) packet).getParticleCount() &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            }
+        } else if(packet instanceof S27PacketExplosion) {
+            S27PacketExplosion explosion = (S27PacketExplosion) packet;
+
+            if(Math.abs(explosion.getStrength()) &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            } else if(System.currentTimeMillis() - lastExplosion &lt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            } else if(packet instanceof S2APacketParticles) {
+            S2APacketParticles particles = (S2APacketParticles) packet;
+
+            if(Math.abs(particles.getParticleSpeed()) &gt; 1) {
+                ChatUtil.print("§cBlocked Exploit: Particles");
+                event.cancel();
+            } else if(particles.getParticleCount() &gt;= 1) {
+                ChatUtil.print("§cBlocked Exploit: Crash");
+                event.cancel();
+            }
+        }
+
+            lastExplosion = System.currentTimeMillis();
+        } else if(packet instanceof S18PacketEntityTeleport) {
+            S18PacketEntityTeleport teleport = (S18PacketEntityTeleport) packet;
+
+            double packetX = Math.abs(teleport.getX());
+            double packetY = Math.abs(teleport.getY());
+            double packetZ = Math.abs(teleport.getZ());
+
+            if(packetX &gt; 30000000 || packetY &gt; 30000000 || packetZ &gt; 30000000) {
+                ChatUtil.print("§cBlocked Exploit: Teleport");
+                event.cancel();
+            }
+        } else if(packet instanceof S11PacketSpawnExperienceOrb) {
+            if(System.currentTimeMillis() - lastExperience &lt;= 1) {
+                invalidExperience++;
+
+                if(invalidExperience &gt;= 2) {
+                    ChatUtil.print("§cBlocked Exploit: Crash");
+                    event.cancel();
+                }
+            } else {
+                invalidExperience = 0;
+            }
+            lastExperience = System.currentTimeMillis();
+        }
+
+    };
+
+    private void triggerKick() {
+        ChatUtil.print("§cAbnormal packet activity detected. Kicking player...");
+    }
+        private void handlePacketCount() {
+            long currentTime = System.currentTimeMillis();
+
+            long lastPacketCheckTime = 0;
+            if (currentTime - lastPacketCheckTime &gt; CHECK_INTERVAL) {
+                packetCount = 0;
+                lastPacketCheckTime = currentTime;
+            }
+            packetCount++;
+            if (packetCount &gt; PACKET_THRESHOLD) {
+                triggerKick();
+                packetCount = 0;
+        }
+
+    }
+
+}
+
+// NOTE (AI): The particle branch (lines ~59-64) is deliberately blunt: any packet with speed &gt;= 1 or count &gt; 1 is killed. Normal ambient particles have near-zero speed and count 1, so the filter is safe in practice.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketReceiveEvent (IEventListener).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The heuristic is aggressive enough that servers emitting unusual particle effects (custom enchant glints, heavy weather) get filtered. ChatUtil.print spam on each block is a minor DoS surface by itself.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 6.x uses the token-bucket ParticleCheck instead; Tenacity's version trades precision for simplicity.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Criticals (packet skip)</span>
+<span class="impl-module-clients">(Sigma 4.11)</span>
+</div>
+<p class="impl-pattern">Keep S2A out of the critical-hit packet state machine so it cannot reset the spoofed-position sequence.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">In the EventPacket branch of Criticals, an early return fires when the packet is S2A, so particle broadcasts never reach the transaction/position logic below. The handler's state machine tracks C0F transactions and C03 position packets to trigger criticals; particle noise would otherwise be type-checked pointlessly.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Sigma 4.11 — info/sigmaclient/module/impl/combat/Criticals.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Sigma 4.11 — info/sigmaclient/module/impl/combat/Criticals.java =====
+package info.sigmaclient.module.impl.combat;
+
+import tv.twitch.chat.Chat;
+import info.sigmaclient.Client;
+import info.sigmaclient.event.Event;
+import info.sigmaclient.event.RegisterEvent;
+import info.sigmaclient.event.impl.EventAttack;
+import info.sigmaclient.event.impl.EventJump;
+import info.sigmaclient.event.impl.EventPacket;
+import info.sigmaclient.event.impl.EventStep;
+import info.sigmaclient.event.impl.EventUpdate;
+import info.sigmaclient.management.MoveUtils;
+import info.sigmaclient.management.notifications.Notifications;
+import info.sigmaclient.module.Module;
+import info.sigmaclient.module.data.ModuleData;
+import info.sigmaclient.module.data.Options;
+import info.sigmaclient.module.data.Setting;
+import info.sigmaclient.module.impl.movement.Bhop;
+import info.sigmaclient.module.impl.movement.LongJump;
+import info.sigmaclient.util.misc.ChatUtil;
+import info.sigmaclient.util.misc.Timer;
+import net.minecraft.client.Minecraft;
+import net.minecraft.entity.Entity;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.network.play.server.S2APacketParticles;
+
+public class Criticals extends Module {
+
+    public static String PACKET = "MODE";
+    static String HURTTIME = "HURTTIME";
+    public static String MODE = "";
+    Timer lastStep = new Timer();
+    Timer timer = new Timer();
+    int groundTicks, stage, count;
+    double y;
+    //0.0625101D
+    
+    public Criticals(ModuleData data) {
+        super(data);
+        settings.put(PACKET, new Setting&lt;&gt;(PACKET, new Options("Mode", "Packet", new String[]{"Packet", "HPacket", "Minis", "HMinis", "Hover", "Jump"}), "Critical attack method."));
+        settings.put(HURTTIME, new Setting&lt;&gt;(HURTTIME, 15, "The hurtTime tick to crit at.", 1, 0, 20));
+    }
+    @Override
+    public void onEnable() {
+    	stage = 0;
+    	String mm = ((Options) settings.get(PACKET).getValue()).getSelected();
+    	count = 0;
+    	if(mm.equalsIgnoreCase("Packet") || mm.equalsIgnoreCase("Minis")){
+   		 if (mc.getCurrentServerData() != null &amp;&amp; mc.getCurrentServerData().serverIP.toLowerCase().contains("hypixel")){
+   			 Notifications.getManager().post("Warning", mm + " criticals doesn't bypass on Hypixel.", Notifications.Type.WARNING);
+   		 }
+   	}
+    }
+    @Override
+    @RegisterEvent(events = {EventPacket.class, EventUpdate.class, EventJump.class, EventAttack.class, EventStep.class})
+    public void onEvent(Event event) {
+        if(event instanceof EventStep){
+        	EventStep es = (EventStep)event;
+        
+        	if(!es.isPre()){
+        		lastStep.reset();
+        		if(!mc.thePlayer.isCollidedHorizontally){
+        			y = mc.thePlayer.boundingBox.minY;
+        			stage = 0;
+        		}
+        	}
+        }
+        if (event instanceof EventUpdate) {
+        	EventUpdate em = (EventUpdate)event;
+            setSuffix(((Options) settings.get(PACKET).getValue()).getSelected() + " " + ((Number) settings.get(HURTTIME).getValue()).intValue());
+            if(MoveUtils.isOnGround(0.001)){
+            	groundTicks ++;
+            }else if(!mc.thePlayer.onGround){
+            	groundTicks = 0;
+            }
+           
+            if(!MODE.equalsIgnoreCase(((Options) settings.get(PACKET).getValue()).getSelected())){          	
+            	MODE = ((Options) settings.get(PACKET).getValue()).getSelected();
+            	if(MODE.equalsIgnoreCase("Packet") || MODE.equalsIgnoreCase("Minis")){
+            		 if (mc.getCurrentServerData() != null &amp;&amp; mc.getCurrentServerData().serverIP.toLowerCase().contains("hypixel")){
+            			 Notifications.getManager().post("Warning", MODE + " criticals doesn't bypass on Hypixel.", Notifications.Type.WARNING);
+            		 }
+            	}
+        	}	
+            if(!MODE.equalsIgnoreCase("Packet") &amp;&amp; !MODE.equalsIgnoreCase("HPacket")){
+            	setSuffix(((Options) settings.get(PACKET).getValue()).getSelected());
+            }
+            if(em.isPre() &amp;&amp; MODE.equalsIgnoreCase("Hover")){
+        		mc.thePlayer.lastReportedPosY = 0;
+    			double ypos = mc.thePlayer.posY;
+        		if(MoveUtils.isOnGround(0.001)){
+        			em.setOnGround(false);
+        			if(stage == 0){
+        				y = ypos + 1E-8;
+        				em.setOnGround(true);
+        			}else if(stage == 1)
+        				y-= 5E-15;
+        			else
+        				y-= 4E-15;
+        			
+        			if(y &lt;= mc.thePlayer.posY){
+        				stage = 0;
+        				y = mc.thePlayer.posY;
+        				em.setOnGround(true);
+        			}
+        			em.setY(y);
+        			stage ++;
+        		}else
+        			stage = 0;
+        		
+            }
+        }
+        if (event instanceof EventPacket) {
+            EventPacket ep = (EventPacket) event;
+            Packet p = ep.getPacket();
+         
+            if (p instanceof S2APacketParticles ) {
+            
+                return;
+            }
+            if(p instanceof S08PacketPlayerPosLook){
+		    	stage = 0;
+            }
+            if(p instanceof C0FPacketConfirmTransaction){
+            	C0FPacketConfirmTransaction packet = (C0FPacketConfirmTransaction)p;
+            	boolean accepted = packet.isAccepted();
+            	int uid = packet.getId();
+            	if(accepted &amp;&amp; uid == 0){
+        			count ++;
+        			if(Killaura.target != null){
+        			//	ep.setCancelled(true);
+        			}
+            	}		
+            }
+            if(p instanceof C03PacketPlayer &amp;&amp; ep.isPre()){
+            	C03PacketPlayer pa = (C03PacketPlayer)p;
+            	double y = pa.y;
+            	if(timer.getTime() == 0)
+            	if(MODE.equalsIgnoreCase("HPacket")){
+                	//ep.setPacket(new C03PacketPlayer(true));
+            	}
+            	
+            }
+        }
+        if(event instanceof EventJump){
+        	EventJump ej = (EventJump)event;
+        	if(ej.isPre()){
+        		 if (Killaura.isSetupTick() &amp;&amp; Client.getModuleManager().isEnabled(Killaura.class)) {
+        	        	if(MODE.equalsIgnoreCase("minis") || MODE.equalsIgnoreCase("HMinis")){
+        	        		//if minis criticals is not on ground, send packet onground to be able to jump
+        	        		Minecraft.getMinecraft().thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C06PacketPlayerPosLook(
+        	        				mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ, mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch, true));
+        	        	}
+        		 }
+        	}
+        }
+        if(event instanceof EventAttack){
+        	EventAttack ea = (EventAttack)event;
+        	if(ea.isPreAttack()){
+        	      if( ea.getEntity() != null){        	        
+        	        	if(mc.thePlayer.onGround &amp;&amp; MoveUtils.isOnGround(0.001) &amp;&amp; !(Client.getModuleManager().isEnabled(LongJump.class) || Client.getModuleManager().isEnabled(Bhop.class))){
+        	        		 if(MODE.equalsIgnoreCase("Packet") || MODE.equalsIgnoreCase("HPacket")){
+        	                     if( ea.getEntity().hurtResistantTime &lt;= ((Number) settings.get(HURTTIME).getValue()).doubleValue() &amp;&amp; lastStep.check(20)
+        	                    		 &amp;&amp; (timer.check(200) || ea.getEntity().hurtResistantTime &gt; 0) &amp;&amp; mc.thePlayer.isCollidedVertically){
+        	                    	 if(groundTicks &gt; 1){
+        	                    		 doCrits(); 
+        	                    	 }
+        	                    	
+        	                     }
+        	        		 }else if (!mc.thePlayer.isJumping &amp;&amp; ((Options) settings.get(PACKET).getValue()).getSelected().equalsIgnoreCase("Jump")){
+        	        			 mc.thePlayer.jump();
+        	        		 }
+        	        		 timer.reset();
+        	        		 
+        	        	}
+        	        }  
+        	}
+        }
+    }
+
+    private boolean hurtTimeCheck(Entity entity) {
+        return entity != null &amp;&amp; entity.hurtResistantTime &lt;= ((Number) settings.get(HURTTIME).getValue()).intValue();
+    }
+
+    public static void doCrits() {
+    	//0.0625 , 17.64e-8 
+    	double off = 0.0626;
+		double x = mc.thePlayer.posX; double y = mc.thePlayer.posY; double z = mc.thePlayer.posZ;
+		mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(x, y+off, z, false));
+		if(MODE.equalsIgnoreCase("HPacket")){
+			mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(x, y+off+0.00000000001, z, false));
+		}
+		mc.thePlayer.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(x, y, z, false));
+    	
+    	
+    } 
+
+}
+
+// NOTE (AI): The S2A guard (lines ~124-127) is a bare return inside the EventPacket handler. The module cares about C0FPacketConfirmTransaction and C03PacketPlayer; particles are skipped as irrelevant traffic.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventPacket (Sigma event bus, pre/post).</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Skipping particles has no anti-cheat effect; it is a micro-optimization and a guard against future code paths that might misinterpret clientbound noise.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> No other client in the corpus touches S2A from a combat module.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">Every handler sits on the packet receive path: Memeware PacketInEvent, Tenacity and Rise 6.x PacketReceiveEvent, Sigma EventPacket, Rise security chain handle(Packet).</div>
+<div class="impl-clients">Memeware cancels via event.cancel() on a custom bus. Rise 6.x components and security features use event.setCancelled() or pipeline drop. Sigma returns early inside a single handler. Tenacity combines cancel with a per-second packet counter shared across crash vectors.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S29PacketSoundEffect/">S29PacketSoundEffect</a>
+<a class="related-chip" href="../S27PacketExplosion/">S27PacketExplosion</a>
+<a class="related-chip" href="../S2BPacketChangeGameState/">S2BPacketChangeGameState</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>

