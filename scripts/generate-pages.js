@@ -6,6 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 const BASE = path.join(__dirname, '..');
 const PACKETS_DIR = path.join(BASE, 'data', 'packets');
@@ -182,9 +183,12 @@ function main() {
     const dirLabel = pkt.dir === 'SERVERBOUND' ? 'Serverbound' : 'Clientbound';
     const fullDesc = (pkt.id + ' (' + pkt.hex + ') \u2014 ' + dirLabel + ' \u2014 Protocol State: ' + pkt.state + '. ' + pkt.desc + (pkt.fields && pkt.fields.length ? ' Fields: ' + pkt.fields.map(function(f) { return f.name; }).join(', ') + '.' : '')).substring(0, 400);
     const tags = (pkt.tags || []).join(', ');
-    const modules = pkt.implementation && pkt.implementation.modules ? pkt.implementation.modules.map(function(m) { return m.name; }).join(', ') : '';
+    const moduleList = pkt.implementation && pkt.implementation.modules ? pkt.implementation.modules : [];
+    const modules = moduleList.map(function(m) { return m.name; }).join(', ');
+    const moduleCount = moduleList.length;
 
-    const metaDesc = fullDesc.replace(/"/g, '&quot;');
+    // Description: protocol facts + module names for richer search snippets.
+    const metaDesc = (fullDesc + (modules ? ' Modules: ' + modules + '.' : '')).replace(/"/g, '&quot;').substring(0, 320);
 
     const dirClass = pkt.dir === 'SERVERBOUND' ? 'dir-sb' : 'dir-cb';
     const dirLabelFull = pkt.dir === 'SERVERBOUND' ? 'Serverbound (Client \u2192 Server)' : 'Clientbound (Server \u2192 Client)';
@@ -199,21 +203,42 @@ function main() {
 
     var implEsc = (pkt.implementation && pkt.implementation.overview ? pkt.implementation.overview : '').replace(/"/g, '\\"').substring(0, 300);
 
+    const pageUrl = SITE + '/packets/' + pkt.id + '/';
+    const ogImage = SITE + '/assets/og-image.png';
+    const pktJsonPath = path.join(PACKETS_DIR, pkt.id + '.json');
+    const pubDate = (function() {
+      try {
+        const d = execSync('git log --diff-filter=A --format=%cI -1 -- data/packets/' + pkt.id + '.json', { cwd: BASE, encoding: 'utf8' }).trim();
+        return d ? d.slice(0, 10) : mtime(pktJsonPath);
+      } catch (e) { return mtime(pktJsonPath); }
+    })();
+    const modDate = mtime(pktJsonPath);
+
     const html = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
       + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
       + '<title>' + metaTitle + '</title>\n'
       + '<meta name="description" content="' + metaDesc + '">\n'
-      + '<meta name="keywords" content="Minecraft, 1.8.9, ' + pkt.id + ', ' + pkt.state + ', ' + dirLabel + ', packet, protocol, ' + tags + '">\n'
+      + '<meta name="keywords" content="Minecraft, 1.8.9, ' + pkt.id + ', ' + pkt.state + ', ' + dirLabel + ', packet, protocol, ' + tags + (modules ? ', ' + modules : '') + '">\n'
+      + '<meta name="author" content="MC Packet Reference">\n'
       + '<meta name="robots" content="index, follow">\n'
-      + '<link rel="canonical" href="' + SITE + '/packets/' + pkt.id + '/">\n'
+      + '<meta name="theme-color" content="#0a0a0a">\n'
+      + '<link rel="manifest" href="../../assets/site.webmanifest">\n'
+      + '<link rel="apple-touch-icon" href="../../assets/icon-192.png">\n'
+      + '<link rel="canonical" href="' + pageUrl + '">\n'
       + '<meta property="og:title" content="' + metaTitle + '">\n'
       + '<meta property="og:description" content="' + metaDesc + '">\n'
       + '<meta property="og:type" content="article">\n'
-      + '<meta property="og:url" content="' + SITE + '/packets/' + pkt.id + '/">\n'
+      + '<meta property="og:url" content="' + pageUrl + '">\n'
       + '<meta property="og:site_name" content="MC 1.8.9 Packet Reference">\n'
+      + '<meta property="og:image" content="' + ogImage + '">\n'
+      + '<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">\n'
+      + '<meta property="og:image:alt" content="Minecraft 1.8.9 Packet Reference — network protocol documentation">\n'
+      + '<meta property="article:published_time" content="' + pubDate + '">\n'
+      + '<meta property="article:modified_time" content="' + modDate + '">\n'
       + '<meta name="twitter:card" content="summary_large_image">\n'
       + '<meta name="twitter:title" content="' + metaTitle + '">\n'
       + '<meta name="twitter:description" content="' + pkt.id + ' (' + pkt.hex + '): ' + pkt.desc.substring(0, 120) + '">\n'
+      + '<meta name="twitter:image" content="' + ogImage + '">\n'
       + '<meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="' + dirLabel + '">\n'
       + '<meta name="twitter:label2" content="State"><meta name="twitter:data2" content="' + pkt.state + '">\n'
       + '<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="' + modules + '">\n'
@@ -221,7 +246,8 @@ function main() {
       + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
       + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
       + '<link rel="stylesheet" href="../../css/style.css">\n'
-      + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"TechArticle","headline":"' + metaTitle + '","description":"' + implEsc + '","about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"' + pkt.state + ' Protocol \u2014 ' + dirLabel + '"}\n</script>\n'
+      + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"TechArticle","headline":"' + metaTitle + '","description":"' + metaDesc.replace(/&quot;/g, '\\"') + '","datePublished":"' + pubDate + '","dateModified":"' + modDate + '","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"' + pageUrl + '"},"author":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"publisher":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"' + pkt.state + ' Protocol \u2014 ' + dirLabel + '"}\n</script>\n'
+      + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"' + SITE + '/"},{"@type":"ListItem","position":2,"name":"' + pkt.state + ' Protocol","item":"' + SITE + '/packets/"},{"@type":"ListItem","position":3,"name":"' + pkt.id + '","item":"' + pageUrl + '"}]}\n</script>\n'
       + '</head>\n<body>\n'
       + '<aside class="sidebar" id="sidebar">\n'
       + '  <div class="sidebar-header">\n'
@@ -240,7 +266,7 @@ function main() {
       + '<main class="main" id="main">\n'
       + '  <div class="content-detail" style="display:block;max-width:860px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
       + '    <div class="detail-header" id="detailHeader">\n'
-      + '      <h2><span class="detail-hex">' + pkt.hex + '</span> ' + pkt.id + '</h2>\n'
+      + '      <h1><span class="detail-hex">' + pkt.hex + '</span> ' + pkt.id + '</h1>\n'
       + '      <p class="detail-desc">' + pkt.desc + '</p>\n'
       + '      <div class="detail-meta">\n'
       + '        <span class="badge ' + dirClass + '">' + dirLabelFull + '</span>\n'
@@ -264,7 +290,7 @@ function main() {
     fs.writeFileSync(path.join(dir2, 'index.html'), html);
   }
 
-  // Sitemap — use real file mtimes
+  // Sitemap — use real file mtimes, priority by module density
   function mtime(p) {
     try { return fs.statSync(p).mtime.toISOString().slice(0, 10); }
     catch (e) { return new Date().toISOString().slice(0, 10); }
@@ -272,11 +298,92 @@ function main() {
   const sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
     + '  <url><loc>' + SITE + '/</loc><lastmod>' + mtime(path.join(BASE, 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>1.0</priority></url>\n'
     + '  <url><loc>' + SITE + '/packets/</loc><lastmod>' + mtime(path.join(BASE, 'packets', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.9</priority></url>\n'
-    + allPkts.map(function(p) { return '  <url><loc>' + SITE + '/packets/' + p.id + '/</loc><lastmod>' + mtime(path.join(PACKETS_DIR, p.id + '.json')) + '</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>'; }).join('\n') + '\n'
+    + '  <url><loc>' + SITE + '/modules/</loc><lastmod>' + mtime(path.join(BASE, 'modules', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>\n'
+    + allPkts.map(function(p) {
+      const mc = (p.implementation && p.implementation.modules) ? p.implementation.modules.length : 0;
+      const prio = mc >= 4 ? '0.9' : (mc >= 1 ? '0.8' : '0.6');
+      const freq = mc >= 4 ? 'weekly' : 'monthly';
+      return '  <url><loc>' + SITE + '/packets/' + p.id + '/</loc><lastmod>' + mtime(path.join(PACKETS_DIR, p.id + '.json')) + '</lastmod><changefreq>' + freq + '</changefreq><priority>' + prio + '</priority></url>';
+    }).join('\n') + '\n'
     + '</urlset>\n';
 
   fs.writeFileSync(path.join(BASE, 'sitemap.xml'), sitemap);
-  console.log('Generated ' + allPkts.length + ' standalone packet pages + sitemap');
+
+  // ============================================================
+  // Modules index — every module name across all packets
+  // ============================================================
+  const modMap = {};
+  allPkts.forEach(function(p) {
+    if (!p.implementation || !p.implementation.modules) return;
+    p.implementation.modules.forEach(function(m) {
+      (modMap[m.name] = modMap[m.name] || []).push({
+        id: p.id, name: p.name, clients: m.found_in || []
+      });
+    });
+  });
+  const modNames = Object.keys(modMap).sort();
+  const modDir = path.join(BASE, 'modules');
+  fs.mkdirSync(modDir, { recursive: true });
+  const modCards = modNames.map(function(mn) {
+    const hits = modMap[mn];
+    const clientSet = {};
+    hits.forEach(function(h) { h.clients.forEach(function(c) { clientSet[c] = true; }); });
+    const clientNames = Object.keys(clientSet).sort();
+    return '<div class="mod-card">'
+      + '<div class="mod-card-head"><span class="mod-card-name">' + esc(mn) + '</span>'
+      + '<span class="mod-card-count">' + hits.length + (hits.length === 1 ? ' packet' : ' packets') + '</span></div>'
+      + '<div class="mod-card-pkts">' + hits.map(function(h) {
+          return '<a class="related-chip" href="../packets/' + h.id + '/">' + esc(h.id) + '</a>';
+        }).join('') + '</div>'
+      + (clientNames.length ? '<div class="mod-card-clients">' + clientNames.join(', ') + '</div>' : '')
+      + '</div>';
+  }).join('\n');
+  const modHtml = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
+    + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+    + '<title>Module Index \u2014 Minecraft 1.8.9 Packet Reference</title>\n'
+    + '<meta name="description" content="Index of every cheat module implementation across the 8 reference clients, mapped to the Minecraft 1.8.9 packets they use: KillAura, Scaffold, Velocity, Disabler, Fly, Speed and more.">\n'
+    + '<meta name="robots" content="index, follow">\n'
+    + '<meta name="theme-color" content="#0a0a0a">\n'
+    + '<link rel="manifest" href="../assets/site.webmanifest">\n'
+    + '<link rel="canonical" href="' + SITE + '/modules/">\n'
+    + '<meta property="og:title" content="Module Index \u2014 Minecraft 1.8.9 Packet Reference">\n'
+    + '<meta property="og:type" content="website">\n'
+    + '<meta property="og:url" content="' + SITE + '/modules/">\n'
+    + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
+    + '<meta name="twitter:card" content="summary_large_image">\n'
+    + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
+    + '<link rel="stylesheet" href="../css/style.css">\n'
+    + '</head>\n<body>\n'
+    + '<aside class="sidebar" id="sidebar">\n'
+    + '  <div class="sidebar-header">\n'
+    + '    <a href="../" class="logo" style="text-decoration:none">\n'
+    + '      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 7h10M7 12h10M7 17h6"/></svg>\n'
+    + '      <span>MC <strong>1.8.9</strong></span>\n'
+    + '    </a>\n'
+    + '  </div>\n'
+    + '  <nav class="sidebar-nav">\n'
+    + '    <div class="nav-section"><div class="nav-section-header"><span>Module Index</span><span class="count">' + modNames.length + '</span></div></div>\n'
+    + '    <div class="nav-section"><div class="nav-section-header"><span>All Packets</span></div><div class="nav-items"><a href="../" class="nav-item"><span class="nav-name">Back to packet reference</span></a></div></div>\n'
+    + '  </nav>\n'
+    + '</aside>\n'
+    + '<main class="main" id="main">\n'
+    + '  <div class="content-detail" style="display:block;max-width:960px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
+    + '    <div class="detail-header">\n'
+    + '      <h1>Module Index</h1>\n'
+    + '      <p class="detail-desc">Every module implementation found in the 8 reference clients (Memeware 7.3, Nekoware v1 private, Rise 5.99, Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0), mapped to the Minecraft 1.8.9 packets they send or intercept.</p>\n'
+    + '    </div>\n'
+    + '    <div class="mod-grid">\n' + modCards + '\n'
+    + '    </div>\n'
+    + '    <div style="margin-top:32px;text-align:center">\n'
+    + '      <a href="../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to all packets</a>\n'
+    + '    </div>\n'
+    + '  </div>\n'
+    + '</main>\n'
+    + '</body>\n</html>';
+  fs.writeFileSync(path.join(modDir, 'index.html'), modHtml);
+
+  console.log('Generated ' + allPkts.length + ' standalone packet pages + module index (' + modNames.length + ' modules) + sitemap');
 }
 
 main();

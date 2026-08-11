@@ -34,6 +34,38 @@ for pid in pkt_ids:
     for m in re.finditer(r'href="\.\./([A-Za-z0-9]+)/"', html):
         if m.group(1) != pid and not os.path.exists(os.path.join(PAGES_DIR, m.group(1), "index.html")):
             errors.append("%s: broken related link to %s" % (pid, m.group(1)))
+    # SEO invariants on every generated page
+    if "@context\":\"https://***@type" in html or "***@type" in html:
+        errors.append("%s: malformed JSON-LD @context" % pid)
+    if 'rel="canonical" href="' + SITE + "/packets/" + pid + '/"' not in html:
+        errors.append("%s: canonical does not point at %s/packets/%s/" % (pid, SITE, pid))
+    if 'og:image' not in html or "assets/og-image.png" not in html:
+        errors.append("%s: missing og:image" % pid)
+    if "<h1>" not in html:
+        errors.append("%s: missing h1" % pid)
+    if "application/ld+json" not in html or "BreadcrumbList" not in html:
+        errors.append("%s: missing structured data" % pid)
+
+# modules index
+mod_page = os.path.join(PAGES_DIR, "..", "modules", "index.html")
+if not os.path.exists(mod_page):
+    errors.append("missing modules/index.html")
+else:
+    mh = open(mod_page, encoding="utf-8").read()
+    if "Module Index" not in mh or "mod-card" not in mh:
+        errors.append("modules/index.html looks empty")
+    if 'rel="canonical" href="' + SITE + '/modules/"' not in mh:
+        errors.append("modules/index.html canonical wrong")
+
+# brand assets
+for asset in ["assets/og-image.png", "assets/icon-192.png", "assets/icon-512.png", "assets/site.webmanifest"]:
+    if not os.path.exists(os.path.join(BASE, asset)):
+        errors.append("missing %s" % asset)
+
+# robots.txt sitemap must point at the real site
+robots = open(os.path.join(BASE, "robots.txt"), encoding="utf-8").read()
+if SITE + "/sitemap.xml" not in robots:
+    errors.append("robots.txt sitemap URL is wrong")
 
 # packet-data.js integrity
 pd_path = os.path.join(BASE, "js", "packet-data.js")

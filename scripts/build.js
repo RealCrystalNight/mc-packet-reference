@@ -91,8 +91,13 @@ function buildFromJsons() {
 function writePacketDataJs(packets) {
   // Strip implementation/writeup payloads from the search bundle — the static
   // packet pages carry the full content; packet-data.js only powers search.
+  // Module NAMES are kept (not code) for keyword search + count chips.
   const lean = packets.map(p => {
     const copy = Object.assign({}, p);
+    if (copy.implementation) {
+      copy.modules = (copy.implementation.modules || []).map(m => m.name);
+      copy.moduleCount = (copy.implementation.modules || []).length;
+    }
     delete copy.implementation;
     return copy;
   });

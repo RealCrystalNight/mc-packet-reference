@@ -13,6 +13,9 @@ if [[ "${1:-}" != "--skip-verify" ]]; then
   python3 scripts/verify-impl.py --all
 fi
 
+echo "==> gen-assets.py (og-image, icons, webmanifest)"
+python3 scripts/gen-assets.py
+
 echo "==> merge-impl.js (data/impl -> data/packets)"
 node scripts/merge-impl.js
 

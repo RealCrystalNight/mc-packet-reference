@@ -31,6 +31,7 @@ function initSearchData(packets) {
     ];
     (p.tags || []).forEach(function(t) { parts.push(t); });
     (p.mcp || []).forEach(function(m) { parts.push(m.toLowerCase()); });
+    (p.modules || []).forEach(function(m) { parts.push(m.toLowerCase()); });
     (p.fields || []).forEach(function(f) {
       parts.push((f.name || '').toLowerCase(), (f.type || '').toLowerCase(), (f.desc || '').toLowerCase());
     });
@@ -224,6 +225,9 @@ function buildOverviewSections(filtered) {
       html += '<span class="row-hex">' + prefix + '</span>';
       html += '<span class="row-name">' + p.name + '</span>';
       html += '<span class="row-desc">' + p.desc + '</span>';
+      if (p.moduleCount) {
+        html += '<span class="row-modules" title="' + (p.modules || []).join(', ') + '">' + p.moduleCount + (p.moduleCount === 1 ? ' module' : ' modules') + '</span>';
+      }
       html += '</a>';
     });
     html += '</div></div>';
