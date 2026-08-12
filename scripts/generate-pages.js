@@ -25,6 +25,56 @@ const GROUPS = [
   { label: 'Play \u2192 Client', state: 'PLAY', dir: 'CLIENTBOUND' }
 ];
 
+// Protocol state + direction -> MCP package path (same mapping as fetch-vanilla-sources.js)
+const STATE_DIR = {
+  'HANDSHAKING|SERVERBOUND': 'handshake/client',
+  'LOGIN|SERVERBOUND': 'login/client',
+  'LOGIN|CLIENTBOUND': 'login/server',
+  'STATUS|SERVERBOUND': 'status/client',
+  'STATUS|CLIENTBOUND': 'status/server',
+  'PLAY|SERVERBOUND': 'play/client',
+  'PLAY|CLIENTBOUND': 'play/server'
+};
+function mcpPathFor(pkt) {
+  const dir = STATE_DIR[pkt.state + '|' + pkt.dir];
+  return dir ? 'net/minecraft/network/' + dir + '/' + pkt.id + '.java' : null;
+}
+const VANILLA_DIR = path.join(BASE, 'data', 'vanilla');
+const MAVEN_BLOB = 'https://github.com/Marcelektro/MavenMCP-1.8.9/blob/master/src/main/java';
+
+// Full vanilla MCP source of a packet class, fetched at build time from
+// Marcelektro/MavenMCP-1.8.9 (scripts/fetch-vanilla-sources.js) — never the
+// local disk copies.
+function loadVanillaSource(pkt) {
+  const rel = mcpPathFor(pkt);
+  if (!rel) return null;
+  const cached = path.join(VANILLA_DIR, pkt.id + '.java');
+  if (fs.existsSync(cached)) {
+    return { rel: rel, code: fs.readFileSync(cached, 'utf8'), blob: MAVEN_BLOB + '/' + rel };
+  }
+  return null;
+}
+
+function renderVanillaSource(pkt) {
+  const v = loadVanillaSource(pkt);
+  if (!v) return '';
+  const code = v.code.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n$/, '');
+  const lines = code.split('\n');
+  const rows = lines.map(function(line, i) {
+    return '<tr class="cv-row"><td class="cv-ln"><span class="cv-num">' + (i + 1) + '</span></td>'
+      + '<td class="cv-code"><pre><code>' + esc(line) + '</code></pre></td></tr>';
+  }).join('\n');
+  return '<div class="detail-section"><h3>Vanilla Source</h3>\n'
+    + '<div class="code-viewer"><div class="cv-toolbar">'
+    + '<span class="cv-file">' + esc(pkt.id + '.java') + '</span>'
+    + '<span class="cv-meta">' + lines.length + ' lines \u00b7 MCP 1.8.9</span>'
+    + '<button class="cv-copy">Copy</button>'
+    + '<a class="cv-link" href="' + v.blob + '" target="_blank" rel="noopener">Original \u2197</a>'
+    + '</div><div class="cv-body"><table class="cv-table">' + rows + '</table></div></div>\n'
+    + '<p style="font-size:0.75rem;color:var(--text-muted);margin-top:6px">Deobfuscated MCP 1.8.9 source of <code>' + esc(pkt.id) + '</code>, fetched directly from <a href="https://github.com/Marcelektro/MavenMCP-1.8.9" target="_blank" rel="noopener" style="color:var(--accent)">Marcelektro/MavenMCP-1.8.9</a> (' + esc(v.rel) + ') at build time and verified present.</p>'
+    + '</div>';
+}
+
 function buildSidebarHtml(allPkts) {
   let html = '';
   GROUPS.forEach(function(g) {
@@ -232,7 +282,7 @@ function main() {
 
     const dirClass = pkt.dir === 'SERVERBOUND' ? 'dir-sb' : 'dir-cb';
     const dirLabelFull = pkt.dir === 'SERVERBOUND' ? 'Serverbound (Client \u2192 Server)' : 'Clientbound (Server \u2192 Client)';
-    const mcpPath = 'net/minecraft/network/' + (pkt.dir === 'SERVERBOUND' ? 'play/client' : pkt.state.toLowerCase() === 'play' ? 'play/server' : '') + '/' + pkt.id + '.java';
+    const mcpPath = mcpPathFor(pkt) || '';
 
     var tagHtml = '';
     if (pkt.tags && pkt.tags.length) {
@@ -286,6 +336,7 @@ function main() {
       + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
       + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
       + '<link rel="stylesheet" href="../../css/style.css">\n'
+      + '<link rel="stylesheet" href="../../assets/github-dark.min.css">\n'
       + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"TechArticle","headline":"' + metaTitle + '","description":"' + metaDesc.replace(/&quot;/g, '\\"') + '","datePublished":"' + pubDate + '","dateModified":"' + modDate + '","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"' + pageUrl + '"},"author":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"publisher":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"' + pkt.state + ' Protocol \u2014 ' + dirLabel + '"}\n</script>\n'
       + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"' + SITE + '/"},{"@type":"ListItem","position":2,"name":"' + pkt.state + ' Protocol","item":"' + SITE + '/packets/"},{"@type":"ListItem","position":3,"name":"' + pkt.id + '","item":"' + pageUrl + '"}]}\n</script>\n'
       + '</head>\n<body>\n'
@@ -319,12 +370,15 @@ function main() {
       + '    </div>\n'
       + '    <div class="detail-body" id="detailBody">\n'
       + renderDetail(pkt) + '\n'
+      + renderVanillaSource(pkt) + '\n'
       + '    </div>\n'
       + '    <div style="margin-top:32px;text-align:center">\n'
       + '      <a href="../../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to all packets</a>\n'
       + '    </div>\n'
       + '  </div>\n'
       + '</main>\n'
+      + '<script src="../../assets/highlight.min.js"></script>\n'
+      + '<script>\n(function() {\n  // highlight vanilla-source code boxes\n  document.querySelectorAll(\'.cv-table\').forEach(function(table) {\n    var rows = table.querySelectorAll(\'tr.cv-row\');\n    if (!rows.length) return;\n    var texts = [];\n    rows.forEach(function(r) { texts.push(r.querySelector(\'code\').textContent); });\n    var src = texts.join(\'\\n\');\n    var hl = hljs.highlight(src, {language: \'java\'}).value.split(\'\\n\');\n    rows.forEach(function(r, i) { r.querySelector(\'code\').innerHTML = hl[i] || \'\'; });\n    table.dataset.src = src;\n  });\n  document.querySelectorAll(\'.cv-copy\').forEach(function(btn) {\n    btn.addEventListener(\'click\', function() {\n      var t = document.createElement(\'textarea\');\n      t.value = btn.closest(\'.code-viewer\').querySelector(\'.cv-table\').dataset.src || \'\';\n      document.body.appendChild(t); t.select();\n      try { document.execCommand(\'copy\'); btn.textContent = \'Copied!\'; } catch (e) {}\n      document.body.removeChild(t);\n      var b = btn; setTimeout(function() { b.textContent = \'Copy\'; }, 1500);\n    });\n  });\n})();\n</script>\n'
       + '</body>\n</html>';
 
     fs.writeFileSync(path.join(dir2, 'index.html'), html);

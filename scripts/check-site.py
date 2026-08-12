@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+from html import unescape as h_unescape
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKETS_DIR = os.path.join(BASE, "data", "packets")
@@ -122,9 +123,38 @@ if os.path.isdir(an_data):
                               % (slug, f["rel"], len(missing_lines)))
         if "annotation" in json.dumps(data).lower():
             errors.append("%s: stale annotation fields present" % slug)
-    for asset in ["analysis/assets/highlight.min.js", "analysis/assets/github-dark.min.css"]:
+    for asset in ["assets/highlight.min.js", "assets/github-dark.min.css"]:
         if not os.path.exists(os.path.join(BASE, asset)):
             errors.append("missing %s" % asset)
+
+# vanilla source: every packet page must carry the full MCP class fetched from
+# Marcelektro/MavenMCP-1.8.9 (data/vanilla/<id>.java) + the original link
+vanilla_idx = os.path.join(BASE, "data", "vanilla", "_index.json")
+if os.path.exists(vanilla_idx):
+    vindex = json.load(open(vanilla_idx))
+    for pid in pkt_ids:
+        page = os.path.join(PAGES_DIR, pid, "index.html")
+        if not os.path.exists(page):
+            continue
+        html = open(page, encoding="utf-8").read()
+        if pid not in vindex:
+            errors.append("%s: no fetched vanilla source (run scripts/fetch-vanilla-sources.js)" % pid)
+            continue
+        if "Vanilla Source" not in html:
+            errors.append("%s: missing Vanilla Source section" % pid)
+        if vindex[pid]["blob"] not in html:
+            errors.append("%s: missing MavenMCP original link" % pid)
+        src = open(os.path.join(BASE, "data", "vanilla", pid + ".java"), encoding="utf-8", errors="replace").read().rstrip("\n")
+        # the page escapes code per line; extract the Vanilla Source viewer's
+        # code cells and unescape to compare against the fetched source
+        m = re.search(r"<h3>Vanilla Source</h3>(.*?)</div>\s*</div>", html, re.S)
+        if not m:
+            errors.append("%s: Vanilla Source section missing" % pid)
+            continue
+        cells = re.findall(r'<td class="cv-code"><pre><code>(.*?)</code></pre></td>', m.group(1), re.S)
+        joined = "\n".join(h_unescape(c) for c in cells)
+        if joined != src:
+            errors.append("%s: vanilla source code mismatch in page (%d vs %d chars)" % (pid, len(joined), len(src)))
 
 # packet-data.js integrity
 pd_path = os.path.join(BASE, "js", "packet-data.js")
