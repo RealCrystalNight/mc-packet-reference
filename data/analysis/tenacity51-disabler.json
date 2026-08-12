@@ -3,19 +3,19 @@
   "client": "Tenacity 5.1",
   "category": "disabler",
   "source_rel": "dev/tenacity/module/impl/exploit/Disabler.java",
-  "overview": "Tenacity 5.1's Disabler is a setting-driven anticheat bypass module. A single MultipleBoolSetting holds 13 named toggles covering Hypixel Watchdog, MMC, Verus and generic packet manipulation, and the module dispatches on the toggle name in three event handlers. The packet-send path cancels, rewrites or replays C00/C03/C0B/C0F packets per toggle, the tick handler flushes buffered packets and spams C0C input, and the receive handler eats server teleports. Constructor wiring gives Hover Height, TP Delay and On Ground a parent setting so they only render when their mode is active.",
+  "overview": "Tenacity 5.1's Disabler is a setting-driven anticheat bypass module built around a single MultipleBoolSetting named 'Disablers' that holds 13 named toggles. Every handler iterates that setting group, filters enabled toggles, and switches on the toggle name, so behavior is driven entirely by which names are active. Three Module overrides carry the logic: onMotionEvent for tick-based buffer flushing and input spam, onPacketSendEvent for cancelling, rewriting and buffering serverbound packets, and onPacketReceiveEvent for suppressing server teleports. The modes split into Hypixel-targeted Watchdog bypasses, the MMC and Omni Sprint sprint-state desyncs, and a row of generic packet transforms that cancel, rewrite or replay C03, C0B, C0C, C0F, C00 and S08 packets.",
   "sections": [
     {
       "h": "Architecture",
-      "p": "The module is a name-based state machine. All 13 bypasses live as BooleanSettings inside one MultipleBoolSetting, and every handler iterates that list, checks each enabled setting, and switches on the setting name string. Three Module overrides drive it: onMotionEvent (tick-based flushing and C0C input spam), onPacketSendEvent (cancellation, rewriting and buffering of serverbound packets) and onPacketReceiveEvent (server teleport suppression). The three tuning values (Hover Height, TP Delay, On Ground) are wired to parent settings in the constructor so they only appear in the UI when their toggle is on."
+      "p": "Disabler is a name-based state machine. All 13 bypasses live as BooleanSettings inside one MultipleBoolSetting, and each event handler iterates the group, checks isEnabled, and switches on the setting name string. Three Module overrides drive everything: onMotionEvent runs every client tick (MMC buffer flush, Watchdog Timer spike, C0C input spam), onPacketSendEvent intercepts every serverbound packet and holds the bulk of the logic, and onPacketReceiveEvent handles inbound traffic for the Silent S08 mode. Packet storage uses CopyOnWriteArrayList buffers because packets are added on the send path and flushed from the tick handler. The constructor wires the three tuning values (TPDelay, hoverHeight, onGround) to their parent toggles with addParent so they only render in the UI when the matching mode is enabled."
     },
     {
       "h": "Packet rewriting and replay",
-      "p": "The modes reduce to three primitives. Inline mutation: Hover lifts y by hoverHeight, Spoof Ground forces the onGround flag to the On Ground setting, Void TP drops y by 1000 every TPDelay ticks. Type rewriting: C06->C04 converts a position-look into a plain position, dropping yaw and pitch, and C04->C06 re-attaches the client's current rotation. Cancel-and-replay buffering: Watchdog Timer parks C0F/C00 packets for 350ms and MMC parks them for 1000-1500ms, then flushes the buffer with PacketUtils.sendPacketNoEvent, which bypasses the event bus so the replay is not re-intercepted."
+      "p": "The modes reduce to three primitives. Inline mutation edits the packet before it hits the wire: Hover replaces the y of every position-carrying C03 with the player's real posY plus hoverHeight, Spoof Ground forces the onGround flag to the On Ground setting, and Void TP subtracts 1000 from the packet y every TPDelay ticks. Type rewriting swaps the packet object inside the event: C06->C04 rebuilds a position-look as a plain C04 position, dropping yaw and pitch, while C04->C06 attaches the client's current rotationYaw and rotationPitch to a plain position. Cancel-and-replay parks cancelled packets in a buffer and releases them later through PacketUtils.sendPacketNoEvent, which sends straight through the network manager with the silent flag so a replay never re-enters the PacketSendEvent hook that cancelled it in the first place."
     },
     {
       "h": "Anti-cheat targeting",
-      "p": "The Hypixel modes are gated by ServerUtils.isOnHypixel. Watchdog Strafe forces onGround and drops every 4th C03 while the Speed module is active and fall distance is under 1. Watchdog Timer cancels stationary C03 packets outright and delays transactions and keepalives to desync Watchdog's timer accounting. MMC and Omni Sprint both spoof a STOP_SPRINTING entity action when the server still thinks the player is sprinting, then cancel the original C0B so server-side sprint state stays false. Silent S08 cancels the server teleport and re-sends the position as C06 with onGround=false, so the client never snaps to the server position."
+      "p": "The Hypixel modes are gated by ServerUtils.isOnHypixel, which requires the server IP to contain 'hypixel' and the client brand to start with 'Hypixel BungeeCord'. Watchdog Strafe only acts while the Speed module is enabled and fallDistance is under 1: it forces onGround true, then cancels and buffers every C03 except on ticks where ticksExisted is a multiple of 4, where the whole buffer flushes at once, so the server sees movement in bursts instead of a steady stream. Watchdog Timer cancels stationary C03s outright (those with neither the moving nor the rotating flag set) and parks C0F transactions and C00 keepalives inside a 350ms window, flushing the backlog when the window elapses, while a 700ms spike timer keeps restarting that window. MMC and Omni Sprint cancel every C0B entity action, and when a START_SPRINTING arrives while EntityPlayerSP.serverSprintState says the server still believes the player is sprinting, they inject a STOP_SPRINTING first and clear the flag, so the server permanently tracks the player as not sprinting while the client sprints freely. Silent S08 cancels the server teleport and re-sends its position as a C06 with onGround=false, confirming the coordinates without the client-side snap. Verus and C0B Cancel are blanket cancels of C0F/C00 and C0B respectively, and C0C Spam pushes a fresh zeroed C0CPacketInput every tick."
     }
   ],
   "packets": [
@@ -26,301 +26,21 @@
     "C0FPacketConfirmTransaction",
     "S08PacketPlayerPosLook"
   ],
-  "annotations": [
+  "files": [
     {
-      "start": 1,
-      "end": 1,
-      "text": "Package declaration: the module lives in Tenacity's exploit package, grouped with the other anticheat-facing modules."
+      "label": "Disabler.java",
+      "rel": "dev/tenacity/module/impl/exploit/Disabler.java",
+      "explanation": "The module's entire behavior is selected by the 13 BooleanSettings inside the 'Disablers' MultipleBoolSetting; the settings carry no logic, they are dispatch keys. onMotionEvent, onPacketSendEvent and onPacketReceiveEvent each iterate disablers.getBoolSettings(), skip disabled toggles, and switch on booleanSetting.name, so renaming a toggle silently changes what the module does. The three tuning values (TPDelay, hoverHeight, onGround) are bound to their modes in the constructor with addParent, and the module suffix reflects how many toggles are enabled.\n\nonMotionEvent runs once per client tick. The MMC case flushes the packets buffer every 1000-1500ms via MathUtils.getRandomInRange with timer reset, so the replay cadence is randomized rather than fixed. The Watchdog Timer case resets the 350ms window timer every 700ms through spikeTimer, so the desync window keeps restarting. The C0C Spam case sends a fresh default C0CPacketInput through sendPacketNoEvent every tick; all four of its fields (strafeSpeed, forwardSpeed, jumping, sneaking) default to zero, which the server's processInput applies to the player's entity action state.\n\nonPacketSendEvent holds most of the logic. Watchdog Strafe, gated by ServerUtils.isOnHypixel, only acts while the Speed module is enabled and fallDistance is under 1: it forces the C03 onGround flag true, then cancels and buffers every C03 except on ticks where ticksExisted is a multiple of 4, at which point the backlog flushes in a burst, staggering the movement stream Watchdog samples. Watchdog Timer cancels C03s that are neither moving (the flag C04 and C06 set) nor rotating, and while the 350ms window has not elapsed it cancels and parks every C0F transaction and C00 keepalive, flushing them when the window elapses. MMC cancels every C0B: a START_SPRINTING is preceded by an injected STOP_SPRINTING whenever EntityPlayerSP.serverSprintState is true, and the flag is cleared, so the server's sprint state can never turn on; MMC also parks C0F and C00 packets in the packets buffer for the tick handler to flush. The generic transforms then rewrite or mutate C03 traffic: C06->C04 rebuilds position-look packets as plain positions, C04->C06 reattaches the current rotation, Hover raises the packet y by hoverHeight, Spoof Ground overwrites the onGround flag, Void TP subtracts 1000 from y every TPDelay ticks, and C0B Cancel and Verus blanket-cancel C0B or C0F/C00 packets with no replay.\n\nonPacketReceiveEvent handles one mode: Silent S08 cancels an incoming S08PacketPlayerPosLook and immediately re-sends the teleport coordinates as a C06 with onGround=false via sendPacketNoEvent, so the server's correction is confirmed without the client ever snapping to it. onWorldEvent clears the Watchdog Timer buffer and resets the timer on world change. The file also carries dead weight: isBlockUnder(), a downward collision scan over 2-block steps, is never called, and joinTimer, synced, watchdogInvPackets, s08Y, spiking and airTicks are declared but never used, leftovers from earlier iterations."
     },
     {
-      "start": 3,
-      "end": 21,
-      "text": "Client imports: the Tenacity singleton (to reach the module collection), the game and network event classes (WorldEvent, PacketReceiveEvent, PacketSendEvent, MotionEvent), the module base and Category, the Speed module (queried for the Watchdog Strafe mode), the settings framework (BooleanSetting, MultipleBoolSetting, NumberSetting), MathUtils for random delays, PacketUtils for event-bus-bypassing sends, ServerUtils for the Hypixel check, and TimerUtil for the delay timers. Several imports here are unused (CustomMainMenu, ChatUtil, MovementUtils, RotationUtils), leftovers from an earlier version."
+      "label": "PacketUtils.java",
+      "rel": "dev/tenacity/utils/server/PacketUtils.java",
+      "explanation": "PacketUtils is the send primitive every Disabler replay depends on. sendPacketNoEvent(Packet) calls sendPacket(packet, true), which routes through mc.getNetHandler().getNetworkManager().sendPacket(packet, silent). The silent boolean is the key: Tenacity's network layer fires PacketSendEvent for non-silent sends, so a silent send reaches the server without being offered back to the module's onPacketSendEvent handler. That is what makes the cancel-and-replay modes work: a packet cancelled from the event stream can be parked, then re-sent later without being cancelled or rewritten a second time.\n\nThe class is shared across the client. The non-silent overload sendPacket(Packet) goes through the event bus normally, and isPacketValid filters out handshake, login, status and ping packets that are not play-phase traffic. In Disabler all three flush paths (watchdogPlayerPackets, watchdogC0FC00Packets and packets) call sendPacketNoEvent, so every replay bypasses the module's own interception."
     },
     {
-      "start": 22,
-      "end": 32,
-      "text": "Minecraft imports: EntityPlayerSP for the server-side sprint state flag, Packet as the buffer element type, the whole net.minecraft.network.play.client wildcard (C00, C03 and its C04/C06 subclasses, C0B, C0C, C0F), S07PacketRespawn and S08PacketPlayerPosLook, Potion for the jump-potion check, AxisAlignedBB for the block-under scan, and PlayerCapabilities, GuiInventory, GuiConnecting and ChatComponentText, all unused here."
-    },
-    {
-      "start": 34,
-      "end": 37,
-      "text": "Java imports: ArrayList (unused, List and CopyOnWriteArrayList are what the fields use), List for the stream result, CopyOnWriteArrayList for the packet buffers (thread-safe because packets are added in the send handler and flushed from the tick handler), and Collectors for the stream terminal operation."
-    },
-    {
-      "start": 39,
-      "end": 39,
-      "text": "Class declaration: Disabler extends Module, Tenacity's module base. final because no subclass is intended. All behavior is driven by the settings and the three overridden event hooks."
-    },
-    {
-      "start": 41,
-      "end": 54,
-      "text": "The disablers setting: a MultipleBoolSetting named 'Disablers' holding all 13 toggles as individual BooleanSettings, all off by default. The names are the dispatch keys used by every switch in the class, so renaming a setting here silently breaks the mode. The list mixes server-targeted modes (Watchdog Strafe, Watchdog Timer, MMC, Verus) with generic packet transforms (C06->C04, C04->C06, Hover, Spoof Ground, C0B Cancel, C0C Spam, Omni Sprint, Void TP, Silent S08)."
-    },
-    {
-      "start": 56,
-      "end": 56,
-      "text": "hoverHeight NumberSetting: the offset applied to the player's y by the Hover mode. Range 0.1 to 5 blocks, default 0.01, increment 0.01."
-    },
-    {
-      "start": 58,
-      "end": 58,
-      "text": "onGround BooleanSetting: the value that Spoof Ground forces into every C03's onGround flag, default true. A single shared value rather than a per-mode copy."
-    },
-    {
-      "start": 60,
-      "end": 60,
-      "text": "TPDelay NumberSetting: how many ticks apart the Void TP y-drops fire. Range 5 to 100 ticks, default 20, increment 1."
-    },
-    {
-      "start": 62,
-      "end": 62,
-      "text": "timer is the flush clock for the MMC and Watchdog Timer buffers, reset on world change. joinTimer is declared but never used anywhere in this file; dead field from an earlier iteration."
-    },
-    {
-      "start": 64,
-      "end": 64,
-      "text": "synced flag: never read or written anywhere in this file. Dead code left over from an older desync approach."
-    },
-    {
-      "start": 66,
-      "end": 66,
-      "text": "Three CopyOnWriteArrayList buffers: watchdogPlayerPackets holds C03 packets dropped by Watchdog Strafe, watchdogC0FC00Packets holds C0F/C00 packets parked by Watchdog Timer, watchdogInvPackets is never touched in this file (reserved for an inventory-desync mode that was never finished)."
-    },
-    {
-      "start": 68,
-      "end": 68,
-      "text": "packets: the generic buffer used by the MMC mode to park cancelled C0F/C00 packets until the flush interval in onMotionEvent."
-    },
-    {
-      "start": 70,
-      "end": 70,
-      "text": "s08Y: never written or read in this file. Dead field from an earlier Silent S08 implementation."
-    },
-    {
-      "start": 72,
-      "end": 72,
-      "text": "spiking: public static flag, never assigned here. It is exposed for other modules in the client to read or set; nothing in this file drives it."
-    },
-    {
-      "start": 73,
-      "end": 73,
-      "text": "spikeTimer: public static timer used by the Watchdog Timer mode in onMotionEvent to pace its 700ms spike window."
-    },
-    {
-      "start": 75,
-      "end": 75,
-      "text": "airTicks counter: never incremented in this file. Dead field."
-    },
-    {
-      "start": 77,
-      "end": 83,
-      "text": "Constructor: registers the module under the name 'Disabler' in Category.EXPLOIT with the description 'Disables some anticheats', then wires three parent settings. TPDelay only shows when Void TP is on, hoverHeight only when Hover is on, onGround only when Spoof Ground is on. addSettings registers the visible settings with the module."
-    },
-    {
-      "start": 85,
-      "end": 87,
-      "text": "onMotionEvent override: fires every client tick. It first collects the enabled toggles into a list via a stream filter; the list is used for the module suffix and is discarded."
-    },
-    {
-      "start": 90,
-      "end": 96,
-      "text": "Suffix logic for the module list UI: one enabled toggle shows its name, multiple show 'N Enabled', none shows 'None'. Purely cosmetic, but it tells the user which bypass is live."
-    },
-    {
-      "start": 98,
-      "end": 100,
-      "text": "Iterates every BooleanSetting in the disablers group and switches on its name. This is the tick-side dispatch: only MMC, Watchdog Timer and C0C Spam have tick behavior."
-    },
-    {
-      "start": 101,
-      "end": 106,
-      "text": "MMC flush: every 1000-1500ms (randomized per cycle via MathUtils.getRandomInRange with reset-on-elapse), everything parked in the packets buffer is flushed with sendPacketNoEvent and the buffer clears. The random window makes the replay pattern look irregular to the anticheat instead of a fixed interval."
-    },
-    {
-      "start": 107,
-      "end": 111,
-      "text": "Watchdog Timer spike: when spikeTimer elapses 700ms, timer resets. The 700ms timer only exists to force the main timer's 350ms window to restart on a cadence that keeps Watchdog from accumulating a consistent delay."
-    },
-    {
-      "start": 112,
-      "end": 114,
-      "text": "C0C Spam: sends a fresh C0CPacketInput every tick with sendPacketNoEvent. Flooding the server with input packets keeps the player's inputs active in server-side movement prediction, which some checks use as a flag for 'is actually moving'."
-    },
-    {
-      "start": 115,
-      "end": 118,
-      "text": "Closes the switch, the enabled check, the settings loop and the method."
-    },
-    {
-      "start": 120,
-      "end": 122,
-      "text": "onPacketSendEvent override: the main interception point for serverbound packets. The null check skips the handler before the player entity exists (login screen, connecting)."
-    },
-    {
-      "start": 123,
-      "end": 125,
-      "text": "Second dispatch loop: same pattern as the tick handler, iterating enabled settings and switching on the name. Every mode here is a send-side transform."
-    },
-    {
-      "start": 126,
-      "end": 141,
-      "text": "Watchdog Strafe: Hypixel-only, and only touches C03 packets while the player does not have jump boost. With the Speed module on and fallDistance under 1, it forces onGround true (so Watchdog's flight check sees grounded movement), then drops every 4th packet into watchdogPlayerPackets (cancelling it) unless the buffer already has entries, in which case the whole buffer flushes and clears. The result is a delayed, staggered movement stream that keeps the server's position estimate behind the client."
-    },
-    {
-      "start": 142,
-      "end": 142,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 143,
-      "end": 161,
-      "text": "Watchdog Timer: Hypixel-only. Stationary C03 packets (no movement, no rotation) are cancelled outright, because Watchdog derives timer violations from the rate of position updates and a standing player needs none. Then, while the 350ms window has not elapsed, every C0F transaction and C00 keepalive is cancelled and parked in watchdogC0FC00Packets; when the window elapses the parked packets flush at once. The server sees all its confirmations arrive, just bursty, so its transaction and keepalive timers never see a true gap."
-    },
-    {
-      "start": 162,
-      "end": 162,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 163,
-      "end": 169,
-      "text": "Void TP: every TPDelay ticks, the outgoing C03's y is lowered by 1000. The server sees a massive fall and sends a teleport back; combined with the other modes this desynchronizes position-based checks, and the client ignores the snap depending on Silent S08."
-    },
-    {
-      "start": 170,
-      "end": 170,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 171,
-      "end": 181,
-      "text": "MMC send-side: every C0B entity action is cancelled. For START_SPRINTING specifically, if the server-side sprint state flag says the server still thinks the player is sprinting, a STOP_SPRINTING action is sent first and the flag is cleared, so the server transitions to not-sprinting before the cancel. This keeps the server's sprint state in sync while still eating the packet."
-    },
-    {
-      "start": 183,
-      "end": 186,
-      "text": "MMC buffer: C0F transactions and C00 keepalives are cancelled and parked in the packets buffer instead of reaching the server. onMotionEvent flushes them 1000-1500ms later."
-    },
-    {
-      "start": 187,
-      "end": 187,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 188,
-      "end": 192,
-      "text": "C06->C04: replaces every outgoing C06 position-look with a C04 plain position carrying the same coordinates and onGround flag. Yaw and pitch are dropped, so the server stops receiving rotation updates with positions, which some movement checks (or server-side anti-rotation checks) key on."
-    },
-    {
-      "start": 193,
-      "end": 193,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 194,
-      "end": 198,
-      "text": "C04->C06: the inverse transform, converting plain positions into position-look by attaching the client's current yaw and pitch. Used to make the server think every movement carries rotation data, which other bypasses (for example against checks that flag missing rotations) rely on."
-    },
-    {
-      "start": 199,
-      "end": 199,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 200,
-      "end": 204,
-      "text": "Hover: every C03's y is replaced with the player's current y plus hoverHeight, so the server believes the player floats at a fixed offset above the real position. The gap lets the client fall or move under the server's view."
-    },
-    {
-      "start": 205,
-      "end": 205,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 206,
-      "end": 210,
-      "text": "Spoof Ground: forces the onGround flag of every C03 to the configured On Ground value, overriding whatever the vanilla movement code computed. Lets the client claim to be on the ground while airborne or vice versa."
-    },
-    {
-      "start": 211,
-      "end": 211,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 212,
-      "end": 213,
-      "text": "C0B Cancel: blanket-cancels every C0B entity action, so the server never learns about sprint, sneak or other entity-state changes."
-    },
-    {
-      "start": 214,
-      "end": 214,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 215,
-      "end": 216,
-      "text": "Verus: blanket-cancels C0F transactions and C00 keepalives with no echo or replay. A blunt kill switch for Verus's transaction and keepalive based checks, relying on the server never timing out."
-    },
-    {
-      "start": 217,
-      "end": 217,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 218,
-      "end": 228,
-      "text": "Omni Sprint: identical logic to the MMC C0B handling. Every entity action is cancelled, and a START_SPRINTING is pre-empted by a STOP_SPRINTING when the server-side flag says the server still believes the player is sprinting, clearing the flag. Keeping the server's sprint state false means the client can sprint visually in any direction while the server measures walk-speed movement."
-    },
-    {
-      "start": 229,
-      "end": 229,
-      "text": "Break out of the switch for this setting."
-    },
-    {
-      "start": 230,
-      "end": 232,
-      "text": "Closes the switch, the enabled check, the settings loop and the method."
-    },
-    {
-      "start": 235,
-      "end": 236,
-      "text": "onPacketReceiveEvent override: fires for every packet arriving from the server. Only the Silent S08 mode handles receive-side traffic."
-    },
-    {
-      "start": 237,
-      "end": 239,
-      "text": "Third dispatch loop over the enabled settings, same pattern as the send and tick handlers."
-    },
-    {
-      "start": 240,
-      "end": 245,
-      "text": "Silent S08: when the server sends an S08 teleport, the packet is cancelled and the teleport is re-sent to the server as a C06 position-look with the same x/y/z and yaw/pitch but onGround=false. The client never processes the teleport, so it keeps its own position and the server's position is confirmed back to it without the client-side snap. Sending via sendPacketNoEvent avoids re-entering the receive path."
-    },
-    {
-      "start": 246,
-      "end": 250,
-      "text": "Closes the switch, the enabled check, the settings loop and the method."
-    },
-    {
-      "start": 252,
-      "end": 253,
-      "text": "isBlockUnder helper: returns false immediately if the player is below y=0. The scan walks the space below the player."
-    },
-    {
-      "start": 254,
-      "end": 261,
-      "text": "The scan: steps a collision box downward in 2-block increments from the player's feet to just past the player's y, checking world collisions at each step. Any collision means there is ground below, and the loop returns true at the first hit; otherwise false. This helper is never called anywhere in this file, so it is dead code here, presumably kept for a mode that was cut."
-    },
-    {
-      "start": 263,
-      "end": 267,
-      "text": "onWorldEvent override: fires on world change (join, respawn). It clears the Watchdog Timer buffer and resets the timer, so no stale parked transactions or keepalives from the previous world get flushed into the new connection where they would desync the fresh server state."
-    },
-    {
-      "start": 268,
-      "end": 268,
-      "text": "Closing brace of the class."
+      "label": "ServerUtils.java",
+      "rel": "dev/tenacity/utils/server/ServerUtils.java",
+      "explanation": "ServerUtils.isOnHypixel() gates both Watchdog modes. It first rejects singleplayer and missing ServerData, then requires the server IP string to contain 'hypixel'. Once the player entity exists it goes further: the server's brand, read from getClientBrand and populated by the server's plugin channel, must start with 'Hypixel BungeeCord'. The check therefore rules out lookalike servers that merely have 'hypixel' in their address, so the Watchdog bypasses only engage against a genuine Hypixel proxy.\n\nThe class also holds helpers the rest of the client uses elsewhere: serverCheck matches an IP suffix, isGeniuneHypixel combines the brand check with a hosts-file redirect flag, and isInLobby scans loaded entities for Hypixel's CLICK TO PLAY NPC. None of those are used by Disabler, which only ever calls isOnHypixel."
     }
   ]
 }

@@ -98,20 +98,30 @@ if os.path.isdir(an_data):
             errors.append("%s: no code viewer rows" % slug)
         if "highlight.min.js" not in ph or "github-dark.min.css" not in ph:
             errors.append("%s: highlight.js assets missing" % slug)
-        if "Line-by-Line Annotations" not in ph:
-            errors.append("%s: missing annotations section" % slug)
-        # every non-blank non-brace line must be annotated
-        src = open(os.path.join(
-            os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "sources")),
-            data["client"], data["source_rel"]), encoding="utf-8", errors="replace").read().split("\n")
-        covered = set()
-        for a in data["annotations"]:
-            for ln in range(a["start"], a["end"] + 1):
-                covered.add(ln)
-        miss = [i + 1 for i, l in enumerate(src)
-                if (i + 1) not in covered and l.strip() and l.strip() not in ("{", "}")]
-        if miss:
-            errors.append("%s: %d lines without annotations (first: %s)" % (slug, len(miss), miss[:8]))
+        if "What this file does" not in ph:
+            errors.append("%s: missing file explanations" % slug)
+        # every declared file must appear as its own viewer with an explanation
+        files = data.get("files", [])
+        if data.get("source_rel") and not any(f["rel"] == data["source_rel"] for f in files):
+            files = [{"rel": data["source_rel"]}] + files
+        for f in files:
+            if not f.get("explanation") or len(f["explanation"]) < 60:
+                errors.append("%s: file '%s' missing real explanation" % (slug, f["rel"]))
+            src = open(os.path.join(
+                os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "sources")),
+                data["client"], f["rel"]), encoding="utf-8", errors="replace").read()
+            # the page renders each code line HTML-escaped inside its own row, so
+            # verify per-line escaped presence rather than a raw whole-file substring
+            def esc(s):
+                return (s.replace("&", "&amp;").replace("<", "&lt;")
+                         .replace(">", "&gt;").replace('"', "&quot;"))
+            missing_lines = [l for l in src.rstrip("\n").split("\n")
+                             if l.strip() and esc(l) not in ph]
+            if missing_lines:
+                errors.append("%s: file '%s' code not present in page (%d lines missing)"
+                              % (slug, f["rel"], len(missing_lines)))
+        if "annotation" in json.dumps(data).lower():
+            errors.append("%s: stale annotation fields present" % slug)
     for asset in ["analysis/assets/highlight.min.js", "analysis/assets/github-dark.min.css"]:
         if not os.path.exists(os.path.join(BASE, asset)):
             errors.append("missing %s" % asset)

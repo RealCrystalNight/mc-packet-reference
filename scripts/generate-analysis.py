@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """generate-analysis.py — build GitHub-style module analysis pages.
 
-Reads data/analysis/<slug>.json (prose + line annotations), cats the real
-module source from the sources root at build time, and emits
-analysis/<category>/<slug>.html with:
+Reads data/analysis/<slug>.json:
 
-  - full working sidebar (packet reference + module index + all analyses)
-  - analysis prose (overview + sections)
-  - GitHub-style code viewer: line numbers, highlight.js java dark theme,
-    inline annotation markers, copy button
-  - line-by-line annotations below the box (every line covered)
+  {
+    "module": "Disabler", "client": "Rise 6.0", "category": "disabler",
+    "source_rel": ".../Disabler.java",          # optional main file
+    "overview": "...", "sections": [{"h","p"}], "packets": [...],
+    "files": [
+      {"label": "Disabler.java (mode selector)",
+       "rel": "com/alan/clients/module/impl/exploit/Disabler.java",
+       "explanation": "What this file does, accurately."},
+      ...
+    ]
+  }
 
-Also regenerates analysis/index.html and analysis/<category>/index.html hubs.
+Each entry in "files" is rendered as its own FULL-SOURCE code box (line
+numbers, highlight.js java dark theme, copy button) with its explanation in
+a new section BELOW the box. No per-line annotations.
 
 Usage:
-  python3 scripts/generate-analysis.py            # all analyses
-  python3 scripts/generate-analysis.py gugustus-disabler   # one slug
-  SOURCES_ROOT=/path python3 scripts/generate-analysis.py
+  python3 scripts/generate-analysis.py            # all
+  python3 scripts/generate-analysis.py <slug>     # one
 """
 import json
 import os
-import re
 import sys
 import urllib.parse
 
@@ -56,17 +60,21 @@ def load_analyses(targets=None):
             continue
         a = json.load(open(data_file))
         a["slug"] = slug
-        a["source_path"] = os.path.join(SOURCES_ROOT, a["client"], a["source_rel"])
-        with open(a["source_path"], encoding="utf-8", errors="replace") as f:
-            a["code"] = f.read()
-        a["lines"] = a["code"].count("\n") + (0 if a["code"].endswith("\n") else 1)
-        a["gh_url"] = gh_url(a["client"], a["source_rel"])
+        a["files"] = a.get("files", [])
+        if a.get("source_rel") and not any(f["rel"] == a["source_rel"] for f in a["files"]):
+            a["files"].insert(0, {"label": a["module"] + ".java", "rel": a["source_rel"],
+                                  "explanation": a.get("file_explanation", "")})
+        for f in a["files"]:
+            f["path"] = os.path.join(SOURCES_ROOT, a["client"], f["rel"])
+            with open(f["path"], encoding="utf-8", errors="replace") as fh:
+                f["code"] = fh.read()
+            f["lines"] = f["code"].count("\n") + (0 if f["code"].endswith("\n") else 1)
+            f["gh_url"] = gh_url(a["client"], f["rel"])
         out.append(a)
     return out
 
 
 def build_sidebar(analyses, active_slug, mode="page"):
-    """mode='page' -> analysis/<cat>/<slug>.html (sibling links); mode='hub' -> analysis/index.html."""
     parts = ['<nav class="sidebar-nav" id="sidebarNav">']
     if mode == "page":
         site_root, modules_href, hub_href = "../../", "../../modules/", "../"
@@ -82,6 +90,10 @@ def build_sidebar(analyses, active_slug, mode="page"):
     cats = {}
     for a in analyses:
         cats.setdefault(a["category"], []).append(a)
+    active_cat = None
+    for a in analyses:
+        if a["slug"] == active_slug:
+            active_cat = a["category"]
     for cat in sorted(cats):
         items = cats[cat]
         parts.append('<div class="nav-section"><div class="nav-section-header" role="button" tabindex="0">'
@@ -93,7 +105,7 @@ def build_sidebar(analyses, active_slug, mode="page"):
             if a["slug"] == active_slug:
                 rel = ""
             else:
-                rel = ("" if mode == "page" and a["category"] == active_cat_of(active_slug, analyses) else cat_prefix(a["category"])) + a["slug"] + ".html"
+                rel = ("" if mode == "page" and a["category"] == active_cat else cat_prefix(a["category"])) + a["slug"] + ".html"
             parts.append('<a href="' + rel + '" class="nav-item' + active + '">'
                          '<span class="nav-hex">ANA</span>'
                          '<span class="nav-name">' + esc(a["client"]) + ' ' + esc(a["module"]) + '</span></a>')
@@ -102,54 +114,33 @@ def build_sidebar(analyses, active_slug, mode="page"):
     return "\n".join(parts)
 
 
-def active_cat_of(slug, analyses):
-    for a in analyses:
-        if a["slug"] == slug:
-            return a["category"]
-    return None
+def render_prose(s):
+    """Multi-paragraph prose -> <p> blocks (no per-line anything)."""
+    return "".join("<p>%s</p>" % esc(p.strip()) for p in s.split("\n\n") if p.strip())
 
 
-def render_annotations_table(a):
+def render_viewer(f):
     rows = []
-    for ann in a["annotations"]:
-        lines = a["code"].split("\n")
-        snippet = " / ".join(lines[i - 1].strip() for i in range(ann["start"], ann["end"] + 1) if i - 1 < len(lines))
-        if len(snippet) > 110:
-            snippet = snippet[:110] + " ..."
-        label = "L%d" % ann["start"] if ann["start"] == ann["end"] else "L%d-%d" % (ann["start"], ann["end"])
-        rows.append('<div class="ann-entry">'
-                    '<div class="ann-head"><button class="ann-line" data-line="%d">%s</button>'
-                    '<code class="ann-snippet">%s</code></div>'
-                    '<div class="ann-text">%s</div></div>'
-                    % (ann["start"], label, esc(snippet), ann["text"]))
-    return "\n".join(rows)
-
-
-def render_viewer(a):
-    """GitHub-style viewer: toolbar + line table + markers. Code is highlighted
-    by highlight.js at load time; the generator splits pre-highlighted lines."""
-    rows = []
-    code = a["code"].rstrip("\n")
-    lines = code.split("\n")
-    ann_by_line = {}
-    for ann in a["annotations"]:
-        ann_by_line.setdefault(ann["start"], ann)
+    lines = f["code"].rstrip("\n").split("\n")
     for i, line in enumerate(lines, 1):
-        ann = ann_by_line.get(i)
-        marker = '<span class="cv-mark" data-line="%d" title="View annotation">+</span>' % i if ann else ""
         rows.append('<tr class="cv-row" data-line="%d">'
-                    '<td class="cv-ln"><span class="cv-num">%d</span>%s</td>'
+                    '<td class="cv-ln"><span class="cv-num">%d</span></td>'
                     '<td class="cv-code"><pre><code>%s</code></pre></td></tr>'
-                    % (i, i, marker, esc(line)))
+                    % (i, i, esc(line)))
+    # raw source kept verbatim (hidden) so the site check can verify the full
+    # file made it into the page; <textarea> content is RCDATA, so Java code
+    # cannot break out of it
+    raw = '<textarea class="cv-raw" hidden>%s</textarea>' % f["code"].rstrip("\n")
     return ('<div class="code-viewer" id="codeViewer">'
             '<div class="cv-toolbar">'
-            '<span class="cv-file">' + esc(a["source_rel"].split("/")[-1]) + '</span>'
-            '<span class="cv-meta">' + str(a["lines"]) + ' lines \u00b7 Java</span>'
-            '<button class="cv-copy" id="copyBtn">Copy</button>'
-            '<a class="cv-link" href="' + a["gh_url"] + '" target="_blank" rel="noopener">Original \u2197</a>'
+            '<span class="cv-file">' + esc(f["rel"].split("/")[-1]) + '</span>'
+            '<span class="cv-meta">' + str(f["lines"]) + ' lines \u00b7 Java</span>'
+            '<button class="cv-copy" data-copy="%d">Copy</button>'
+            '<a class="cv-link" href="' + f["gh_url"] + '" target="_blank" rel="noopener">Original \u2197</a>'
             '</div>'
             '<div class="cv-body"><table class="cv-table" id="cvTable">' + "\n".join(rows) + '</table></div>'
-            '</div>')
+            + raw
+            + '</div>')
 
 
 def render_page(a, analyses):
@@ -159,8 +150,17 @@ def render_page(a, analyses):
     if a.get("packets"):
         chips = "".join('<a class="related-chip" href="../../packets/%s/">%s</a>' % (p, p) for p in a["packets"])
         packets_html = '<div class="detail-section"><h3>Packets This Module Uses</h3><div class="related-list">' + chips + '</div></div>'
-    sections_html = "".join('<h4>' + esc(s["h"]) + '</h4><p>' + s["p"] + '</p>' for s in a.get("sections", []))
-    ann_json = json.dumps(a["annotations"])
+    sections_html = "".join('<h4>' + esc(s["h"]) + '</h4>' + render_prose(s["p"]) for s in a.get("sections", []))
+    total_lines = sum(f["lines"] for f in a["files"])
+    # every file box: viewer + explanation section below the code
+    file_blocks = []
+    for f in a["files"]:
+        file_blocks.append('<div class="detail-section file-section">'
+                           '<h3><span class="file-badge">source</span> ' + esc(f["label"]) + '</h3>'
+                           + render_viewer(f) +
+                           (('<h4>What this file does</h4>' + render_prose(f["explanation"])) if f.get("explanation") else "")
+                           + '</div>')
+    files_html = "\n".join(file_blocks)
     return """<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -186,10 +186,12 @@ def render_page(a, analyses):
 {"@context":"https://schema.org","@type":"TechArticle","headline":"%s %s \u2014 Full Source Analysis","description":"%s","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"%s/analysis/%s/%s.html"},"author":{"@type":"Organization","name":"MC Packet Reference"},"publisher":{"@type":"Organization","name":"MC Packet Reference"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"}}
 </script>
 <style>
-/* analysis page specific styles */
 .analysis-body h4 { font-size:0.82rem; font-weight:600; color:var(--text-primary); margin:18px 0 6px; text-transform:uppercase; letter-spacing:0.04em; }
 .analysis-body p { font-size:0.88rem; color:var(--text-secondary); line-height:1.7; margin-bottom:10px; }
-.code-viewer { border:1px solid var(--border); border-radius:var(--radius-sm); overflow:hidden; margin:16px 0; background:#0d1117; }
+.file-section h4 { font-size:0.82rem; font-weight:600; color:var(--accent); margin:14px 0 6px; text-transform:uppercase; letter-spacing:0.04em; }
+.file-section p { font-size:0.87rem; color:var(--text-secondary); line-height:1.7; margin-bottom:10px; }
+.file-badge { font-size:0.6rem; background:var(--accent-dim); color:var(--accent); padding:1px 6px; border-radius:4px; font-weight:600; text-transform:uppercase; vertical-align:middle; }
+.code-viewer { border:1px solid var(--border); border-radius:var(--radius-sm); overflow:hidden; margin:12px 0; background:#0d1117; }
 .cv-toolbar { display:flex; align-items:center; gap:12px; padding:8px 14px; background:#161b22; border-bottom:1px solid var(--border); font-size:0.78rem; }
 .cv-file { font-family:var(--font-mono); color:var(--text-primary); font-weight:600; }
 .cv-meta { color:var(--text-muted); }
@@ -198,24 +200,12 @@ def render_page(a, analyses):
 .cv-link { color:var(--accent); text-decoration:none; font-size:0.72rem; }
 .cv-body { max-height:640px; overflow:auto; }
 .cv-table { width:100%%; border-collapse:collapse; font-family:var(--font-mono); font-size:0.76rem; line-height:1.55; }
-.cv-table .cv-ln { width:64px; text-align:right; padding:0 10px 0 0; color:#484f58; background:#0d1117; border-right:1px solid #21262d; user-select:none; white-space:nowrap; vertical-align:top; }
+.cv-table .cv-ln { width:48px; text-align:right; padding:0 10px 0 0; color:#484f58; background:#0d1117; border-right:1px solid #21262d; user-select:none; white-space:nowrap; vertical-align:top; }
 .cv-table .cv-num { display:inline-block; width:28px; text-align:right; }
-.cv-mark { display:inline-block; width:16px; height:16px; line-height:14px; margin-left:6px; text-align:center; border-radius:3px; background:#21262d; color:#8b949e; font-size:0.7rem; font-weight:700; cursor:pointer; }
-.cv-mark:hover, .cv-mark.open { background:var(--accent); color:#fff; }
 .cv-table .cv-code { padding:0 14px; vertical-align:top; }
 .cv-table .cv-code pre { margin:0; background:transparent; }
 .cv-table .cv-code code { background:transparent; padding:0; font-size:inherit; color:var(--text-primary); }
 .cv-table .cv-code .hljs { background:transparent; padding:0; }
-tr.cv-ann { background:rgba(59,130,246,0.08); }
-tr.cv-ann td { box-shadow: inset 3px 0 0 var(--accent); }
-.cv-bubble { background:#161b22; border:1px solid var(--accent); border-radius:6px; padding:10px 14px; font-family:var(--font-sans); font-size:0.8rem; color:var(--text-secondary); line-height:1.6; margin:6px 0; }
-.cv-bubble strong { color:var(--accent); font-family:var(--font-mono); font-size:0.72rem; }
-.ann-entry { background:var(--bg-secondary); border:1px solid var(--border); border-left:3px solid var(--accent); border-radius:var(--radius-sm); padding:10px 14px; margin-bottom:10px; }
-.ann-head { display:flex; align-items:baseline; gap:10px; margin-bottom:4px; flex-wrap:wrap; }
-.ann-line { font-family:var(--font-mono); font-size:0.7rem; color:var(--accent); background:var(--accent-dim); border:none; border-radius:4px; padding:1px 8px; cursor:pointer; }
-.ann-line:hover { background:var(--accent); color:#fff; }
-.ann-snippet { font-size:0.72rem; color:var(--text-muted); }
-.ann-text { font-size:0.82rem; color:var(--text-secondary); line-height:1.65; }
 </style>
 </head>
 <body>
@@ -234,13 +224,12 @@ tr.cv-ann td { box-shadow: inset 3px 0 0 var(--accent); }
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap">
         <span class="badge state">%s</span>
         <span class="badge dir-sb">%s module</span>
+        <span class="badge" style="background:var(--bg-tertiary);color:var(--text-muted)">%d files, %d lines</span>
       </div>
       <h1>%s \u2014 Full Source Analysis</h1>
       <p class="detail-desc">%s</p>
       <div class="detail-meta">
         <span class="meta-mcp">%s</span>
-        <span class="meta-sep">\u00b7</span>
-        <span class="meta-mcp">%d lines</span>
         <span class="meta-sep">\u00b7</span>
         <a class="meta-mcp" style="color:var(--accent)" href="%s" target="_blank" rel="noopener">GitHub source \u2197</a>
       </div>
@@ -248,18 +237,10 @@ tr.cv-ann td { box-shadow: inset 3px 0 0 var(--accent); }
     %s
     <div class="detail-section analysis-body">
       <h3>Analysis</h3>
-      <h4>Overview</h4><p>%s</p>
+      <h4>Overview</h4>%s
       %s
     </div>
-    <div class="detail-section">
-      <h3>Full Source</h3>
-      %s
-    </div>
-    <div class="detail-section">
-      <h3>Line-by-Line Annotations</h3>
-      <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:12px">Every line of the module, annotated. Click a line number to jump to it in the source viewer above.</p>
-      %s
-    </div>
+    %s
     <div style="margin-top:32px;text-align:center">
       <a href="../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to Analysis Hub</a>
     </div>
@@ -268,54 +249,27 @@ tr.cv-ann td { box-shadow: inset 3px 0 0 var(--accent); }
 <script src="../assets/highlight.min.js"></script>
 <script>
 (function() {
-  var ANN = %s;
-  // highlight + split into rows
-  var table = document.getElementById('cvTable');
-  var rows = table.querySelectorAll('tr.cv-row');
-  var texts = [];
-  rows.forEach(function(r) { texts.push(r.querySelector('code').textContent); });
-  var src = texts.join('\\n');
-  var hl = hljs.highlight(src, {language: 'java'}).value.split('\\n');
-  rows.forEach(function(r, i) { r.querySelector('code').innerHTML = hl[i] || ''; });
-  // annotation markers
-  function annForLine(n) { for (var i = 0; i < ANN.length; i++) if (ANN[i].start === n) return ANN[i]; return null; }
-  function clearBubbles() { document.querySelectorAll('.cv-bubble').forEach(function(b) { b.remove(); }); rows.forEach(function(r) { r.classList.remove('cv-ann'); }); document.querySelectorAll('.cv-mark.open').forEach(function(m) { m.classList.remove('open'); }); }
-  function openAnn(n, scroll) {
-    clearBubbles();
-    var ann = annForLine(n); if (!ann) return;
-    var row = table.querySelector('tr[data-line="%%d"'.replace('%%d', n) + ']');
-    if (!row) return;
-    row.classList.add('cv-ann');
-    var mark = row.querySelector('.cv-mark'); if (mark) mark.classList.add('open');
-    var bubble = document.createElement('div');
-    bubble.className = 'cv-bubble';
-    bubble.innerHTML = '<strong>' + (ann.start === ann.end ? 'L' + ann.start : 'L' + ann.start + '-' + ann.end) + '</strong> ' + ann.text;
-    row.insertAdjacentElement('afterend', bubble);
-    if (scroll) {
-      row.scrollIntoView({block: 'center', behavior: 'smooth'});
-      var body = document.querySelector('.cv-body');
-      var top = body.getBoundingClientRect().top;
-      window.scrollBy(0, top - 80 < 0 ? top - 80 : 0);
-    }
-  }
-  table.addEventListener('click', function(e) {
-    var mark = e.target.closest('.cv-mark');
-    if (mark) { openAnn(parseInt(mark.dataset.line, 10), true); }
+  // highlight each code box
+  document.querySelectorAll('.cv-table').forEach(function(table) {
+    var rows = table.querySelectorAll('tr.cv-row');
+    var texts = [];
+    rows.forEach(function(r) { texts.push(r.querySelector('code').textContent); });
+    var src = texts.join('\\n');
+    var hl = hljs.highlight(src, {language: 'java'}).value.split('\\n');
+    rows.forEach(function(r, i) { r.querySelector('code').innerHTML = hl[i] || ''; });
+    table.dataset.src = src;
   });
-  document.querySelectorAll('.ann-line').forEach(function(b) {
-    b.addEventListener('click', function() {
-      var n = parseInt(b.dataset.line, 10);
-      openAnn(n, true);
-      var viewer = document.getElementById('codeViewer');
-      viewer.scrollIntoView({block: 'start', behavior: 'smooth'});
+  // copy buttons
+  document.querySelectorAll('.cv-copy').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var table = btn.closest('.code-viewer').querySelector('.cv-table');
+      var t = document.createElement('textarea');
+      t.value = table.dataset.src || '';
+      document.body.appendChild(t); t.select();
+      try { document.execCommand('copy'); btn.textContent = 'Copied!'; } catch (e) {}
+      document.body.removeChild(t);
+      var b = btn; setTimeout(function() { b.textContent = 'Copy'; }, 1500);
     });
-  });
-  document.getElementById('copyBtn').addEventListener('click', function() {
-    var t = document.createElement('textarea');
-    t.value = src; document.body.appendChild(t); t.select();
-    try { document.execCommand('copy'); this.textContent = 'Copied!'; } catch (e) {}
-    document.body.removeChild(t);
-    var btn = this; setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
   });
   // sidebar collapse toggles
   document.querySelectorAll('.nav-section-header').forEach(function(h) {
@@ -334,13 +288,12 @@ tr.cv-ann td { box-shadow: inset 3px 0 0 var(--accent); }
         SITE, a["category"], a["slug"],
         sidebar,
         esc(a["client"]), esc(a["module"]),
+        len(a["files"]), total_lines,
         esc(a["client"] + " " + a["module"]), esc(a["overview"]),
-        esc(a["source_rel"]), a["lines"], a["gh_url"],
+        esc(a["files"][0]["rel"]) if a["files"] else "", a["files"][0]["gh_url"] if a["files"] else "#",
         packets_html,
-        esc(a["overview"]), sections_html,
-        render_viewer(a),
-        render_annotations_table(a),
-        ann_json,
+        render_prose(a["overview"]), sections_html,
+        files_html,
     )
 
 
@@ -355,10 +308,10 @@ def render_hub(analyses):
             cards.append('<div class="analysis-card">'
                          '<h3><a href="' + a["category"] + '/' + a["slug"] + '.html">' + esc(a["client"]) + ' \u2014 ' + esc(a["module"]) + '</a></h3>'
                          '<div class="meta"><span class="badge state">' + esc(a["client"]) + '</span><span class="badge dir-sb">' + esc(a["module"]) + '</span>'
-                         '<span>' + str(a["lines"]) + ' lines</span></div>'
+                         '<span>' + str(len(a["files"])) + ' files \u00b7 ' + str(sum(f["lines"] for f in a["files"])) + ' lines</span></div>'
                          '<p class="desc">' + esc(a["overview"][:200]) + '</p>'
                          '<div class="packets">' + "".join('<span class="badge" style="background:var(--accent-dim);color:var(--accent)">' + p + '</span>' for p in (a.get("packets") or [])[:6]) + '</div>'
-                         '<p class="src-link" style="margin-top:8px"><a href="' + a["gh_url"] + '" target="_blank" rel="noopener">GitHub source \u2197</a></p>'
+                         '<p class="src-link" style="margin-top:8px"><a href="' + a["files"][0]["gh_url"] + '" target="_blank" rel="noopener">GitHub source \u2197</a></p>'
                          '</div>')
         cards.append('</div>')
     return "\n".join(cards)
@@ -370,88 +323,16 @@ def main():
     if not analyses:
         print("no analyses matched", file=sys.stderr)
         sys.exit(1)
-
     all_analyses = load_analyses()
     for a in analyses:
-        # coverage check: every non-blank line annotated
-        covered = set()
-        for ann in a["annotations"]:
-            for ln in range(ann["start"], ann["end"] + 1):
-                covered.add(ln)
-        code_lines = a["code"].split("\n")
-        missing = [ln for ln in range(1, a["lines"] + 1)
-                   if ln not in covered and code_lines[ln - 1].strip()
-                   and code_lines[ln - 1].strip() not in ("{", "}")]
-        if missing:
-            print("WARN %s: lines without annotations: %s" % (a["slug"], missing[:20]))
         out_dir = os.path.join(OUT, a["category"])
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, a["slug"] + ".html"), "w", encoding="utf-8") as f:
             f.write(render_page(a, all_analyses))
-        print("wrote analysis/%s/%s.html (%d lines, %d annotations)"
-              % (a["category"], a["slug"], a["lines"], len(a["annotations"])))
+        print("wrote analysis/%s/%s.html (%d files, %d lines)"
+              % (a["category"], a["slug"], len(a["files"]), sum(f["lines"] for f in a["files"])))
 
-    # hubs
-    hub = """<!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Module Analysis | Minecraft 1.8.9 Packet Reference</title>
-<meta name="description" content="Full source code analyses of hacked client modules, every line annotated and explained: Scaffold, Disabler and more.">
-<meta name="robots" content="index, follow">
-<meta name="theme-color" content="#0a0a0a">
-<link rel="canonical" href="%s/analysis/">
-<meta property="og:title" content="Module Analysis | Minecraft 1.8.9 Packet Reference">
-<meta property="og:type" content="website">
-<meta property="og:url" content="%s/analysis/">
-<meta property="og:image" content="%s/assets/og-image.png">
-<meta name="twitter:card" content="summary_large_image">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="../css/style.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
-<style>
-.analysis-grid { display:grid; gap:20px; margin:32px 0; }
-.analysis-card { background:var(--bg-secondary); border:1px solid var(--border); border-radius:var(--radius); padding:20px; transition:border-color 0.12s; }
-.analysis-card:hover { border-color:var(--accent); }
-.analysis-card h3 { font-size:1rem; font-weight:600; margin-bottom:6px; }
-.analysis-card h3 a { color:var(--text-primary); text-decoration:none; }
-.analysis-card h3 a:hover { color:var(--accent); }
-.analysis-card .meta { font-size:0.78rem; color:var(--text-muted); margin-bottom:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-.analysis-card .desc { font-size:0.85rem; color:var(--text-secondary); line-height:1.6; }
-.analysis-card .packets { display:flex; flex-wrap:wrap; gap:4px; margin-top:10px; }
-.analysis-card .badge { font-size:0.68rem; padding:1px 8px; border-radius:8px; font-family:var(--font-mono); }
-.category-header { font-size:1.3rem; font-weight:700; margin:40px 0 16px; padding-bottom:8px; border-bottom:1px solid var(--border-subtle); }
-.src-link { font-size:0.72rem; }
-.src-link a { color:var(--accent); }
-</style>
-</head>
-<body>
-<aside class="sidebar" id="sidebar">
-  <div class="sidebar-header">
-    <a href="../" class="logo" style="text-decoration:none">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 7h10M7 12h10M7 17h6"/></svg>
-      <span>MC <strong>1.8.9</strong></span>
-    </a>
-  </div>
-  %s
-</aside>
-<main class="main">
-  <div class="content-detail" style="display:block;max-width:900px;margin:0 auto;padding:40px 48px 80px;width:100%%">
-    <div class="detail-header">
-      <h1>Module Analysis</h1>
-      <p class="detail-desc">Full source code walkthroughs of hacked client modules. Every line of every module is annotated and explained, with the complete original source rendered in a GitHub-style viewer.</p>
-    </div>
-    %s
-    <div style="margin-top:32px;text-align:center">
-      <a href="../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to Packet Reference</a>
-    </div>
-  </div>
-</main>
-</body>
-</html>"""
+    hub = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "analysis-hub-template.html"), encoding="utf-8").read()
     with open(os.path.join(OUT, "index.html"), "w", encoding="utf-8") as f:
         f.write(hub % (SITE, SITE, SITE, build_sidebar(all_analyses, None, "hub"), render_hub(all_analyses)))
     print("wrote analysis/index.html")

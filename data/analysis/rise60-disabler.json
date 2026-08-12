@@ -3,19 +3,19 @@
   "client": "Rise 6.0",
   "category": "disabler",
   "source_rel": "com/alan/clients/module/impl/exploit/Disabler.java",
-  "overview": "Rise 6.0's Disabler is a toggle registry built on the client's module component system. The class itself contains no packet logic: each BooleanValue binds a named bypass to a component class in the exploit/disabler package (CubeCraftDisabler, VulcanDisabler, KeepAliveDisabler and friends), and those components register their own packet listeners against Rise's PACKET_ROUTER. Active toggles target CubeCraft, Mine Land, Verus, Vulcan, UniversoCraft and other anticheats, plus generic primitives: keepalive cancellation, transaction cancellation, sprint entity-action cancellation, spectate injection and forced server teleports. The constructor implements a deprecation system: every setting declared after the Deprecated toggle is hidden from the UI unless that toggle is enabled.",
+  "overview": "Rise 6.0's Disabler is a mode-selector module: one BooleanValue per bypass, and each value instantiates a dedicated Mode class from the exploit.disabler package that contains all of that bypass's packet logic. Eighteen of the nineteen mode classes are wired to toggles (three of them reused by deprecated UI aliases); WatchdogDisabler sits in the package but is not registered by the module in this build. Modes hook the client's newevent bus through @EventLink/Listener fields and lean on global components (BadPacketsComponent, PingSpoofComponent, BlinkComponent) that normalize the packet stream for anticheats.",
   "sections": [
     {
       "h": "Architecture",
-      "p": "The module is a thin composition root. Each bypass lives in its own class under com.alan.clients.module.impl.exploit.disabler, and the Disabler core only wires values to component instances through the BooleanValue constructor. The component pattern is Rise 6.x's standard module organization: a module declares values and components, and the client instantiates and drives both. All packet work is delegated, so the core file stays at 87 lines while the behavior is spread across 19 component classes."
+      "p": "The module is a thin composition root. Each BooleanValue is built with four arguments: the display name, the owning module, a default state, and a Mode instance created inline. Mode<T> is the client's per-toggle base class: when a value flips on, the mode is registered with the global EventBus and its onEnable hook runs; flipping off unregisters it. Registration is reflection-based: the bus scans the mode's declared fields for the @EventLink marker, resolves the event type from the Listener<T> generic, and sorts call sites by the marker's priority byte, so every mode in this package is pure event wiring with zero lifecycle code.\n\nThe three components the modes depend on are registered once at client startup and expose static state. BadPacketsComponent flags slot/attack/swing/block/inventory packets as they are sent and clears the flags on the next C03PacketPlayer, giving modes a cheap 'is the stream polluted' test. PingSpoofComponent and BlinkComponent both buffer packets in ConcurrentLinkedQueues and replay them on a schedule or on demand. Because the disabler modes drive these components through static calls, several toggles can cooperate without knowing about each other."
     },
     {
-      "h": "Packet abstraction",
-      "p": "Rise 6.x does not use the vanilla packet event bus that older clients (Gugustus, Tenacity 5.1) expose. Packets are wrapped in the client's own Packet abstraction and routed through PACKET_ROUTER to EventLink/Listener handlers registered by components. The disabler package confirms the shift: movement components hook C03PacketPlayer and its subclasses (C04PacketPlayerPosition, C06PacketPlayerPosLook), while dedicated components eat C00PacketKeepAlive, C0FPacketConfirmTransaction, C0BPacketEntityAction, C07PacketPlayerDigging and C08PacketPlayerBlockPlacement. Serverbound spoofs cover C13PacketPlayerAbilities, C17PacketCustomPayload and C18PacketSpectate, and UniversoCraft's state machine watches S07PacketRespawn and C02PacketUseEntity."
+      "h": "Key techniques",
+      "p": "Modes shape the outbound stream in three ways. event.setCancelled(true) drops a packet entirely, the choice for keepalives and transactions that the client wants to starve. event.setPacket(...) swaps the payload, used to upgrade C04PacketPlayerPosition into C06PacketPlayerPosLook or to corrupt the uid of a C0FPacketConfirmTransaction. PacketUtil.sendNoEvent injects a packet through addToSendQueueUnregistered so it bypasses the mode's own listener (and every other listener), while PacketUtil.send routes it through the normal pipeline; this distinction is what lets a mode emit a packet from inside its own handler without recursing.\n\nThe sprint family (SprintDisabler, DynamicPVP, Lunar, Ghostly) shares one trick: the client's EntityPlayerSP tracks serverSprintState, the sprint state the server last heard, and vanilla only sends C0BPacketEntityAction on state changes. When a START_SPRINTING arrives while the server already believes the player is sprinting, the modes first emit a STOP_SPRINTING via sendNoEvent and clear serverSprintState, then cancel the original START. The server is left believing the player is not sprinting while the client moves at sprint speed, so sprint-speed motion is never matched to a sprint action. Movement modes rewrite or gate C03PacketPlayer itself: position jitter, forced onGround flags, grid-aligned Y snapping, rotation spoofs, and whole-packet cancellation on a tick window."
     },
     {
-      "h": "Deprecation system",
-      "p": "The constructor walks getValues() in declaration order with a one-value lookahead. Once it reaches the value whose name equals 'deprecated', every later value gets hideIf = () -> !this.deprecated.getValue(), so the legacy toggles disappear from the UI unless the Deprecated master switch is on. The deprecated block reuses live components: Hypixel Slime binds the same AbilitiesDisabler as Abilities, MMC Partial Reach binds the same TransactionDisabler as Cancel Transactions, and MMC Keep Sprint binds the same SprintDisabler as Cancel Sprint Packet, so those rows are historical UI aliases, not separate implementations."
+      "h": "Anti-cheat targeting",
+      "p": "The mode set maps cleanly onto the anticheat landscape of 2022: CubeCraftDisabler, VulcanDisabler, VerusCustomDisabler, UniversoCraftDisabler, MineLandKickDisabler and WatchdogDisabler target named servers or anticheats, while LunarDisabler and OmniSprintDisabler aim at Lunar Client's client-side checks, and RiseBalanceDisabler is tuned against Rise's own 'Balance' anticheat on its practice servers. The generic primitives (KeepAlive, Transaction, Sprint, Input, Vehicle, Teleport, Spectate, Abilities) are server-agnostic building blocks that combine with the components for a full bypass.\n\nVanilla packet facts verified against the bundled MCP sources: C0FPacketConfirmTransaction carries windowId (one byte on the wire), uid (a short) and accepted, and the server's processConfirmTransaction only marks a container craftable when the echoed uid and windowId match its expected values. C00PacketKeepAlive echoes the server's random key, and processKeepAlive folds the round-trip into the player's ping as an exponential moving average. C18PacketSpectate is only honored for spectator-mode players, and S08PacketPlayerPosLook is the server's teleport-correction packet that PingSpoofComponent delays under its 'teleport' category. The server's processPlayer rejects nothing for a single absurd position packet: the 'moved too quickly' check caps each delta by the player's known motion, which is why TeleportDisabler can jump 2000 blocks and only force a correction."
     }
   ],
   "packets": [
@@ -25,172 +25,114 @@
     "C07PacketPlayerDigging",
     "C08PacketPlayerBlockPlacement",
     "C0BPacketEntityAction",
+    "C0CPacketInput",
     "C0FPacketConfirmTransaction",
     "C13PacketPlayerAbilities",
     "C17PacketCustomPayload",
     "C18PacketSpectate",
-    "S07PacketRespawn"
+    "S07PacketRespawn",
+    "S08PacketPlayerPosLook"
   ],
-  "annotations": [
+  "files": [
     {
-      "start": 1,
-      "end": 1,
-      "text": "Package declaration: the module lives in the exploit package of Rise's module tree, grouped with the other anticheat-facing utilities."
+      "label": "Disabler.java (mode selector)",
+      "rel": "com/alan/clients/module/impl/exploit/Disabler.java",
+      "explanation": "The composition root of the entire disabler suite. Twenty-two BooleanValue fields are declared in order; fifteen of them bind a named bypass to a fresh Mode instance passed as the fourth constructor argument (cubecraft, mineLandKick, verus, vehicle, teleport, vulcan, sprint, omnisprint, universocraft, riseBalance, cancelTransactions, Abilities, input, spectate, cancelKeepAlives), and the deprecated block adds hypixelSlime, mmcReachPartial and mmcKeepSprint, which instantiate second copies of AbilitiesDisabler, TransactionDisabler and SprintDisabler rather than new implementations. The class itself contains no packet logic; it only wires values to modes, so the whole file is 87 lines while the behavior lives in the 19 classes of the disabler subpackage.\n\nThe constructor implements the UI deprecation scheme. A local boolean starts false and the loop walks getValues() in declaration order: before processing each value it applies hideIf = () -> !this.deprecated.getValue() if the flag is set, then sets the flag when the current value's name equals 'deprecated'. Because the flag is read before the assignment on every iteration, the Deprecated toggle itself is never hidden, but every value declared after it (hypixelSlime through lunar) only appears in the settings screen while the Deprecated master switch is on. The legacy rows are UI aliases, not separate implementations: Hypixel Slime runs the same abilities spoof as Abilities, MMC Partial Reach the same transaction cancellation as Cancel Transactions, and MMC Keep Sprint the same sprint-packet cancellation as Cancel Sprint Packet.\n\nThe module is annotated @Rise and @ModuleInfo with the translation keys module.combat.disabler.name (a leftover from when the module lived in the combat category) and module.exploit.disabler.description, category Category.EXPLOIT. Note that WatchdogDisabler exists in the imported wildcard package but no value instantiates it in this build, so it is an orphaned mode reachable only through its class file."
     },
     {
-      "start": 3,
-      "end": 9,
-      "text": "Client-framework imports: the @Rise marker annotation, the Module base class, Category and ModuleInfo from the module API, the wildcard import of every Disabler component in the exploit.disabler subpackage, and the Value/BooleanValue settings framework. The wildcard matters: this file never names a component class explicitly beyond the constructor calls below."
+      "label": "AbilitiesDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/AbilitiesDisabler.java",
+      "explanation": "Spoofs the player's ability flags to the server. On a StrafeEvent (fired every tick while movement input is being processed), and only every fifth tick (ticksExisted % 5 == 0), it builds a fresh PlayerCapabilities, sets isFlying = true, and sends a C13PacketPlayerAbilities built from it.\n\nThe C13 constructor copies all six capability fields into the packet: disableDamage, isFlying, allowFlying, isCreativeMode, flySpeed and walkSpeed, serialized as one flags byte plus two floats. A fresh PlayerCapabilities has flySpeed 0.05 and walkSpeed 0.1, so the packet tells the server exactly one thing: the player is flying. This is the classic Hypixel slime-block bypass: slime bounce motion looks like flight to ground checks, and periodically re-asserting the flying flag keeps the server's flight/fall tracker in a state it accepts. The same mode is reused verbatim by the deprecated 'Hypixel Slime' toggle, which is why that row behaves identically to Abilities."
     },
     {
-      "start": 11,
-      "end": 11,
-      "text": "@Rise: a marker annotation from com.alan.clients.api tagging this class as part of the Rise client's module set. It is processed at startup when the client scans and registers modules."
+      "label": "CubeCraftDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/CubeCraftDisabler.java",
+      "explanation": "Aimed at CubeCraft's anticheat. For every C03PacketPlayer that reaches the send pipeline, and only while no GUI is open (mc.currentScreen == null) and the selector detection is clear, the mode injects a C08PacketPlayerBlockPlacement targeting the player's own position five blocks down: new BlockPos(mc.thePlayer).down(5), EnumFacing.UP.getIndex(), a null item stack, and facing offsets 0.0F, 1.0F, 0.0F. The C08 constructor verified in the MCP sources is (BlockPos, int direction, ItemStack, float facingX, float facingY, float facingZ), so this is a fake 'place a block under myself' interaction with no held item. CubeCraft's checks correlate block interactions with movement; the phantom placement keeps that correlation from ever lining up.\n\nAfter the injection the mode calls BadPacketsComponent.reset(), clearing the block/attack/swing flags so the follow-up movement packet is not treated as polluted by the component's consumers. It then cancels every C00PacketKeepAlive, starving the server's keepalive round-trip tracking. The SelectorDetectionComponent.selector() guard skips the injection while the held item is a server selector (an item whose display name does not match its registered name, detected by the component at very high priority each PreUpdate), which avoids sending placement spam through CubeCraft's game-mode selection screens."
     },
     {
-      "start": 12,
-      "end": 12,
-      "text": "@ModuleInfo declares the module: a translation-component key for the name (module.combat.disabler.name, a leftover from when the module sat in combat, hence the combat path) and for the description (module.exploit.disabler.description), with category = Category.EXPLOIT. Rise resolves the language keys at runtime from its locale files."
+      "label": "DynamicPVPDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/DynamicPVPDisabler.java",
+      "explanation": "A legacy all-in-one mode (deprecated in the UI) that rewrites the movement stream. On every C03PacketPlayer it cancels the packet outright every third tick (ticksExisted % 3 == 0), reducing the visible packet rate; every twentieth tick it sends a C04PacketPlayerPosition at the current position via sendNoEvent so the server still receives a movement packet during the cancel cadence; and every surviving packet is replaced with a C06PacketPlayerPosLook carrying the player's live rotation and the original onGround flag. The rewrite guarantees the server always sees position and rotation together, which is the state the vanilla handler and most anticheats expect from a moving player.\n\nTransactions and keepalives are cancelled outright (C0FPacketConfirmTransaction and C00PacketKeepAlive), and the sprint block matches the shared family pattern: START_SPRINTING while the server already believes the player is sprinting triggers a STOP_SPRINTING via sendNoEvent and a serverSprintState reset, then the START is cancelled; STOP_SPRINTING is always cancelled. The combination starves the anticheat's timing oracles (transactions, keepalives) and its sprint-state tracking, so ground and speed checks have only position deltas to reason about."
     },
     {
-      "start": 13,
-      "end": 13,
-      "text": "Class declaration: Disabler extends Module, the client's base module class. Every Rise module follows this shape; the instance fields below are the entire body."
+      "label": "GhostlyDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/GhostlyDisabler.java",
+      "explanation": "A deprecated movement-normalization mode. On every C03PacketPlayer it first sends an empty C0CPacketInput via sendNoEvent (the no-argument constructor serializes strafeSpeed 0, forwardSpeed 0, jumping false, sneaking false), then rewrites the movement packet: the Y coordinate is snapped with Math.round(y / 0.015625) * 0.015625, the same 1/64 sub-block grid quantization MoveUtil.roundToGround uses, and onGround is forced true.\n\nThe grid snap makes the reported Y an exact multiple of the block grid, matching the height values the server's ground and block-collision logic computes with, so the packet always looks 'on the grid'. Forcing onGround true removes the airborne ambiguity that ground checks flag. The empty C0C input tells the server no movement keys are held while the player is clearly moving, which defeats checks that cross-correlate input packets with position deltas. The sprint cancellation block is identical to the shared family pattern used by SprintDisabler and DynamicPVPDisabler."
     },
     {
-      "start": 14,
-      "end": 15,
-      "text": "cubecraft toggle: a BooleanValue named 'Cubecraft', off by default, bound to a CubeCraftDisabler component instance. The fourth constructor argument is the component that runs while the value is enabled."
+      "label": "InputDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/InputDisabler.java",
+      "explanation": "Spoofs a constant, valid input state. On every StrafeEvent it sends C0CPacketInput(0.98f, 0, true, true). The packet fields verified in the MCP source are strafeSpeed, forwardSpeed, jumping and sneaking; this call reports a strafe speed of 0.98, no forward movement, and both jump and sneak held.\n\n0.98 is the maximum strafe magnitude the client's movement code can produce (the forward/strafe input multiplier), so any diagonal strafing the player performs is fully covered by the reported input, and the jump/sneak flags give the packet a realistic full input state. Servers and anticheats that validate movement against input packets (comparing reported strafe to position deltas, or flagging movement with zero input) see a continuous, key-driven input stream instead of the zero-input packets a cheat normally emits."
     },
     {
-      "start": 17,
-      "end": 18,
-      "text": "mineLandKick toggle: 'Mine Land Kick Checks' bound to MineLandKickDisabler. Named after the Mine Land server's kick checks, which the component desynchronizes so the server stops disconnecting the player."
+      "label": "KeepAliveDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/KeepAliveDisabler.java",
+      "explanation": "Cancels every C00PacketKeepAlive outright, with no echo. The vanilla server's processKeepAlive compares the echoed key against the one it sent and folds the measured round-trip into the player's ping as an exponential moving average (ping = (ping * 3 + elapsed) / 4); with no replies at all, the server's ping estimate goes stale and every check that uses keepalive timing as a clock loses its signal.\n\nThis is the bluntest primitive in the suite: anticheats use the keepalive round-trip to measure latency for timer and speed checks, and canceling it makes the client look like it is lagging rather than cheating. The trade-off is real: on servers with strict keepalive timeout handling this mode can produce 'Timed out' disconnects, which is why the WatchdogDisabler takes the softer path of delaying keepalives through PingSpoofComponent instead of dropping them."
     },
     {
-      "start": 20,
-      "end": 21,
-      "text": "verus toggle: 'Verus Checks' bound to VerusCustomDisabler, the bypass suite for the Verus anticheat."
+      "label": "LunarDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/LunarDisabler.java",
+      "explanation": "Targets Lunar Client's anticheat integration. It cancels C0FPacketConfirmTransaction and C00PacketKeepAlive, applies the shared sprint-cancellation block, and rewrites every C04PacketPlayerPosition into a C06PacketPlayerPosLook with a jittered yaw: the yaw is offset by plus or minus a random value between 0.05 and 0.1 degrees, with the sign chosen by tick parity (RandomUtils.nextFloat(0.05F, 0.1F)). Pitch and the original onGround flag pass through unchanged.\n\nThe rotation jitter is the point of the mode. Lunar's checks (both the client-side anticheat and server-side integration for Lunar users) watch rotation consistency; converting every position-only packet into a rotation-carrying one with a small alternating yaw offset makes the rotation stream look like genuine mouse movement rather than a fixed cheat angle, while movement itself is reported exactly as vanilla would. The small magnitude keeps the yaw drift below any rotation-speed threshold."
     },
     {
-      "start": 23,
-      "end": 24,
-      "text": "vehicle toggle: 'Vehicle Packets' bound to VehicleDisabler, a component that handles the serverbound stream while the player is mounted."
+      "label": "MineLandKickDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/MineLandKickDisabler.java",
+      "explanation": "Designed against the Mine Land server's join-period kick checks. A boolean state machine arms during a fixed window: enabled once the player has existed more than 20 ticks and at most 40 ticks while standing on the ground, and disabled again at tick 100. A TeleportEvent (fired when the server corrects the player's position) disables it immediately as a safety valve.\n\nWhile armed, the PreMotionEvent listener forces onGround true, jitters posX and posZ by plus or minus 0.1 blocks alternating with tick parity, and rewrites posY to MoveUtil.roundToGround(posY + 1), i.e. the current Y plus one block snapped to the 1/64 grid. The MoveInputEvent listener zeroes forward, strafe and jump for the same window. The server therefore sees a player hovering exactly one block above grid-aligned ground, drifting 0.1 blocks sideways every tick with no movement input: the pattern the mode is built to defeat is Mine Land's spawn-time checks that sample early movement and kick on the first anomaly, and the teleport guard stops the desync the moment the server re-anchors the player."
     },
     {
-      "start": 26,
-      "end": 27,
-      "text": "teleport toggle: 'Force Server Teleport' bound to TeleportDisabler, which pushes the server into confirming teleports so the client keeps a consistent position."
+      "label": "OmniSprintDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/OmniSprintDisabler.java",
+      "explanation": "Lets the player sprint in every direction, including backwards. On PreMotionEvent, when the player is not swinging (isSwingInProgress false) and is holding the back key (keyBindBack.isKeyDown()), the event's yaw is overwritten with the x component of RotationUtil.applySensitivityPatch(new Vector2f(Math.toDegrees(MoveUtil.direction()), event.getPitch())).\n\nMoveUtil.direction() computes the yaw of the player's movement vector, flipping 180 degrees when moving backwards, so the sent yaw always points along the direction of travel; the server then interprets the motion as forward movement and never revokes the sprint state, which is what makes backwards sprint work. applySensitivityPatch quantizes the target rotation to the mouse-sensitivity multiplier steps (the same mouseSensitivity^3 * 8 * 0.15 formula vanilla uses for mouse turns, clamped to pitch 90) so the programmatic rotation change is indistinguishable from an actual mouse movement and does not trip rotation checks. The swing guard keeps the spoof from firing while attacking, when rotations are already covered by combat logic."
     },
     {
-      "start": 29,
-      "end": 30,
-      "text": "vulcan toggle: 'Vulcan Checks' bound to VulcanDisabler, the bypass set for the Vulcan anticheat."
+      "label": "RiseBalanceDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/RiseBalanceDisabler.java",
+      "explanation": "A timer-abuse disabler tuned against Rise's own 'Balance' anticheat on its practice servers, driven by a self-tracked ledger. On every C03PacketPlayer, an 'empty' packet (no rotation, no movement, and no bad packets pending, optionally gated to moments when the player is not moving at all) is cancelled outright, so the client stops sending the useless no-op movement packets that inflate the packet rate. The ledger then runs: every C03 that actually goes out (or is held by the blink component) subtracts 50, and the elapsed time since the previous C03, read from a StopWatch, is added. Balance therefore approximates time credit minus 50 milliseconds per sent movement packet, a model of how much the anticheat's packet-rate accounting thinks the client owes.\n\nThe optional Pulse mode abuses timer speed: when mc.timer.timerSpeed exceeds 1 it sets BlinkComponent.blinking true and every 450 milliseconds (50 * 9) calls BlinkComponent.dispatch(), which flushes all buffered packets at once. Movement packets accumulate invisibly and then dump in a burst, hiding high tick rates behind periodic bursts. The forceLowTimer option, evaluated on Render2DEvent, clamps mc.timer.timerSpeed to 0.5 when the balance goes negative and to 1 when it recovers above zero, slowing the game below real-time so the ledger never overflows. onEnable resets the ledger, onDisable clears the blink state, and the optional resetOnWorldChange re-zeros everything on a WorldChangeEvent; Display prints the running balance to chat every 20 ticks."
     },
     {
-      "start": 32,
-      "end": 33,
-      "text": "sprint toggle: 'Cancel Sprint Packet' bound to SprintDisabler, which stops C0BPacketEntityAction sprint-state packets from reaching the server."
+      "label": "SpectateDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/SpectateDisabler.java",
+      "explanation": "Injects C18PacketSpectate with the player's own UUID on every StrafeEvent, sent via sendNoEvent so it bypasses the client's own packet listeners. The C18 packet verified in the MCP sources carries a single UUID and is handled by the server's processSpectate, which only acts when the player is in spectator mode (func_175149_v): it searches all loaded worlds for the entity with that UUID and re-anchors the spectator to it, unmounting any ridden entity and transferring dimensions if needed.\n\nTargeting your own UUID forces the server to re-anchor the spectator camera and position to your own entity, resetting whatever spectator-position tracking the server (or a server-side anticheat integration) samples for that player. On servers that place players in spectator for death spectating or minigames, this keeps the server-side spectator state pinned to the player's true position instead of a stale one."
     },
     {
-      "start": 35,
-      "end": 36,
-      "text": "omnisprint toggle: 'OmniSprint' bound to OmniSprintDisabler, a variant that lets the client sprint in every direction (including backwards) without the server-side sprint flags."
+      "label": "SprintDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/SprintDisabler.java",
+      "explanation": "The generic 'cancel sprint packet' primitive, reused by the deprecated MMC Keep Sprint toggle. It cancels every C0BPacketEntityAction whose action is START_SPRINTING or STOP_SPRINTING, and keeps the client's local sprint bookkeeping consistent: when a START_SPRINTING arrives while mc.thePlayer.serverSprintState is already true, it first sends a STOP_SPRINTING via sendNoEvent and clears serverSprintState, then cancels the original START.\n\nThe serverSprintState field, verified in the client's EntityPlayerSP, is the sprint state the server last heard; vanilla only emits C0B sprint packets when that state changes. By intercepting the change packets and mirroring the state manually, the mode ensures the server never learns the player is sprinting while the client moves at sprint speed. Anticheats that flag sprint-speed movement without a matching entity action see nothing to flag, and the manual state mirror keeps the client from desynchronizing its own sprint logic. SprintDisabler is the purest version of the pattern that DynamicPVPDisabler, LunarDisabler and GhostlyDisabler embed in their larger handlers."
     },
     {
-      "start": 38,
-      "end": 39,
-      "text": "universocraft toggle: bound to UniversoCraftDisabler, the state machine aimed at the UniversoCraft network. The component tracks S07PacketRespawn and C02PacketUseEntity to time its transaction corruption."
+      "label": "TeleportDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/TeleportDisabler.java",
+      "explanation": "'Force Server Teleport' desynchronizes the server's position model by sending absurd coordinates on a schedule. Every delay ticks (a NumberValue defaulting to 20, range 2-100) it sends a C04PacketPlayerPosition offset from the current position by a random 1024 to 2048 blocks in the chosen direction (Up, Down or Horizontal via a ModeValue with SubModes), with the onGround flag taken from the groundState option; the mathGround option rounds the sent Y to the 1/64 grid before sending.\n\nThe trick survives vanilla's sanity checks, verified in the MCP NetHandlerPlayServer.processPlayer: the 'moved too quickly' test computes each delta component as min(|packet delta|, |player motion|) and flags only when the squared sum exceeds 100, so a single 2000-block jump (whose components are capped to near-zero motion values) passes, and only the |x|,|z| > 3e7 'Illegal position' check is absolute. The server then moves its entity by the full delta, sets the player to the packet's coordinates, and either runs the 'moved wrongly'/collision path back to the previous location (an S08PacketPlayerPosLook rubber-band to the client) or leaves the phantom position in place.\n\nEither outcome resets the server-side movement model: after a correction the server's motion and fall-distance tracking (handleFalling, floatingTickCount) restart from a clean slate, and without one the anticheat reasons about a player 2000 blocks away from its true position. The delay spacing keeps the desync alive while staying under the 80-tick floating-kick threshold, and the direction option tunes which tracker gets confused (Up/Down for vertical checks, Horizontal for speed)."
     },
     {
-      "start": 41,
-      "end": 42,
-      "text": "riseBalance toggle: 'Rise Balance Timer Abuse' bound to RiseBalanceDisabler, a timer exploit tuned against Rise's own balance anticheat."
+      "label": "TransactionDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/TransactionDisabler.java",
+      "explanation": "Cancels every C0FPacketConfirmTransaction. The C0F packet verified in the MCP sources carries the window id (a byte on the wire), a short uid, and an accepted flag; the server's processConfirmTransaction looks up the expected uid for the open container's window id and only marks the container craftable when both the uid and the window id match.\n\nAnticheats exploit the transaction exchange as a precise round-trip oracle: each S32PacketConfirmTransaction expects the matching C0F echo, the measured delay is a ping sample, and the uid sequence tracks client responsiveness. Canceling all C0Fs starves that oracle: timer, flight and speed checks that gate on transaction pings lose their timing signal, and the client's effective latency looks infinite to the transaction-based measurements while the server's own window logic simply never confirms. This is the same primitive the deprecated MMC Partial Reach toggle runs, and it pairs with keepalive cancellation in the bigger modes."
     },
     {
-      "start": 44,
-      "end": 45,
-      "text": "cancelTransactions toggle: 'Cancel Transactions' bound to TransactionDisabler, which eats C0FPacketConfirmTransaction confirmations to break the server's inventory-transaction tracking."
+      "label": "UniversoCraftDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/UniversoCraftDisabler.java",
+      "explanation": "Targets UniversoCraft's anticheat with a transaction-corruption state machine. A boolean flag ('disabling') is armed by three branches in the send pipeline: an S07PacketRespawn passing through, any C02PacketUseEntity (which disarms it), and any C03PacketPlayer sent within the first ten ticks after joining. While the flag is set and the player has existed for fewer than 350 ticks, every C0FPacketConfirmTransaction has its uid rewritten to Short.MIN_VALUE on even ticks and Short.MAX_VALUE on odd ticks.\n\nThe uid is a short on the wire (verified in C0FPacketConfirmTransaction.writePacketData, data.writeShort(this.uid)), and the vanilla server matches it exactly against its expected value in processConfirmTransaction. Corrupting it to the two extreme shorts guarantees the match always fails, so the server's transaction correlation for that window desynchronizes and UniversoCraft's checks that sequence transactions to measure the client can never line up their expected uid. One caveat worth noting: the S07 arm is checked on the outbound pipeline, but S07PacketRespawn is a clientbound packet in vanilla (it arrives through the receive path and is handled by handleRespawn), so in stock flow that branch never arms; the practical drivers are the early-join C03 arm and the disarm on the first attack."
     },
     {
-      "start": 47,
-      "end": 48,
-      "text": "Abilities toggle: bound to AbilitiesDisabler, which spoofs C13PacketPlayerAbilities. The field name breaks the lowercase convention (a capital A in Abilities), a minor naming inconsistency."
+      "label": "VehicleDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/VehicleDisabler.java",
+      "explanation": "Sends an empty C0CPacketInput on every PreMotionEvent while the mode is on. The no-argument C0C constructor verified in the MCP sources serializes strafeSpeed 0.0, forwardSpeed 0.0, jumping false and sneaking false.\n\nWhile riding a vehicle, the server steers the ridden entity from the client's C0C input packets, so a constant zero-input stream tells the server the player is holding no movement keys even while the client moves the vehicle locally. This defeats anticheats that verify vehicle speed against the reported input (flagging 'vehicle moved too fast for input'), and keeps the server's vehicle position model from being fed contradictory steering data. It is the vehicle-specific counterpart of InputDisabler, which spoofs a full input state for on-foot movement."
     },
     {
-      "start": 50,
-      "end": 51,
-      "text": "input toggle: 'Input' bound to InputDisabler, which handles the C07PacketPlayerDigging / C08PacketPlayerBlockPlacement stream to desynchronize server-side input validation."
+      "label": "VerusCustomDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/VerusCustomDisabler.java",
+      "explanation": "A Verus bypass with two toggles, Movement and Sprint. The Movement path fires every 100 ticks and sends three C04PacketPlayerPosition packets back to back via sendNoEvent: the current position with the real ground flag, then the same x/z at y = -0.015625 with onGround false, then the current position again. The middle packet claims the player sits exactly at the block boundary just below the ground plane, the classic 'snap to ground' spoof that perturbs Verus's movement model; the mode then sets teleported true and, on the resulting TeleportEvent (fired when the server answers with a position correction), cancels that single event and clears the flag, so the client never rubber-bands while the server-side position model is left confused.\n\nThe Sprint path alternates STOP_SPRINTING and START_SPRINTING C0BPacketEntityAction every tick via sendNoEvent while simultaneously cancelling every vanilla sprint entity action, burying Verus's sprint checks in toggle spam while the real sprint state stays hidden. WorldChangeEvent clears the two ConcurrentLinkedQueues (transactions and keepAlives) and resets teleported; those queues are declared and flushed on world change but never populated in this version, vestigial fields left over from an older queue-based Verus disabler that delayed transactions and keepalives instead of using the teleport trick."
     },
     {
-      "start": 53,
-      "end": 54,
-      "text": "spectate toggle: 'Spectate' bound to SpectateDisabler, which injects C18PacketSpectate for the player's own entity to desync the server's camera tracking."
+      "label": "VulcanDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/VulcanDisabler.java",
+      "explanation": "A seven-toggle bypass suite for the Vulcan anticheat, with everything defaulting to on. Omni-Sprint sends START_SPRINTING then STOP_SPRINTING back to back on every PreMotionEvent through the normal send path, keeping Vulcan's sprint-action spam checks satisfied while the client sprints freely. Strafe and Jump sends a C07PacketPlayerDigging STOP_DESTROY_BLOCK at the player's own position facing UP every 5 ticks; Auto Clicker sends START_DESTROY_BLOCK at the same position whenever BadPacketsComponent.bad(false, true, true, false, false) reports no attack/swing/block pollution and GUIDetectionComponent.inGUI() reports no chest-like GUI open (the component's display-name mismatch confidence heuristic); Fast Use sends DROP_ITEM at BlockPos.ORIGIN facing DOWN every 7 ticks. The digging/drop packets fake a continuous stream of click, dig and item-use activity, so Vulcan's click-consistency and no-swing checks always see a player that is doing something.\n\nThe Reach toggle drives BlinkComponent: it sets blinking true and calls dispatch() every 2 ticks, so outgoing packets buffer in the component's queue and flush in alternating bursts, hiding the hit packets of a 4.5-block reach behind blink timing. Miscellaneous cancels every C17PacketCustomPayload, suppressing the MC|Brand channel and any other plugin channel traffic that Vulcan reads to fingerprint the client. The Keep Sprint toggle is declared with the label 'To disable KeepSprint spoof 1.9' but is not referenced by any listener in this version, making it a dead option."
     },
     {
-      "start": 56,
-      "end": 57,
-      "text": "cancelKeepAlives toggle: 'Cancel Keep Alive' bound to KeepAliveDisabler, which cancels C00PacketKeepAlive packets outright (no echo, unlike a ping-spoof)."
-    },
-    {
-      "start": 59,
-      "end": 60,
-      "text": "deprecated toggle: a plain BooleanValue with no component. It is the master switch for the legacy section; the constructor wires every later value's visibility to it."
-    },
-    {
-      "start": 62,
-      "end": 63,
-      "text": "hypixelSlime toggle: 'Hypixel Slime (Deprecated)' reuses the AbilitiesDisabler component from line 48, so enabling it behaves identically to Abilities. Kept for users who still remember the old Hypixel slime bypass by name."
-    },
-    {
-      "start": 65,
-      "end": 66,
-      "text": "mmcReachPartial toggle: 'MMC Partial Reach (Deprecated)' reuses TransactionDisabler, the same component as Cancel Transactions."
-    },
-    {
-      "start": 68,
-      "end": 69,
-      "text": "mmcKeepSprint toggle: 'MMC Keep Sprint (Deprecated)' reuses SprintDisabler, the same component as Cancel Sprint Packet."
-    },
-    {
-      "start": 71,
-      "end": 72,
-      "text": "dynamicPVP toggle: 'Dynamic PVP (Deprecated)' bound to DynamicPVPDisabler, a standalone legacy component for the old Dynamic PVP bypass."
-    },
-    {
-      "start": 74,
-      "end": 75,
-      "text": "ghostly toggle: 'Ghostly (Deprecated)' bound to GhostlyDisabler, a standalone legacy component."
-    },
-    {
-      "start": 77,
-      "end": 78,
-      "text": "lunar toggle: 'Lunar (Deprecated)' bound to LunarDisabler, a standalone legacy component aimed at the Lunar client anticheat."
-    },
-    {
-      "start": 80,
-      "end": 80,
-      "text": "Constructor. Empty parameter list; the module is self-registering through @ModuleInfo, so no registration calls are needed here."
-    },
-    {
-      "start": 81,
-      "end": 81,
-      "text": "Local lookahead flag: starts false and is set to true once the constructor has passed the Deprecated toggle. It drives the hideIf wiring in the loop below."
-    },
-    {
-      "start": 83,
-      "end": 83,
-      "text": "Walks every value the module declares (getValues() returns the fields in declaration order). The loop assigns hideIf to each value based on the flag from the previous iteration."
-    },
-    {
-      "start": 84,
-      "end": 84,
-      "text": "For every value declared after the Deprecated toggle, hideIf = () -> !this.deprecated.getValue() hides it from the settings UI unless the Deprecated master switch is enabled. The lambda captures the module's deprecated value, so toggling it live re-shows the legacy section."
-    },
-    {
-      "start": 85,
-      "end": 85,
-      "text": "Sets the lookahead flag when the current value's name equals 'deprecated' (case-insensitive). Because the flag is read before the assignment on each pass, the Deprecated toggle itself is never hidden."
+      "label": "WatchdogDisabler.java (mode)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/WatchdogDisabler.java",
+      "explanation": "A ping-spoof disabler aimed at Hypixel's Watchdog, gated on packet cleanliness. On every PreUpdateEvent (fired at the top of the client's onUpdateWalkingPlayer, before the movement packet is built), if BadPacketsComponent.bad(false, true, true, true, true) reports attack, swing, block or inventory packets since the last C03, a StopWatch is reset, keeping the spoof disabled while the player is actively fighting. Once the stream has been clean for 2000 milliseconds, it arms PingSpoofComponent.setSpoofing((int) (Math.random() * 400), true, true, false, false, false, true): a random 0-400 millisecond delay with the normal, teleport and client spoof categories enabled and velocity, world and entity disabled. While the stream is dirty it calls PingSpoofComponent.dispatch() instead, flushing the queues.\n\nThe component mechanics it drives are verified in PingSpoofComponent: while spoofing, outbound packets (C03, entity actions, clicks, payloads, spectate and more) are pulled from the pipeline into a timed queue, and inbound S32PacketConfirmTransaction and S00PacketKeepAlive (the normal category) plus S08PacketPlayerPosLook (the teleport category) are delayed by the same random amount, so the client's measured ping jumps by a random 0-400ms per spoof cycle. Watchdog's heuristics compare click patterns and movement against ping consistency; an unstable fake latency breaks the 'impossible ping for CPS' and latency-band correlations. The 2-second clean window restricts the spoof to movement-only periods, and the component's own guards disable spoofing entirely for the first 20 ticks, during terrain loading, or when 60ms pass without a PreUpdate.\n\nStructural note: WatchdogDisabler is not instantiated by any BooleanValue in Disabler.java in this build, so it is an orphaned mode that the module never toggles, though every component it drives is fully wired."
     }
   ]
 }
