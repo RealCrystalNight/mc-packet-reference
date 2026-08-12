@@ -104,12 +104,15 @@ def main():
     # Split args: packet ids vs --clients=... flag
     ids = []
     clients_override = None
+    out_dir = None
     for a in sys.argv[1:]:
         if a.startswith("--clients="):
             clients_override = a.split("=", 1)[1].split(",")
         elif a.startswith("--sources="):
             global SOURCES_ROOT
             SOURCES_ROOT = a.split("=", 1)[1]
+        elif a.startswith("--out="):
+            out_dir = a.split("=", 1)[1]
         else:
             ids.append(a)
     clients = clients_override or (os.environ.get("MC_CLIENTS", "").split(",") if os.environ.get("MC_CLIENTS") else DEFAULT_CLIENTS)
@@ -121,14 +124,16 @@ def main():
         print("Pass --sources=/path/to/sources or set MC_SOURCES_ROOT.", file=sys.stderr)
         sys.exit(1)
 
-    index_path = os.path.join(MINED_DIR, "_index.json")
+    mine_dir = out_dir or MINED_DIR
+    os.makedirs(mine_dir, exist_ok=True)
+    index_path = os.path.join(mine_dir, "_index.json")
     index = {}
     if os.path.exists(index_path):
         index = json.load(open(index_path))
 
     for pkt_id in ids:
         corpus, entry = mine_packet(pkt_id, clients)
-        with open(os.path.join(MINED_DIR, pkt_id + ".txt"), "w") as f:
+        with open(os.path.join(mine_dir, pkt_id + ".txt"), "w") as f:
             f.write(corpus)
         total_files = sum(len(v) for v in entry.values())
         index[pkt_id] = entry
@@ -136,7 +141,7 @@ def main():
 
     with open(index_path, "w") as f:
         json.dump(index, f, indent=1, sort_keys=True)
-    print("Wrote %d corpus files to %s" % (len(ids), MINED_DIR))
+    print("Wrote %d corpus files to %s" % (len(ids), mine_dir))
 
 
 if __name__ == "__main__":

@@ -7,10 +7,11 @@ by `scripts/merge-impl.js` and rendered by `scripts/generate-pages.js`.
 ## Ground truth rules (MANDATORY)
 
 1. Every module, code snippet, and client attribution MUST come from the mined
-   corpus: `data/mined/<PacketId>.txt` (grep of the 8 reference clients) and the
+   corpus: `data/mined/<PacketId>.txt` (grep of the 8 original clients) and `data/mined-novliquid/<PacketId>.txt` (November Recode 2.0, LiquidSense Dev) and the
    real source files under `references/mc-client-sources/sources/`.
-2. The 8 reference clients are: Memeware 7.3, Nekoware v1 private, Rise 5.99,
-   Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0.
+2. The 10 reference clients are: Memeware 7.3, Nekoware v1 private, Rise 5.99,
+   Rise 6.2.4, Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0, November Recode 2.0,
+   LiquidSense Dev.
    `found_in` MUST contain ONLY these client names, and ONLY clients whose
    corpus actually contains the module file for this packet.
 3. `detailed_code` MUST be the FULL Java file, cat'd verbatim from the cited

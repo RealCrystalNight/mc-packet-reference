@@ -30,7 +30,8 @@ DEFAULT_SOURCES = os.path.normpath(os.path.join(BASE, "..", "references", "mc-cl
 SOURCES_ROOT = os.environ.get("MC_SOURCES_ROOT") or DEFAULT_SOURCES
 
 CLIENTS = ["Memeware 7.3", "Nekoware v1 private", "Rise 5.99", "Rise 6.2.4",
-           "Rise 6.1.30", "Sigma 4.11", "Spicy", "Tenacity 6.0"]
+           "Rise 6.1.30", "Sigma 4.11", "Spicy", "Tenacity 6.0",
+           "November Recode 2.0", "LiquidSense Dev"]
 
 ALLOWED = {"writeup", "overview", "server_handling", "protocol_notes",
            "anticheat_landscape", "modules", "general_hooks",
@@ -144,6 +145,9 @@ def main():
         index = json.load(open(MINED_INDEX))
     else:
         index = {}
+    # second client corpus (November Recode 2.0, LiquidSense Dev)
+    NOVL_INDEX = os.path.join(BASE, "data", "mined-novliquid", "_index.json")
+    novl_index = json.load(open(NOVL_INDEX)) if os.path.exists(NOVL_INDEX) else {}
     ac_index_path = os.path.join(BASE, "data", "ac-mined", "_index.json")
     ac_index = json.load(open(ac_index_path)) if os.path.exists(ac_index_path) else {}
 
@@ -161,7 +165,9 @@ def main():
             if not isinstance(mod, dict) or "name" not in mod:
                 errors.append("[%s] malformed module entry" % pkt_id)
                 continue
-            check_module(pkt_id, mod, index.get(pkt_id, {}))
+            combined = dict(index.get(pkt_id, {}))
+            combined.update(novl_index.get(pkt_id, {}))
+            check_module(pkt_id, mod, combined)
         for rel in data.get("related") or []:
             if not os.path.exists(os.path.join(PACKETS_DIR, rel + ".json")):
                 errors.append("[%s] related packet '%s' does not exist" % (pkt_id, rel))

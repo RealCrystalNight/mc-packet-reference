@@ -20,7 +20,7 @@ Rise 6.1.30, Sigma 4.11, Spicy, Tenacity 6.0).
 - MCP (Minecraft Coder Pack) deobfuscated 1.8.9 sources
 - wiki.vg protocol specification
 - Forge JavaDocs (1.8.9)
-- 8 reference client source trees (see `data/mined/` for the grep corpus)
+- 10 reference client source trees (see `data/mined/` + `data/mined-novliquid/` for the grep corpora)
 - 50 cloned open-source anticheats (see
   `../references/mc-client-sources/anticheats/` + its manifest.json; clone with
   `scripts/clone-anticheats.sh`, AC_ROOT configurable)
