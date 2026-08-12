@@ -1,0 +1,76 @@
+{
+  "module": "KillAura",
+  "client": "Tenacity 6.0",
+  "category": "killaura",
+  "source_rel": "dev/tenacity/module/impl/combat/KillAuraModule.java",
+  "overview": "Tenacity 6.0's KillAura is a reach-extending melee aura with randomized CPS, optional auto-block and an optional rotation snap. On every MotionEvent pre-phase it rebuilds a target list of living entities within the Reach setting (default 4, up to 8) that pass canEntityBeSeen, are not invisible and are not friends, sorts it by distance, snaps the client's yaw to the closest target (pitch is left untouched in every rotation mode), and fires swingItem() plus a C02PacketUseEntity ATTACK whenever the per-attack TimerUtil has elapsed 1000 / cps milliseconds. CPS is a configurable 10-100 range (default 10) drawn per attack, optionally multiplied by a random 1-2x interval under 'Extra Randomization'. Auto-block supports Vanilla and Hurt Time modes that send the C08 use-item / C07 release pair around the attacks, and onDisable releases the sword if a block is still active. The 'Fake' auto-block mode and the HvH rotation mode are registered but have no implementing code path.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "KillAuraModule extends Module and wires all combat logic to a single IEventListener<MotionEvent> (onMotionEvent); a second UpdateEvent listener only updates the HUD suffix with the CPS. Settings are Minimum CPS / Maximum CPS (both default 10, range 1-100), Reach (default 4, range 3-8), Auto Block, Rotate, Enchant/Critical particle toggles, Extra Randomization, Auto Block Mode (Vanilla / Hurt Time / Fake) and Rotation Mode (Vanilla / HvH Mode). The constructor and every tick re-clamp minimumCPS against maximumCPS so the two settings cannot invert. Each motion event calls sortAndAddTargets: the loaded entity list is filtered to EntityLivingBase instances within reach.getCurrentValue() that are not the player, pass mc.thePlayer.canEntityBeSeen(entity) (a world ray trace - no wall hits), are not invisible, and are not on the friend list via FriendCommand.isFriend on the display name, then sorted by distance so the closest legal target is attacked. Packets go through mc.getNetHandler().addToSendQueue, the normal client queue, so they are sent with the tick's batch."
+    },
+    {
+      "h": "Rotation and auto-block",
+      "p": "Rotation is applied only on the pre phase. Vanilla mode calls RotationUtil.getRotationFromTarget and writes only event.setYaw(rotations[0]) - the pitch component is computed by the helper but deliberately not applied, so vertical aim stays at the player's real pitch. The yaw is also quantized in a peculiar way: fixedYaw = rotations[0] - rotations[1] % sensitivityMultiplier is computed but never used, and the plain rotations[0] is what reaches the event, so the snap is a full instant yaw. HvH Mode computes fixedYaw = rotations[1] - rotations[0] % sensitivityMultiplier (a swapped expression) and clamps it with MathUtil.clamp(fixedYaw, 0, 10), pinning the yaw between 0 and 10 degrees - a near-constant bearing that makes the player appear to look in roughly one direction while still attacking, a deliberate anti-aim/HvH gimmick. Auto-block runs independently: Vanilla mode places C08PacketPlayerBlockPlacement(BlockPos(-1,-1,-1), 255, heldItem, 0,0,0) once when !wasBlocked and releases with C07 RELEASE_USE_ITEM when the target disappears or the module disables; Hurt Time mode places the block when mc.thePlayer.hurtTime == 9 (the tick after being hit) and releases when hurtTime == 0, with both releases skipped while isSwingInProgress. The Fake mode has no case in either switch, so it does nothing."
+    },
+    {
+      "h": "CPS timing and attack dispatch",
+      "p": "Attacks are timed by a TimerUtil with hasTimeElapsed(1000 / cps, true), which resets the clock on every fire. With randomization off, cps is Math.round(MathUtil.getRandomInRange(min, max)) drawn per attack, so a 10-10 setting yields a perfectly regular 10 Hz; with Extra Randomization on, the interval becomes 1000 / cps * MathUtil.getRandomInRange(1, 2), so the effective rate alternates between the configured CPS and half of it. At the 100 CPS maximum the interval is 10ms, far shorter than a tick, so the actual rate is capped by the motion-event cadence - at most one attack per tick - but every eligible tick can fire. Each fire calls swingItem() then addToSendQueue(new C02PacketUseEntity(currentTarget, ATTACK)), and the optional particle toggles call mc.thePlayer.onEnchantmentCritical / onCriticalHit directly, which only spawns the client-side particle burst - no server packet - so they are purely cosmetic. The timer clock is shared with the rest of the module and onDisable resets Timer.timerSpeed to 1f, hinting the module normally drives game-speed via the global Timer elsewhere in the client."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity",
+    "C07PacketPlayerDigging",
+    "C08PacketPlayerBlockPlacement",
+    "C0APacketAnimation",
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "KillAuraModule.java (module, targeting, attack dispatch)",
+      "rel": "dev/tenacity/module/impl/combat/KillAuraModule.java",
+      "explanation": "The entire module: onMotionEvent filters and sorts the target list each tick, applies the rotation modes (Vanilla sets yaw only; HvH Mode clamps a swapped yaw expression into 0-10 degrees), dispatches attacks on the TimerUtil cadence with optional client-side particle calls, and runs the Vanilla / Hurt Time auto-block state machine with C08 placements at BlockPos(-1,-1,-1) and C07 releases. It also holds the reach (3-8) and CPS (1-100) NumberSettings, the currentTarget getter used by other modules, and an onDisable that releases the sword when wasBlocked and clears target state. Note the asymmetry: getRotationFromTarget computes a pitch that is never applied, and the Fake auto-block mode and the fixedYaw quantization in Vanilla mode are dead code paths."
+    },
+    {
+      "label": "RotationUtil.java (aim math and sensitivity)",
+      "rel": "dev/tenacity/util/player/RotationUtil.java",
+      "explanation": "getRotationFromTarget aims at the entity's position plus half its eye height against the player's eye level and returns a yaw/pitch pair wrapped into the player's current angles; getSensitivityMultiplier computes the cubic mouse-sensitivity factor (sensitivity^3 * 8 * 0.15) that the module uses to quantize the yaw. The dead commented block shows an earlier variant that aimed at the player's eye height with no /2 adjustment. The key fact for anticheats is that KillAuraModule consumes only the yaw element of this helper's return value, so pitch is never rotated and vertical aim is the player's real look."
+    },
+    {
+      "label": "MathUtil.java (random ranges and clamp)",
+      "rel": "dev/tenacity/util/misc/MathUtil.java",
+      "explanation": "getRandomInRange(double, double) draws from a SecureRandom and is the per-attack CPS source, getRandomInRange(int, int) feeds the 1-2x Extra Randomization multiplier, and clamp is what pins the HvH Mode yaw into the 0-10 degree band. The fixed-interval behavior when randomization is off follows from min == max: the double overload returns the constant directly, so a 10-10 CPS setting produces a perfectly regular 100ms attack interval - the signature that rate checks rely on."
+    },
+    {
+      "label": "TimerUtil.java (attack clock)",
+      "rel": "dev/tenacity/util/misc/TimerUtil.java",
+      "explanation": "A millisecond stopwatch: hasTimeElapsed(time, reset) returns true once System.currentTimeMillis() - lastMS exceeds the interval and then resets the clock, which is exactly how the module implements its 1000 / cps attack cadence. The reset-on-fire semantics mean a single long frame (lag spike, render stall) only delays the next attack - the clock re-arms from the moment it fires, so the module cannot burst-attack after a stall, but it also means the attack stream is strictly periodic at the configured CPS, which is what makes the rate deterministic for server-side frequency checks."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Reach (queued attack ray trace with angle)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/combat/Reach.java",
+      "explanation": "Grim's Reach check runs on every ATTACK packet and never trusts the client's claim. onPacketReceive stores the player's exact position in playerAttackQueue, and on the next look update tickBetterReachCheckWithAngle casts rays from every possible eye height along the current yaw/pitch plus the previous yaw (1.8 clients are allowed both, since the attack and the look update arrive in the same tick) against the entity's tracked collision box expanded by the threshold (0.0005) plus a 0.1 hitbox margin for pre-1.9 clients. A ray that never intercepts the box produces the HITBOX result and flags the Hitboxes check; an intercept farther than maxReach (3.0) produces the REACH result. Independently, the real-time path (block-impossible-hits, on by default) uses getMinReachToBox - the distance from the eyes to the closest point of the box - and cancels any attack whose minimum reach exceeds the limit, arming a 4-hit cancel buffer.\\n\\nTenacity's default Reach of 4 blocks is nearly a full block over the 3.1005 effective ceiling, so every attack REACH-flags and the real-time cancel path kills the hit before damage. Raising Reach toward 8 makes the flagged distance larger. Because the module never sets pitch, a target standing above or below the player's eye level can also make the ray miss the box entirely, producing a Hitboxes flag on top of the reach violation. The only configuration that passes is Reach at 3.0 with targets at eye level, which removes the module's entire point."
+    },
+    {
+      "label": "FightHitbox (lag-compensated hitbox ray trace)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightHitbox.java",
+      "explanation": "Hawk validates each hit with its own ray trace after the fact: the interaction is deferred to the next MoveEvent, the victim's hitbox is rewound by the attacker's ping through the lag compensator and expanded by 0.005, and a ray from the attacker's eye (position + 1.62, minus 0.08 while sneaking) along the attacking direction must intersect it within maxReach (3.1 survival, 5.0 creative). A hit beyond 3.1 punishes 'Reach: Xm'; a ray that never touches the expanded box punishes 'Did not hit hitbox.' when checkBoxIntersection is on (default); optional occlusion checking exposes wall hits.\\n\\nTenacity's default 4-block reach exceeds the 3.1 cap by a clear margin, so FightHitbox flags every attack with the measured distance. The yaw snap does not help because Hawk uses the actual attacking direction and the module's pitch is never rotated: for a target above or below eye level the ray passes over or under the box and the check reports a missed hitbox instead of a reach violation. The lag compensator and the 0.005 epsilon forgive the small position interpolation error on legit 3.0-3.1 hits, but a 4+ block attack is far outside that envelope."
+    },
+    {
+      "label": "AttackFrequency (per-second attack caps)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/AttackFrequency.java",
+      "explanation": "The ProtocolLib UseEntityAdapter feeds every USE_ENTITY packet through action interpretation (legacy reflection for 1.7, enum wrappers for newer) and counts only ATTACK actions into attackFrequencySeconds, an ActionFrequency of 16 buckets x 500ms spanning 8 seconds. Each packet checks five windows - 500ms (limit 8), 1s (15), 2s (30), 4s (60), 8s (95) - and raises a violation the moment any sum exceeds its limit, feeding Improbable with weight 3.0 and defaulting to cancel at vl>10.\\n\\nTenacity's attack stream is a strict 1000/cps periodic series (the TimerUtil resets on every fire), which makes it easy to score: at the default 10 CPS all five windows stay under their caps, but the module's range goes to 100. A sustained 16 CPS trips the 1s and 2s caps, 17+ trips the 500ms cap, and anything above 30 trips the 2s window immediately; at 100 CPS every window overflows on the first second. Extra Randomization's 1-2x interval multiplier halves the effective rate on multiplier-2 draws, which delays but does not eliminate the violation at high CPS, and because the stream is perfectly periodic when randomization is off, the 8s window accumulates the excess without any bursty averaging-out."
+    },
+    {
+      "label": "KillAura (direction / noswing / reach / speed)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/KillAura.java",
+      "explanation": "Arc v2's composite KillAura check runs from FightListener.onFight on the damage event at HIGHEST priority and applies five sub-checks with config defaults max-direction-angle 1.2 radians, max-swing-time 80ms, max-reach 4.2, max-attacks 16/s and max-attack-packets 20/s. Direction measures the angle between the player's look vector and the attacked entity, Multi compares the angles to two consecutive targets, NoSwing demands an arm swing within 80ms of the attack, Reach measures the distance to the entity position minus its velocity, and Speed counts attacks and attack packets per second with a per-second reset.\\n\\nAgainst Tenacity the reach sub-check bites as soon as the Reach setting exceeds 4.2 (the module allows up to 8), so the default 4 passes but any extension flags every hit with the measured distance. The speed sub-checks counter the CPS range: more than 16 attacks in a second (CPS 17+) trips max-attacks, and more than 20 attack packets in a second (CPS 21+) trips max-attack-packets, so the default 10 CPS passes but the upper half of the 1-100 range is exposed. Direction passes because the yaw is snapped onto the target, and NoSwing passes because swingItem() precedes every C02 - the same two components that let Memeware's blockhit aura pass those branches."
+    }
+  ]
+}

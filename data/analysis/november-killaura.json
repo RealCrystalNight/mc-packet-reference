@@ -1,0 +1,58 @@
+{
+  "module": "KillAura",
+  "client": "November Recode 2.0",
+  "category": "killaura",
+  "source_rel": "feature/module/impl/combat/KillAuraModule.java",
+  "overview": "November's KillAura is a compact combat module driven by a single EventWalkingUpdate subscription with two small support listeners. Every walking tick it re-selects the attack target when the current one is invalid or the mode is SWITCH, streaming the loaded entity list through a comparator chosen by the Sort setting (Distance, Health, HurtTime, Armor), after validTarget rejects dead entities, armor stands, AntiBot-flagged bots and anything outside a range that shrinks to WallRange when the entity cannot be seen. Rotations come from RotationUtils.entity and are spoofed through November's rotation manager at HIGH priority. Attacks fire on the PRE stage of the walking update when the attack timer has elapsed: a swing, then either a direct C02PacketUseEntity ATTACK when KeepSprint is on or the vanilla playerController.attackEntity path otherwise. Six autoblock modes (NONE, FAKE, HOLD, BASIC, VANILLA, WATCHDOG) wrap the attacks in C08 block placements, keybind holds and C07 releases, with the WATCHDOG mode cancelling outgoing C02 attacks while the target is in hurt time.",
+  "sections": [
+    {
+      "h": "Target selection and rotation spoofing",
+      "p": "The walkingUpdate listener re-runs selection every tick whenever the stored attackTarget fails validTarget or the mode is SWITCH. Selection is a stream over mc.theWorld.loadedEntityList filtered to EntityLivingBase instances that pass validTarget, reduced with Comparator.comparingDouble on the Sort enum's comparator, so the entity minimizing distance, health, hurtTime or armor wins. validTarget rejects null, the local player, dead entities, health at or below zero and armor stands, consults the AntiBot module when it is toggled, then applies the range test: canEntityBeSeen selects the Range value, otherwise WallRange, and the target must satisfy getDistanceSqToEntity within the squared radius. Once a target exists, RotationUtils.entity computes the facing angles and November.instance().rotations().spoof(HIGH, 5, rots) pushes them into the rotation manager so the server-side look tracks the target while the camera may not. The attack and the spoof run inside the same walking update, which keeps the server-observed facing consistent with the hit."
+    },
+    {
+      "h": "Attack timing and execution",
+      "p": "Attacks are scheduled by a Timer against attackTime(), which returns 1000 divided by a random integer between MinCPS and MaxCPS for the BASIC clicking mode and 0.0 for ADVANCED and UPDATED, meaning those two modes attack on every walking update tick. On the PRE stage, after the timer passes, the module sends the release packet for BASIC autoblock, calls swingItem, then dispatches the hit: the KeepSprint path queues a C02PacketUseEntity ATTACK directly through the send queue, while the default path calls playerController.attackEntity, which lets vanilla handle sprint stopping and the packet. The timer resets after each attack, and the BASIC autoblock mode re-asserts the block with a fresh C08 after the hit. The packetOut listener is the safety net: in WATCHDOG mode it cancels any outgoing C02 ATTACK while the target's hurtTime is above 2, so the module never stacks hits on a target that is already showing damage."
+    },
+    {
+      "h": "Autoblock modes and packet handling",
+      "p": "Blocking is asserted through one of six modes. HOLD sets the inventory key binding pressed, BASIC and VANILLA send C08PacketPlayerBlockPlacement with the held item, and VANILLA returns immediately after blocking, skipping the attack for that tick, which makes it the block-only mode. WATCHDOG sends C08 with a null item stack while the target's hurtTime is above 2 and unblocks at exactly 2, riding the vanilla use-item state to keep the block animation alive. FAKE and NONE never send block packets. unblock() releases the key binding or sends C07PacketPlayerDigging RELEASE_USE_ITEM at BlockPos.ORIGIN with facing DOWN, and the packetOut listener cancels that same C07 for the VANILLA and WATCHDOG modes so the server never sees the release, while BASIC lets it through. The renderItemUse listener forces the held sword's action to BLOCK and cancels the event whenever blocking is true, so the client renders the blocking pose even though the packet stream only shows C08 placements. The module only blocks while holding a sword, and disable() tears down the block state when the module turns off."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity",
+    "C07PacketPlayerDigging",
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "KillAuraModule.java (module logic)",
+      "rel": "feature/module/impl/combat/KillAuraModule.java",
+      "explanation": "The entire module is this one class: the Setting declarations for Mode, Sort, Clicking, CPS, Range, WallRange, AutoBlock, Rotate and KeepSprint, the walkingUpdate listener that selects targets and fires attacks, the packetOut listener that polices C02 and C07 traffic for the WATCHDOG and VANILLA autoblock modes, the renderItemUse listener that forces the blocking pose, and the validTarget, unblock, holdingSword and attackTime helpers. The Mode enum (SINGLE, SWITCH, HURT_TIME) and the Sort enum's comparators define the target selection surface, and the Click enum's BASIC/ADVANCED/UPDATED values control whether attacks are randomized or every tick. Everything a counter needs to know about what the module sends and when is in the two listeners plus attackTime."
+    },
+    {
+      "label": "RotationUtils.java (target angle computation)",
+      "rel": "utility/math/RotationUtils.java",
+      "explanation": "RotationUtils.entity computes the yaw and pitch that face an EntityLivingBase, which is the only rotation primitive the module uses; the returned float array is passed straight to the rotation manager's spoof call. The class also provides block and middleBlock helpers used by the client's other modules, but KillAura only consumes entity(). The separation matters for countering: the angle the server sees comes from this computation plus the rotation manager's spoof timing, so an aim-pattern check that analyzes the sent yaw/pitch stream is really analyzing the output of this utility, not human input."
+    }
+  ],
+  "countering": [
+    {
+      "label": "KillAura (speed, multi, direction)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/KillAura.java",
+      "explanation": "Arc's KillAura check is invoked from the FightListener on every use-entity attack and bundles direction, multi-target, no-swing, reach and speed sub-checks. The speed sub-check counts totalAttacks against max-attacks and attack packets against max-attack-packets, resetting both on a one-second boundary, and checkFrequency applies the packet ceiling so a burst of C02 packets inside a second trips a violation even when the entity-facing angles are clean. The multi sub-check compares the angles to the previously attacked entity and the current one, flagging when they differ by more than maxAngle while both targets are in reach. The direction sub-check measures the angle between the player's server-side look and the attacked entity, and the reach sub-check measures distance to the entity position minus its velocity so knockback does not mask an out-of-range hit."
+    },
+    {
+      "label": "EntityInteractReach (lag-compensated reach)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/entity/EntityInteractReach.java",
+      "explanation": "Hawk's EntityInteractReach validates every entity interaction, attacks included, against a server-side distance measurement. The check builds the attacker position from the lag compensator's ping-based history location plus eye height, then computes the distance from that point to the victim's bounding box and punishes when it exceeds the configured reach. Because the attacker position is rewound by the player's ping, client-server desync does not inflate the measured distance in the attacker's favor, and because the distance is measured to the AABB, standing inside the box's footprint is what counts rather than any claimed range. The check is cancelless by design, so its role is flagging rather than packet blocking."
+    },
+    {
+      "label": "Reach (distance limit with precision and dynamic reduction)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Reach.java",
+      "explanation": "NCP's fight.Reach compares every attack's measured distance lenpRel against distanceLimit, which comes from reachSurvivalDistance or the 6.5 creative constant, and flags when the difference is positive, with reachPrecision tightening the comparison to the exact separation. Repeated violations accumulate reachVL and drive a dynamic reduction that lowers the effective limit via reachReduceDistance in steps of reachReduceStep, and cancelled hits apply reachPenalty to further suppress combat output. The measurement uses the server's own player and entity positions, so no client-side claim about range, facing or onGround changes the result. Improbable and the VL accumulator gate the actions so a single borderline hit does not immediately punish."
+    }
+  ]
+}
