@@ -22,6 +22,9 @@ node scripts/merge-impl.js
 echo "==> build.js (js/packet-data.js + registry)"
 node scripts/build.js
 
+echo "==> generate-analysis.py (module analyses + hub — before pages so the sitemap sees fresh mtimes)"
+python3 scripts/generate-analysis.py
+
 echo "==> generate-pages.js (packets/*/index.html + sitemap)"
 node scripts/generate-pages.js
 
