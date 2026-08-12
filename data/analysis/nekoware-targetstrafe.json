@@ -1,0 +1,57 @@
+{
+  "module": "TargetStrafe",
+  "client": "Nekoware v1 private",
+  "category": "targetstrafe",
+  "source_rel": "me/nekoWare/client/module/combat/TargetStrafe.java",
+  "overview": "Nekoware v1 private ships the same TargetStrafe as Memeware 7.3: the module file, the MovementUtils helpers and the patched vanilla tree are byte-identical apart from the package renames, so the orbit behaves identically on the wire. The module exposes one shared direction, flips it on horizontal collision, zeroes the forward input while a target exists, and draws the orbit ring in Render3D; the circular motion itself is produced by MovementUtils whenever a speed module drives the player through it. The analysis of one applies to the other, with the fork lineage noted for accuracy.",
+  "sections": [
+    {
+      "h": "A fork with identical mechanics",
+      "p": "The module file differs from the Memeware original only in the package statement and the import paths: the handlers, the dir field and the canStrafe gate are the same lines of code. The same holds for the MovementUtils helpers that build the motion and the EntityPlayerSP tick machinery that emits the packets. Nekoware v1 private is a fork of the Memeware lineage, and for this module the fork changed nothing behavioral.\n\nThe practical consequence is that detection reasoning transfers directly: the server-visible signature of a Nekoware orbit is the same C03 circle around the Aura target, the same tangential motion at a right angle to the reported aim yaw, and the same C0B sprint state carried by the companion Sprint module."
+    },
+    {
+      "h": "Handlers and shared state",
+      "p": "The pre-phase UpdateEvent handler inverts the public static dir on horizontal collision and zeroes movementInput.forward when canStrafe passes, so the player stops advancing on the target. The Render3D handler interpolates the Aura target's position with the render tick and draws a dark-gray circle at a radius of the Aura Range setting minus one. The motion-side radius, Range minus 2.3, lives in MovementUtils and is where the approach and orbit phases switch."
+    },
+    {
+      "h": "Wire signature",
+      "p": "func_175161_p in the patched player fires the UpdateEvent, emits C0B for sprint and sneak state changes, then sends the C03 packet built from the event's values. The orbit shows up as C03 deltas tracing a circle around the target while the yaw points at it, because SingleAura writes the aim rotation into the event. The C0B contribution is the sprint state the Sprint module holds during the strafe; Nekoware's Aura also declares a Keep Sprint toggle that no code reads."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C0BPacketEntityAction"
+  ],
+  "files": [
+    {
+      "label": "TargetStrafe.java (orbit module)",
+      "rel": "me/nekoWare/client/module/combat/TargetStrafe.java",
+      "explanation": "The module is the same thin shell as the Memeware original: it owns the direction state, the collision flip and the visual ring, and nothing else. dir is a public static double initialized to 1, read by the movement utils without a module lookup. The pre-update handler flips dir on horizontal collision and zeroes the forward input while canStrafe passes, and the Render3D handler draws the ring around the interpolated target position at a radius of Aura Range minus 1.\n\nThe module never constructs a packet. Its entire effect is the dir value and the forward zeroing, both consumed elsewhere: MovementUtils turns them into tangential motion and the vanilla tick machinery turns the resulting position and rotation into C03 packets. The ring is visual only; the walked circle radius is Range minus 2.3, which is decided in MovementUtils, not here.\n\ncanStrafe is the shared gate with the kill aura: Aura.currentEntity must be non-null and the module toggled. currentEntity is cleared when Aura disables, so the orbit dies with the aura. The collision flip runs even without a target, but dir is only read when canStrafe is true, so an idle flip has no effect."
+    },
+    {
+      "label": "MovementUtils.java (orbit builder)",
+      "rel": "me/nekoWare/client/util/movement/MovementUtils.java",
+      "explanation": "The helpers here are byte-identical to the Memeware versions apart from the package names, which is verifiable by diffing the two trees. Every motion helper consults TargetStrafe.canStrafe and rebuilds the input triplet: forward becomes 0 inside Range minus 2.3 and 1 outside, strafe becomes dir, and the yaw comes from RotationUtils.getRotations on the Aura target. The forward and strafe decomposition around that yaw produces the tangential orbit motion.\n\nAll the client's velocity-driving modules route through this class, so whichever of them is toggled inherits the orbit behavior: inside the hold radius the player only strafes, outside it the player approaches. The yaw used for the motion math is the same target rotation that SingleAura writes into the UpdateEvent, so the reported rotation and the motion agree on the target."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SprintDirection (sprint motion vs yaw)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/SprintDirection.java",
+      "explanation": "SprintDirection compares the direction of the player's horizontal move against the yaw reported in the same move packet. It tracks the last tick each player was not sprinting and only evaluates once the player has been sprinting for at least two consecutive ticks and has moved at least 0.2 blocks. The check builds the expected move force from the previous velocity, applies friction, soul sand, web and hit-slowdown modifiers, then measures the angle between the yaw vector and the actual move vector. An angle above pi over 4 plus 0.3 radians, about 62 degrees, is a violation with a rubberband.\n\nThe orbit trips this check whenever the sprint flag is up. The module's motion is tangential to the line to the target while the reported yaw points at the target, so the angle between them is a right angle, well past the 62-degree limit. The player also has to be sprinting, which is exactly what the Sprint module provides: it reasserts setSprinting(true) every tick while strafing, defeating the vanilla auto-stop, so the orbit runs with the sprint flag held. Server-side the sprint state, the motion direction and the reported yaw are all visible, and none of them needs a client bot list to be compared.\n\nWhat the check does not catch is a walk-speed orbit with sprint off. Without the Sprint module the strafe-only motion keeps the player out of the sprinting branch and the check skips it, so a conservative configuration that circles without sprinting avoids this specific check. That is the honest boundary: SprintDirection scores the sprinting orbit, not the bare circle."
+    },
+    {
+      "label": "SurvivalFly (movement envelope + illegal sprint)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "NCP's SurvivalFly rebuilds the player's physics envelope from the world and the last accepted move. The horizontal allowance comes from the previous move's momentum plus the input force implied by the current motion, and any horizontal distance above that envelope raises a violation that ends in a set-back to the stored location. The check does not trust the client's onGround flag and it does not trust the client's choice of direction; it compares distances to a physics model.\n\nTargetStrafe itself adds no speed, so the check's direct target is the combination the module enables: an orbit driven by a speed module at the module's configured velocity. The moment the tangential speed exceeds the walk envelope, the accumulated horizontal distance above the limit converts into violation points and the player is snapped back, which breaks the circle. The sprint multiplier is part of the model too, so an orbit that holds the sprint flag gets the 1.3 times allowance and nothing more.\n\nThe check also carries an illegal-sprint input cross-check for servers that know the client's WASD impulse: a sprinting player whose impulse is backward or sideways, or whose food level is at or below 5, is tagged illegalsprint and reset. That branch is the layer that catches the sprint-on-strafe orbit on servers where the impulse is known, while the envelope catches the over-speed orbit on every server."
+    },
+    {
+      "label": "Speed (base speed envelope)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Speed.java",
+      "explanation": "Arc v2's Speed check measures the horizontal distance of every move against a base speed of 0.2873 blocks per tick adjusted for speed potions, with additional allowances for ice, slime blocks, stairs and jump stages. On the ground it averages the move distance over the accumulated ground ticks and flags when the move exceeds the base plus that average. The check never looks at direction, so it is blind to the geometry of the orbit, but it bounds the speed the orbit can sustain.\n\nThe orbiting player inherits its velocity from whatever speed module is driving MovementUtils, so the check scores the combined effect: a circle at walk speed passes, while a circle driven at bunny-hop velocity accumulates ground ticks and trips the on-ground expected branch with a set-back to the previous location. Because the module holds the player in a constant-speed circle, the violation is sustained rather than a single spike, which pushes the violation level up.\n\nThe check is the speed-side companion to the direction checks: it cannot see the circle, so a target strafe at legal speed is invisible to it, but it is the piece that removes the reason to orbit at boosted speed. On its own it is an envelope; paired with the direction and sprint checks it closes the orbit signature."
+    }
+  ]
+}

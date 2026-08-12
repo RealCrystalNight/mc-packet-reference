@@ -1,0 +1,57 @@
+{
+  "module": "Freecam",
+  "client": "Rise 5.99",
+  "category": "freecam",
+  "source_rel": "dev/rise/module/impl/render/Freecam.java",
+  "overview": "Rise 5.99's Freecam separates the camera from the body: it spawns a fake EntityOtherPlayerMP that mirrors the player, then flies the real entity around with motion writes while suppressing almost the entire outbound packet stream and cancelling S08PacketPlayerPosLook teleports on the receive side. The outbound allowlist keeps chat, block placement, inventory transactions, keepalives, held-item changes, sign updates, creative actions, window clicks and closes, client status, animation and attacks, and cancels everything else, including every C03 movement packet and C0C input, so the server-side entity is frozen at the position where the module was enabled while the local camera flies through the map. NoClip and collision removal are client-side only.",
+  "sections": [
+    {
+      "h": "The split entity",
+      "p": "onEnable builds an EntityOtherPlayerMP from the player's GameProfile, copies position, rotation, head yaw, sprint, invisibility and sneak state, and registers it with the world, storing startX/Y/Z and the yaw-pitch pair. onDisable removes the fake entity and teleports the real player back to the stored pose, then clears noClip and motion. The fake keeps the body rendered at the origin spot, so the module reads as a camera detach rather than a vanish, and the player model stays visible to other clients at the frozen server position."
+    },
+    {
+      "h": "Flight controls",
+      "p": "onPreMotion writes motionY from the jump and sneak keys at plus or minus flySpeed (0.1-9.5, default 1.0), then calls MoveUtil.strafe(flySpeed), which decomposes the yaw into motionX and motionZ when any movement key is down, or MoveUtil.stop() to zero them. onMoveButton forces sneak off while fly is enabled and onBlockCollide nulls the collision bounding box while Fly and NoClip are both on, so the camera walks through blocks without the vanilla collide-and-step. The flySpeed and noClip settings are hidden from the GUI whenever the Fly toggle is off."
+    },
+    {
+      "h": "Packet suppression",
+      "p": "onPacketSend cancels every packet outside the allowlist: the entire C03 movement family, C0C input, C0B entity action, C07 digging, C13 abilities and C18 spectate are dropped, so the server entity never moves, never sprints or sneaks, and never digs. onPacketReceive cancels S08PacketPlayerPosLook once the player has existed for more than one tick, which keeps the local camera where it is but also eats server-forced position corrections; the world-change guard (ticksExisted below 5) disables the module instead of letting it fight a fresh world."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "Freecam.java",
+      "rel": "dev/rise/module/impl/render/Freecam.java",
+      "explanation": "The module is five handlers around one idea: a fake entity for the body, motion writes for the camera, and an allowlist filter for the wire. onEnable/onDisable manage the EntityOtherPlayerMP lifecycle and the position save-restore; onPreMotion performs the flight; onPacketSend implements the cancellation allowlist; onPacketReceive eats S08 teleports; onMoveButton and onBlockCollide remove the input and collision constraints that would otherwise pin the camera to the body.\n\nThe allowlist is the module's real mechanism. The cancelled set is defined by exclusion, so any packet class added to the client over time is suppressed by default until explicitly whitelisted, which is why the movement family, input, entity action, digging and abilities all vanish from the wire while chat and container traffic still flow. The S08 cancel is unconditional after tick 1, so even anticheat teleport corrections are swallowed, and the module's only guard against a world change is the ticksExisted check that disables it before the fresh world can desync the stored start position."
+    },
+    {
+      "label": "MoveUtil.java (flight motion)",
+      "rel": "dev/rise/util/player/MoveUtil.java",
+      "explanation": "MoveUtil is the movement math the flight depends on. strafe(float speed) reads the movement keys, computes the look direction with getDirection (which folds strafe and backward input into the yaw), and writes motionX = -sin(yaw) * speed and motionZ = cos(yaw) * speed; isMoving() gates it, so strafe returns early when no movement key is held, which is why the module pairs it with stop() to explicitly zero the horizontal motion. The util is a LiquidBounce-derived port, credited in its header, and carries the client's full movement toolkit from speed estimation to scaffold helpers.\n\nFor Freecam only three functions matter: strafe, stop and isMoving, all operating on the local entity's motion fields. The writes are client-side state, and because the module cancels the C03 stream those fields never reach the server; the same util is what makes the flight feel like normal strafing rather than teleport stepping. The getAllowedHorizontalDistance function even replicates NCP's per-tick horizontal allowance math, which is the exact envelope the anticheat side applies to the movement the module suppresses."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "NoCheatPlus SurvivalFly rebuilds the client's physics envelope from the world instead of trusting the packet. The horizontal allowance comes from prepareSpeedEstimation and the vertical allowance from vDistRel, which initializes from the previous move's momentum and only accepts named envelopes: zero-y moves on ground, jumps, step-ups and riptide launches. The violation is (max(hDistanceAboveLimit, 0.0) + max(yDistanceAboveLimit, 0.0)) * 100 with a set-back, and both ground flags come from a block-cache ray trace at minY minus yOnGround, never from the packet's onGround claim.\n\nThe Freecam flight would blow this envelope instantly if any movement reached the server: Rise's flySpeed runs up to 9.5 blocks per tick horizontally with a constant vertical component, against a vanilla allowance of roughly 0.22 blocks per tick on flat ground. The module's suppression is what keeps the check quiet, because a frozen entity emits no moves to score. The check becomes relevant at the edges: if the S08 cancel misses a teleport, or the server moved the entity during the freecam session, the first C03 after disable shows a jump the envelope never authorized, and the set-back snaps the player to the tracked location."
+    },
+    {
+      "label": "TeleportQueue (teleport acknowledgment ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/model/TeleportQueue.java",
+      "explanation": "NCP's TeleportQueue keeps the teleport contract honest. Every outgoing S08 location is queued via onOutgoingTeleport (entries age out after 4000ms with a queue cap of 60), and each incoming C03 is classified by processAck(DataPacketFlying) as ACK when it matches a queued location, IDLE when no acknowledgment is expected, or WAITING while the client owes an acknowledgment; the queue's stated purpose is to cancel other movement until the client confirms previous teleports. The id-tracked variant matches teleport ids and clears the queue when the latest id is confirmed.\n\nThe S08 cancel in onPacketReceive breaks this ledger. The client drops the teleport on arrival, so it never knows a teleport was issued and cannot send the matching C03; the queued entry sits in WAITING until it ages out after four seconds, and any movement that does arrive in that window is held as unacknowledged. When the module disables, the first C03s resume from the local position, which NCP measures against the queued teleport location, so a teleport that landed during the freecam session converts directly into a held-movement violation on resume. The module's only mitigation is that it suppresses movement for the whole session, which starves the queue of the packets that would expose the mismatch."
+    },
+    {
+      "label": "Flight (hover, ascension, glide)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Flight.java",
+      "explanation": "Arc v2's Flight check validates the vertical profile of the movement stream. hoverCheck flags a player whose vertical speed is zero while the air-tick counter exceeds max-hover-time; the ascension path flags distance from the ground beyond max-ascend-distance, sustained ascension beyond max-ascend-time, and vertical speed beyond the jump curve; the glide path flags constant-velocity descent and descent speeds that diverge from the expected air-resistance curve. Ground state, air ticks, ladder time and velocity data all come from MovingData fed by the C03 stream.\n\nThe Freecam flight is the exact profile these branches were written for: sustained constant vertical speed from the jump and sneak keys, zero gravity, and arbitrarily long air time, so the first leaked C03 would trip ascension within a few ticks at the default 1.0 speed and hover shortly after. The honest limit is that the module's cancellation is thorough, so the check only ever sees the flight if a movement packet slips through the allowlist, and the suppression itself is why the module survives on servers running Arc. On disable, the resume jump from the stored position is likewise measured against the ground-distance and vertical-speed curves."
+    }
+  ]
+}

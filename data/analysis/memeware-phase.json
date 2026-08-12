@@ -1,0 +1,62 @@
+{
+  "module": "Phase",
+  "client": "Memeware 7.3",
+  "category": "phase",
+  "source_rel": "me/memewaredevs/client/module/player/Phase.java",
+  "overview": "Memeware 7.3's Phase runs two independent bypasses from one UpdateEvent handler and a collide override. With the module enabled the player is permanently noClipped and vertical motion is zeroed every tick; whenever the bounding box intersects a solid block's collision box (the isInsideBlock scan, with hoppers forced to full-cube boxes), the module claims ground on the movement event, pins vertical motion to 1.139 up or down per the jump and sneak keys, and pushes horizontal speed to 1.139 blocks per tick through MovementUtils.setMoveSpeed, walking through the wall while the EventCollide handler nulls the local bounding box. Outside any block, holding sneak sends a silent pair of C04 packets, one 120 blocks up and one back to the original y, both claiming ground: a vertical teleport out and back that desynchronizes the server-side position tracker without the client ever leaving its spot.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module is two lwjeb-registered consumers plus a static helper. The UpdateEvent consumer runs every tick: it forces noClip on, zeroes motionY, then branches on isInsideBlock(). The scan iterates every block cell overlapped by the player bounding box and compares each block's collision box against the AABB; BlockHopper is special-cased to a full 1x1x1 box because its real collision box is nearly empty. The EventCollide consumer receives every collision the player would hit and unconditionally replaces the bounding box with null, so no solid block can stop local motion. The sneak branch is the second half of the UpdateEvent consumer and only fires when the player is NOT inside a block."
+    },
+    {
+      "h": "Block phase",
+      "p": "Inside a block the handler writes a ground claim on the movement event (event.setGround(true)), then sets motionY to 1.139 when jump is held, -1.139 when sneak is held, or 0, and calls MovementUtils.setMoveSpeed(1.139), which resolves the movement input into motionX and motionZ at 1.139 blocks per tick. The client moves at roughly four times sprint speed through the solid block while noClip and the nulled collide box keep local physics from interfering. The next C03 position update the client emits carries the new position inside the block with onGround true, so the server-side track is fed a grounded move whose destination is inside a solid block."
+    },
+    {
+      "h": "Packet phase",
+      "p": "While the player is clear of blocks, holding sneak fires PacketUtil.sendPacketSilent twice: C04 at (x, y + 120, z) with onGround true, then C04 back at (x, y, z) with onGround true. sendPacketSilent writes straight to the network manager, bypassing the send queue and the event bus, so the pair leaves immediately and cannot be re-intercepted. The trick survives vanilla because the server's moved-too-quickly bound only squares horizontal deltas; a 120-block vertical excursion is not bounded by it. The net effect is a two-packet y desync with no position change, after which the noClip movement from the other branch continues."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Phase.java (module)",
+      "rel": "me/memewaredevs/client/module/player/Phase.java",
+      "explanation": "The whole module is this 64-line file. The UpdateEvent consumer sets noClip true and motionY 0 every tick, then either runs the block phase (ground claim, 1.139 vertical and horizontal pin, via event.setGround and MovementUtils.setMoveSpeed) or, when sneaking outside a block, sends the silent C04 pair at y + 120 and back through PacketUtil.sendPacketSilent. The EventCollide consumer nulls every collision bounding box, and the static isInsideBlock() helper is the AABB-overlap scan with the hopper special case. The module never sends a C03 of its own construction; it edits the movement event and lets the client's normal move packet carry the inside-block position."
+    },
+    {
+      "label": "MovementUtils.java (horizontal pin)",
+      "rel": "me/memewaredevs/client/util/movement/MovementUtils.java",
+      "explanation": "setMoveSpeed(double) is the horizontal driver of the block phase. It reads the movement input, applies target-strafe adjustments from the Aura module when active, and writes motionX and motionZ at the given speed along the input direction; the two overloads share the same core, one taking a MovementEvent to also stamp. The 1.139 call from Phase is what moves the player through the solid block between ticks, so this file is the second half of the block-phase mechanism."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Passable (swept-box ray trace)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/Passable.java",
+      "explanation": "Passable ray-traces the player's swept collision volume between consecutive positions with configurable margins (passableVerticalMargins, passableHorizontalMargins) and flags any transit whose box intersects a solid block's collision box; it retries alternate axis orders (YXZ, then YZX or XZY/ZXY) before giving up, and a hit raises passableVL by 1 (decaying by 0.99 per clean move) and returns a set-back location. The block phase is a direct hit: every tick the player is inside a solid block and moves at 1.139 blocks per tick, so each move is a swept box crossing block faces, which the ray trace collides on. The initial-inside-block position is ignored (setIgnoreInitiallyColliding(true)), so standing still inside a block at rest is not flagged; the transit itself is what trips the check, which matches the module's continuous movement. The 120-block sneak pair is not Passable's domain; the vertical envelope covers that."
+    },
+    {
+      "label": "SurvivalFly (vertical envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the physics envelope server-side. The vertical allowance in vDistRel is initialized from the previous move's momentum and only accepts named envelopes: a zero-y grounded move, a real jump, a step-up and a riptide launch; the horizontal allowance comes from prepareSpeedEstimation, which predicts per-tick sprint distance (0.91 air inertia, sprint +30%). The sneak pair presents a single 120-block rise against an allowance of a few tenths of a block, so yDistanceAboveLimit is roughly 119.7 and the (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 violation fires on the first C04 with a set-back. The block phase's 1.139 pin is caught the same way horizontally: 1.139 against a predicted ~0.31 sprint gives hDistanceAboveLimit around 0.83, a violation of about 83 per tick. The onGround true flags on the C04s and the ground claim on the movement event do not help, because from- and to-ground are computed by NCP's own block ray trace, never by the packet flag."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts every serverbound move packet into an ActionFrequency with 500ms buckets and scores the window against cc.morePacketsEPSMax (22/s, 20 ideal), with a burst path on the newest half-second bucket (15 packets, 10 direct-violation). Each sneak phase adds two silent C04s on top of the tick's regular move; holding sneak sustained (the trigger requires only that the player is not inside a block) turns the baseline 20/s into roughly 60/s, blowing the 22/s window and tripping the burst path on the very first concentrated burst. The pair's extreme y offsets are irrelevant: the check is content-blind and counts the packets. The block phase adds no extra packets, so it is invisible to this check; its tell is the envelope and the ray trace instead."
+    },
+    {
+      "label": "Phase (tesseract swept AABB)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Phase.java",
+      "explanation": "Hawk's Phase check builds the swept volume between the previous and current player boxes (shrunk by side 0.1, bottom 0.4 and top 0.1 epsilons to cut false positives), tests it as a tesseract against every nearby solid block's collision boxes, and on a three-axis hit calls punish with rubber-band. The block phase is exactly the geometry it detects: the player's box starts inside a solid block and moves 1.139 blocks per tick, so the swept volume intersects the block's collision box on every move. The check's distance guard (distanceSquared > 65 returns early) is the one honest gap: the 120-block sneak pair and its return trip both exceed 65 squared distance and are skipped, which is why the vertical envelope must cover that branch. The module's collide override only affects the client's local physics; Hawk computes its boxes from the server positions the C03s carry."
+    }
+  ]
+}

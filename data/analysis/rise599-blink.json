@@ -1,0 +1,62 @@
+{
+  "module": "Blink",
+  "client": "Rise 5.99",
+  "category": "blink",
+  "source_rel": "dev/rise/module/impl/player/Blink.java",
+  "overview": "Rise 5.99's Blink is a fake-lag module built around a single interception point: onPacketSend cancels the outgoing packet and parks it in a ConcurrentLinkedQueue, and onDisable replays the whole buffer through PacketUtil.sendPacketWithoutEvent so the server receives every stale packet in one burst. The allPackets toggle, on by default, cancels every packet class, while turning it off narrows the buffer to C03PacketPlayer only, a mode the class comment itself warns is trivially detectable. The pulse setting turns the module into a periodic fake-lagger: every delayPulse ticks (default 20, range 4 to 100, with a 10 percent random skip) the entire buffer flushes through the same event-bus bypass, so the server sees a player that stands still and then jumps forward in 20-tick steps. A showPlayer ghost entity renders the player's real position client-side while the server-side model is frozen, and onPreMotion records breadcrumb path points for the render layer. The buffer is cleared whenever the world state is unsafe (null player, dead, singleplayer, or under 150 ticks), which keeps stale packets from replaying across a respawn.",
+  "sections": [
+    {
+      "h": "Buffer and flush cycle",
+      "p": "onPacketSend adds every outgoing packet to the queue and cancels it, then the pulse branch runs inside the same handler: when the pulse toggle is on and the current tick count is an exact multiple of the delay setting, the handler iterates the queue and pushes each packet through sendPacketWithoutEvent before clearing it. The Math.random() > 0.1 guard means roughly one pulse in ten silently drops the whole buffer instead of flushing it, so the cadence is intentionally irregular. onDisable drains the queue the same way, and because sendPacketWithoutEvent routes around the event bus the flushed packets cannot be re-intercepted by this very handler. The path list used for breadcrumbs is capped at the pulse delay length while pulsing, and the showPlayer ghost is only spawned when both pulse and showPlayer are off."
+    },
+    {
+      "h": "Server-side footprint",
+      "p": "With the default settings the server sees roughly 20 packets arrive in a single tick followed by 20 ticks of silence, an average near 20 packets per second that sits under common rate ceilings while the instantaneous burst is the fingerprint. In the all-packets mode the buffer also holds C00 keepalives, C0F confirmations, C0B entity actions and C02 attacks, so the flush replays the entire gameplay stream at once, and the keepalive echoes arrive long after the server issued their keys. With allPackets off and pulse off, the module produces one long silent gap and then a replay of the whole path in a single tick."
+    },
+    {
+      "h": "Detection surface",
+      "p": "The flush presents every buffered move as a single-tick sequence: the first replayed move is a jump from the last position the server tracked, and every later move is stale relative to any correction the server applied during the gap. The pulse mode shrinks the gap to about a second so the first move of each flush stays small, but the per-flush burst remains, and a set-back that lands mid-blink leaves the buffered path starting from a pre-correction location, so the next flush begins with a divergence the envelope checks can see."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Blink.java",
+      "rel": "dev/rise/module/impl/player/Blink.java",
+      "explanation": "onPacketSend is the single chokepoint: every outgoing packet is added to the ConcurrentLinkedQueue and cancelled, and the pulse branch runs inside this same handler, so a C03 arriving mid-blink can trigger a flush of the whole buffer. onDisable drains the queue through PacketUtil.sendPacketWithoutEvent, which routes around the event bus and therefore cannot be re-buffered by this handler. The tick guards (null player, dead, singleplayer, ticksExisted under 150) clear the buffer instead of flushing it, so a blink cannot survive a world join. The path list and the blinkEntity ghost are render-side state maintained by onPreMotion and onRender3DEvent."
+    },
+    {
+      "label": "PacketUtil.java (flush bypass)",
+      "rel": "dev/rise/util/player/PacketUtil.java",
+      "explanation": "The flush carrier. sendPacketWithoutEvent delegates to NetHandlerPlayClient.addToSendQueueWithoutEvent, the fork's bypass that enqueues the packet straight into the network layer without firing the send event. Every replay in the module, pulsed or on disable, goes through this one method; without it the flushed packets would re-enter onPacketSend and be cancelled again, which would make the module unable to ever deliver its buffer."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (flush burst)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NoCheatPlus MorePackets scores every arriving move into 500ms buckets against a 22 packets per second window and a half-second burst path (default 15 packets). The pulse flush lands the whole buffer, about 20 C03s at the default delay, in a single tick, so the newest half-second bucket trips the burst path on every pulse; the disable flush of a long all-packets blink delivers the accumulated stream at once, which drives the window accumulator above the ceiling and pushes toward the direct-violation threshold. The module's average rate near 20 per second stays under the window ceiling, so the instantaneous burst is the lever that catches it."
+    },
+    {
+      "label": "SurvivalFly (stale replay envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the movement envelope from the server-side tracked location instead of trusting the packets. The first move of a flush has a delta equal to the whole distance walked during the silent gap, because the tracked position is where the server last saw the player and the first buffered C03 is where the blink started walking; the horizontal and vertical allowances from prepareSpeedEstimation and vDistRel are per-move physics bounds, so a gap of a few seconds produces a first move far over the allowance, a violation, and a set-back to the stored location. With pulse mode the gap is about a second and the first move stays small, so the pulse configuration trades the replay flag for the burst flag."
+    },
+    {
+      "label": "MovingListener (set-back teleports)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/MovingListener.java",
+      "explanation": "NoCheatPlus enforces violations by teleporting the player: prepareSetBack records the target location and SchedulerHelper.teleportEntity issues the S08 with the correction-of-position cause, and the teleport bookkeeping in onPlayerTeleportLowest accepts only moves that reach the recorded position. When a set-back lands while the client is mid-blink, the client keeps walking locally and the buffered path starts from the pre-correction location, so the first flushed move diverges from the corrected server position, the envelope re-flags it, and NoCheatPlus set-backs again. A long blink against a server that corrects aggressively oscillates against the set-back until violations accumulate to the action threshold."
+    },
+    {
+      "label": "PlayerEventListener (teleport ledger and resync)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/module/PlayerEventListener.java",
+      "explanation": "Hawk records every server teleport in a per-player pending list and, in MoveEvent construction, drops incoming moves while a pending teleport is unanswered; a move farther than 64 blocks squared from the last accepted position triggers resync instead of being processed. The blink flush's first replayed move after a meaningful gap exceeds that squared distance, so Hawk discards the replay and resyncs the player, and the same drop logic swallows every replayed move that does not start from Hawk's tracked position. The pending-teleport timeout path, which clears the list and re-teleports after ping plus 40 ticks, is what ends a blink that outlived a rubberband."
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "module": "Timer",
+  "client": "Memeware 7.3",
+  "category": "timer",
+  "source_rel": "me/memewaredevs/client/module/misc/Timer.java",
+  "overview": "Memeware's Timer is a two-line tick-rate scaler: a LWJEB handler consumer on UpdateEvent writes the module's Timer setting straight into mc.timer.timerSpeed, and onDisable restores 1F. The setting spans 0.1 to 10 with a default of 1, so the module both accelerates and slows the client's game loop. Because the vanilla Timer multiplies the tick advance by timerSpeed, every serverbound packet that the loop emits per tick scales with it, and the C03 movement stream is the first thing the server notices.",
+  "sections": [
+    {
+      "h": "Tick-rate scaling",
+      "p": "The vanilla net.minecraft.util.Timer.updateTimer() accumulates elapsedPartialTicks from the frame delta times timerSpeed times ticksPerSecond (20), then splits the integer part into elapsedTicks. Minecraft's main loop calls updateTimer once per frame and runs that many game ticks, so a timerSpeed of 2 makes the client execute roughly 40 game ticks per real second while the server still ticks at 20. The module never touches packet construction; it only rewrites the speed field, and every tick the client sends its C03 look or position packet, so the wire rate follows the speed multiplier directly."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "Each accelerated tick runs EntityPlayerSP.func_175161_p, which fires the pre UpdateEvent and then sends one C03 variant (C04 position, C05 look, C06 position-look) per tick based on the position and look deltas. At 2x the server receives roughly 40 movement packets per second instead of 20, and the player advances twice per server tick. Keepalive echoes and transaction confirmations ride the same loop, but their rate is set by the server's own S00 and S32 cadence, so the movement stream is the cleanest signal of the speed-up."
+    },
+    {
+      "h": "Detection surface",
+      "p": "The rate checks and clock checks that catch a speed-up all live on the C00 and C0F corpora. NCP MorePackets caps the movement packet rate at 22 per second with a 20 ideal. NCP KeepAliveFrequency keeps the keepalive echo ledger that other checks gate on. Frequency TimerA measures the inter-movement delay against the 50ms tick expectation and runs only while a keepalive echo is accepted. Grim Timer accrues 50ms of balance per movement packet and compares it against a clock anchored to the C0F transaction stream, so ping fluctuations do not hide the drift."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive",
+    "C0FPacketConfirmTransaction"
+  ],
+  "files": [
+    {
+      "label": "Timer.java",
+      "rel": "me/memewaredevs/client/module/misc/Timer.java",
+      "explanation": "The entire module is this file. The constructor registers a double setting named Timer with range 0.1 to 10 and default 1, and the handler consumer is the only logic: every UpdateEvent writes the setting into mc.timer.timerSpeed. The update event fires once per client tick from EntityPlayerSP.func_175161_p, so the speed value is re-asserted every tick, which also makes the module self-correcting if another module or the game resets the field. onDisable restores the vanilla 1F so the speed-up or slow-down never leaks into the next session.\n\nThe setting is a plain multiplier on the vanilla tick clock. Values above 1 raise the movement packet rate and are the classic speed-hack use; values below 1 slow the loop, which is used to stretch timing-sensitive sequences. The double setting is read fresh every event, so changing it in the GUI applies on the next tick with no rebind step."
+    },
+    {
+      "label": "Timer.java (vanilla tick clock)",
+      "rel": "net/minecraft/util/Timer.java",
+      "explanation": "This is the vanilla class the module mutates. updateTimer() computes the frame delta var13, clamps it to [0, 1], and accumulates elapsedPartialTicks += var13 * timerSpeed * ticksPerSecond, then drains the integer part into elapsedTicks. The timerSpeed field is the only thing the module writes, and because the field multiplies the whole accumulation, a speed of 2 doubles the number of game ticks per real second. The constructor takes ticksPerSecond = 20, the vanilla tick rate.\n\nThe module writes the field every update event rather than once at toggle time, so any external reset of timerSpeed (server-side teleport handling, another module, a game-mode change) is overwritten on the next tick. onDisable restoring 1F is what keeps the scale from persisting across toggles."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts serverbound movement packets content-blind. MovingListener invokes morePackets.check on every processed move, which feeds NetStatic.morePacketsCheck with data.morePacketsFreq, an ActionFrequency with 500ms buckets (MovingData line 321) over the configured window, and cc.morePacketsEPSMax, default 22 packets per second with 20 ideal (DefaultConfig lines 458-459). A second ActionFrequency(12, 5000) (MovingData line 322) backs a burst path with defaults of 15 packets in half a second, 10 direct-burst events, and 95 burst events per minute (DefaultConfig lines 460-462). A violation returns the MorePackets set-back location, seeded from the SurvivalFly set-back when one exists, so the player snaps back on top of the movement check.\n\nA timer speed of 2 raises the C03 stream to about 40 packets per second, nearly double the 22 per second ceiling, so the window accumulator runs positive for the whole window and the default actions cancel at vl > 2. Even a speed of 1.2 pushes the average toward the ceiling, and the half-second burst path catches a concentrated flush. The tolerance is real: speeds at or slightly above 1.1 keep the average inside the window most of the time because empty buckets burn the excess, so the check is not a hard edge at 1.0; sustained use above roughly 1.1 is what accumulates."
+    },
+    {
+      "label": "KeepAliveFrequency (keepalive echo ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java",
+      "explanation": "KeepAliveFrequency replaces the accept-any-echo model with a timed ledger over the C00 stream. Every incoming echo is timestamped into data.keepAliveFreq (an ActionFrequency with 20 one-second buckets), the check bails while a reply is still expected unless the id is a duplicate (lines 44-46), and a newest-bucket score above 1 flags a violation with a full-window score comparison (lines 48-58). The modeled-boundary-burst helpers (lines 63-83) forgive small monotonic id bursts when outgoing tracking is unavailable, so the check is tuned to reject only real floods.\n\nAgainst the timer module the ledger is the gatekeeper, not the main trigger. A 2x loop does not raise the echo rate by itself, because the server issues S00 at its own cadence and the client answers each one; the check fires when the accelerated loop drains a batched delivery of keepalives in one tick, landing several echoes in the same second, or when a reply arrives with a duplicate or aged-out id that the tracking window no longer recognizes. Its real value for the timer family is that Frequency TimerA refuses to run unless a keepalive was accepted in the current tick window, so a module that floods or starves the echo stream disables the transaction-clock checks that would otherwise catch it."
+    },
+    {
+      "label": "TimerA (movement delay deviation)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/timer/TimerA.java",
+      "explanation": "Frequency TimerA measures the delay between consecutive C03 flying packets against the 50ms tick expectation. Each movement adds the inter-packet delay to a MovingStats(20) window, and the check runs only when the player is not exempt (TPS, teleporting, lagging) and the connection manager has an accepted keepalive for the current server tick (lines 36-37). If the delay standard deviation stays under 7.07 (the square root of the 50ms expectation), an allowance accumulates 50ms per packet minus the measured delay, and a fail fires once the allowance exceeds the floor of that threshold (lines 59-74).\n\nA 2x timer halves the inter-movement delay to about 25ms, so each packet adds roughly 25ms to the allowance and the fail threshold is crossed on the second packet. Even 1.1x produces 45ms delays that accumulate the remaining 5ms per packet. The slow side is the blind spot: a sub-1x timer stretches delays past 50ms, which drains the allowance instead of filling it, so slow-motion modes pass this check by design. The keepalive gate is also a hard dependency, so the check goes dormant if the echo stream is broken."
+    },
+    {
+      "label": "Timer (transaction-anchored balance)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java",
+      "explanation": "Grim Timer accrues 50ms of balance for every counted movement packet and flags when the balance passes real time (timerBalanceRealTime > System.nanoTime(), lines 74-90), canceling the packet and running a setback. The clock it compares against is not wall time but the player's own transaction-anchored clock: knownPlayerClockTime is refreshed only after a movement followed by a transaction (PONG or WINDOW_CONFIRMATION, the C0F), so ping fluctuations and server lag do not shift the baseline (lines 47-64, 99-102). The drift allowance clockDrift defaults to 120ms (line 111) and a limitFallBehind clamps how far behind real time the balance may sit.\n\nAt 2x the balance accrues 50ms per packet while only 25ms of real time passes, so the surplus exceeds even the 120ms drift within a handful of packets and the check flags almost immediately. The check is deliberately one-directional: a slow timer makes the balance fall behind, which the drift clamp absorbs, so the module's sub-1x range is invisible here. Standing still also resets the drift (the movement stream stops accruing), which is why idle periods before the speed-up do not accumulate."
+    }
+  ]
+}

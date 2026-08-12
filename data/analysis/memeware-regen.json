@@ -1,0 +1,62 @@
+{
+  "module": "Regen",
+  "client": "Memeware 7.3",
+  "category": "regen",
+  "source_rel": "me/memewaredevs/client/module/combat/Regen.java",
+  "overview": "Memeware's Regen is a two-mode position-packet spammer gated by health and ground contact. The ComuGamers mode fires 125 C04PacketPlayerPosition packets from a single UpdateEvent whenever the player is below max health and collided vertically, lifting every claim by 1.0E-9 blocks and stamping onGround true; the Vanilla mode fires 15 C04s at the exact position once health reaches 17 or below. Both modes run from one @Handler consumer and push through addToSendQueue, so the bursts ride the normal outbound queue and reach the server as a single-tick flood of grounded position claims.",
+  "sections": [
+    {
+      "h": "Mode split",
+      "p": "The two modes differ only in the burst size, the y offset and the health gate. ComuGamers triggers at any health below maxHealth and sends 125 C04s per tick at posY plus 1.0E-9 with onGround true; Vanilla triggers at health 17 or below and sends 15 C04s at the unmodified position with onGround true. Both require isCollidedVertically, so the module only spams while standing on a surface. The mode names are the giveaway: ComuGamers is a server-specific mode tuned for one network's tolerance, while Vanilla is the generic fallback. At 20 ticks per second the ComuGamers burst is 2500 position packets per second, and the Vanilla mode is 300 per second."
+    },
+    {
+      "h": "Wire shape and server processing",
+      "p": "C04PacketPlayerPosition sets the moving flag (field_149480_h) and carries x, y, z and the onGround byte, so every packet in the burst is a full position update with a grounded claim. The server's processPlayer applies the onGround flag while the 1.0E-9 lift sits far below the 0.03 minimum-move epsilon, so the coordinate is ignored and the claim is what survives. Natural regeneration on a vanilla 1.8.9 server runs from FoodStats.onUpdate once per EntityPlayer tick (1 HP per 80 ticks while foodLevel is 18 or above and shouldHeal), and packet volume does not advance that timer, so the module's real payload is the repeated grounded claim plus the sheer send rate. The burst is what server-side rate checks and regain-rate checks observe."
+    },
+    {
+      "h": "Regen exploit context",
+      "p": "The health gates deliberately mirror the vanilla regen window: FoodStats only heals while shouldHeal() is true, so the module arms exactly when natural regen is active and tries to force more of it. The onGround true claims also reset fall distance in vanilla processing, which is the classic client-side regeneration pattern that NoCheatPlus-era anticheats were built to cancel. Against a stock server the exploit produces no accelerated heal because the timer is per-tick; against forks and plugins that re-evaluate regen on movement updates the burst pushes the heal cadence up, which is precisely the pattern NCP's FastHeal check rejects."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Regen.java",
+      "rel": "me/memewaredevs/client/module/combat/Regen.java",
+      "explanation": "The entire module is one @Handler consumer plus empty enable and disable stubs. The constructor registers the two mode strings through addModes, and the consumer branches on isMode: ComuGamers requires health below maxHealth and sends 125 C04PacketPlayerPosition instances with a 1.0E-9 y lift and onGround true; Vanilla requires health 17 or below and sends 15 C04s at the exact position. Both loops guard on isCollidedVertically and push through sendQueue.addToSendQueue, so the packets are interleaved with the client's normal movement traffic. There are no settings and no util imports; the module is a pure packet spammer.\n\nThe inner-class construction is the interesting part: new C03PacketPlayer.C04PacketPlayerPosition(x, y, z, true) sets the moving flag and the onGround byte in one object, so each send is a complete grounded position claim. The 1.0E-9 lift in the ComuGamers branch is a deliberate sub-epsilon offset: it sits below the server's 0.03 minimum-move threshold, so the position delta is discarded while the onGround flag is applied, which is what keeps the spam from tripping vanilla position validation while still delivering the ground claim."
+    },
+    {
+      "label": "C03PacketPlayer.java (packet variants)",
+      "rel": "net/minecraft/network/play/client/C03PacketPlayer.java",
+      "explanation": "The vanilla packet class that defines every variant the module instantiates. The base class carries x, y, z doubles, yaw and pitch floats and the onGround boolean, with the moving flag (field_149480_h) and rotating flag deciding which fields serialize: C04PacketPlayerPosition sets moving so the three doubles and the onGround byte go on the wire, while the plain C03() default constructor leaves onGround false and writes a single zero byte. That split is why the Regen bursts are position updates while a plain C03() burst would be flag-only noise.\n\nThe inner C04 and C06 classes are what the three Regen variants across the reference clients use: Memeware instantiates C04 with an explicit position and onGround true, and the same class family carries the C06 pos-look variant that Rise's Ghostly mode and the fastbow modules rely on. Reading the base class shows exactly which bytes reach the server for each constructor, which is the load-bearing fact for the countering checks below."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastHeal (health regain rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/FastHeal.java",
+      "explanation": "FastHeal is the NCP check that exists specifically for the client-side regeneration pattern. FightListener.onEntityRegainHealthLow intercepts the EntityRegainHealthEvent with reason SATIATED, which is the natural hunger-regeneration heal, and calls fastHeal.check before the heal applies. The check keeps a reference timestamp and a 1000ms buffer (FIGHT_FASTHEAL_BUFFER) against a 4000ms interval (FIGHT_FASTHEAL_INTERVAL): when two SATIATED heals arrive closer than four seconds apart the buffer is drained by the shortfall and violation level accumulates with 0.96 decay, and the default actions cancel the regain event from vl 10 upward.\n\nThe module exists to produce heals faster than the vanilla one-per-4-seconds cadence, so whatever the burst achieves on the server, any heal beyond that cadence is cancelled before it lands. That makes the module's entire output null on an NCP-protected server regardless of packet shape: the spam can raise the rate, and every extra heal is swallowed by the cancel. The check never looks at movement packets at all, which is why it pairs with MorePackets below rather than replacing it."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts the raw rate of serverbound move packets with no content inspection. MovingListener invokes morePackets.check on every processed move, and each one scores into data.morePacketsFreq, an ActionFrequency with 500ms buckets; NetStatic.morePacketsCheck accumulates the window against cc.morePacketsEPSMax (22 per second default, 20 ideal) and adds a burst path on the newest half-second bucket (15 packets default, direct violation at 10) with lag adaption. A violation returns the morePacketsSetBack location, which is seeded from the SurvivalFly set-back when one exists.\n\nThe ComuGamers burst sends 125 C04s in a single tick, roughly 2500 per second sustained: the window accumulator runs at more than a hundred times the ceiling and the half-second burst bucket trips in the first second, so the module flags and snaps back almost immediately. Even the Vanilla mode's 15 per tick (300 per second) is over the 22 per second ceiling by an order of magnitude. The check is content-blind, so the sub-epsilon position deltas and the onGround claims are irrelevant to it; the send rate alone is the violation, and the default action cancels from vl 2 upward."
+    },
+    {
+      "label": "SurvivalFly (ground truth and envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the player's physics envelope from the world instead of trusting the packet. The fromOnGround and toOnGround states come from RichBoundsLocation.isOnGround, which scans the block cache at minY minus yOnGround, never from the packet's onGround flag, and the vertical allowance comes from vDistRel against the previous move's momentum. The C04s in the burst claim onGround true, but NCP only treats the move as grounded when its own ray trace agrees, so the module's claims earn nothing the server did not verify.\n\nThe 1.0E-9 lift is invisible to the envelope because it sits below the 0.03 minimum-move, so the honest effect of this check on the Regen burst is indirect: it keeps the grounded state truthful while the player stands still, and it supplies the set-back location that MorePackets snaps to. The one scenario where it bites directly is the burst racing the collision gate, such as a knockback or a ledge walk-off mid-burst: the trailing C04s claim ground while the envelope's block cache says the player is airborne, and the vertical accounting treats the claimed position as an impossible move."
+    },
+    {
+      "label": "NoFall (faked grounded claims)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/NoFall.java",
+      "explanation": "NCP's NoFall maintains its own fall-distance model from the move history and resets it only when its computed ground state agrees. The check runs on the same move stream as the burst and compares the packet's grounded claim against the server-side ground model; when a player claims onGround while the model says airborne with accumulated fall distance, NCP applies the computed fall damage itself instead of honoring the reset. The module's C04s carry onGround true unconditionally, so the claim is only legitimate while the collision gate held at event time.\n\nA knockback, a ledge walk-off or a piston push that separates the player from the ground mid-burst leaves the trailing packets of the same tick claiming ground over open air, and the check scores the contradiction against its accumulated fall distance. The module cannot shed this by adjusting the offset because the claim is baked into every packet; it would have to drop the onGround flag, which is the flag that resets fall distance in vanilla and the reason the module sends it."
+    }
+  ]
+}

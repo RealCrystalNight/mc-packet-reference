@@ -1,0 +1,64 @@
+{
+  "module": "AutoPot",
+  "client": "Sigma 4.11",
+  "category": "autopot",
+  "source_rel": "info/sigmaclient/module/impl/combat/AutoPot.java",
+  "overview": "Sigma 4.11's AutoPot is a three-effect potion bot - heal, regen and speed - with a spoof-slot design: getBestSpoofSlot picks an empty hotbar slot (or the first potion slot) as the routing target, and getBestPot swaps the best available splash of the wanted effect into that slot with a mode-2 window click before the throw. The throw itself is a four-packet burst in one pre-update tick: C09 to the spoof slot, C05 look at the throw rotation (pitch 90, or a PREDICT-computed aim at the player's position extrapolated 26 ticks ahead and 3.6 blocks down), C08 with the current stack, and C09 back to the old slot. A public static potting flag and a 200ms timer let other modules react, while the actual re-arms are gated at 900ms for heal/regen and 1000ms for speed, each requiring the effect to be inactive and (for heal) health below twice the HEALTH setting (default 6). The window click is the differentiator: the swap emits C0E traffic on the player container, optionally with the inventory screen open (GuiInventory is explicitly allowed), which the hotbar-only throwers avoid.",
+  "sections": [
+    {
+      "h": "Spoof-slot routing and swap",
+      "p": "getBestSpoofSlot returns the first hotbar slot whose container slot 36-44 is empty, or the first slot already holding a potion - the throw target that minimises visible disruption. getBestPot scans container slots 9-44 for a splash potion of the wanted effect, ranks candidates with isBestPot (rejecting any potion of the same effect with a higher amplifier, or an equal amplifier with a longer duration), and if the winner is not already in the spoof slot performs swap(i, hotbarSlot): windowClick(windowId, i, hotbarSlot, 2) - mode 2 SWAP, which exchanges the inventory slot with the named hotbar slot and emits a C0E. The scan permits mc.currentScreen == null or a GuiInventory, so the swap can legitimately occur while the player is looking at the inventory screen, and the windowId comes from inventoryContainer, keeping the click on the player window. After the swap the module sends the throw burst and resets the timer; the 200ms timer clears the public potting flag so a sprint or scaffold module can resume quickly."
+    },
+    {
+      "h": "Throw burst and rotation modes",
+      "p": "The burst is queued in one pre-update tick: C09(hotbarSlot), C05PacketPlayerLook(rotations[0], rotations[1], onGround), C08(inventory.getCurrentItem()), C09(oldSlot). The C05 is what distinguishes Sigma from the others - the throw pitch is claimed on the wire before the use, so the server throws the splash at the claimed rotation. getRotations returns either {currentYaw, 90} or, with PREDICT on, the yaw to a point at posX + motionX * 26, boundingBox.minY - 3.6, posZ + motionZ * 26 - a lead-aim 26 ticks ahead and 3.6 blocks below the feet, so the potion lands under the predicted position. The C08 is the face-255 use form carrying the potion stack from the current slot, which the C09 just switched to. The three settings (SPEED, REGEN, HEALTH) build a pots[] priority list [heal, regen, speed]; heal and regen share the 900ms gate and the health check (health < HEALTH * 2), speed uses the 1000ms gate and no health requirement, and both require the effect to be inactive."
+    },
+    {
+      "h": "Effect ranking and gate cadence",
+      "p": "isBestPot normalizes the comparison surface: it rejects potions with null or multi-effect lists, then walks the entire container comparing every splash of the same effect ID by amplifier first and duration second - a genuine best-of-inventory selection, unlike the Memeware/Nekoware ranker bug in the sibling analyses. The gates are timer-based: heal/regen re-arm at 900ms, speed at 1000ms, each only when the effect is not active, so buff refresh is demand-driven rather than periodic. The effect list is fixed by the settings - heal (ID 6) is always armed, regen (10) and speed (1) are toggles - and the module never drinks, only throws splash. The combination of a wire-claimed rotation and a window-click swap makes Sigma's AutoPot the most packet-visible of the three autopot modules: C0E, C09, C05 and C08 per cycle."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement",
+    "C09PacketHeldItemChange",
+    "C0EPacketClickWindow"
+  ],
+  "files": [
+    {
+      "label": "AutoPot.java (module)",
+      "rel": "info/sigmaclient/module/impl/combat/AutoPot.java",
+      "explanation": "The settings are declared in the constructor (lines 55-61): SPEED, REGEN toggles, HEALTH default 6 (compared as health < value * 2), PREDICT off. onEvent (lines 75-108) handles EventUpdate pre-only, clears the potting flag on the 200ms timer, builds the pots[] list, and dispatches getBestPot per enabled effect with the 900/1000ms gates. swap (lines 110-112) is the mode-2 C0E hotbar swap. getRotations (lines 113-121) implements the 90-degree throw or the 26-tick PREDICT lead-aim. getBestSpoofSlot (lines 122-134) picks the routing slot. getBestPot (lines 135-162) selects the best splash, swaps it in, then queues the C09-C05-C08-C09 burst and sets potting. isBestPot (lines 164-195) ranks candidates by amplifier then duration."
+    },
+    {
+      "label": "RotationUtils.java (throw aim)",
+      "rel": "info/sigmaclient/util/RotationUtils.java",
+      "explanation": "The module consumes exactly one method from this utility: getRotationFromPosition(x, z, y), the atan2/MathHelper math that converts a target point into yaw and pitch. The PREDICT mode feeds it the extrapolated position (pos + motion * 26, minY - 3.6), and the pitch that comes back is what the C05 look packet claims before the C08 throw. The same utility backs Sigma's Killaura and Scaffold aim paths, so the throw rotation is computed with the client's standard aim machinery rather than a hardcoded angle - only the non-PREDICT fallback hardcodes pitch 90."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastConsume (consume-time ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastConsume.java",
+      "explanation": "NCP's FastConsume times the gap between starting and finishing a consumable. The interaction side is fed by InventoryListener.onPlayerInteract (consumables stamp fastConsumeInteract and fastConsumeFood) and the completion side by PlayerItemConsumeEvent; the check compares the elapsed time against fastConsumeDuration with lag division and a VL that decays by 0.6 on clean completions. Against Sigma's module the ledger sees only the start half: each throw fires a right-click with the potion in hand, stamping the interaction time, but a splash throw never emits PlayerItemConsumeEvent, so the completion branch (and its cancel path via getFirstConsumableItemInHand) never runs - NCP cannot time what never completes. The C09 half is where the ledger does engage: InventoryListener.onItemHeldChange (MONITOR priority) resets fastConsumeInteract to now and clears fastConsumeFood on every slot change, and the module's C09-to-pot and C09-back sandwich the throw, so each ceremony re-stamps the interaction baseline twice. The result is that NCP's consume machinery churns on every throw without ever flagging - the honest reading is that this check is structured for drinking/eating clients and the module's splash-only design steps around its only timing hook."
+    },
+    {
+      "label": "ItemSwitchSpeed (C09 after item use)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/item/ItemSwitchSpeed.java",
+      "explanation": "Hawk's ItemSwitchSpeed is the direct counter to Sigma's burst. The check feeds on the event pairing: an InteractItemEvent (the C08 use) adds the player to usedSomething, and the next ItemSwitchEvent - the switch-back C09 - is measured against the last switch tick with MIN_SWITCH_TICKS default 1. Sigma queues C09(pot slot), C05, C08, C09(oldSlot) inside one pre-update tick, so both C09s and the use arrive in a single processed batch: the switch-back's ItemSwitchEvent follows the use's InteractItemEvent within the same tick, a delta of zero against a window of one. Every throw violates, and the 900/1000ms re-arm gates mean sustained low-health or expired-buff play produces a steady violation stream with no human-like jitter to smooth it. The PREDICT and rotation settings change the C05's payload, not the ordering, so no configuration of the module alters the verdict - the only mitigation would be deferring the switch-back by at least one tick, which is exactly the change Rise's ceremony already implements."
+    },
+    {
+      "label": "UseItemAdapter (C08 face-255 and slot-change resync)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "NCP's adapter classifies the module's C08 as a use-item claim: handleBlockPlacePacket sets mightUseItem for any face index above 5, and the throw's face-255 form qualifies, so the right-click that follows drives onItemInteract - which skips setItemInUse for splash potions at the pre-1.9 durability guard. The C09 pair is the part the adapter processes for real: onChangeSlot runs on each held-slot change and calls requestItemUseResync whenever the slot actually differs, forcibly unwinding server-side item-use state. Sigma's burst fires both C09s within one tick of the use, so the adapter sees a use-claim bracketed by two slot changes - the precise sequence its resync path was built to reconcile. The C05 look packet is invisible to this adapter (it only listens to BLOCK_DIG and BLOCK_PLACE), so the claimed 90-degree throw rotation passes through the net layer unexamined; the item-use state machine, however, is churned on every cycle."
+    },
+    {
+      "label": "InventoryListener (consume-time feed)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/listener/inventory/InventoryListener.java",
+      "explanation": "Arc v2's inventory listener is the feed for its FastConsume check: onInteract stamps InventoryData.consumeTime for any RIGHT_CLICK_AIR or RIGHT_CLICK_BLOCK while holding an edible or POTION, and onConsume runs FastConsume.check on PlayerItemConsumeEvent. Sigma's C08 throw produces the right-click, so consumeTime is stamped on every throw; the splash completion never fires the consume event, leaving the ledger half-open exactly as with NCP. The listener's onClick handler, by contrast, only guards Arc's own management GUI, so the module's mode-2 C0E swap passes through unexamined - Arc v2 has no window-click check for the player container in this snapshot, which is why the C0E half of Sigma's cycle is unobserved here. The countering value of the file is the consume-time hook itself: with consumeTime stamped on every potion right-click and the module's 900/1000ms gates setting the minimum separation, any lowering of the module's gates below Arc's consume-time threshold - or any server lag that coalesces two ceremonies - turns the repeated stamps into a FastConsume violation, and the soup-gated AutoHeal path in PacketListener shows the intended shape of that detection for consumable-based healing."
+    }
+  ]
+}

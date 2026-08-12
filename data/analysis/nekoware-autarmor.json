@@ -1,0 +1,63 @@
+{
+  "module": "AutoArmor",
+  "client": "Nekoware v1 private",
+  "category": "autarmor",
+  "source_rel": "me/nekoWare/client/module/combat/AutoArmor.java",
+  "overview": "Nekoware v1 private's AutoArmor is a byte-for-byte fork of Memeware 7.3's module - same tier arrays, same self-referential protection comparison, same one-shot Timer latch - differing only in the display name passed to the Module constructor. The handler runs on every pre-update tick after the first half-second of client uptime, cycling one armor slot at a time through the 5-8 rotation and shift-clicking the first matching piece it finds into whatever slot is empty. Because change() evaluates the armor slot's own stack instead of the candidate's, the module cannot rank armor and cannot upgrade an occupied slot; it only fills gaps. Each equip emits C0EPacketClickWindow traffic on window 0 (mode 1 SHIFT_CLICK) with no GUI open, and the fork's PlayerControllerMP.windowClick omits the held-slot sync, so the swap is pure C0E with no C09 companion - the same closed-window, same-tick click burst as its parent client. The shared lineage means both modules trip the same anticheat surfaces, and Nekoware adds nothing to hide it.",
+  "sections": [
+    {
+      "h": "Fork lineage",
+      "p": "The file is Memeware 7.3's AutoArmor.java with the package renamed me.nekoWare, the class renamed, and the module title changed from 'Auto Armor' to 'AutoArmor'. Every behavioral line matches: the five-element tier arrays per armor slot, the inventory scan over container slots 9-44, the canEquip slot mapping, the change() ranker that compares the armor slot's own stack against itself, the two windowClick(0, slot, 0, 1) calls, and the Timer that is constructed once and never reset. The only divergence is cosmetic, which makes the two modules a single codebase for anticheat purposes: anything that detects one detects the other, and the identical wire pattern - two C0E SHIFT_CLICK packets in one tick, per empty armor slot, with no preceding window-open - is the fingerprint."
+    },
+    {
+      "h": "Per-tick rotation and gap filling",
+      "p": "The num field walks 5 (helmet) through 8 (boots), one slot per tick, wrapping back to 5. Each cycle scans inventory slots 9-44 for the first stack whose canEquip() equals the current num, and the change() guard only passes when the armor slot is empty: protVal starts at -1.0 against getProtValue(null) == 0.0, so the first candidate is pinned (item = slot, maxValue = 0.0) and every subsequent candidate in the same cycle loses the 0.0 <= 0.0 tie. The result is first-scan-order equipping - an iron chestplate in slot 9 beats a diamond one in slot 20 - and no upgrade path at all once a slot is filled. The timer.delay(500L) check is a latch, not a period, so a full four-slot equip completes in four ticks from world entry rather than the two seconds the constant implies."
+    },
+    {
+      "h": "Wire signature",
+      "p": "The equip sequence is windowClick(0, num, 0, 1, player) then windowClick(0, item, 0, 1, player): a C0EPacketClickWindow with windowId 0, button 0, mode 1 for the armor slot, then a second C0E for the inventory slot. Since the ranker never replaces a worn piece, the first click only fires during the brief window when a slot is empty - the common case is a single C0E per equip. The creative-mode and windowId != 0 guards confine all clicks to window 0 with no screen open. Nekoware's PlayerControllerMP.windowClick (line 518) sends the C0E directly without the syncCurrentPlayItem call, so no C09PacketHeldItemChange is ever emitted by the module; the entire operation is C0E-only, which is the signature the countering checks below are keyed to."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoArmor.java (module)",
+      "rel": "me/nekoWare/client/module/combat/AutoArmor.java",
+      "explanation": "The module body mirrors Memeware 7.3 exactly. The UpdateEvent handler (lines 33-60) bails on post events, creative mode, and any openContainer.windowId other than 0; the timer check (line 41) is the non-resetting one-shot latch; the scan (lines 44-51) filters slots 9-44 to items whose canEquip() equals the current armor slot num; and lines 52-57 emit the one or two windowClick(0, ..., 0, 1) calls that become the C0E burst. Line 58 advances the rotation. canEquip (lines 62-88) returns the armor slot index for each of the four item families, and change() (lines 90-100) holds the ranker bug: stack is the armor slot's own stack, protVal derives from it, and the guard compares it against itself, so only the first candidate of an empty-slot cycle is selected. getProtValue (lines 102-110) is the unused rating formula."
+    },
+    {
+      "label": "Timer.java (cadence gate)",
+      "rel": "me/nekoWare/client/util/misc/Timer.java",
+      "explanation": "Nekoware ships the same Timer as its parent client: a constructor reset to the current millis and a delay(milliSec) that only compares - no reset inside. AutoArmor never calls reset(), so the gate opens 500ms after the module instance is constructed (client startup) and stays open for the rest of the session, which is what turns the intended 500ms cadence into a per-tick cadence. Modules that do call reset() - Nekoware's AutoPotion-family modules - get a genuine period from the same class. The class is the load-bearing difference between the module's intended and actual click rates."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastClick (C0E click-rate ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "FastClick is NCP's per-click accounting layer for window traffic. Every InventoryClickEvent is fed to FastClick.check, which adds an amount-weighted sample to data.fastClickFreq - shift-click MOVE_TO_OTHER_INVENTORY actions are discounted through detectTweaks1_5 by dividing the limit by the stack counts involved - then scores the newest bucket against fastClickShortTermLimit and the whole window against fastClickNormalLimit, decaying VL by 0.99 on clean buckets and feeding Improbable when configured. For Nekoware's module the ledger sees one or two SHIFT_CLICK C0Es per armor slot, all in the same tick because the rotation advances per tick; a full four-slot equip is a 4-8 click burst inside 200ms, which is exactly the short-term window the check samples. Sustained combat equipping - re-equipping after armor breaks, or toggling the module - repeats the burst, and each burst lands in a fresh bucket. The click-speed thresholds are tuned to tolerate rapid legitimate clicking, so the module usually survives the raw rate; what it cannot avoid is the surrounding accounting: checkContainerInteraction compares click timing against container-open timing (never satisfied here), and every click feeds Improbable, dragging the combined probability score toward flagging."
+    },
+    {
+      "label": "InventoryActions (clicks with inventory closed)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/inventory/InventoryActions.java",
+      "explanation": "Hawk's InventoryActions enforces the invariant that window clicks require an open window. When HawkPlayer.hasInventoryOpen() is 0 and a ClickInventoryEvent arrives, the check punishes (VL +1) and calls e.resync() - the first branch of check() is written for exactly the cheat family this module belongs to, and the comment in the source names the residual problem: after repeated fails the server-side inventory state may disagree with the client, which is precisely the state an auto-armor module produces. Nekoware's handler clicks window 0 from a pre-update event while mc.currentScreen is null, so hasInventoryOpen() is always 0 when its C0Es arrive. The resync is the operative countermeasure: it force-syncs the inventory, reverting the just-completed armor swap, so the module's local view and the server's view diverge and its next scan clicks stale slots - every cycle repeats the punish/resync loop as long as the module is on. Because the check is cancellable and accumulates VL with no false-positive pressure from legitimate closed-window clicks (humans cannot click a closed inventory), sustained use is a guaranteed VL climb."
+    },
+    {
+      "label": "CheckEnums (INVENTORY_CLICKS registration)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/ai/idealistic/spartan/abstraction/check/CheckEnums.java",
+      "explanation": "Spartan's detection registry maps HackType entries to executor classes; the C0E-relevant registrations are INVENTORY_CLICKS (executor InventoryClicks.class, HackCategoryType.MISCELLANEOUS) and IMPOSSIBLE_INVENTORY (executor ImpossibleInventory.class), with FAST_CLICKS covering the swing/click path. Each HackType owns a Check instance and a per-player detections map that the runner framework fills as clicks are processed. For Nekoware's module the significance is structural: the click stream from InventoryEvent.executeRunners is matched against these registered executors, and the inventory-click checks are the ones designed to distinguish a human organizing a chest from a script emitting SHIFT_CLICK pairs at 20 slots per second with no window open. The module's same-tick C0E pairs are delivered as consecutive click events, and the executor layer sees the full click metadata - slot, cursor, ClickType - so the pattern is visible even though the thresholds themselves live in the executor classes that are not included in this source snapshot."
+    },
+    {
+      "label": "InventoryListener (Open check and open-state ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/InventoryListener.java",
+      "explanation": "The listener maintains the inventory-open ledger the Open check and FastClick both rely on. The first window click with inventoryOpenTime == 0 stamps the open time and assumes the inventory is open from that moment (line 218-223), onInventoryClose resets it, and onContainerOpen only stamps real opens. The Open check then force-closes the window whenever the player breaks blocks, places blocks, uses a portal or respawns while the ledger says a window is open - actions Auto Armor's host client performs constantly in combat. Nekoware's module fabricates the open state through its window-0 clicks, so the Open check's force-close path activates on the first subsequent world interaction: the interaction is cancelled and the inventory resynced, and because the module keeps clicking every tick, the fabricated-open state is continuously renewed. The listener's MONITOR-priority onItemHeldChange is the C09 side of the ledger: it resets fastConsume bookkeeping and stamps fastConsumeInteract on every slot change, which matters for the sibling AutoPotion modules that pair C09 with C08 - AutoArmor never sends C09 in this fork, so it touches only the click side of this listener."
+    }
+  ]
+}

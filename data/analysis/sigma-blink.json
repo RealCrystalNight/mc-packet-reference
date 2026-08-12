@@ -1,0 +1,62 @@
+{
+  "module": "Blink",
+  "client": "Sigma 4.11",
+  "category": "blink",
+  "source_rel": "info/sigmaclient/module/impl/other/Blink.java",
+  "overview": "Sigma 4.11's Blink cancels outgoing C03PacketPlayer moves and C00PacketKeepAlive echoes at the pre-send stage of EventPacket, parks them in a CopyOnWriteArrayList, and replays the whole list through NetworkManager.sendPacketNoEvent when the module is disabled. The keepalive buffering is the distinctive choice: freezing the echo stream alongside the movement stream means the server sees a player that neither moves nor answers pings, which stalls the latency windows that correlate movement with keepalive round trips, at the cost of the connection eventually timing out. The second distinctive behavior is receive-side: every incoming S08PacketPlayerPosLook is cancelled at the pre-receive stage, which eats all server teleports, including the set-back teleports anticheats use to correct position. A breadcrumb trail is drawn in render-3D from positions sampled every 50ms and the module suffix displays the live buffer size.",
+  "sections": [
+    {
+      "h": "Movement and keepalive freeze",
+      "p": "The pre-outgoing branch of EventPacket accepts C03PacketPlayer and C00PacketKeepAlive, appends them to the list, and cancels them, so the server receives neither position updates nor keepalive echoes for the whole blink. onDisable iterates the list and pushes each packet through sendPacketNoEvent, the fork's direct dispatch path that never fires the event bus, so the replayed packets cannot be re-cancelled. The CopyOnWriteArrayList makes the flush safe against the render thread appending crumbs, and the crumbs list is cleared on both enable and disable."
+    },
+    {
+      "h": "S08 teleport eater",
+      "p": "The pre-incoming branch cancels every S08PacketPlayerPosLook unconditionally. That blocks set-back teleports from applying, but it also breaks legitimate teleport synchronization, so the client desyncs on ender pearls, portals and any server teleport because it never snaps to the target. The module's utility is against anticheats that correct position by teleport: the server-side entity is moved to the corrected spot, the client ignores it and keeps playing from the old position, and the next move the client sends starts from where the server no longer believes the player is."
+    },
+    {
+      "h": "Detection surface",
+      "p": "Eating an S08 does not undo the server-side correction: the server entity sits at the corrected location while the client continues from the stale one, so the next non-eaten move is a teleport-sized jump from the tracked position, and the disable flush stacks the classic replay burst on top. The keepalive freeze also starves the server's ping validation, so a long blink trades movement detection for a timeout kick."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Blink.java",
+      "rel": "info/sigmaclient/module/impl/other/Blink.java",
+      "explanation": "The pre-outgoing stage of EventPacket buffers C03PacketPlayer and C00PacketKeepAlive and cancels them, and the pre-incoming stage cancels every S08PacketPlayerPosLook, which is the module's teleport eater. onDisable drains the CopyOnWriteArrayList through NetworkManager.sendPacketNoEvent so the flush bypasses the event bus. EventRender3D samples a crumb position every 50ms for the line render, and setSuffix reports the current buffer size in the module list."
+    },
+    {
+      "label": "NetworkManager.java (flush bypass)",
+      "rel": "net/minecraft/network/NetworkManager.java",
+      "explanation": "sendPacketNoEvent is the fork's bypass: it flushes the outbound queue and calls dispatchPacket directly, never firing EventPacket, which is why the replayed buffer cannot be re-cancelled by the module's own pre-send hook. The vanilla sendPacket path is where EventPacket fires at the pre stage, and that same interception point is what the module hooks to buffer packets in the first place; the flush has to go through the no-event variant or it would loop."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MovingListener (set-back confirmation)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/MovingListener.java",
+      "explanation": "NoCheatPlus set-backs are server-authoritative: prepareSetBack records the target and SchedulerHelper.teleportEntity issues the S08, and the teleport bookkeeping in onPlayerTeleportLowest expects the next move to reach the recorded position. The module eats the S08, so the client never sends a move to the set-back target, the expected-position tracking stays unsatisfied, and the next move from the stale location is a teleport-sized jump from the tracked position, which the envelope flags immediately and set-backs again. The eaten correction therefore converts a single correction into a guaranteed repeat violation, and the loop only ends when the violation counter crosses the configured action threshold."
+    },
+    {
+      "label": "PlayerEventListener (pending teleport ledger)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/module/PlayerEventListener.java",
+      "explanation": "Hawk records every server teleport in a pending list and, in MoveEvent construction, drops moves that do not exactly match the pending teleported location; after the elapsed ticks exceed the player ping plus 40 ticks, Hawk clears the list and resyncs, with the source comment naming a client that cancelled the teleport packet as the exact target case. The module's S08 eater produces precisely that state: the pending teleport never matches a move, every subsequent move is dropped, and Hawk eventually resyncs and re-teleports the player, so the blink converts every rubberband into a resync loop."
+    },
+    {
+      "label": "SurvivalFly (replay delta)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "The disable flush replays the entire buffered path in one tick, and the first replayed move is a delta equal to the whole silent gap from the last server-tracked position. Because the S08 eater prevented convergence during the gap, the tracked position is exactly where the server last saw the player, and the envelope built by prepareSpeedEstimation and vDistRel bounds per-move horizontal and vertical distance, so a multi-second blink produces a first move far over the allowance, a violation, and a set-back. The flushed path after the first move is the player's real path and reads as normal, which is why the first move is the whole tell."
+    },
+    {
+      "label": "MorePackets (flush burst)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts raw serverbound moves in 500ms buckets against a 22 per second window and a half-second burst path of 15 packets. The disable flush delivers the entire buffer at once: a blink that ran for several seconds means dozens to hundreds of C03s in a single tick, which trips the newest-bucket burst path immediately and drives the window accumulator past the ceiling. The keepalive packets in the buffer do not count toward MorePackets, so the movement portion alone is what the check sees."
+    }
+  ]
+}

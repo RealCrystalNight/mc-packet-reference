@@ -1,0 +1,64 @@
+{
+  "module": "AutoPot",
+  "client": "Rise 5.99",
+  "category": "autopot",
+  "source_rel": "dev/rise/module/impl/combat/AutoPot.java",
+  "overview": "Rise 5.99's AutoPot is a hotbar-only potion thrower with two hard anti-detection constraints: it never clicks a window (no C0E at all) and it only acts while mc.currentScreen is null. Driven from PreMotionEvent, it maintains two counters - ticksSinceLastSplash (throws throttled to one per 21 ticks minimum) and ticksSinceCanSplash (reset while scaffold is on, in liquid, or above air/ladder, so throws only happen on stable ground). A throw is a two-tick ceremony: on the arming tick it forces the pitch to 89-90 (or -90 during the jump variant's prep) and optionally pushes a C06 pos-look through sendPacketWithoutEvent, and on the follow-up tick it sends C09 to the pot slot, C08 with the held stack (face-255 use form), then on the NEXT tick C07 RELEASE_USE_ITEM plus C09 back to the old slot. Potion selection is effect-aware: an accepted-effect whitelist (heal, speed, strength, regen, fire resistance, night vision, jump, invisibility) with heal/regeneration additionally gated behind the Health setting (default 15) and every effect checked against the player's active effects, so buffs are re-applied only when expired.",
+  "sections": [
+    {
+      "h": "Slot ceremony and pacing",
+      "p": "The module scans container slots 36-44 (the hotbar) for a splash potion with an accepted effect that is not currently active, then performs the throw across three ticks. Tick one: if jump mode is off, pitch is set to 89-90 (randomised within one degree) and needSplash is armed; with the Extra Packet setting a C06 pos-look carrying the same pitch is pushed through sendPacketWithoutEvent, which bypasses the module event bus so sibling modules never observe the rotation claim. Tick two: pitch still above 88 gates the actual use - C09(i - 36) switches to the pot slot and C08(itemStack) fires the use; switchBack is armed and ticksSinceLastSplash resets. Tick three: C07 RELEASE_USE_ITEM at BlockPos.ORIGIN unwinds the use and C09(oldSlot) returns the sword. The jump variant interleaves mc.thePlayer.jump() on tick one and splits the pitch into -90 prep then +90 throw from a 300ms background thread. Because only the two C09s and the C08 cross the wire (plus the optional C06), the ceremony is three to four packets per throw with a minimum 20-tick gap between throws."
+    },
+    {
+      "h": "Terrain and context gating",
+      "p": "ticksSinceCanSplash is zeroed while Scaffold is enabled, while the player is in liquid, or when the block below is air or a ladder - the module refuses to throw from positions where a splash would be wasted or the throw would look odd - and the throw itself requires ticksSinceCanSplash > 1 and mc.thePlayer.onGround. The mc.currentScreen == null check inside the hotbar scan means the module never throws or even selects a slot while any GUI is open, and combined with the hotbar-only range (36-44) it never needs window clicks, so the module emits no C0E and leaves no window-transaction trail. The health gate is setting-driven (minHealth default 15) and applies only to heal and regeneration effects; the six buff effects are thrown whenever expired, making the module a combat buff maintainer first and a panic healer second."
+    },
+    {
+      "h": "Packet-level fingerprint",
+      "p": "Per throw the wire carries C09(pot slot) immediately followed by C08(stack) in one tick, then C07 RELEASE_USE_ITEM + C09(oldSlot) in the next. The C08 is the face-255 use form (single-stack constructor), so the server routes it to onItemRightClick and spawns the splash. The C07 release one tick after a splash use is harmless server-side (a splash throw has no use-hold to release) but is the classic sword-block release packet, and pairing it with the switch-back C09 is the tell: an anticheat watching the item-use state machine sees a use initiated and released within one tick while the held slot changes twice. The randomised pitch keeps the rotation claim in the 89-90 band, and the optional C06 makes the claimed look explicit on the wire - the module's pitch is never silent, which is the opposite trade from Memeware's local-only setPitch."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement",
+    "C09PacketHeldItemChange",
+    "C0EPacketClickWindow"
+  ],
+  "files": [
+    {
+      "label": "AutoPot.java (module)",
+      "rel": "dev/rise/module/impl/combat/AutoPot.java",
+      "explanation": "Four settings are declared up front (lines 37-40): minHealth default 15, randomiseRots default on, Extra Packet default off, and a jump mode. onDisable (lines 57-59) clears both state flags. onPreMotion (lines 62-159) is the whole logic: tick counters advance (lines 63-68), the switchBack branch (lines 70-75) sends C07 RELEASE_USE_ITEM + C09(oldSlot) and returns, the terrain/ground gates (lines 77-78) abort early, and the hotbar scan (lines 81-158) implements effect-aware selection - acceptedPotions whitelist (lines 45-54), active-effect check (lines 92-97), the 20-tick throw throttle (line 99), the heal/regeneration health gate (lines 102-103), and the two-tick jump or straight throw ceremony ending in C09(i - 36) + C08(itemStack) (lines 126-127 and 143-144). The Extra Packet C06s go through sendPacketWithoutEvent (lines 119, 137) so the rotation claims stay invisible to other modules."
+    },
+    {
+      "label": "PlayerUtil.java (terrain probe)",
+      "rel": "dev/rise/util/player/PlayerUtil.java",
+      "explanation": "getBlockRelativeToPlayer (lines 382-384) resolves the block at a fixed offset from the player's position via mc.theWorld.getBlockState - the helper the module uses to classify the block below as air or ladder for its ticksSinceCanSplash gate. The module only reads the (0, -1, 0) offset, so this single method is the module's entire world-sensing surface: it makes the throw gate depend on server-visible terrain rather than the client's motion state. The same utility class backs many Rise modules, but AutoPot consumes only this one probe."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ItemSwitchSpeed (C09 after item use)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/item/ItemSwitchSpeed.java",
+      "explanation": "Hawk's ItemSwitchSpeed targets the use-then-switch cadence that auto-pot and auto-tool modules share. The check marks a player in usedSomething on any InteractItemEvent or InteractWorldEvent - the C08 use produces an InteractItemEvent - and the next ItemSwitchEvent compares the tick gap against MIN_SWITCH_TICKS (default 1): a slot change within one tick of a use punishes. Rise's ceremony is engineered around the letter of this check but not its spirit: the switch-back C09 lands one tick after the use tick (the module defers it to the next onPreMotion via switchBack), and the initial C09-to-pot-slot precedes the C08, so no switch follows the use within the same tick - the module stays one tick ahead of the check's window in the common case. The jump variant's 300ms thread and the C06 extra packet do not change the ordering. The counter surface is the pacing: the check's ledger is per-player and permanent, and any hiccup that collapses the ceremony into a single tick - a lag spike that coalesces the C09-C08-C09 into one processed batch, or a server tick that processes the use and the switch-back together - produces the exact same-tick pattern the check punishes. At one throw per 21 ticks the module gives the check few samples, but the pattern it does emit is structurally the one the check exists to see."
+    },
+    {
+      "label": "UseItemAdapter (C08 face-255 and release ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "NCP's adapter classifies the module's C08 as an item use: handleBlockPlacePacket treats any pre-1.9 face index above 5 - the 255 from the single-stack constructor - as mightUseItem = true, and the throw then drives onItemInteract, which for splash potions returns at the pre-1.9 durability guard without setting itemInUse. The C09 traffic is where the adapter engages: onChangeSlot runs on every held-slot change and, when the previous and new slots differ, calls pData.requestItemUseResync() - forcibly releasing any server-side item-use state. The module's two C09s bracket the C08 in consecutive ticks, so the adapter processes a slot change immediately before and immediately after an item-use claim, the exact sequence its resync path was written for. The release side is the C07: handleDiggingPacket stamps data.releaseItemTime for RELEASE_USE_ITEM and sets data.isHackingRI when two releases arrive within timeBetweenRL (70ms). Rise's single release per throw, spaced at least 20 ticks apart, never trips that window - the release ledger is a no-op against this module's pacing, though it is the same packet class the module chose to unwind its use, so any future tightening of the release interval would land directly on this ceremony."
+    },
+    {
+      "label": "PacketListener (C08/C09 inventory feed)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/listener/packet/PacketListener.java",
+      "explanation": "Arc v2's packet layer carries the C09 and C08 listeners that feed its inventory data. The HELD_ITEM_SLOT adapter (line 119) reads the slot index and, when the newly held item is MUSHROOM_SOUP, stamps InventoryData.lastItemSwitch; the BLOCK_PLACE adapter (line 134) reads the held item from the packet and, for soup, invokes the AutoHeal check. Both are gated on mushroom soup, so Rise's potion throws bypass the checks entirely - the honest gap: Arc v2's auto-heal countermeasures in this snapshot only model soup-based healing clients. What the listeners still observe is the raw pattern: two C09s and one C08 per throw, with the C08's carried stack being an ItemPotion rather than soup, and InventoryData.consumeTime only being stamped by the separate InventoryListener on PlayerInteractEvent. The file matters as the boundary where a potion-aware extension of the soup model would hook in - the C08 handler already unwraps the held item from the packet, so recognising a splash potion there is a one-line change, and the module's three-packet ceremony would then feed a consume-time ledger exactly like the soup path."
+    },
+    {
+      "label": "UseItemStatusHandle (use-item classifier)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/ai/idealistic/spartan/listeners/protocol/UseItemStatusHandle.java",
+      "explanation": "Spartan's use-item classifier walks every C08/BLOCK_PLACE packet and decides whether it constitutes an item use. The pre-1.9 branch reads the block position and returns immediately for real places (Y != -1); the module's use-form C08 carries ORIGIN (Y == 0), so it reaches the item inspection, which sets protocol.useItemPacket = true only for shields and food (with the golden-apple and food-level carve-outs). A splash potion is neither, so the throw leaves useItemPacket unset. The result is the same classification gap as with Memeware's module: Spartan's status machine never records the potion throw as an item use, and downstream logic keyed on useItemPacket - including the interplay with the C09-based slot handling elsewhere in the protocol layer - does not see the ceremony. The file is the reference point for that boundary: it shows precisely which C08s Spartan treats as use-items, and potion throwing is outside the set, which is why this check cannot counter Rise's AutoPot and why the module's pitch claims and slot churn are the only observable residue."
+    }
+  ]
+}

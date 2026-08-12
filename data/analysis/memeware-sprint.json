@@ -1,0 +1,56 @@
+{
+  "module": "Sprint",
+  "client": "Memeware 7.3",
+  "category": "sprint",
+  "source_rel": "me/memewaredevs/client/module/movement/Sprint.java",
+  "overview": "Sprint is a one-handler module that keeps the sprint flag up whenever the player is moving. Its only setting, No Direction Check, is enabled by default and removes the forward-movement requirement: while it is on, the module calls setSprinting(true) even when the player is only strafing or moving backward, which vanilla would never allow. Because the call happens from the pre-update event, after the vanilla auto-stop has already run for the tick, the flag never drops and the server-side sprint state stays true for as long as the module is toggled.",
+  "sections": [
+    {
+      "h": "A single reassertion",
+      "p": "The module registers one UpdateEvent handler. With No Direction Check on, any nonzero moveForward or moveStrafing triggers setSprinting(true); with the setting off, only a positive moveForward does. The handler runs in the pre phase, the first UpdateEvent of the tick, which is fired before the movement packets are built. There is no tick counter, no cooldown and no packet code in the module; its entire effect is the repeated flag write.\n\nThe setting defaults to true, so the module's default behavior is the aggressive one. The no-direction variant is the reason the module exists: vanilla only starts sprinting while moving forward at 0.8 or more, and only keeps it while that input holds, so a pure strafe or a backpedal drops the flag within a tick. The module reasserts it before the server can learn about the drop."
+    },
+    {
+      "h": "Vanilla interplay",
+      "p": "The patched EntityPlayerSP runs the vanilla sprint logic in onLivingUpdate: sprinting stops when the forward input drops below 0.8, when the player collides horizontally, or when the food level drops to 6 or below. That check runs inside super.onUpdate, which finishes before func_175161_p fires the UpdateEvent, so the auto-stop executes first and the module's setSprinting(true) executes after it within the same tick. The net state at packet time is always sprinting.\n\nThe C0B emission sits between the event and the position packet in func_175161_p: the sprint flag is compared to the last transmitted state and a START_SPRINTING or STOP_SPRINTING is sent on a difference. Because the module reasserts the flag before that comparison, the tracked state never sees the false value, so the client sends one START when the module takes over a stopped state and then no STOP for as long as it stays toggled. The server-side sprint flag therefore stays true while the player strafes or backpedals."
+    },
+    {
+      "h": "Wire signature",
+      "p": "The observable effect is a player whose sprint state is on while the movement is sideways or backward, which vanilla never produces for more than a tick. The sprint multiplier of 1.3 applies server-side to the strafe motion as well, so the horizontal speed is boosted while the state is held. The C0B traffic is limited to the single START on activation and the single STOP when the module is turned off or the player stops moving, so the module is not a packet-spam vector; its signature is the contradiction between the sprint state and the motion direction."
+    }
+  ],
+  "packets": [
+    "C0BPacketEntityAction"
+  ],
+  "files": [
+    {
+      "label": "Sprint.java (keep-sprint module)",
+      "rel": "me/memewaredevs/client/module/movement/Sprint.java",
+      "explanation": "The whole module is the constructor and one handler. The constructor registers the No Direction Check boolean, defaulting to true, and the handler branches on it. The moveForward and moveStrafing fields are the entity's input values, set from the movement input earlier in the tick, so the check reflects what the player is actually requesting.\n\nThe default path sprints on any motion at all, including a pure strafe with zero forward input. The vanilla path requires positive forward input, but still differs from vanilla by applying the flag through setSprinting directly, bypassing the food, sneaking, item-use and blindness gates that guard the vanilla sprint start. The call is idempotent: setSprinting(true) on an already-sprinting player is a no-op, so the per-tick cost is a flag write and a timer reset.\n\nThere is no packet construction anywhere in the file. The C0B association is indirect: the flag write changes the sprint state that the patched vanilla diff check in func_175161_p compares, and that comparison emits the packets. The module's only contract with the network layer is the boolean state it leaves behind."
+    },
+    {
+      "label": "EntityPlayerSP.java (patched tick machinery)",
+      "rel": "net/minecraft/client/entity/EntityPlayerSP.java",
+      "explanation": "The patched player class turns the module's flag write into a wire effect. onLivingUpdate contains the vanilla sprint gate: sprinting stops when the forward input is below 0.8, when the player collides horizontally, or when the food level is 6 or below, which is the rule the module's No Direction Check defeats. It also carries the double-tap sprint timer and the sprintingTicksLeft countdown that vanilla uses to end sprinting.\n\nfunc_175161_p is the packet builder for the tick. It fires the UpdateEvent first, giving modules a chance to mutate state, then compares the sprint flag to the last transmitted value and sends C0B START or STOP on a difference, does the same for sneaking, and finally emits the C03 packet from the event's position, yaw, pitch and ground state. The ordering is why the module works: the reassertion lands between the auto-stop and the packet emission.\n\nThe same file shows the movement hooks the client adds: moveEntity fires a MovementEvent that modules can cancel or rewrite, and the UpdateEvent carries the values that become the C03 payload. The sprint logic in this file is byte-identical across the Memeware and Nekoware trees, which is why both clients' Sprint modules behave the same way on the wire."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SprintDirection (sprint motion vs yaw)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/SprintDirection.java",
+      "explanation": "SprintDirection validates the sprint state against the motion direction. It only evaluates a player who has been sprinting for at least two consecutive ticks and has moved at least 0.2 blocks horizontally, then compares the move vector to the reported yaw. An angle above about 62 degrees is a violation with a rubberband, and backward motion is a 180-degree case. The module's default mode produces exactly those geometries: a strafe-only sprint moves at a right angle to the facing, and a backpedal sprint moves against it.\n\nThe check is server-side and reads the move packets and the reported rotation, so the client's input state never enters the decision. The module cannot be detected by its setSprinting call; it is detected by the motion the sprint state accompanies, which is a contradiction the check was written to catch. Because the module keeps the flag up continuously, every qualifying move during a strafe or backpedal feeds the violation counter rather than a single isolated event.\n\nThe check needs the sprint flag to be up, which is the module's defining behavior. With the No Direction Check setting off, the module only sprints with forward input and the check has nothing to score; with the setting on, the strafe and backpedal cases feed it violations on every move. That setting is on by default, so the module ships in the configuration this check flags."
+    },
+    {
+      "label": "SurvivalFly (movement envelope + illegal sprint)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "NCP's SurvivalFly carries an illegal-sprint cross-check for servers that know the client's WASD impulse from the input packet. When the client reports a sprint state while its impulse is backward, or while its food level is at or below 5, the move is tagged illegalsprint, sent through the Improbable scorer, and the horizontal tracking is reset. The check runs inside the movement envelope, so the sprint contradiction is scored at the same place as over-speed.\n\nThe module is what makes the contradiction reachable: vanilla gates sprint starts on food above 6, and the auto-stop drops the flag at food 6 or below, so a vanilla client cannot be sprinting at food 5. The module bypasses both gates with a direct setSprinting call, which lets the player fight through low hunger while sprinting, and the server-side food level crossing 5 with the sprint flag up is exactly the tagged condition.\n\nThe backward-impulse branch covers the other half: with the direction check off, a player holding S with a strafe key gets the sprint flag reasserted every tick, and the impulse read from the input packet is backward, which matches the first clause of the check. The pure sideways case is not covered by this check, which is where the Hawk direction check closes the gap."
+    },
+    {
+      "label": "Speed (base speed envelope)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Speed.java",
+      "explanation": "Arc v2's Speed check measures the horizontal distance of each move against a base speed of 0.2873 blocks per tick, adjusted for speed potions and terrain modifiers. On the ground it averages the move over the accumulated ground ticks and flags when the move exceeds the base plus the average, which makes sustained constant-speed motion the failure mode. The check has no sprint branch, so the sprint state itself is invisible to it.\n\nThe role here is bounding the speed that the keep-sprint state can carry. With the sprint flag held, the 1.3 multiplier applies to the client's own motion as well, and if the player combines the module with a speed module, the sustained rate is what this check measures and punishes with a set-back to the previous location. A sprint-strafe at normal speed passes, which is the honest limit of the check.\n\nThe check complements the direction checks without overlapping them: it cannot see the sprint flag or the motion angle, and they cannot see the speed. On an Arc v2 server the keep-sprint state is therefore free at legal velocities but cannot be leveraged into a speed advantage, which removes most of the reason to combine the module with a movement boost."
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "module": "AutoSoup",
+  "client": "Memeware 7.3",
+  "category": "autosoup",
+  "source_rel": "me/memewaredevs/client/module/combat/AutoSoup.java",
+  "overview": "Memeware 7.3's AutoSoup is a health-gated soup chugger that moves mushroom stew from the player's own inventory container into the hotbar with shift-click window operations and then fires the use-and-release sequence soup servers accept. The entire module is one UpdateEvent consumer: while health sits more than 10 points below max, it checks the hotbar, refills it from the inventory by clicking window 0, and on the next cycle sends C08PacketPlayerBlockPlacement with the soup stack, C09PacketHeldItemChange, and a C07PacketPlayerDigging RELEASE_USE_ITEM. It never opens a GUI: every transfer is a direct PlayerControllerMP.windowClick against the player's own window id 0, which is exactly the traffic pattern Hawk's inventory checks and NCP's FastClick were built to measure.",
+  "sections": [
+    {
+      "h": "Health gate and timer",
+      "p": "The module arms on one condition: mc.thePlayer.getHealth() is below getMaxHealth() minus 10.0f, so the player must be missing more than five hearts before anything happens. A Timer utility gates the cycle with a 50ms floor, but the reset only runs in the refill branch. When the hotbar already holds soup, useSoup() fires without ever calling time.reset(), so once 50ms have elapsed since construction the delay check returns true on every subsequent update tick and the module eats at 20 cycles per second for as long as the health condition holds and soup remains in the hotbar."
+    },
+    {
+      "h": "Inventory shuffling without a GUI",
+      "p": "hotbarHasSoups scans container slots 36 to 44, which is the hotbar in the player inventory container. getSoupFromInventory scans slots 36 down to 9, finds the first soup, then looks for a bowl in the hotbar and drops it: windowClick(0, bowlSlot, 0, 0) picks the bowl onto the cursor and windowClick(0, -999, 0, 0) throws it outside the window, which spawns it as a dropped item in the world. The soup is then shift-clicked into the hotbar with mode 1. useSoup drops every hotbar bowl in a loop instead of just the first, then selects the soup slot. All of these windowClick calls emit C0EPacketClickWindow packets against window 0; the -999 throws are C0Es with the outside-window slot id."
+    },
+    {
+      "h": "The eat sequence and the missed slot sync",
+      "p": "useSoup sets inventory.currentItem to the soup slot, calls updateController, then queues C08 with the itemstack constructor (use item on air), a C09 re-asserting the new held slot, and C07 RELEASE_USE_ITEM at BlockPos.ORIGIN facing down, followed by stopUsingItem and a local-only restore of the previous slot. The restore never goes out as a second C09, so the server believes the soup slot is still selected until the next natural held-item change from normal play. Vanilla servers require the full 32-tick use duration before the soup is consumed server-side, so the instant release only pays off on servers whose soup handling completes on release; client-side, the bowl is gone and the soup stack is drained regardless."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoSoup.java",
+      "rel": "me/memewaredevs/client/module/combat/AutoSoup.java",
+      "explanation": "The module is a single @Handler-registered Consumer over UpdateEvent, which keeps the whole mechanism in one file: a health gate, a hotbar probe, a refill routine that shuffles soup from the inventory container into the hotbar, and a use routine that emits the C08/C09/C07 sequence. The inventory work never touches a GuiScreen; PlayerControllerMP.windowClick is called with window id 0 directly, so every transfer is a C0EPacketClickWindow against the player's own container. The -999 slot id in the bowl-throw calls is the outside-window sentinel, and mode 1 on the soup transfer is the shift-click flag.\n\nThe asymmetry between the two inventory routines is the module's most telling detail. getSoupFromInventory drops only the first hotbar bowl it finds before shift-clicking a soup in, while useSoup drops every hotbar bowl in a single pass; both routines scan for ItemSoup instances, so any soup variant (mushroom stew and rabbit stew) is treated identically. The timer reset living only in the refill branch is what turns the 50ms gate into a one-shot floor during sustained eating, which drives the 20-cycle-per-second spam that server-side click-rate checks see."
+    },
+    {
+      "label": "Timer.java (delay gate)",
+      "rel": "me/memewaredevs/client/util/misc/Timer.java",
+      "explanation": "The Timer utility is a monotonic millisecond clock: prevMS holds the last reset time and getTime() reads System.nanoTime() divided by 1e6, so the gate is immune to wall-clock adjustments. delay(milliSec) returns whether the elapsed time is at least the argument, and reset() re-anchors prevMS to the current instant.\n\nAutoSoup constructs one Timer and calls delay(50.0f) as the cycle gate. Because reset() is only invoked from getSoupFromInventory, the 50ms floor is not re-armed while the hotbar already contains soup; the gate stays open on every tick after the first 50ms, which is the mechanism behind the module's maximum eat rate. The same class is shared by other Memeware combat modules, which all rely on the nanoTime basis to avoid System.currentTimeMillis() jumps."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastClick (window click rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "NoCheatPlus FastClick counts inventory clicks into an ActionFrequency with five 200ms buckets, then compares the newest bucket against the short-term limit of 4 and the full one-second window against the normal limit of 15 (DefaultConfig INVENTORY_FASTCLICK_LIMIT_SHORTTERM and LIMIT_NORMAL, with lag division via TickTask). Each counted click adds its weighted amount via getAmountWithAction; a plain shift-click with an empty cursor scores 1.0, while the legacy detectTweaks1_5 path scales the count down for large stack moves. Clicks on the -999 outside slot are explicitly skipped in InventoryListener.onInventoryClick (slot < 0 returns after stamping lastClickTime), so the module's bowl throws never count.\n\nThe AutoSoup transfer spam is what the window path catches. Each eat cycle contributes one shift-click C0E on a positive slot (the soup transfer), and because the 50ms gate is never re-armed while soup is in the hotbar, the module sustains roughly 20 counted clicks per second. The one-second window score of about 20 clears the normal limit of 15, so every click adds roughly 5 to fastClickVL and the default cancel action at vl>150 lands after about one and a half seconds of sustained eating. The short-term bucket path stays quiet at exactly 4 clicks per bucket, which is why the normal window limit, not the burst path, is the real counter."
+    },
+    {
+      "label": "InventoryActions (click without an open window)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/inventory/InventoryActions.java",
+      "explanation": "Hawk's InventoryActions check punishes two patterns: world interaction (InteractEntity, BlockDig, ArmSwing, InteractWorld) while HawkPlayer.hasInventoryOpen() is non-zero, and a ClickInventoryEvent while it is zero. Hawk tracks the open state from the S2D window-open and C16 inventory-command packets, so a chest window or the player inventory screen being open moves the flag off zero, and CloseInventoryEvent clears it.\n\nAutoSoup never opens any GUI. It clicks the player's own container (window id 0) straight from the module, and a vanilla client only ever emits C0E clicks from GUI code, so every transfer packet arrives with the inventory-open state at zero. Each such click is punished and the event is resynced, which re-syncs the container contents with the client. The -999 bowl throws are C0E packets too and hit the same path; the module cannot shed the violation by dropping to window 0 because that is precisely the window Hawk expects to be closed."
+    },
+    {
+      "label": "FastConsume (consume duration)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/inventory/FastConsume.java",
+      "explanation": "Arc v2's FastConsume enforces a minimum time between starting and finishing an item use. The InventoryListener stamps InventoryData.consumeTime on a RIGHT_CLICK_AIR or RIGHT_CLICK_BLOCK interaction with an edible item or potion (soup is edible), and the consume event handler runs FastConsume.check on PlayerItemConsumeEvent; the check flags when now minus the stamped time is below consume-time, which defaults to 1280ms in config.yml.\n\nAutoSoup's eat sequence is C08 use-on-air followed immediately by C07 RELEASE_USE_ITEM, so on any server that completes soup consumption at release the PlayerItemConsumeEvent lands within a few milliseconds of the right-click that armed the timer, and the check fires with a consume time far under 1280ms. On vanilla servers the release never finishes the eat, no consume event fires, and the check stays silent, which is the honest split: the counter bites exactly on the instant-soup mechanics the module depends on. The violation message is 'consume time less than allowed', and the check cancels the consume event when the AC's cancel action is configured."
+    }
+  ]
+}

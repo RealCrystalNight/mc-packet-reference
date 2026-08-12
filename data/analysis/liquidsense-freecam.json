@@ -1,0 +1,57 @@
+{
+  "module": "FreeCam",
+  "client": "LiquidSense Dev",
+  "category": "freecam",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/render/FreeCam.java",
+  "overview": "LiquidSense Dev's FreeCam flies the camera out of the body while cancelling the two packet types that would expose it: every C03PacketPlayer and every C0BPacketEntityAction is dropped in the packet event, so the server-side entity stays pinned at the enable position while the local player flies with motion writes and MovementUtils.strafe. A fake EntityOtherPlayerMP with entity id -1000 mirrors the original pose, fall distance is zeroed every tick, and NoClip keeps the camera inside blocks. The module does not touch S08PacketPlayerPosLook, so server teleports still land; the desync risk is concentrated in the resume, when the player snaps back to the stored position.",
+  "sections": [
+    {
+      "h": "The mirror entity",
+      "p": "onEnable stores the current coordinates, builds an EntityOtherPlayerMP from the player's GameProfile, clones the player state with clonePlayer and copies location and angles, then registers the fake with entity id -1000, a deliberately invalid id range that cannot collide with server entities, and sets noClip if the toggle is on. onDisable restores position and rotation, removes the fake from the world and zeroes all three motion components. The body stays rendered at the origin pose, which is what makes the module a camera detach rather than a vanish."
+    },
+    {
+      "h": "Flight in the update event",
+      "p": "onUpdate runs every tick: noClip is re-asserted, fallDistance is forced to 0 so the client never accumulates fall state, and if Fly is on the three motion components are zeroed and rebuilt from the jump and sneak keys (plus or minus speed, 0.1-2.0 with a 0.8 default) plus MovementUtils.strafe(value), which writes motionX = -sin(yaw) * speed and motionZ = cos(yaw) * speed in the look direction. The flight is pure local state; none of it is ever serialized into a packet."
+    },
+    {
+      "h": "Packet suppression",
+      "p": "onPacket cancels C03 and C0B outright: no position updates, no ground flags, no sprint or sneak entity actions, so the server entity is frozen mid-air at the enable spot. Because the module only eats those two classes, everything else flows normally, which keeps the connection healthy while the camera is away: chat, block placement, window clicks, transactions and keepalives all pass through. S08 teleports are not intercepted, so the client remains teleport-coherent with the server, and the frozen entity simply stays where it was until the module turns off."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "FreeCam.java",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/render/FreeCam.java",
+      "explanation": "The module is four handlers over a fake-entity pattern. onEnable/onDisable manage the mirror entity and the position save-restore, onUpdate performs the flight and the fall-distance zeroing, and onPacket implements the two-class suppression. The entity id -1000 is a deliberate negative id outside the server's allocation range, and clonePlayer plus copyLocationAndAnglesFrom reproduces the body pose so the fake renders identically to the player.\n\nThe suppression list is the defining choice: cancelling C03 and C0B only. Movement and entity-action packets are the two classes that would let the server see the body move, so eating them freezes the server entity, while every other packet class continues to flow, which keeps the session alive without the allowlist bookkeeping Rise's Freecam needs. S08 is deliberately left alone, so the module's teleport behavior is vanilla; the resume snap to oldX/Y/Z is the only place the local and server positions can diverge."
+    },
+    {
+      "label": "MovementUtils.java (strafe math)",
+      "rel": "net/ccbluex/liquidbounce/utils/MovementUtils.java",
+      "explanation": "MovementUtils is the shared motion helper the flight uses. strafe(float speed) gates on isMoving(), computes the movement yaw with getDirection, and writes motionX = -sin(yaw) * speed and motionZ = cos(yaw) * speed onto the local entity; the overloads read the current speed and the event-based variants write into a MoveEvent instead. FreeCam uses only the float-speed overload, and only after zeroing the motion components itself, so the camera accelerates instantly to the configured speed in the look direction.\n\nThe util is LiquidBounce's stock movement kit, shared by the client's Speed, Flight and Scaffold modules, and its presence here explains the module's feel: the camera inherits the same strafe math as the client's movement modules, just applied to an entity whose packets never leave the client. Because the writes target mc.thePlayer.motion fields directly and the C03 stream is cancelled, the motion exists only locally until the module disables."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "NoCheatPlus SurvivalFly validates the C03 stream against a physics envelope rebuilt from the world. The horizontal allowance comes from prepareSpeedEstimation and the vertical allowance from vDistRel, seeded from the previous move's momentum and restricted to named envelopes (zero-y ground moves, jumps, step-ups, riptide launches); the violation is (max(hDistanceAboveLimit, 0.0) + max(yDistanceAboveLimit, 0.0)) * 100 with a set-back, and ground state comes from a block-cache ray trace, never the packet flag.\n\nFreeCam's flight profile would exceed this envelope on the first transmitted move: a constant vertical component from the jump key and a horizontal strafe up to 2.0 blocks per tick against a vanilla allowance near 0.22. The module's C03 cancel is what keeps the check silent, since a frozen entity emits nothing to score. The check bites at the resume: onDisable snaps the local player back to oldX/Y/Z, and if the server applied any position change during the session (knockback, a landing from the frozen mid-air spot, a teleport), the first C03 after disable shows a jump the envelope did not authorize and the set-back restores the tracked location."
+    },
+    {
+      "label": "Flight (hover, ascension, glide)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Flight.java",
+      "explanation": "Arc v2's Flight check scores the vertical profile of the movement stream. hoverCheck flags zero vertical speed after max-hover-time air ticks, the ascension path flags distance from the ground beyond the ascend-distance cap, sustained ascent beyond the ascend-time cap and vertical speed beyond the jump curve, and the glide path flags constant-velocity descent and descents that diverge from the expected air-resistance curve.\n\nThe FreeCam flight matches these signatures precisely: sustained air time with a constant vertical component from the jump key and no gravity, which trips hover and ascension the moment any movement packet is scored. The module's two-class suppression is what prevents that, so on a server running Arc the freecam survives only as long as the cancel holds; a single leaked C03, or the resume move after disable, gives the check its first real sample, and the 0.8-2.0 block-per-tick flight speeds are far beyond the jump curve the ascension branch allows."
+    },
+    {
+      "label": "TeleportQueue (position convergence ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/model/TeleportQueue.java",
+      "explanation": "NCP's TeleportQueue records every outgoing S08 location and classifies each incoming C03 as ACK when it matches a queued location, IDLE when none is owed, or WAITING while an acknowledgment is outstanding, holding movement in the WAITING state until the client confirms. Entries expire after 4000ms with a queue cap of 60, and the id-tracked variant clears the queue when the latest teleport id is acknowledged.\n\nFreeCam does not cancel S08, so this ledger behaves exactly as designed during the session: teleports land, the client receives them, and the first movement packet after disable must match the queued location or NCP holds the move. The exposure is the resume snap. onDisable restores the client position to the stored oldX/Y/Z, which is only correct if the server position never changed; if a teleport, knockback or landing occurred while the entity was frozen, the stored pose diverges from the server's, and the first post-disable C03 is measured against the queued teleport location instead of the client's local restore. The frozen-entity design prevents divergence from accumulating through movement, but it cannot protect the stored pose from server-side changes."
+    }
+  ]
+}

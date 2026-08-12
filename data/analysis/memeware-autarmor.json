@@ -1,0 +1,63 @@
+{
+  "module": "Auto Armor",
+  "client": "Memeware 7.3",
+  "category": "autarmor",
+  "source_rel": "me/memewaredevs/client/module/combat/AutoArmor.java",
+  "overview": "Memeware's Auto Armor is a 110-line inventory-equip module with a structural flaw that shapes everything it does: the protection-value comparison in change() never reads the candidate item, so the module cannot rank armor at all. Each pre-update tick it processes one armor slot (helmet, chestplate, leggings, boots in a fixed 5-8 rotation) and shift-clicks the first matching piece it finds into that slot - but only while the slot is empty, because the comparison evaluates the armor slot's own stack against itself. The 500ms Timer gate is a one-shot latch rather than a period (delay() never resets and the module never calls reset()), so after the first half-second the handler fires every tick, cycling all four slots in four ticks. Every equip is a pair of windowClick calls on window 0 - slot 5-8 first to strip a worn piece, then the inventory slot - which becomes a burst of two C0EPacketClickWindow packets in the same 50ms tick, emitted with no GUI screen open and no C09 held-slot sync, because this fork's windowClick dropped the syncCurrentPlayItem call.",
+  "sections": [
+    {
+      "h": "The broken ranker",
+      "p": "change(armorSlot, slot) fetches the stack currently in the armor slot and computes protVal from that stack only; the candidate in the inventory slot is never passed to getProtValue. The guard protVal <= getProtValue(stack) && protVal != getProtValue(stack) therefore compares the running max (or the armor slot's own value) against the armor slot's own value. When the armor slot is empty, protVal starts at -1.0 and the guard passes for the first candidate, pinning item to that slot and maxValue to 0.0; every later candidate fails because 0.0 <= 0.0 is false. When the armor slot holds a piece, protVal equals its value and the guard is false for every candidate. Net effect: the enchantment-weighted getProtValue formula (damageReduceAmount plus a 0.0075-scaled Protection bonus) is dead code, and the module fills an empty armor slot with whatever matching piece happens to be scanned first - lowest-scan-order wins, iron before diamond if the iron is in an earlier slot."
+    },
+    {
+      "h": "Timer latch and per-tick cadence",
+      "p": "The Timer field is constructed once when the module instance is created (client startup) and Auto Armor never calls reset(). Timer.delay(500) is a pure comparison of now against the constructor-stamped prevMS with no side effect, so it returns true for every update after the first 500ms of client uptime. The handler therefore runs on every pre-update tick: it walks slots 9-44, finds the first piece whose canEquip() result equals the current num, shift-clicks it into place, and advances num (5 -> 8 -> 5). With all four armor slots empty, the module equips a full set in four consecutive ticks rather than the two seconds the 500ms constant suggests. The isPost() early return keeps the swap in the pre phase, so the two windowClick calls - and the two C0E packets they emit - land back-to-back inside one tick."
+    },
+    {
+      "h": "Wire signature",
+      "p": "windowClick(0, num, 0, 1, player) sends C0EPacketClickWindow with windowId 0, slotId 5-8, button 0, mode 1 (SHIFT_CLICK); windowClick(0, item, 0, 1, player) sends a second C0E with the inventory slot. The first click only fires when the armor slot is occupied, so a bare equip is one C0E and a replace is two - but because the ranker never replaces, the two-click pair appears only when the module briefly strips and re-equips, which its own logic prevents. The fork's PlayerControllerMP.windowClick no longer calls syncCurrentPlayItem, so no C09PacketHeldItemChange accompanies the clicks; the whole operation is pure C0E traffic on window 0, issued while mc.currentScreen is null and openContainer.windowId is 0. The open-window guard (windowId != 0) means the module never clicks a real chest, so every C0E it emits carries the closed-inventory signature that anticheats key on."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoArmor.java (module)",
+      "rel": "me/memewaredevs/client/module/combat/AutoArmor.java",
+      "explanation": "The module is one @Handler Consumer on UpdateEvent (lines 33-60). The gate at line 37 bails in creative mode or when openContainer.windowId differs from 0, so window clicks only ever target the player container. The timer check at line 41 is the one-shot latch described above - delay(500) with no reset anywhere in the class. The scan loop (lines 44-51) iterates container slots 9-44, skips empty stacks, items whose canEquip() returns -1, and items whose armor slot does not match the current num, then calls change(num, i). Lines 52-57 perform the equip: the first windowClick(0, num, 0, 1) strips the occupied armor slot, the second windowClick(0, item, 0, 1) shift-clicks the found piece in. Line 58 advances the rotation. canEquip (lines 62-88) maps item IDs to armor slots via the four tier-ordered arrays (BOOTS 8, LEGGINGS 7, CHESTPLATE 6, HELMET 5) - the array order (diamond, gold, iron, chain, leather) is irrelevant because only the slot is returned. change() (lines 90-100) contains the self-comparison bug: it evaluates the armor slot's own stack, so only the first candidate is ever selected and occupied slots are never upgraded. getProtValue (lines 102-110) computes the damage-reduction-plus-Protection rating that the buggy comparison never actually applies to a candidate."
+    },
+    {
+      "label": "Timer.java (cadence gate)",
+      "rel": "me/memewaredevs/client/util/misc/Timer.java",
+      "explanation": "The Timer is a plain wall-clock comparator. The constructor resets prevMS to the current millis (nanoTime / 1e6), and delay(milliSec) returns true once getTime() - prevMS passes the threshold - with no reset side effect. Auto Armor relies on this as a 500ms period but never calls reset(), so the gate fires once 500ms after module construction and stays open; only AutoPotion, which calls reset() before arming its throw, gets a real period out of this class. The same Timer backs Memeware's other combat modules, which is why their cadences differ despite sharing the class. The sleep() helper is unused by Auto Armor."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastClick (C0E click-rate ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "NoCheatPlus scores every inventory click into a frequency ledger instead of trusting the client's timing. InventoryListener.onInventoryClick routes each Bukkit InventoryClickEvent into FastClick.check, which stamps data.fastClickFreq with an amount-weighted sample: plain clicks count 1f, shift-clicks and COLLECT_TO_CURSOR actions are discounted through detectTweaks1_5/getAmountWithAction, and the same bucket feeds Improbable when fastClickImprobableWeight is configured. Two windows are scored - the newest short-term bucket against fastClickShortTermLimit and the full window against fastClickNormalLimit - with lag division and a VL that decays by 0.99 on clean buckets. Auto Armor's traffic is exactly the shape this ledger was built to absorb: each equip is one or two SHIFT_CLICK C0Es (action MOVE_TO_OTHER_INVENTORY) emitted in the same tick, and the per-tick rotation means consecutive clicks land in adjacent 50ms windows. The raw rate - up to eight C0Es per second across a full four-slot equip - stays under most short-term limits, so the click-speed branch alone is lenient; what the module cannot shed is the ledger's side effects: every click extends the interaction history and feeds Improbable, and checkContainerInteraction ties click timing to container-open timing, which the module's window-0 clicks never legitimately satisfy because no container open event precedes them."
+    },
+    {
+      "label": "InventoryActions (clicks with inventory closed)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/inventory/InventoryActions.java",
+      "explanation": "Hawk's InventoryActions enforces the window state contract around clicks. The check punishes any ClickInventoryEvent while HawkPlayer.hasInventoryOpen() reports 0 - the player clicked a window the server never saw opened - and conversely punishes world interactions (InteractEntity, BlockDig, ArmSwing, InteractWorld) while a window is open. The first branch is a direct hit on Auto Armor: the module clicks window 0 from the pre-update handler with mc.currentScreen null, so hasInventoryOpen() is 0 for every one of its C0Es. A single punish(pp, true, e) (VL +1, cancellable) plus e.resync() follows; resync forces the client back into the server's inventory state, undoing the local armor swap the module just performed and desynchronizing its own scan on the next tick - the client re-reads slots from the sync it was just forced to accept. The check's 5-second reward decay (0.999 per tick) means the module's sustained every-tick click stream accumulates VL steadily while a legit player who only clicks an actually-open inventory stays clean."
+    },
+    {
+      "label": "InventoryListener (inventory-open estimation)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/InventoryListener.java",
+      "explanation": "NCP's inventory listener maintains the open/closed state that its checks trust. onInventoryClick (line 199) treats the first click as authoritative: when data.inventoryOpenTime is 0 it stamps the current time with the explicit debug comment 'assume inventory is open from this moment on' - a heuristic designed for exactly the situation Auto Armor creates, where C0Es arrive with no InventoryOpenEvent before them. onContainerOpen only sets inventoryOpenTime for real opens, onInventoryClose resets it, and the Open check force-closes the window when the player breaks blocks, places blocks or interacts while the ledger says it is open. The module's window-0 clicks therefore fabricate the open state the Open check then polices: the listener's first-click assumption marks the inventory as open, and every subsequent world interaction - attacking, mining, placing - while the module keeps clicking feeds the forced-close path, which cancels the interaction and requests an inventory resync. The C0E pair in a single tick also means lastClickTime is stamped twice within 50ms, tightening the container-interaction timing check checkContainerInteraction feeds from."
+    },
+    {
+      "label": "InventoryEvent (click dispatch into check runners)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/ai/idealistic/spartan/listeners/bukkit/standalone/InventoryEvent.java",
+      "explanation": "Spartan's inventory click surface is a Bukkit listener that funnels every InventoryClickEvent into the check framework: InventoryClick() runs p.executeRunners(false, e) on the check thread for any click carrying a material, which is the entry point for the INVENTORY_CLICKS and IMPOSSIBLE_INVENTORY detections registered in CheckEnums (the same runner pipeline the click-pattern checks consume). The second half of the handler intercepts clicks on Spartan's own menu items (InventoryMenu.handle) - the anti-management-UI path that any click stream, including Auto Armor's, must traverse before Spartan's per-click checks see it. For the module, the relevant property is that every window-0 C0E is delivered to executeRunners as a genuine click with its slot, cursor and click-type intact; the module's back-to-back SHIFT_CLICK pair arrives as two consecutive runner invocations in the same tick, which is the input pattern the inventory-click detections are structured to examine, and the closed-window origin of those clicks is visible to the protocol layer even though this listener alone does not classify it."
+    }
+  ]
+}

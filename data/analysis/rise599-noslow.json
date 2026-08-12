@@ -1,0 +1,63 @@
+{
+  "module": "NoSlow",
+  "client": "Rise 5.99",
+  "category": "noslow",
+  "source_rel": "dev/rise/module/impl/movement/NoSlow.java",
+  "overview": "Rise 5.99's NoSlow is a six-mode slowdown bypass dispatched from the PreMotion/PostMotion pair. The NCP mode releases the item with C07 RELEASE_USE_ITEM pre-motion and re-arms with a use-item C08 post-motion; Reverse NCP swaps the order (C08 then C07); Hypixel only forces the use-key input state so the server sees continuous use with no release at all; Delay alternates one C08 and one C07 on a 5-tick cadence to stay under release-rate detectors; Intave emits C07 releases on an alternating 200ms/100ms timer. The default 'Vanilla' mode has no branch and does nothing, and the slowdown NumberSetting (0-80) is declared but never read. The actual input-slowing removal happens in the client's runtime movement code, which is not part of this source snapshot; the module file itself manages only the wire state.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "onPreMotion holds the release side and onPostMotion the re-arm side (or the reverse for Reverse NCP), so each mode emits its packets from a different point in the motion pipeline. All sends go through PacketUtil.sendPacket, which routes into addToSendQueue (PacketUtil line 12) and therefore through Rise's own packet event bus; sendPacketWithoutEvent (line 15) is the alternate path the module does not use. onPacketReceive is an empty stub, onEnable resets ticks and blocking, and there is no onDisable cleanup, so the alternating Delay state survives a toggle-off. The state machines are the aBoolean flag (Delay) and the TimeUtil timer (Intave), both reset in onEnable."
+    },
+    {
+      "h": "Mode mechanics",
+      "p": "NCP mode, per tick while blocking: syncCurrentPlayItem plus C07 RELEASE_USE_ITEM with facing DOWN pre-motion (lines 61-64), then syncCurrentPlayItem plus C08 item-placement post-motion (lines 118-121). Reverse NCP inverts the pair: C08 pre (lines 95-98), C07 post (lines 137-140). Delay gates on ticksExisted % 5: on tick % 5 == 1 with aBoolean false it sends the C08 and sets aBoolean true (lines 85-90); on tick % 5 == 0 with aBoolean true it sends the C07 and clears the flag (lines 78-83), so one release and one re-arm arrive per 5-tick cycle, roughly 200ms between releases. Intave sends C07 in both pre and post handlers when the timer has reached delay, then alternates the next delay between 200ms and 100ms (lines 104-107, 146-156), doubling the release rate inside the 100ms windows."
+    },
+    {
+      "h": "Timing profile",
+      "p": "The per-tick modes (NCP, Reverse NCP) stream releases at 20/s, 50ms apart; the Delay mode spaces releases by 5 ticks (~200ms); Intave by 100-200ms. That spread is the design: fast modes trade release-gap detection against continuous slowdown removal, slow modes keep the slowdown off for most of each cycle while staying under gap thresholds, and Hypixel sends no dig packets at all, so its fingerprint is the held-use-input behavior and the missing release. The unused slowdown slider and the empty packet-receive stub show the module was trimmed: the visible handler surface is entirely packet orchestration, with the speed effect delegated to the runtime movement hook."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging",
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "NoSlow.java (module logic)",
+      "rel": "dev/rise/module/impl/movement/NoSlow.java",
+      "explanation": "All six modes and their packet sequences: the ModeSetting list (line 36), the unused slowdown NumberSetting (line 37), the empty onPacketReceive stub (lines 52-55), the onPreMotion switch (lines 58-109) and the onPostMotion switch (lines 114-158). The Delay mode's aBoolean toggling (lines 76-90) and the Intave mode's TimeUtil with alternating 200/100ms delay (lines 104-107, 145-156) are the only state machines; onEnable (lines 47-50) resets ticks and blocking but there is no onDisable."
+    },
+    {
+      "label": "PacketUtil.java (send path)",
+      "rel": "dev/rise/util/player/PacketUtil.java",
+      "explanation": "sendPacket calls mc.getNetHandler().addToSendQueue(packet) (line 12), which places the C07 or C08 at the tail of the outgoing stream and fires Rise's packet-send events; sendPacketWithoutEvent (line 15) would bypass those events but the module never uses it. The queued order within one motion cycle (release then re-arm for NCP mode, reversed for Reverse NCP) is exactly what the server processes, and it is what the release-gap counters measure."
+    }
+  ],
+  "countering": [
+    {
+      "label": "UseItemAdapter release-gap detection",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "NCP's UseItemAdapter timestamps every C07 RELEASE_USE_ITEM and sets CombinedData.isHackingRI when a release arrives less than timeBetweenRL (default 70ms, line 128) after the previous one (lines 412-425); SurvivalFly then tags the move 'noslowpacket' and runs Improbable.check on the horizontal distance (lines 877-883). The per-tick NCP and Reverse NCP modes emit releases 50ms apart and trip the gap on every release after the first, so the full-speed blocking sprint is scored against NCP's statistical model. The Delay mode (releases ~200ms apart) and Intave (100-200ms) stay above the 70ms threshold and evade the gap detector; their slower cycles are exactly the design trade that keeps them under this check, at the cost of the slowdown returning between re-arms."
+    },
+    {
+      "label": "NoSlow (blocking while sprinting)",
+      "ac": "amnoah-BetterAnticheat",
+      "rel": "core/src/main/java/better/anticheat/core/check/broken/NoSlowCheck.java",
+      "explanation": "BetterAnticheat's NoSlowCheck fails when a RELEASE_USE_ITEM arrives while both blocking (USE_ITEM seen) and sprinting (START_SPRINTING seen) are recorded (lines 39-47), resetting blocking after each release. Every mode that keeps sprint active while the block is armed and then releases (NCP, Reverse NCP, Delay, Intave) matches that state at the moment of the release; the Hypixel mode, which never releases, is the one pattern it cannot see. The check is marked broken in the shipped tree with documented false positives, so its enforcement depends on the server, but when enabled the module's own release stream is the trigger."
+    },
+    {
+      "label": "Speed (release-item-over-VL force release)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed check compares predicted against actual horizontal position each update, punishes past its discrepancy threshold, and with releaseItemOverVl (default 4, line 80) forces the item to release (lines 213-214) when a flagged player is pulling a bow, consuming or blocking. The module's effect in every mode is sprint-speed movement while blocking, so the blocked sprint accumulates speed VL; once the VL passes 4, Hawk emits a genuine release, tearing down the module's re-arm loop and leaving the server-side use state desynced. The forced release is independent of the release-gap counters because it keys on movement speed rather than dig-packet timing."
+    },
+    {
+      "label": "RepeatedRelease (release without a use)",
+      "ac": "amnoah-BetterAnticheat",
+      "rel": "core/src/main/java/better/anticheat/core/check/broken/RepeatedReleaseCheck.java",
+      "explanation": "RepeatedReleaseCheck flags any RELEASE_USE_ITEM without an intervening USE_ITEM (lines 48-52). It is disabled in the shipped tree due to false flags (lines 12-14), and every mode here re-arms with a use-item C08 after its release (or before, in Reverse NCP), so the predicate never fires even when enabled. It is included as the boundary case: the check targets the per-tick release signature that NoSlow modules produce, but this client's re-arm packets satisfy its precondition, and its 1.9-oriented item model does not match 1.8 semantics."
+    }
+  ]
+}

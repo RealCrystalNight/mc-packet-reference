@@ -1,0 +1,56 @@
+{
+  "module": "Regen",
+  "client": "Sigma 4.11",
+  "category": "regen",
+  "source_rel": "info/sigmaclient/module/impl/player/Regen.java",
+  "overview": "Sigma's Regen is a single-mode spammer with the strictest environmental gate stack of the three regen modules: health below the HEALTH setting doubled (default 7, so 14 HP), food level above 16, no item in use, collided vertically, onGround true, jump key released, and no lava or water contact. When every gate passes, one pre-phase EventUpdate pushes 40 plain C03PacketPlayer instances through addToSendQueue. The plain C03() constructor writes only the onGround byte with onGround false and carries no position, so the burst is flag-and-rate noise that the server processes through processPlayer without any coordinate delta.",
+  "sections": [
+    {
+      "h": "Gate stack",
+      "p": "The module reads a single Setting named HEALTH with default 7, scale 0.5, minimum 1 and maximum 10, and compares getHealth() against health * 2, so the setting is effectively half-hearts and the default threshold is 14 HP. Around it sit six environmental conditions: getFoodStats().getFoodLevel() above 16, not using an item, collided vertically, onGround true, the jump key released, and no lava or water material around the player. The food gate mirrors the vanilla natural-regeneration condition (FoodStats heals while foodLevel is 18 or above), and the jump, water and lava gates keep the module from firing during any motion that would interrupt regen, so it only arms in the exact window where vanilla regen is already active."
+    },
+    {
+      "h": "Packet shape",
+      "p": "The burst instantiates new C03PacketPlayer() forty times, which is the vanilla default constructor: onGround false, no moving flag, no rotation flag, so the serialized payload is a single byte carrying the false ground claim. The server's processPlayer treats it as a ground-flag update with no coordinate change, which means the burst produces no position delta for vanilla validation to reject and no envelope event for movement checks to score on distance. Forty packets per tick is 800 per second of pure flag noise."
+    },
+    {
+      "h": "Exploit window",
+      "p": "Because the module only fires while food is above 16, grounded and stationary, it never spams during the states that would make the burst look anomalous by position; the flag it repeats is the only content. The intended effect is the same legacy client-side regeneration pattern as the other Regen modules: force the server to process more regen triggers than the vanilla per-tick timer produces. The countering surface is therefore the rate check and the regain-rate check, not the movement envelope, since the packets carry no movement at all."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Regen.java",
+      "rel": "info/sigmaclient/module/impl/player/Regen.java",
+      "explanation": "The module is one registered EventUpdate handler with a single Setting. The constructor stores the HEALTH setting with the tooltip text 'Health to regen at', and onEvent casts the event to EventUpdate, checks isPre, reads the setting as a double, and evaluates the six-condition gate stack before looping 40 times over new C03PacketPlayer() into sendQueue.addToSendQueue. The gate reads mc.thePlayer state directly, so every condition is re-evaluated per tick and the burst fires at most once per tick.\n\nThe notable design choice is the plain C03() constructor: Sigma deliberately does not attach positions or the onGround true flag, unlike the Memeware and Rise variants. The packet is one byte on the wire and the server cannot distinguish it from a vanilla ground-flag update, which is exactly why the countering checks for this module are rate-based and regain-based rather than envelope-based."
+    },
+    {
+      "label": "C03PacketPlayer.java (flag-only variant)",
+      "rel": "net/minecraft/network/play/client/C03PacketPlayer.java",
+      "explanation": "The vanilla packet class that shows what the plain constructor actually serializes. The default C03PacketPlayer() leaves onGround false and both the moving and rotating flags unset, so writePacketData emits a single byte: zero. By contrast the C04 and C06 inner classes set the moving flag and serialize the three doubles and the onGround byte, which is what the other clients' regen and fastbow modules use. The distinction decides what the server sees: a flag-only update versus a full position claim.\n\nThe Sigma tree ships this stock class unchanged, so the flag-only burst goes through processPlayer exactly like vanilla movement updates. The single-byte shape is also why MorePackets is the primary counter: content-blind rate accounting does not care how small the payload is."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastHeal (health regain rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/FastHeal.java",
+      "explanation": "FastHeal intercepts the SATIATED EntityRegainHealthEvent, which is the natural hunger-regeneration heal, and enforces a 4000ms minimum interval with a 1000ms buffer (FIGHT_FASTHEAL_INTERVAL and FIGHT_FASTHEAL_BUFFER). Heals that arrive closer than the interval drain the buffer and accumulate violation level with 0.96 decay, and the default action list cancels the regain event from vl 10 upward. The check never inspects movement packets, so the flag-only shape of the Sigma burst is irrelevant to it.\n\nThe module's food-above-16 gate arms exactly when vanilla regen is active, and its purpose is to push the heal cadence past the four-second interval. Every heal beyond that cadence is cancelled before it lands, so the module's output is null on an NCP-protected server. The honest summary is that FastHeal is the only check that directly targets what the module is for, while MorePackets below targets how it behaves on the wire."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "Every C03-family packet, including the flag-only plain C03(), flows through the NCP flying queue and is scored by morePackets.check on each processed move. The window accumulator runs against a 22 per second ceiling with 500ms buckets, and the burst path flags 15 packets in a half-second bucket (direct violation at 10). Sigma's 40 packets per tick is 800 per second sustained, roughly 36 times the ceiling, so the accumulator stays positive for the whole window and the burst bucket trips in the first half second.\n\nThe check is content-blind, so the single-byte payload scores identically to a full position update; the module cannot shed the violation by shrinking the packet because the count is what matters. The default actions cancel from vl 2 upward and escalate to a kick at high levels, so the module is unusable on an NCP-protected server within seconds of arming."
+    },
+    {
+      "label": "SurvivalFly (envelope and setback anchor)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly processes the same move stream and derives ground state from the block cache rather than the packet flag. For this module the envelope has almost nothing to score: the burst carries no coordinates, so every move is zero-distance, and the onGround false claim is an under-claim that earns no leniency and no violation. The check's real role in this matchup is as the setback anchor: MorePackets returns the morePacketsSetBack location seeded from the SurvivalFly set-back, so when the rate check fires, the player is snapped back to the last verified grounded position rather than simply dropped.\n\nThe honest framing is that the flag-only spam is invisible to the movement envelope, which is why the module's gate stack goes to such lengths to keep the player stationary: the only observable behavior left is the packet rate. The pairing of the two checks is what closes the module: SurvivalFly guarantees the grounded state stays truthful while MorePackets enforces the rate."
+    }
+  ]
+}

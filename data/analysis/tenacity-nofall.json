@@ -1,0 +1,62 @@
+{
+  "module": "NoFall",
+  "client": "Tenacity 6.0",
+  "category": "nofall",
+  "source_rel": "dev/tenacity/module/impl/player/NoFallModule.java",
+  "overview": "Tenacity's NoFall is a two-mode tick-state module that never constructs a packet of its own. The Vanilla mode, the default, pins the client's fallDistance at exactly 3.0: while fallDistance is below 3.1 it forces mc.thePlayer.onGround true, and once it reaches 3.1 it switches onGround to false and calls fall(3f, 0), which caps the field at 3.0, one tick under the vanilla damage threshold of fallDistance greater than 3.0, so the landing never deals damage. The Verus mode stops the fall outright: at fallDistance above 3.5 it zeroes motionY, sets the event ground flag, and resets the field. A TimerUtil field is allocated but never used, and the switch cases have no break statements, so selecting Vanilla also executes the Verus block.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module registers a single IEventListener on MotionEvent, the pre-motion event whose fields serialize into the outgoing C03, and switches on a two-option ModeSetting with Vanilla as the default. No packet objects are created anywhere: the Verus branch writes event.setOnGround(true), and the Vanilla branch mutates mc.thePlayer.onGround and mc.thePlayer.fallDistance directly, both of which feed the next C03 the vanilla send path builds. The constructor allocates a TimerUtil that no handler ever calls, a leftover from an earlier revision, and the event listener is the only logic in the class."
+    },
+    {
+      "h": "Ground-spoof mechanics",
+      "p": "The Vanilla mode works in two phases. While fallDistance is below 3.1 it sets onGround true on the player object every tick, so every movement packet of the early fall claims ground and the server resets its own fall-distance accounting to zero. Once fallDistance reaches 3.1 it switches onGround to false and calls fall(3f, 0), which caps the field at exactly 3.0; the vanilla damage check requires fallDistance strictly greater than 3.0, so the cap sits one tick under the trigger and no damage ever applies. The Verus mode instead kills the fall at the source: at fallDistance above 3.5 it zeroes motionY, claims ground on the event, and resets the field, converting the fall into a float."
+    },
+    {
+      "h": "Interaction with movement",
+      "p": "Because the switch cases lack break statements, selecting Vanilla falls through into the Verus block every tick; the overlap is harmless in practice because the Vanilla block leaves fallDistance at exactly 3.0 and the Verus block requires greater than 3.5, so its body never executes after the cap. Forcing onGround true on the player object changes the onGround bit of every C03 the tick emits, which is a pure tick-mode spoof: no extra packets appear in the stream, so packet-rate accounting sees nothing unusual, and the server resets its fall distance on each accepted claim. The Verus motionY zeroing alters the vertical profile the server integrates, stopping the descent mid-air instead of letting it continue."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "NoFallModule.java",
+      "rel": "dev/tenacity/module/impl/player/NoFallModule.java",
+      "explanation": "The whole module: the two-option ModeSetting, the unused TimerUtil field, and the single MotionEvent listener. The Vanilla branch caps fallDistance at 3.0 through fall(3f, 0) and flips mc.thePlayer.onGround, the Verus branch zeroes motionY and claims ground on the event, and the missing break between the cases is a real fall-through that makes Vanilla execute the Verus gate as well. The module is deliberately packet-free: every effect rides the C03 the vanilla movement path emits."
+    },
+    {
+      "label": "MotionEvent.java (pre-motion carrier)",
+      "rel": "dev/tenacity/event/impl/player/MotionEvent.java",
+      "explanation": "The pre-motion event the module hooks. Its x, y, z, yaw, pitch and onGround fields mirror the values the vanilla movement send path writes into the next C03PacketPlayer, and setOnGround in the Verus branch is the module's only explicit wire-level ground claim. The event also carries the player reference and a cancel flag, and its constructor is called by the client's movement pipeline once per tick, which is the cadence the Vanilla branch's state flips follow."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (block-cache ground truth)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly never trusts the C03 onGround bit. In check() the from and to ground states come from RichBoundsLocation.isOnGround() (lines 138-140), a block-cache scan at minY minus the yOnGround epsilon, optionally widened through isOnGroundOpportune against the BlockChangeTracker; the packet flag plays no part. The vertical allowance comes from vDistRel, which seeds the allowed distance from the previous move's momentum and only accepts a handful of named envelopes (zero-y move on ground, jump, step-up, riptide launch), and the violation is (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 with a set-back to the stored location.\n\nThe Vanilla mode claims ground on every tick while fallDistance is under 3.1, which includes the first blocks of any fall where the player is clearly airborne. NCP's block-cache ground state contradicts those claims, so the moves are scored against the vDistRel fall envelope regardless of the flag, and the client-side cap at 3.0 never touches NCP's own noFallMaxY model, which keeps tracking the true fall height and deals the damage itself through handleOnGround when the player lands. The claim is simply ignored: SurvivalFly keeps enforcing the fall envelope against the ray-traced ground state, so a ground spoof buys no leniency in the vertical model and the client-side fallDistance reset is invisible to NCP because the server tracks its own heights. The companion check moving/player/NoFall.java keeps its own noFallMaxY / noFallFallDistance bookkeeping and deals the fall damage itself through handleOnGround, so zeroing the client field never cancels the damage NCP has already accounted."
+    },
+    {
+      "label": "NoFall (ground-location cross-check)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/NoFall.java",
+      "explanation": "Vrekt's NoFall compares three independently derived states. MovingListener computes ground from the world (LocationHelper.isOnGround) and stores the location as groundLocation whenever it is grounded; PacketListener records the raw packet flag into MovingData via setFlyingClientOnGround(flying.getOnGround()); and Bukkit tracks the server-side fall distance. NoFall.check() fires when the vertical distance from the last grounded location is at least 3.0 blocks, the player is descending, Vrekt's own ground state says airborne, the client claimed onGround, and the server fall distance is exactly 0.0, producing the violation \"Fall distance is 0 while not onGround. (Client faked)\" and player.damage(toGround) on cancel.\n\nEach forced onGround claim zeroes the server-side fall distance through vanilla handling, so during a sustained fall the server fall distance reads zero while the player descends. The check fires in the window where the module's claim band (fallDistance under 3.1) overlaps the 3.0-block descent threshold with Vrekt's own ground state airborne: the faked-ground violation and toGround damage apply. The Verus mode's motionY zeroing changes the trajectory but not the ground contradiction, since the event ground claim still arrives over air. The 3.0-block descent requirement is the tolerance: genuine short hops and real landings pass. The bypass is to claim ground only when the position truly touches a block, which is exactly the behavior the module exists to fake."
+    },
+    {
+      "label": "GroundSpoof (predicted-position trace)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/GroundSpoof.java",
+      "explanation": "Hawk's GroundSpoof derives its own ground state on every MoveEvent. For position updates it reads event.isOnGroundReally(), which is already lag-compensated; for flag-only updates it runs AdjacentBlocks.onGroundReally on the predicted position with the predicted velocity Y at a 0.001 tolerance. When the event claims onGround but the trace reports air, the check re-tests the pre-move position with the Y already clipped (mirroring the client's clip-then-flag order), skips steps and web-phasing cases, and otherwise punishes with a rubber-band. With the preventNoFall setting enabled, setNotOnGround rewrites the raw packet bytes so the onGround flag is forced to false on the wire, actively undoing the spoof before the server processes it.\n\nThe Vanilla mode's onGround-true flips start on the first airborne tick of every fall, so Hawk's lag-compensated trace of the predicted position reports not-ground while the event still claims ground; the check punishes with a rubber-band and, with preventNoFall on, rewrites the C03 onGround byte to false. Claims made within the 0.02 tolerance of real terrain pass the pre-move re-test, which is the legitimate-landing band the check preserves. The 0.001-0.02 tolerances and the lag-compensated position mean threshold-timed claims over air are caught as soon as the trace disagrees, and the flag rewrite neutralizes the payload even when the server would otherwise accept it."
+    },
+    {
+      "label": "NoFall (post-prediction collision check)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/groundspoof/NoFall.java",
+      "explanation": "Grim's NoFall runs as a PacketReceiveListener on PLAYER_FLYING and PLAYER_ROTATION after the prediction engine has already simulated the tick. For any packet that claims onGround true and carries no position change (wrapper.isOnGround() && !wrapper.hasPositionChanged()), it builds a 0.6 by 0.001 feet box at the simulated x, y, z, expands it by the player's movement threshold, and collides it against the compensated world plus nearby hard entities. If nothing is under the player it flags with the 10-tick setback from the check data and, when packet modification is allowed, rewrites the onGround bit to false and re-encodes the packet.\n\nThe Vanilla mode's onGround-true flips ride flag-carrying movement packets with positions, so they land in the prediction-based GroundSpoof domain, while any flag-only C03 the client happens to emit over air is caught directly by this check: no collision under the simulated feet box, 10-tick setback, and the onGround bit rewritten to false. The claims made within about 0.6 blocks of real terrain pass the isNearGround box test, which is exactly the legitimate-landing band the check tolerates. The position-less onGround claim is the exact wire shape the check targets; position-bearing spoofs fall to the prediction-based GroundSpoof check instead, since this one deliberately skips packets that changed position."
+    }
+  ]
+}

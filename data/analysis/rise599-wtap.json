@@ -1,0 +1,62 @@
+{
+  "module": "WTap",
+  "client": "Rise 5.99",
+  "category": "wtap",
+  "source_rel": "dev/rise/module/impl/combat/WTap.java",
+  "overview": "Rise 5.99's WTap is a sprint-flag reset that amplifies the knockback applied to opponents. An AttackEvent sets a static tick counter to zero, and onPreMotion increments it and, while the local player is sprinting, re-asserts the sprint state: the Legit mode flips setSprinting(false) at tick 2 and setSprinting(true) at tick 3 through the vanilla flag path, while the default mode pushes a C0BPacketEntityAction STOP_SPRINTING followed by START_SPRINTING every tick while the counter is below 10, through PacketUtil.sendPacketWithoutEvent so the pair bypasses the client's own event bus. The STOP and START pair resets the server-side sprint state after each attack, so the follow-up hit is processed while the server believes the attacker is freshly sprinting, which is the condition under which the vanilla combat code applies the sprint knockback multiplier; the client-side flag never drops, so sprint movement continues uninterrupted.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module holds one piece of state, a public static int ticks, and two settings: the Legit BooleanSetting and the packet mode that runs whenever Legit is off. onAttackEvent runs on the client's AttackEvent, which fires when a C02 attack is issued, and resets ticks to zero. onPreMotion then counts ticks and branches on mc.thePlayer.isSprinting(). The Legit branch toggles the local sprint flag at ticks 2 and 3; because EntityPlayerSP.setSprinting mirrors the change into C0B packets through the normal send path, that mode emits a STOP then a START one tick apart and visible to the event bus. The default branch sends the same pair every tick from 1 through 9 directly to the network layer."
+    },
+    {
+      "h": "Packet shape and timing",
+      "p": "Each attack cycle produces up to nine STOP plus START pairs, eighteen C0B packets, spread over the first ten ticks after the attack. sendPacketWithoutEvent routes each packet straight into the NetworkManager queue, skipping the send event, so no other module observes or cancels the pair and the client-side sprint flag is never touched by the packet path. The server receives the pair with both actions for the same entity id, ending with the sprint flag true, and the burst repeats for every attack, so sustained combat produces a stream of roughly 36 C0B packets per second at two attacks per second."
+    },
+    {
+      "h": "Why the pair works",
+      "p": "In vanilla 1.8 the knockback vector a victim receives from a melee attack is amplified when the attacker is sprinting at the moment the attack is processed. The client normally keeps its sprint flag true for the whole engagement, but the W-tap technique re-issues STOP then START so the server treats the sprint as freshly restarted, which is the state the knockback math rewards. The non-legit mode is strictly better than the Legit one: it resets the server state without ever dropping the local flag, so the player keeps full sprint speed and gets the amplified knockback on every hit in the chain, while the Legit mode momentarily stops sprinting locally and slows the player down."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "WTap.java (module)",
+      "rel": "dev/rise/module/impl/combat/WTap.java",
+      "explanation": "The complete logic lives here. onAttackEvent resets the static tick counter on every C02 attack; onPreMotion implements both modes, with the Legit branch toggling the local flag at ticks 2 and 3 and the packet branch emitting STOP_SPRINTING then START_SPRINTING for every tick below 10 while the player is sprinting. The packet constructor arguments show the full payload: the local player entity and the Action enum value. The isSprinting gate means the module is inert while the player is not sprinting, which also means every burst it sends starts from a true server sprint state."
+    },
+    {
+      "label": "PacketUtil.java (send path)",
+      "rel": "dev/rise/util/player/PacketUtil.java",
+      "explanation": "PacketUtil.sendPacketWithoutEvent is the delivery mechanism that defines the module's signature. Unlike the normal sendPacket path, which fires the outgoing-packet event and lets other modules intercept or cancel, this method pushes the packet directly into the network layer, so the STOP and START pairs are invisible to the client's own module bus and cannot be suppressed by a disabler or a packet logger. The module relies on this to keep the pair intact, and the consequence is that the pairs appear in the network stream with no accompanying event-side accounting."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ActionToggleSpeed (sprint toggle rate)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/ActionToggleSpeed.java",
+      "explanation": "Hawk's ActionToggleSpeed exists to stop sprint and sneak toggle spam, and it fires on the exact shape the module produces. It listens for PlayerActionEvent, tracks the tick of the last sprint toggle per player, and punishes whenever a new SPRINT_START or SPRINT_STOP arrives less than one tick after the previous one. The Rise module sends both packets of the pair inside a single onPreMotion, so they land in the same server tick: the STOP records the current tick, and the START that follows sees a gap of zero ticks, which is below 1, and punishes. Every attack cycle therefore produces a violation the moment the pair is processed, making this the check that maps one to one onto the module's core behavior. A single C0B per tick or a pair split across ticks passes, which is why the Legit mode, with its one-tick gap, is the quieter variant."
+    },
+    {
+      "label": "ToggleFrequency (entity action rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/ToggleFrequency.java",
+      "explanation": "NoCheatPlus counts every C0B through EntityActionAdapter, which feeds each action into NetData.playerActionFreq, an ActionFrequency with one-second buckets (NetData line 229), and ToggleFrequency.check compares the window score against toggleActionLimit, default 25 per second (DefaultConfig line 578). The Rise burst is nine pairs per attack, so two attacks per second sustain roughly 36 C0B packets per second, which exceeds the 25/s ceiling and accumulates toggleFrequencyVL. The window also forgives idle seconds, so a single isolated attack burst of eighteen packets stays under the ceiling; the check bites on sustained combat chains rather than single hits, and the per-second bucket means the module cannot shed the excess by pacing within a second."
+    },
+    {
+      "label": "BadPacketsF (duplicate sprint status)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsF.java",
+      "explanation": "Grim's BadPacketsF flags a START_SPRINTING when the server-side sprint state is already true, and a STOP_SPRINTING when it is already false, with a one-packet exemption for the first unknown state. The Rise pair is a strict STOP then START from a true state, so a perfectly alternating burst passes the check; the failure mode is overlap. When an attack cycle begins while the previous burst's final START has not been processed, or when the player's own sprint toggle interleaves with the module's pair, the stream stops alternating and a START arrives while lastSprinting is true, which flags and cancels the packet. The check therefore punishes the module's burst semantics under packet loss and latency jitter rather than in the clean case, which is the honest bypass surface to state."
+    },
+    {
+      "label": "SprintA (hunger gate)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/sprint/SprintA.java",
+      "explanation": "SprintA runs after prediction and flags whenever the player's food level is at or below 6.0 while the server-side sprint flag is true. The Rise module re-asserts START_SPRINTING every attack regardless of hunger, and sprinting itself drains hunger, so a long engagement naturally crosses the threshold and the check fires while the module keeps the flag alive; a vanilla player would have been forced out of sprint long before. The check needs the module's own flag stream to stay true, which is exactly what WTap guarantees, so low-hunger combat is where this check lands. Keeping the flag false below the threshold, which would require the module to stop re-asserting, also disables the knockback trick, so there is no configuration that satisfies both."
+    }
+  ]
+}

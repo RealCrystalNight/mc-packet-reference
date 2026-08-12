@@ -1,0 +1,63 @@
+{
+  "module": "Derp",
+  "client": "Memeware 7.3",
+  "category": "derp",
+  "source_rel": "me/memewaredevs/client/module/player/Derp.java",
+  "overview": "Memeware's Derp spins the player's yaw 22 degrees per tick on every pre-update event, wrapping from -180 back to 180, and writes the spun value into the C03 look stream through event.setYaw as well as into renderYawOffset and rotationYawHead for the visible body. The pitch branch is commented out, and the spin pauses while AutoPotion.isPotting() is true. The module is constructed with explicit arguments from ModuleManager rather than a no-arg constructor, which is the registration detail that explains its parametrized constructor.",
+  "sections": [
+    {
+      "h": "Rotation rewrite",
+      "p": "EntityPlayerSP.func_175161_p builds the pre UpdateEvent from the player's current position, yaw and pitch, and after firing it reads event.getYaw() and event.getPitch() to build the C03 variant (C05 look or C06 position-look, EntityPlayerSP lines 181-188). The handler subtracts 22 from the module's yaw field every pre event, resets the field to 180 when it passes -180, and calls event.setYaw, so the look the server sees rotates continuously. renderYawOffset and rotationYawHead carry the same value so the client-side body and head match the wire rotation."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "Every tick carries a C03 look packet with a yaw delta of exactly -22 degrees, and on the wrap tick the raw value jumps from -176 to 180, a +356 degree discontinuity (the shortest-distance delta is only 4 degrees). The pitch is never touched, so the look stream is a constant one-axis spin at integer steps. AutoPotion.isPotting() pauses the handler while the potion throw sequence runs, so the spin has gaps during auto-potion use."
+    },
+    {
+      "h": "Detection surface",
+      "p": "The rotation-pattern checks that counter the spin are indexed in the C0A-mined corpus even though the module itself never swings: the animation corpus carries the rotation-analysis family (Photon PacketAnalysis AimStep and PerfectRotation), Hawk's look heuristics, and intave's rotation heuristics, because the mining keywords for that packet overlap the aim and rotation domain. Photon AimStep fires on every tick of the spin, Photon PerfectRotation fires on the exact integer deltas, Hawk AimbotHeuristic fires on the wrap discontinuity while the player is clicking, and intave RotationSnapHeuristic misses the uniform spin entirely, which is itself the finding."
+    }
+  ],
+  "packets": [
+    "C0APacketAnimation",
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Derp.java",
+      "rel": "me/memewaredevs/client/module/player/Derp.java",
+      "explanation": "The module is a single handler with two guards and one mutation. The AutoPotion.isPotting() gate pauses the spin while the combat module throws, the pre-event check confines the mutation to the packet-bearing phase of the update, and the body subtracts 22 from the yaw field, wraps it at -180, then writes renderYawOffset, rotationYawHead and the event yaw. The commented-out setPitch(180) line is dead code that would have made the spin a full look spoof; as shipped the pitch stays the player's real pitch.\n\nThe constructor takes a name, key and category instead of hard-coding them, and ModuleManager registers the instance as new Derp(\"Derp\", 0, Module.Category.PLAYER), which is why the module is constructed with arguments rather than a no-arg form. The yaw field starts at 0, so the first tick sends -22, and the spin completes one revolution every 16 to 17 ticks, about 1.2 rotations per second."
+    },
+    {
+      "label": "UpdateEvent.java (pre-update carrier)",
+      "rel": "me/memewaredevs/client/event/events/UpdateEvent.java",
+      "explanation": "UpdateEvent is the carrier the spin travels on. The argument constructor captures position, yaw, pitch and ground state with pre = true, and the C03 send path in EntityPlayerSP.func_175161_p reads those fields back through getYaw and getPitch after the bus fires, so a mutation made in a pre handler rewrites the packet the server receives. The no-arg constructor produces the post event with pre = false, which is the phase where modules react to the tick after the send.\n\nThe event also carries x, y, z and the ground flag with setters, which is how movement modules rewrite position on the same bus. For Derp only the yaw setter matters, and the pre/post split is what lets the handler check event.isPre() to mutate before the send."
+    }
+  ],
+  "countering": [
+    {
+      "label": "PacketAnalysisAimStep (frozen-axis stepping)",
+      "ac": "Photon-GitHub-AntiCheatAddition",
+      "rel": "src/main/java/de/photon/anticheataddition/modules/checks/packetanalysis/PacketAnalysisAimStep.java",
+      "explanation": "Photon's AimStep listens on PlayerMoveEvent and computes yawDelta via MathUtil.yawDistance (the shortest angular distance, normalized) and pitchDelta as the absolute difference (lines 36-37). The step signature is one axis frozen while the other moves more than 1 degree: isAimStep returns true when deltaOne is under 0.00001 and deltaTwo exceeds 1 (lines 47-50), and the check fires when either axis order matches (line 42), adding 20 VL per flag with a 200ms decay.\n\nThe derp's pitch delta is exactly 0, safely under the frozen threshold, and the yaw delta is exactly 22, far over the step threshold, so the check flags on every move of the spin; on the wrap tick the shortest-distance yaw delta is 4 degrees, still over the threshold, so the wrap does not hide it either. This is the hardest counter in the set: the spin is a textbook frozen-axis step pattern. The commented-out pitch spoof in the module is exactly the change that would have defeated the check, because rotating pitch too breaks the frozen-axis signature."
+    },
+    {
+      "label": "PacketAnalysisPerfectRotation (integer-multiple deltas)",
+      "ac": "Photon-GitHub-AntiCheatAddition",
+      "rel": "src/main/java/de/photon/anticheataddition/modules/checks/packetanalysis/PacketAnalysisPerfectRotation.java",
+      "explanation": "Photon's PerfectRotation flags rotation deltas that are exact integer multiples of 0.1 or 0.25 degrees (MULTIPLE_PATTERNS, lines 27, 78-83), using an epsilon of 1e-10 and a conditionallyIncDec counter so an occasional match decays instead of flagging. Normal mouse input almost never produces exact multiples repeatedly, which is why the consistency requirement exists.\n\nThe derp's yaw delta is exactly 22.0 every tick (22 / 0.1 is 220 and 22 / 0.25 is 88, both exact integers) and the wrap delta is exactly 4.0 (40 and 16), so the counter increments every tick and flags. The module's use of a plain float decrement is what makes the deltas exact; any jitter in the step size would break the multiples and defeat this check, so a derp variant that adds noise to the decrement would bypass it."
+    },
+    {
+      "label": "AimbotHeuristic (wrap discontinuity while clicking)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotHeuristic.java",
+      "explanation": "Hawk's heuristic samples the last four to five raw yaw and pitch deltas, computed as a plain subtraction without shortest-distance wrapping (line 73), and evaluates them only when a click or world interaction happened within the last two moves (clickedXMovesBefore, lines 83, 127-137). The twitching and zig-zag branch flags when both the current and previous speeds exceed 20 degrees and the angle between the move vectors exceeds 2.86 radians (line 107).\n\nThe derp's normal ticks are invisible to it: speed 22 with an angle of 0 matches none of the three branches. The wrap tick is not: the raw delta from -176 to 180 is +356 degrees with the previous delta at -22, the angle between them is pi radians, and both speeds exceed 20, so the twitch branch fires. That happens once per revolution, every 16 to 17 ticks, and only while the player is clicking or swinging, which is exactly the derp-plus-killaura combination. A pure spin with no clicks never trips it, and the check's own comment warns it is a hint check with false-positive potential, so a single wrap flag is weak; sustained spinning with combat accumulates."
+    },
+    {
+      "label": "RotationSnapHeuristic (snap signature, spin miss)",
+      "ac": "intave-intave",
+      "rel": "src/main/java/de/jpx3/intave/check/combat/heuristics/combatpatterns/rotation/RotationSnapHeuristic.java",
+      "explanation": "intave's snap heuristic subscribes to ARM_ANIMATION (the C0A packet, which is why the check is mined under the animation corpus), ATTACK_ENTITY and USE_ENTITY, POSITION_LOOK and LOOK, and FLYING (lines 49-93). The snap signature is a single-tick yaw jump between two near-static rotations: previousYawMotion under 9 degrees, the jump over 40, and the following motion under 9, gated on a swing or attack within 150ms, more than 10 rotation packets, and more than 7 ticks since a teleport (lines 103-109, 167-175). A second lite path flags silent movement with key-input changes (lines 150-158, 167-168, 232-236).\n\nThe uniform spin defeats it on both gates. The motion triple is constant 22 degrees per tick, and even at the wrap it is [22, 356, 22], where the 22s fail the under-9 thresholds, so the snap signature never matches. The combat gate is closed anyway: the module never swings or attacks, so recentSwingOrAttack stays false. The lite path needs a change in the strafe or forward keys that the module does not produce. This entry documents the miss rather than a catch: intave's rotation heuristics are built for aimbot-style one-tick retargets, and a derp's uniform rotation is exactly the pattern they were not designed to see."
+    }
+  ]
+}

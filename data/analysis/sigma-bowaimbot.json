@@ -1,0 +1,63 @@
+{
+  "module": "BowAimbot",
+  "client": "Sigma 4.11",
+  "category": "bowaimbot",
+  "source_rel": "info/sigmaclient/module/impl/combat/BowAimbot.java",
+  "overview": "Sigma 4.11's BowAimbot is a pre-fire aim predictor for bows. On the pre phase of EventUpdate it picks a target from the loaded entity list, and when a bow is drawn it computes predicted aim angles with RotationUtils.getBowAngles, which extrapolates the target's velocity forward, scales the extrapolation by the distance in 0.8-block steps with a 1.25 sprint multiplier, and compensates the pitch arc with a distance-scaled offset. The angles are written into the EventUpdate's yaw and pitch when the SILENT setting is on, so they ride the next C03 movement packet without moving the visible view, or straight into the player rotation when it is off. The server computes the arrow trajectory from the player's position and look at release time, so the predicted angles in the movement packet before the C07 RELEASE_USE_ITEM determine where the arrow flies.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module registers for EventUpdate and EventPacket but only implements the update path. onEvent runs in the pre phase: it refreshes the target field with getTarg(), and when shouldAim() passes it computes RotationUtils.getBowAngles(target) and either writes the angles into the event (SILENT, server-sided rotations) or sets the real player rotation. onDisable nulls the target. The SILENT setting is the only configuration, defaulting to true. The EventPacket registration is vestigial in this snapshot; no packet handler body exists in the class."
+    },
+    {
+      "h": "Prediction model (getBowAngles)",
+      "p": "The aim math lives in RotationUtils.getBowAngles. It reads the target's per-tick velocity from posX minus lastTickPosX and posZ minus lastTickPosZ, scales it by 0.4, quantizes the distance to the target down to the nearest 0.8-block step, and multiplies the velocity by d over 0.8 and by 1.25 when the target is sprinting, producing an extrapolated aim point ahead of the moving target. Yaw comes from atan2 of the aim offset, and pitch from atan2 of the vertical difference, with the eye height of both entities, plus a dist times 0.11 gravity arc correction. The returned array is yaw then the negated pitch, which the module applies directly."
+    },
+    {
+      "h": "Target selection and firing path",
+      "p": "getTarg scans the loaded entity list for EntityLivingBase players that are not the local player, visible via canEntityBeSeen, within 65 blocks, and not friends, with Killaura.vip short-circuiting the selection, then sorts the survivors by summed yaw and pitch angular distance to the current rotation. shouldAim requires a bow in the current slot and either the FastBow module enabled with the use key held, or the player already using the item. The release itself is the vanilla C07 RELEASE_USE_ITEM, timed by the player or FastBow; the aimbot only guarantees the look carried by the preceding C03 points at the predicted position, so the arrow's server-side trajectory starts on target."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "BowAimbot.java (module)",
+      "rel": "info/sigmaclient/module/impl/combat/BowAimbot.java",
+      "explanation": "The module is a single EventUpdate pre handler plus the selection helper. onEvent refreshes the target and applies the rotation, either into the event's yaw and pitch for silent server-sided rotation or directly onto the player for the visible mode. getTarg implements the distance, visibility, friend and Killaura.vip filters and the angular sort; shouldAim gates on the bow item, the FastBow combination, and the using-item state. The class shows the module's limits: no release packet is sent by the aimbot itself, and the bow shot depends on the vanilla release flow, so the module's only output is the rotation carried by the movement stream."
+    },
+    {
+      "label": "RotationUtils.java (prediction math)",
+      "rel": "info/sigmaclient/util/RotationUtils.java",
+      "explanation": "getBowAngles is the prediction core the module depends on. It implements the velocity extrapolation with the 0.4 scale, the 0.8-block distance quantization, the 1.25 sprint multiplier, the atan2 yaw, and the pitch arc offset of dist times 0.11, returning the angle pair the module writes into the event. The same file provides getRotations and getDistanceBetweenAngles used by getTarg's sort. The pitch output is a continuous float derived from entity positions rather than a sensitivity-quantized mouse step, which is the observable signature the rotation checks below key on."
+    }
+  ],
+  "countering": [
+    {
+      "label": "AimbotConvergence (fixed convergence point)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotConvergence.java",
+      "explanation": "Hawk's AimbotConvergence intersects the pre-move and post-move sight lines on every MoveEvent with a position delta, taking the midpoint of closestPointsBetweenLines as the convergence point, and punishes when that point moves less than 1e-8 squared between consecutive moves, once the player is past 100 ticks and beyond ping-based teleport grace. Sigma's BowAimbot aims at a single predicted world point each tick, so against a standing target the convergence point is fixed and the check flags, exactly as its comment warns: turn off the aimbot when the opponent stands still. The bypass surface is the prediction itself: while the target moves, the velocity extrapolation keeps the aim point moving and the convergence point jumps between ticks, so the check needs a fairly static target to fire at all."
+    },
+    {
+      "label": "AimbotHeuristic (click-window motion analysis)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotHeuristic.java",
+      "explanation": "AimbotHeuristic analyzes the last four move vectors only when a click landed two ticks earlier, testing for a stutter (fixed-speed run then a stall under 0.01 speed on one bearing), a twitch (two moves above 20 degrees per tick), or a jump discontinuity (a speed drop over 30 with a bearing change over 0.8 radians). The honest limitation for this module: the window opens on interaction clicks, and a pure bow release sends C07, which Hawk does not record as a click, so a bow-only aimbot never enters the window. The check bites when the same session also melee-attacks with C02 or interacts while the aimbot is running, because the aimbot's per-tick rotation toward the predicted point then feeds the sampled moves and the stutter pattern appears on convergence."
+    },
+    {
+      "label": "AimbotPrecision (pitch-delta GCD)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotPrecision.java",
+      "explanation": "AimbotPrecision collects nonzero pitch deltas at or below the 0.96 degree sampling cap and solves their rational GCD; when the GCD is practically unsolvable, below 1e-5, it fails, on the model that every legit pitch change is divisible by the mouse sensitivity constant. BowAimbot's pitch is an atan2 float plus the dist times 0.11 arc offset, effectively continuous precision with no common divisor, so the first such delta that falls under the 0.96 cap joins the ten-sample window and collapses the GCD, and the check fails on the batch. The detection lands on convergence episodes: while the target keeps moving, every tick feeds a fresh remainder and the window keeps failing. The module's yaw is never sampled, which is why the check is pitch-specific."
+    },
+    {
+      "label": "SensitivityProcessor (sensitivity grid validation)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/kireiko/dev/millennium/math/SensitivityProcessor.java",
+      "explanation": "Spartan embeds Millennium's SensitivityProcessor as the rotation layer its aim checks read. processSensitivity takes the GCD of consecutive pitch deltas, maps it through the Minecraft sensitivity formula to a 0 to 200 scale, and for small deltas scans the 200-entry sensitivity table for a match within 1e-3; the mode of the last 40 samples becomes the player's sensitivity. BowAimbot's deltas cannot be attributed to any sensitivity: the continuous atan2 remainders have an unsolvable GCD that lands near index zero, and any sustained portion maps outside the table, so the processor reports an invalid or unstable sensitivity, the exact signal the consuming aim checks treat as non-human. Only sub-half-degree-per-tick steps map into the table, and the bow aimbot never produces them."
+    }
+  ]
+}

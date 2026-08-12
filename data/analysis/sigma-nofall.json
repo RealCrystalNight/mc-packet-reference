@@ -1,0 +1,62 @@
+{
+  "module": "NoFall",
+  "client": "Sigma 4.11",
+  "category": "nofall",
+  "source_rel": "info/sigmaclient/module/impl/player/NoFall.java",
+  "overview": "Sigma's NoFall selects from five registered modes (Vanilla, Packet, Hypixel, Damage, AAC) and contains a sixth switch case, Cubecraft, that no selector can reach because it is absent from the Options array, making it dead code. The pre-phase EventUpdate handler keys off MoveUtils.isOnGround(), a client-side bounding-box drop test, and the player's motionY. Vanilla, Hypixel and Damage are tick-mode flag spoofs with different trigger styles: Vanilla claims ground immediately on any airborne descent, Hypixel accumulates the fall from motionY until it passes 2 blocks, and Damage waits for fallDistance above 3.5. Packet sends a bare C03PacketPlayer(true) through the sendQueue. AAC exploits a server-side parsing quirk by sending a C04PacketPlayerPosition whose y is Double.NaN with onGround true, once on enable and once at ticksExisted 1.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "onEvent dispatches on EventUpdate in its pre phase and switches on the Options selector string, setting the module suffix to the current mode for the HUD. The mode list is built in the constructor as an Options setting with Vanilla, Packet, Hypixel, Damage and AAC; the Cubecraft case in the switch has no registered counterpart, so it is unreachable. The module tracks a double fall accumulator for the Hypixel mode, reset whenever the player is on ground, and reads mc.thePlayer.fallDistance for the Damage mode. onEnable arms the AAC NaN packet when a world is loaded, and the handler repeats it at ticksExisted 1."
+    },
+    {
+      "h": "Ground-spoof mechanics",
+      "p": "Vanilla and Packet gate on !MoveUtils.isOnGround(0.001) and !MoveUtils.isOnGround(0.0001) respectively, both combined with motionY < 0, so they only claim ground while descending. Vanilla sets the event ground flag immediately; Packet pushes a position-less C03PacketPlayer(true) into the sendQueue. Hypixel accumulates -motionY while motionY is below -0.08 and claims ground once the accumulator passes 2, which approximates two blocks of fall from the velocity integral. Damage claims ground once fallDistance exceeds 3.5, just past the vanilla damage trigger at 3.0, so the spoof fires in the narrow window before damage would apply. AAC's NaN-y C04 makes the server's double parser choke on the y coordinate while the onGround true bit still lands."
+    },
+    {
+      "h": "Interaction with movement",
+      "p": "All flag modes leave coordinates alone: the EventUpdate ground flag rides the tick's normal C03, while Packet's explicit send is an extra packet in the stream. MoveUtils.isOnGround shifts a copy of the bounding box down by the epsilon and tests world collision, so the pre-gate reflects real nearby terrain rather than the client's onGround field, which makes the Vanilla and Packet modes terrain-aware without the block-under sweep other clients use. The AAC mode sends its NaN packet through addToSendQueue, the standard queued path, so it is visible to any packet interceptor in the client and to server-side parsers alike."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "NoFall.java",
+      "rel": "info/sigmaclient/module/impl/player/NoFall.java",
+      "explanation": "The module itself. The constructor registers the five-mode Options selector, onEnable arms the AAC NaN-y C04, and the pre-phase EventUpdate handler runs the five live cases plus the unreachable Cubecraft branch. The Vanilla, Hypixel and Damage modes set the event ground flag with different triggers, Packet adds a bare C03PacketPlayer(true), and AAC sends a C04PacketPlayerPosition with Double.NaN y and onGround true. The Cubecraft case is the dead-code finding: it tests fallDistance > 2.69 and a collision-box check, but no selector can ever produce that string."
+    },
+    {
+      "label": "MoveUtils.java (isOnGround)",
+      "rel": "info/sigmaclient/management/MoveUtils.java",
+      "explanation": "The movement helper the NoFall pre-gates depend on. isOnGround(double height) offsets a copy of the player's bounding box downward by the given height and returns true when getCollidingBoundingBoxes finds any block. The Vanilla, Packet and Hypixel modes use it with epsilons of 0.001 or 0.0001 to decide whether the player is airborne before claiming ground, so the spoof only fires when the client-side terrain test says the player is off the ground."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (block-cache ground truth)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly never trusts the C03 onGround bit. In check() the from and to ground states come from RichBoundsLocation.isOnGround() (lines 138-140), a block-cache scan at minY minus the yOnGround epsilon, optionally widened through isOnGroundOpportune against the BlockChangeTracker; the packet flag plays no part. The vertical allowance comes from vDistRel, which seeds the allowed distance from the previous move's momentum and only accepts a handful of named envelopes (zero-y move on ground, jump, step-up, riptide launch), and the violation is (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 with a set-back to the stored location.\n\nSigma's Vanilla and Packet modes claim ground on the first descending tick over air, and the Hypixel and Damage modes follow at 2 and 3.5 blocks. NCP's block-cache ground state contradicts every one of those claims, so each descent is scored against the vDistRel fall envelope and the client-side fallDistance resets never reach NCP's own noFallMaxY model. The 0.001-0.0001 terrain pre-gates use the client's world view, which can lag the server's block state. The claim is simply ignored: SurvivalFly keeps enforcing the fall envelope against the ray-traced ground state, so a ground spoof buys no leniency in the vertical model and the client-side fallDistance reset is invisible to NCP because the server tracks its own heights. The companion check moving/player/NoFall.java keeps its own noFallMaxY / noFallFallDistance bookkeeping and deals the fall damage itself through handleOnGround, so zeroing the client field never cancels the damage NCP has already accounted."
+    },
+    {
+      "label": "NoFall (ground-location cross-check)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/NoFall.java",
+      "explanation": "Vrekt's NoFall compares three independently derived states. MovingListener computes ground from the world (LocationHelper.isOnGround) and stores the location as groundLocation whenever it is grounded; PacketListener records the raw packet flag into MovingData via setFlyingClientOnGround(flying.getOnGround()); and Bukkit tracks the server-side fall distance. NoFall.check() fires when the vertical distance from the last grounded location is at least 3.0 blocks, the player is descending, Vrekt's own ground state says airborne, the client claimed onGround, and the server fall distance is exactly 0.0, producing the violation \"Fall distance is 0 while not onGround. (Client faked)\" and player.damage(toGround) on cancel.\n\nEvery flag claim zeroes the server-side fall distance through vanilla onGround handling. Once the player is 3 or more blocks below the last grounded location while descending, with Vrekt's own ground state airborne and the server fall distance at zero, the faked-ground violation fires; the Damage mode's 3.5 threshold deliberately sits past the check's 3.0 descent line, so a single extra block of fall puts it squarely in the detection window. The AAC NaN-y C04 is outside this check's domain: it never claims a position, and its y parses as NaN server-side. The 3.0-block descent requirement is the tolerance: genuine short hops and real landings pass. The bypass is to claim ground only when the position truly touches a block, which is exactly the behavior the module exists to fake."
+    },
+    {
+      "label": "GroundSpoof (predicted-position trace)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/GroundSpoof.java",
+      "explanation": "Hawk's GroundSpoof derives its own ground state on every MoveEvent. For position updates it reads event.isOnGroundReally(), which is already lag-compensated; for flag-only updates it runs AdjacentBlocks.onGroundReally on the predicted position with the predicted velocity Y at a 0.001 tolerance. When the event claims onGround but the trace reports air, the check re-tests the pre-move position with the Y already clipped (mirroring the client's clip-then-flag order), skips steps and web-phasing cases, and otherwise punishes with a rubber-band. With the preventNoFall setting enabled, setNotOnGround rewrites the raw packet bytes so the onGround flag is forced to false on the wire, actively undoing the spoof before the server processes it.\n\nHawk's lag-compensated trace of the predicted position reports not-ground for every descent claim, whether it rides the tick C03 or the explicit packet, and the check punishes with a rubber-band; with preventNoFall on it rewrites the C03 onGround byte to false. The terrain pre-gates in Sigma's modes use the client's own collision state, which can disagree with Hawk's compensated world, and Hawk treats the disagreement as a failed spoof. The 0.001-0.02 tolerances and the lag-compensated position mean threshold-timed claims over air are caught as soon as the trace disagrees, and the flag rewrite neutralizes the payload even when the server would otherwise accept it."
+    },
+    {
+      "label": "NoFall (post-prediction collision check)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/groundspoof/NoFall.java",
+      "explanation": "Grim's NoFall runs as a PacketReceiveListener on PLAYER_FLYING and PLAYER_ROTATION after the prediction engine has already simulated the tick. For any packet that claims onGround true and carries no position change (wrapper.isOnGround() && !wrapper.hasPositionChanged()), it builds a 0.6 by 0.001 feet box at the simulated x, y, z, expands it by the player's movement threshold, and collides it against the compensated world plus nearby hard entities. If nothing is under the player it flags with the 10-tick setback from the check data and, when packet modification is allowed, rewrites the onGround bit to false and re-encodes the packet.\n\nThe Packet mode's bare C03PacketPlayer(true) is a flag-only PLAYER_FLYING packet: Grim's post-prediction NoFall builds the 0.6 by 0.001 feet box at the simulated position, finds no collision while the player falls, and flags with the 10-tick setback, rewriting the bit to false. The tick-mode flag claims ride position-bearing packets and are handled by the prediction-based GroundSpoof check instead, which compares the simulated move against the compensated world. The position-less onGround claim is the exact wire shape the check targets; position-bearing spoofs fall to the prediction-based GroundSpoof check instead, since this one deliberately skips packets that changed position."
+    }
+  ]
+}

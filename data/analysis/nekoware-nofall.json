@@ -1,0 +1,62 @@
+{
+  "module": "NoFall",
+  "client": "Nekoware v1 private",
+  "category": "nofall",
+  "source_rel": "me/nekoWare/client/module/movement/NoFall.java",
+  "overview": "Nekoware's NoFall is a near-verbatim port of the Memeware module with the terrain guard removed. The Packet mode sends a bare C03PacketPlayer(true) once fallDistance reaches 2.0 and resets the field; the Spoof mode sets the ground flag on the per-tick UpdateEvent once fallDistance passes 2.5. With no block-under check anywhere in the handler, the packet-mode branch fires over open air, over ocean, and in the void, which makes it the more aggressive of the two techniques and the easier one to fingerprint by its fixed threshold and unconditional emit. The module has no settings; both thresholds are hardcoded and both branches run inside the same event consumer.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "A single event handler field on UpdateEvent dispatches the two modes, selected by isMode() against the registered strings \"Spoof\" and \"Packet\", both of which match the addModes registration verbatim, so both branches are reachable. The Packet branch calls PacketUtil.sendPacketSilent, which in Nekoware is a direct NetworkManager.sendPacket call that skips the sendQueue and the outgoing event bus. The module keeps no instance state; it reads and mutates mc.thePlayer.fallDistance directly and decides purely on that field plus the mode string."
+    },
+    {
+      "h": "Ground-spoof mechanics",
+      "p": "Spoof is tick-mode: fallDistance > 2.5 sets the ground flag on the UpdateEvent and the next C03 of the tick carries onGround true regardless of terrain. Packet is packet-mode: a position-less C03PacketPlayer(true) is emitted at fallDistance >= 2.0 with no guard at all, every time the threshold is crossed. Because the client-side field is reset to zero after each packet send and each flagged tick, the spoof pattern repeats roughly every two blocks of fall. Unlike the Memeware port, nothing checks whether a block exists below, so the claim is sent over the void as happily as over a cliff edge."
+    },
+    {
+      "h": "Interaction with movement",
+      "p": "Both modes leave coordinates untouched, so the server integrates the same positions it would see from vanilla and only the ground bit differs, plus the extra C03 in packet mode. The direct silent send bypasses the client's per-packet send event, so other modules in this client that hook outgoing traffic never observe the spoof packet. On the wire the packet-mode behavior is an isolated onGround-true flying packet at a regular fall interval, which is the canonical NoFall signature: a flag-only packet with no position that arrives mid-freefall."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "NoFall.java",
+      "rel": "me/nekoWare/client/module/movement/NoFall.java",
+      "explanation": "The module itself, structurally identical to the Memeware NoFall but with the AntiFall.isBlockUnder() gate deleted. The Packet branch emits a silent bare C03PacketPlayer(true) at fallDistance >= 2.0 and resets the field; the Spoof branch sets the event ground flag at fallDistance > 2.5. The mode strings registered by addModes match the isMode() tests exactly, so both branches are live code."
+    },
+    {
+      "label": "PacketUtil.java (silent send path)",
+      "rel": "me/nekoWare/client/util/packet/PacketUtil.java",
+      "explanation": "The two-slot send utility behind the Packet mode. sendPacketSilent calls mc.getNetHandler().getNetworkManager().sendPacket(packet) directly, while sendPacket goes through the sendQueue. NoFall uses the silent variant, so the spoof C03 is written straight to the network layer and never re-enters the client's event pipeline, which is why the module's own outgoing hooks and any interceptor modules never see it."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (block-cache ground truth)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly never trusts the C03 onGround bit. In check() the from and to ground states come from RichBoundsLocation.isOnGround() (lines 138-140), a block-cache scan at minY minus the yOnGround epsilon, optionally widened through isOnGroundOpportune against the BlockChangeTracker; the packet flag plays no part. The vertical allowance comes from vDistRel, which seeds the allowed distance from the previous move's momentum and only accepts a handful of named envelopes (zero-y move on ground, jump, step-up, riptide launch), and the violation is (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 with a set-back to the stored location.\n\nNekoware's flag-only C03 at fallDistance 2.0 and its tick-flag ride at 2.5 both arrive over air with no terrain check. NCP's block-cache ground state contradicts the claim, so the descent is scored against the vDistRel fall envelope and the client-side field reset is irrelevant to NCP's own noFallMaxY bookkeeping. The claim is simply ignored: SurvivalFly keeps enforcing the fall envelope against the ray-traced ground state, so a ground spoof buys no leniency in the vertical model and the client-side fallDistance reset is invisible to NCP because the server tracks its own heights. The companion check moving/player/NoFall.java keeps its own noFallMaxY / noFallFallDistance bookkeeping and deals the fall damage itself through handleOnGround, so zeroing the client field never cancels the damage NCP has already accounted."
+    },
+    {
+      "label": "NoFall (ground-location cross-check)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/NoFall.java",
+      "explanation": "Vrekt's NoFall compares three independently derived states. MovingListener computes ground from the world (LocationHelper.isOnGround) and stores the location as groundLocation whenever it is grounded; PacketListener records the raw packet flag into MovingData via setFlyingClientOnGround(flying.getOnGround()); and Bukkit tracks the server-side fall distance. NoFall.check() fires when the vertical distance from the last grounded location is at least 3.0 blocks, the player is descending, Vrekt's own ground state says airborne, the client claimed onGround, and the server fall distance is exactly 0.0, producing the violation \"Fall distance is 0 while not onGround. (Client faked)\" and player.damage(toGround) on cancel.\n\nEvery emit zeroes the server-side fall distance through vanilla onGround handling. The first descent past 3.0 blocks below the last grounded location, while descending with Vrekt's own ground state airborne and the server fall distance at zero, trips the faked-ground violation and deals toGround damage on cancel. The missing block-under gate means the module spoofs exactly where the check is watching. The 3.0-block descent requirement is the tolerance: genuine short hops and real landings pass. The bypass is to claim ground only when the position truly touches a block, which is exactly the behavior the module exists to fake."
+    },
+    {
+      "label": "GroundSpoof (predicted-position trace)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/GroundSpoof.java",
+      "explanation": "Hawk's GroundSpoof derives its own ground state on every MoveEvent. For position updates it reads event.isOnGroundReally(), which is already lag-compensated; for flag-only updates it runs AdjacentBlocks.onGroundReally on the predicted position with the predicted velocity Y at a 0.001 tolerance. When the event claims onGround but the trace reports air, the check re-tests the pre-move position with the Y already clipped (mirroring the client's clip-then-flag order), skips steps and web-phasing cases, and otherwise punishes with a rubber-band. With the preventNoFall setting enabled, setNotOnGround rewrites the raw packet bytes so the onGround flag is forced to false on the wire, actively undoing the spoof before the server processes it.\n\nThe unconditional claim over air is the easiest target in this batch: Hawk's lag-compensated trace of the predicted position reports not-ground, the check punishes and rubber-bands, and the preventNoFall flag rewrite forces the C03 onGround byte to false on the wire, so even the server that would have accepted the spoof receives an honest flag. The 0.001-0.02 tolerances and the lag-compensated position mean threshold-timed claims over air are caught as soon as the trace disagrees, and the flag rewrite neutralizes the payload even when the server would otherwise accept it."
+    },
+    {
+      "label": "NoFall (post-prediction collision check)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/groundspoof/NoFall.java",
+      "explanation": "Grim's NoFall runs as a PacketReceiveListener on PLAYER_FLYING and PLAYER_ROTATION after the prediction engine has already simulated the tick. For any packet that claims onGround true and carries no position change (wrapper.isOnGround() && !wrapper.hasPositionChanged()), it builds a 0.6 by 0.001 feet box at the simulated x, y, z, expands it by the player's movement threshold, and collides it against the compensated world plus nearby hard entities. If nothing is under the player it flags with the 10-tick setback from the check data and, when packet modification is allowed, rewrites the onGround bit to false and re-encodes the packet.\n\nThe Packet mode emits a PLAYER_FLYING packet with only the onGround bit, the exact shape Grim's post-prediction NoFall handles: a 0.6 by 0.001 feet box at the simulated position finds nothing under the player, the check flags with the 10-tick setback and re-encodes the packet with onGround false. The Spoof tick flag rides a position-bearing packet and is handled by the prediction-based GroundSpoof instead. The position-less onGround claim is the exact wire shape the check targets; position-bearing spoofs fall to the prediction-based GroundSpoof check instead, since this one deliberately skips packets that changed position."
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "module": "NoSlow",
+  "client": "Memeware 7.3",
+  "category": "noslow",
+  "source_rel": "me/memewaredevs/client/module/movement/NoSlow.java",
+  "overview": "Memeware 7.3's NoSlow works on two layers. The client itself is modified: EntityPlayerSP.onLivingUpdate gates the vanilla 0.2F movement-input slowdown on Module.getInstance(NoSlow.class).isToggled(), so while the module is on, blocking no longer scales strafe and forward input by 0.2F and sprint is never cancelled. The module's own handler adds the packet layer: in the 'NCP' mode, the pre phase of each UpdateEvent sends C07PacketPlayerDigging RELEASE_USE_ITEM while blocking, and the post phase re-arms with setItemInUse(currentItem, 71999999) plus sendUseItem, which emits a fresh C08PacketPlayerBlockPlacement, keeping the server-side item-in-use state consistent with full-speed movement. The constructor registers modes 'AAC', 'NCP' and 'Velt', but the handler only tests isMode('NCP'), so the other two names select no branch and the packet layer is effectively single-mode.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "Two independent mechanisms share the module name. The client-side half lives in the fork's EntityPlayerSP.onLivingUpdate: line 634 reads boolean cancel = Module.getInstance(NoSlow.class).isToggled() and lines 635-639 only apply the 0.2F strafe/forward multiplier, the sprintToggleTimer reset and the sprint-suppression when !cancel, so a toggled module removes the entire vanilla slowdown and the isUsingItem-based sprint lock. The module file itself only carries the packet half: a single @Handler-flagged Consumer on UpdateEvent whose isPre() flag splits the work, plus the static unusableItemSlot() helper (lines 36-44) that scans the hotbar for an EnumAction.NONE stack and is never called from the handler in this tree, a leftover from a slot-swap variant."
+    },
+    {
+      "h": "The packet re-arm cycle",
+      "p": "In the NCP mode, while mc.thePlayer.isBlocking() is true the pre phase queues C07PacketPlayerDigging(RELEASE_USE_ITEM, BlockPos.ORIGIN, EnumFacing.UP), and the post phase calls setItemInUse(getCurrentEquippedItem(), 71999999) followed by mc.playerController.sendUseItem. This fork's sendUseItem (PlayerControllerMP line 457) syncs the held slot, addToSendQueue's a C08PacketPlayerBlockPlacement carrying only the item stack (line 463), then runs useItemRightClick locally. The 71999999 duration is effectively infinite, so the client believes the block is still held for the whole fight while the server saw a release. Per blocking tick the server therefore receives RELEASE_USE_ITEM followed by a use-item C08: the release clears the server's item-in-use state (which is what allows sprint and full-speed movement to be consistent), and the C08 re-arms the use for combat purposes."
+    },
+    {
+      "h": "Mode and timing profile",
+      "p": "The packet pair fires every tick while blocking, so the C07 release cadence is 20/s, 50ms between releases; vanilla sends a single RELEASE_USE_ITEM when the use key is released, so the per-tick release stream is the module's packet fingerprint. The dead registrations matter for behavior: addModes registers 'AAC', 'NCP' and 'Velt' (line 18), but the handler tests only isMode('NCP') (line 23), so switching to 'AAC' or 'Velt' leaves the packet layer inert while the client-side EntityPlayerSP hook (which does not consult the mode string) keeps removing the slowdown. A user in those modes gets the speed gain with no packet re-arm, which produces the one-fingerprint state: full-speed blocking movement with no releases at all."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging",
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "NoSlow.java (module logic)",
+      "rel": "me/memewaredevs/client/module/movement/NoSlow.java",
+      "explanation": "The handler is the packet layer: e.isPre() gates the C07 RELEASE_USE_ITEM send (lines 25-27) and the else branch re-arms with setItemInUse(..., 71999999) plus sendUseItem (lines 28-31), which routes through PlayerControllerMP.sendUseItem to emit the C08. The mode wiring is the module's defining quirk: addModes('AAC', 'NCP', 'Velt') at line 18 versus the single isMode('NCP') test at line 23, so two of three registered modes select nothing. unusableItemSlot() (lines 36-44) is dead code in this tree."
+    },
+    {
+      "label": "EntityPlayerSP.java (the client-side slowdown hook)",
+      "rel": "net/minecraft/client/entity/EntityPlayerSP.java",
+      "explanation": "The fork-modified movement code is where the actual speed gain lives. onLivingUpdate line 634 reads boolean cancel = Module.getInstance(NoSlow.class).isToggled(), and lines 635-639 apply the vanilla 0.2F strafe/forward multiplier and the sprintToggleTimer reset only when !cancel. With the module toggled, blocking no longer scales movement input and sprint is no longer suppressed by isUsingItem, so the client generates full-speed movement packets while holding a block. This file is the reason the packet handler alone is not the whole module."
+    }
+  ],
+  "countering": [
+    {
+      "label": "UseItemAdapter release-gap detection",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "NCP's UseItemAdapter intercepts C07 and timestamps every RELEASE_USE_ITEM (lines 412-425): when a new release arrives less than timeBetweenRL (default 70ms, line 128) after the previous one, it sets CombinedData.isHackingRI. The NCP mode's releases land 50ms apart, so every release after the first marks the player; SurvivalFly consumes the flag (line 877) by tagging the move 'noslowpacket' and running Improbable.check on the horizontal distance (line 880), so the full-speed sprint the re-arm cycle enables is scored against NCP's statistical speed model instead of the vanilla slowdown. This is the direct counter to the packet layer: the module removes the slowdown, and the release-gap detector fingerprints exactly that removal."
+    },
+    {
+      "label": "NoSlow (blocking while sprinting)",
+      "ac": "amnoah-BetterAnticheat",
+      "rel": "core/src/main/java/better/anticheat/core/check/broken/NoSlowCheck.java",
+      "explanation": "BetterAnticheat's NoSlowCheck tracks USE_ITEM (blocking = true), ENTITY_ACTION START_SPRINTING (sprinting = true) and fails when a RELEASE_USE_ITEM arrives with both flags set (lines 39-47), resetting blocking after each release. That is precisely the module's state: the EntityPlayerSP hook keeps sprint active while the block is armed, and the per-tick release lands mid-sprint, so the first release trips the check. The check ships in the 'broken' package with a comment admitting unexplainable false positives, so servers may keep it disabled; when enabled, the module's own wire pattern is the textbook trigger."
+    },
+    {
+      "label": "Speed (release-item-over-VL force release)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed check predicts the horizontal position from the previous move and compares it against the actual update; on a discrepancy beyond its threshold it punishes and rubber-bands, and its releaseItemOverVl setting (default 4, line 80) then forces the item to release (lines 213-214) when the flagged player is pulling a bow, consuming or blocking. The module's whole effect is sprint-speed movement while blocking, so a blocked sprint that accumulates speed VL triggers the forced release, which tears the re-arm loop down: the client is made to emit a genuine RELEASE_USE_ITEM that the module did not schedule, and the server-side use state desyncs."
+    },
+    {
+      "label": "RepeatedRelease (release without a use)",
+      "ac": "amnoah-BetterAnticheat",
+      "rel": "core/src/main/java/better/anticheat/core/check/broken/RepeatedReleaseCheck.java",
+      "explanation": "RepeatedReleaseCheck flags any RELEASE_USE_ITEM that arrives without an intervening USE_ITEM (lines 48-52), on the model that every release must be preceded by a use. Two facts blunt it against this module: it is disabled in the shipped tree due to false flags (lines 12-14), and the module re-arms with a use-item C08 after each release, so every release in the stream is preceded by a use and the predicate never fires even when enabled. It is included as the boundary case: the check family exists precisely because per-tick release streams are the NoSlow signature, but this implementation's own 1.8 item semantics leave the pattern uncaught."
+    }
+  ]
+}

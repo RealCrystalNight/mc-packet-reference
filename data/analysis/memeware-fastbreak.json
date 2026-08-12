@@ -1,0 +1,62 @@
+{
+  "module": "FastBreak",
+  "client": "Memeware 7.3",
+  "category": "fastbreak",
+  "source_rel": "me/memewaredevs/client/module/misc/FastBreak.java",
+  "overview": "Memeware's FastBreak accelerates block breaking by mutating the client-side damage controller. Every update event it zeroes mc.playerController.blockHitDelay, and once the accumulated curBlockDamageMP passes the Break setting (default 0.7) it snaps the accumulator to 1.0, completing the break up to one damage tick early. Removing the 5-tick post-break delay is the larger win: consecutive blocks chain with no gap, which is the wire signature the block-break anticheat checks measure.",
+  "sections": [
+    {
+      "h": "Damage accumulation shortcut",
+      "p": "PlayerControllerMP.onPlayerDamageBlock decrements blockHitDelay and skips damage while it is positive, adds the block's relative hardness to curBlockDamageMP each damage tick, and breaks the block when the accumulator reaches 1.0, then sets blockHitDelay to 5 (PlayerControllerMP lines 263-267, 279, 292-299). The module writes blockHitDelay to 0 every update, so the 5-tick gate never applies, and promotes curBlockDamageMP to 1.0 as soon as it crosses the Break threshold, so the block finishes on the tick the accumulator first passes 0.7 instead of waiting for 1.0."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The C07 sequence for a block is START_DIGGING on the first damage tick and STOP_DIGGING on the break, and the server breaks the block on receipt without re-validating the elapsed time. The module shortens the per-block window by up to one damage tick (about 50ms at 20 ticks per second) and, with blockHitDelay zeroed, the next block's START_DIGGING lands in the same tick as the previous STOP_DIGGING. Sustained use therefore produces back-to-back break events with no 250ms inter-block gap."
+    },
+    {
+      "h": "Detection surface",
+      "p": "The counters split across the two effects. NCP blockbreak FastBreak and Grim FastBreak compare the measured break time against the expected time derived from the block's hardness and the player's tool, and Grim also scores the inter-break delay, which is the direct counter to the zeroed blockHitDelay. NCP blockbreak Frequency caps breaks per time frame and bites in creative-mode chains. Vrekt-Arc's Nuker is creative-gated and its v2 build dropped the block package, so the Arc lineage offers no survival-mode block-break counter."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging"
+  ],
+  "files": [
+    {
+      "label": "FastBreak.java",
+      "rel": "me/memewaredevs/client/module/misc/FastBreak.java",
+      "explanation": "The module is two field writes on the player controller. The Break setting defaults to 0.7 with a range of 0 to 1, and the handler runs on every update event, so the writes are re-asserted each tick regardless of what the controller does. Setting blockHitDelay to 0 removes the post-break pause, and promoting curBlockDamageMP to 1.0 once it passes the threshold triggers the controller's break path early.\n\nThe two writes compose: the delay removal chains blocks, and the threshold snap shortens each block's tail. The module does not send packets itself; it changes the controller state that drives the vanilla C07 emission, which is why the wire difference is visible only in the timing of the dig sequence."
+    },
+    {
+      "label": "PlayerControllerMP.java (damage controller)",
+      "rel": "net/minecraft/client/multiplayer/PlayerControllerMP.java",
+      "explanation": "This is the vanilla class the module mutates. The relevant state is curBlockDamageMP (line 49) and blockHitDelay (line 59). onPlayerDamageBlock decrements blockHitDelay and returns without damaging while it is positive (lines 263-265), sets it to 5 when a block is first targeted (line 267), accumulates getPlayerRelativeBlockHardness into curBlockDamageMP (line 279), and when the accumulator reaches 1.0 sends the break (lines 292-299), resetting the accumulator and the delay.\n\nEmbedding the controller makes the module's two writes legible: blockHitDelay = 0 keeps the damage path open every tick, and curBlockDamageMP = 1F inside the >= Break guard forces the line-292 break branch to fire early. The 605-line file is embedded in full so the break path and its packet sends are visible in context."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastBreak (break-time differential)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/FastBreak.java",
+      "explanation": "NCP's blockbreak FastBreak validates the measured break time against the block's expected breaking time. The expected value is round(getBreakingDuration(blockType, player) * fastBreakModSurvival / 100) (line 56; the survival modifier defaults to 100, DefaultConfig line 126), and the elapsed time is now minus the first damage time in strict mode (lines 61-63; strict defaults to true, DefaultConfig line 124). When elapsed plus the fastBreakDelay (default 10ms) falls short of the expected time, the missing time is added as a penalty to a bucket (lines 74-81) and a violation fires once the bucket score exceeds the grace (default 2000, DefaultConfig line 128), with the violation level scaled by the missing time in seconds (lines 85-87).\n\nThe module's 0.7 snap cuts each block's measured window short by up to one damage tick, so every block adds roughly 50ms of missing time to the penalty bucket. The catch is the grace: 2000ms of accumulated shortfall means roughly 40 blocks of continuous fast breaking before the first violation at default settings, so the check punishes sustained use rather than a single accelerated block. Insta-break blocks are skipped entirely (line 66). The honest reading is that this is a slow accumulator that rewards short bursts, which is exactly the pattern a casual module user produces."
+    },
+    {
+      "label": "Frequency (break-rate cap)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/Frequency.java",
+      "explanation": "NCP's blockbreak Frequency limits breaks per time frame with two windows: a full-window bucket score (2 buckets of 1000ms each, BlockBreakConfig lines 81-82) where each break adds the interval modifier (45 in survival, 95 in creative, DefaultConfig lines 132-133) and a violation fires when the score passes the window duration, plus a short-term counter that flags when more than 7 breaks land inside 5 ticks (frequencyShortTermTicks 5, frequencyShortTermLimit 7, DefaultConfig lines 134-135; check lines 55-75). The default actions cancel at vl > 5.\n\nThe thresholds are tuned for instant-break chains. In survival, a block takes hundreds of milliseconds even with the module, so the chained rate of roughly 3 breaks per second stays far below the 7-in-5-ticks short-term limit and the 45-per-break full-window score needs over 40 breaks in two seconds to exceed the 2000ms window. The check therefore does not fire on the survival module at defaults. In creative mode the story flips: insta-breaks chained by the zeroed blockHitDelay flood both windows, and the 7-in-5-ticks limit trips within a few ticks. This entry is the honest version of the task's blockbreak Speed label: there is no Speed check in the NCP blockbreak package, and Frequency is the rate-side sibling that only bites the module's creative-mode use."
+    },
+    {
+      "label": "FastBreak (predicted-time and delay balances)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/breaking/FastBreak.java",
+      "explanation": "Grim's FastBreak keeps two balances. On START_DIGGING it records startBreak, reads the per-tick block damage from BlockBreakSpeed (refreshed from the animation and flying packets, lines 124-134), and scores the inter-break delay: a gap under 275ms adds 300 minus the gap to blockDelayBalance, flagging when the balance passes 1000 (lines 81-94). On FINISHED_DIGGING it computes predictedTime as ceil(1 / maximumBlockDamage) times 50ms, compares it to the measured realTime, and adds the difference to blockBreakBalance when it exceeds 25ms, flagging above 1000 (lines 99-117). Both balances decay by 0.9 when close and clamp to the transaction ping (lines 136-139).\n\nThis is the sharpest counter for the module because it scores both effects with no grace window. The zeroed blockHitDelay makes the inter-break gap about 0ms, so blockDelayBalance gains 300 per chained block and passes 1000 after roughly four consecutive breaks. The 0.7 snap makes realTime about 50ms short of predicted, adding a similar per-block charge to blockBreakBalance. The balances are clamped to the player's transaction ping (a 300ms ping raises the clamp to 1000), which gives high-ping players more headroom, and a 25ms diff threshold means a module that shaves less than half a tick per block accumulates slowly."
+    },
+    {
+      "label": "Nuker (creative-gated break rate)",
+      "ac": "Vrekt-Arc",
+      "rel": "src/main/java/arc/check/block/Nuker.java",
+      "explanation": "Arc's block-break check registers a BLOCK_DIG packet listener (line 195) and enforces a break-rate cap of 15 breaks per second, a 50ms minimum delta between breaks with a 5-occurrence threshold, and a packet-side cap of 50 break packets per second (lines 63-72, 91-127, 135-164). The gate matters most: creativeOnly defaults to true, and the check returns false immediately for any non-creative player (line 84), so in survival the entire check is dormant.\n\nAgainst the survival module the check does nothing unless an admin disables the creative-only gate. With the gate off, the module's 30% early break still takes hundreds of milliseconds, so it stays inside the 50ms min-delta, and only the chained breaks from the zeroed blockHitDelay approach the delta threshold; five consecutive chains would trip it. The lineage note matters for attribution: the C07 corpus files under the Vrekt section are the v1 layout (arc.check.block), and Vrekt-Arc v2 dropped the block package entirely, its PacketListener subscribing only to FLYING, POSITION, USE_ENTITY, ARM_ANIMATION, HELD_ITEM_SLOT and BLOCK_PLACE (soup auto-heal), so the v2 build offers no block-break counter at all."
+    }
+  ]
+}

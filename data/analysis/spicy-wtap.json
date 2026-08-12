@@ -1,0 +1,62 @@
+{
+  "module": "Wtap",
+  "client": "Spicy",
+  "category": "wtap",
+  "source_rel": "info/spicyclient/modules/combat/Wtap.java",
+  "overview": "Spicy's Wtap attaches the sprint reset directly to the attack packet. A single EventSendPacket handler watches the outgoing stream, and when it sees a C02PacketUseEntity with the ATTACK action while the food level is above 6, it captures the current sprint state, pushes a C0BPacketEntityAction STOP_SPRINTING followed by START_SPRINTING onto the send queue, and restores the local sprint flag. The pair trails the C02 and re-arms the server-side sprint state for the following hit, which is what keeps the vanilla sprint knockback multiplier applied to consecutive attacks. Unlike Rise's tick-driven burst, Spicy emits exactly one pair per attack, gated by the same food rule vanilla applies to sprinting, and the handler never fires on anything but C02 ATTACK packets, so the enqueued pair cannot re-enter the handler.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module registers one handler on the EventSendPacket bus with a pre-phase check. onEvent casts the packet, tests instanceof C02PacketUseEntity, reads getAction() and requires it to equal Action.ATTACK, then requires mc.thePlayer.getFoodStats().getFoodLevel() > 6. The handler body captures continueSprint from isSprinting(), enqueues the STOP then START pair through mc.thePlayer.sendQueue.addToSendQueue, and calls setSprinting(continueSprint) to restore the client-side flag. The food gate mirrors the vanilla hunger rule that sprinting requires more than 6 hunger, so the module never contradicts the client's own sprint eligibility."
+    },
+    {
+      "h": "Ordering and send path",
+      "p": "The handler runs while the C02 is already being processed, and the pair is appended to the outgoing queue, so the server sees the STOP and START after the attack that triggered them. That ordering is the point of the technique: the reset applies to the next hit in the chain, and because the client flag is restored to continueSprint, the player keeps sprinting visually and mechanically. addToSendQueue bypasses the event bus, so the pair is not re-broadcast to other modules, and even if it were, the handler only reacts to C02 ATTACK packets, so there is no loop. The module is inert when the player is not sprinting only in the sense that the pair still goes out; the local flag restore then just re-asserts the non-sprint state."
+    },
+    {
+      "h": "Behavioral footprint",
+      "p": "Each melee hit emits exactly two C0B packets, one STOP and one START, with no tick timer and no burst window, which distinguishes it from Rise's nine-pair burst. The footprint is therefore a two-packet toggle pair per C02 attack, always in the same order and always from a true sprint state when the player is sprinting, or from a false state when the player is not, because the pair is sent unconditionally past the food gate. That unconditional send is the module's tell: a STOP while the server already believes the player is not sprinting is a duplicate status packet, which server-side checks read as a protocol violation."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "Wtap.java (module)",
+      "rel": "info/spicyclient/modules/combat/Wtap.java",
+      "explanation": "The entire module is the EventSendPacket handler plus the NumberSetting-free constructor. The handler filters C02 ATTACK packets, applies the food gate, and enqueues the C0BPacketEntityAction STOP then START pair with the local player as the entity argument, then restores the sprint flag. The file also imports Timer and declares a timer field that is never used in the handler, a leftover from a different iteration of the module, which is worth noting because the module has no timing state at all: its cadence is driven entirely by the player's attack rate."
+    },
+    {
+      "label": "EventSendPacket.java (event API)",
+      "rel": "info/spicyclient/events/listeners/EventSendPacket.java",
+      "explanation": "EventSendPacket is the event class the handler receives; it wraps a single public Packet field and extends the Event base with pre and post phases. The module only uses the pre phase and reads the packet field to test the C02 type and action. The class also documents why the module cannot loop: the handler is only invoked for packets routed through the send event, and the pair it enqueues goes through addToSendQueue directly, so the two C0B packets never re-enter the handler even though they pass through the same queue."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ActionToggleSpeed (sprint toggle rate)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/ActionToggleSpeed.java",
+      "explanation": "Hawk's ActionToggleSpeed punishes sprint toggles that arrive less than one tick apart. The Spicy handler enqueues both C0B packets in a single event, so the STOP and START are processed in the same server tick: the STOP stamps the current tick into the per-player sprint toggle map, and the START that follows sees a zero-tick gap, which is below the threshold, and punishes. Every attack therefore produces the violation, and because the check is keyed on the action type rather than the packet count, neither the food gate nor the sprint state changes the outcome. The only quiet variant would be a pair split across ticks, which the module never does."
+    },
+    {
+      "label": "ToggleFrequency (entity action rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/ToggleFrequency.java",
+      "explanation": "NoCheatPlus scores every C0B into NetData.playerActionFreq, a one-second ActionFrequency, and ToggleFrequency.check compares the window score against the 25 per second toggleActionLimit. Spicy emits two C0B per attack, so the check engages only at sustained high attack rates: roughly 13 attacks per second sustain 26 C0B packets per second and begin accumulating toggleFrequencyVL, while normal clicking stays far below the ceiling. The honest framing is that this check is a background constraint rather than a direct hit: it caps how fast the technique can be applied per second, but a normal 6 to 10 CPS fight never crosses it, which is why the module can operate under it for typical play."
+    },
+    {
+      "label": "BadPacketsF (duplicate sprint status)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsF.java",
+      "explanation": "Grim's BadPacketsF flags a START_SPRINTING when the tracked sprint state is already true and a STOP_SPRINTING when it is already false, after a one-packet exemption. The Spicy pair is sent unconditionally once the food gate passes, so the outcome depends on the player's actual sprint state. While sprinting, the STOP is valid and the START restores a false state, so the pair alternates cleanly and passes. The failure is the non-sprint case: when the player is not sprinting, the STOP arrives while lastSprinting is already false, which is a duplicate status and flags immediately, cancelling the packet. The module's own isSprinting-independent send is exactly what feeds this check whenever the player attacks while walking."
+    },
+    {
+      "label": "SprintA (hunger gate)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/sprint/SprintA.java",
+      "explanation": "SprintA flags the sprint flag being true while food is at or below 6.0. The Spicy module's food gate is set at the identical threshold, so the two rules are the same line: while the gate holds, the check rewards, and the moment hunger drops to 6 or below the module stops sending its pair, which keeps the server flag from being re-asserted and the check quiet. The gate is therefore a deliberate alignment with vanilla hunger semantics that also happens to keep SprintA from ever seeing a violation from this module. The check still matters as the constraint that defines the gate: any wtap variant that drops the food check inherits the low-hunger sprint violation immediately."
+    }
+  ]
+}

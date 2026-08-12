@@ -1,0 +1,63 @@
+{
+  "module": "Fast Bow",
+  "client": "Memeware 7.3",
+  "category": "fastbow",
+  "source_rel": "me/memewaredevs/client/module/combat/FastBow.java",
+  "overview": "Memeware's Fast Bow collapses the bow charge into a single tick. While the use key is held and a player is visible within 25 blocks, the pre-phase UpdateEvent starts the item use (sendUseItem plus a manual onItemRightClick), resets the bow's durability with a double inventory click, snaps the camera to the target via RotationUtils.getBowAngles, pushes 20 C06PacketPlayerPosLook packets carrying that aim with onGround true, then releases with C07PacketPlayerDigging RELEASE_USE_ITEM and a client-side onPlayerStoppedUsing with 10 ticks used, which computes a full-power critical arrow. The server fires the shot along the look the C06 spam delivered, so aim and release happen in the same tick. The module never emits C02PacketUseEntity; its wire traffic is the C03 family plus the C08 use sentinel and the C07 release.",
+  "sections": [
+    {
+      "h": "One-tick charge sequence",
+      "p": "For every visible target the pre-update runs the full sequence: setItemDamage(-1) clears the bow's durability counter client-side, duraHack window-clicks inventoryContainer slot 9 twice with the hotbar swap mode, sendUseItem pushes the C08 use-item sentinel and arms itemInUse, and the explicit onItemRightClick call re-arms it again (sendUseItem already invoked it internally). Then 20 C06PacketPlayerPosLook packets carry the getBowAngles aim with onGround true, duraHack runs again, and C07PacketPlayerDigging RELEASE_USE_ITEM at BlockPos.ORIGIN facing UP triggers the server-side shot. The client-side onPlayerStoppedUsing with 10 ticks used computes j equal to 72000 minus 10, which caps the charge factor at 1.0 and spawns a critical arrow at full velocity."
+    },
+    {
+      "h": "Aim and release",
+      "p": "getBowAngles computes the yaw and pitch that point at the target, and the 20 C06s deliver that rotation to the server, so the arrow entity launches along the locked look when the release lands. The onGround true stamps keep the fall-distance reset active through the burst. The re-arm matters: the server's own item-use state decrements per tick from 72000, so each tick's sendUseItem resets the charge window while the release fires, which is how the module produces one full-power arrow per tick instead of waiting the vanilla one-second charge."
+    },
+    {
+      "h": "Target filter",
+      "p": "getTarg() streams the world's player entities and keeps those that pass canEntityBeSeen (a client-side ray trace), sit within 25 blocks, and are not the local player, capped at 10 targets. Every qualifying target gets its own complete shot sequence in the same tick, so with several targets in view the module multiplies the burst by the target count. The doCheck gate additionally requires health above zero, either vertical collision or creative mode, a bow in hand, and the use key physically held."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "FastBow.java",
+      "rel": "me/memewaredevs/client/module/combat/FastBow.java",
+      "explanation": "The module is one pre-phase UpdateEvent consumer plus the two helpers it calls. The main loop iterates the target list and runs the charge sequence per target: setItemDamage(-1), the first duraHack, sendUseItem and the manual onItemRightClick to arm the use state, the 20 C06 sends with the getBowAngles rotations and onGround true, the second duraHack, the C07 release at BlockPos.ORIGIN facing UP, the client-side onPlayerStoppedUsing with 10 ticks used, and a trailing plain C03. The sequence runs for every target on every tick while the key is held.\n\nduraHack is a two-iteration loop over playerController.windowClick with mode 2, which swaps the clicked slot with the hotbar slot and emits click-window packets; clicking slot 9 (the first main-inventory slot in the player container) twice swaps the current hotbar item out and back, resetting its client-side state. doCheck assembles the inverted gate, and getTarg provides the visible-within-25-blocks player filter. The whole module has no settings and no enable or disable logic."
+    },
+    {
+      "label": "RotationUtils.java (bow aim)",
+      "rel": "me/memewaredevs/client/util/combat/RotationUtils.java",
+      "explanation": "The aim source for the C06 spam. getBowAngles computes the yaw and pitch that point from the local player at the target entity, and the fastbow feeds those values into every one of the 20 C06PacketPlayerPosLook packets so the server's arrow entity launches along the locked look. The same utility backs the client's other combat modules, which is why the fastbow's aim profile matches the killaura family.\n\nThe aim is delivered as packet rotations rather than a client-side camera write, which is the load-bearing detail for the countering checks: the server consumes the last delivered look when the release fires the arrow, so the rotation content of the C06 burst is what aims the shot, and rate and rotation checks see exactly that traffic."
+    }
+  ],
+  "countering": [
+    {
+      "label": "UseItemAdapter (release-item rate gate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "The adapter watches the two packets that drive item use: the block-dig packet (for RELEASE_USE_ITEM) and the block-place packet (for the use sentinel). handleDiggingPacket stamps releaseItemTime on every RELEASE_USE_ITEM and sets the isHackingRI flag when a second release arrives within timeBetweenRL of the first, with the threshold defaulting to 70ms and tunable through setuseRLThreshold. The javadoc is explicit that this is a minimum-time-between-releases gate for exactly this exploit class.\n\nThe fastbow releases once per tick, which is 50ms at the standard tick rate, so from the second shot onward every release lands inside the 70ms window and the flag is set continuously. The adapter also tracks the block-place sentinel through handleBlockPlacePacket to keep the use state model consistent. This is the direct counter for the module's core behavior: no position trick affects it, because it keys purely on the release cadence."
+    },
+    {
+      "label": "SurvivalFly (rapid-release penalty path)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "The isHackingRI flag set by the release gate is consumed here: the next SurvivalFly move check tags the move 'noslowpacket', runs Improbable.check against the horizontal distance with the tag 'moving.survivalfly.noslow', and resets the horizontal data before returning. The rapid-release pattern is folded into the movement layer with the standard violation and set-back machinery, so the fastbow's release spam does not just trip a counter, it degrades the player's accepted movement model.\n\nThe penalty path runs on the move that follows the flagged release, which for this module is every tick while firing. The design intent is visible in the tag name: NCP treats rapid item release as the no-slowdown pattern, the same family as the speed-while-using exploit, and the movement penalty is what makes the pattern costly rather than merely logged."
+    },
+    {
+      "label": "MorePackets (charge-spam rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "Each shot emits 20 C06 packets plus a plain C03 and the C08 sentinel, and with the key held the module fires every tick, so the sustained rate is over 400 move-family packets per second against a 22 per second ceiling. The window accumulator with 500ms buckets and the half-second burst path (15 packets default, direct violation at 10) both fire within the first second of holding the key. With multiple targets in view the per-tick burst multiplies by the target count, pushing the rate into thousands per second.\n\nThe check is content-blind, so the identical positions and the onGround stamps do not matter; the count alone is the violation. The default actions cancel from vl 2 upward, so the module cannot hold the key down on an NCP-protected server. This is the second independent kill on the module alongside the release gate."
+    },
+    {
+      "label": "Angle (attack-stream rotation deltas)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Angle.java",
+      "explanation": "The angle check scores rotation behavior across the attack stream, and the fastbow produces exactly the profile it was built for: the C06 burst snaps the camera to a target lock every tick, and the same aim feeds the melee attacks the user mixes in between shots. The check accumulates per-call signal into a window and flags when the yaw and pitch deltas between consecutive attack-bound updates exceed the configured thresholds.\n\nThe honest caveat is the stock configuration in this tree: the move, time, yaw and switch thresholds sit at 100, 150, 60 and 50, which leave per-call scores far below trip level, so the check is dormant until an admin lowers them. The mechanism still matters because it is the C02-corpus check that constrains the aim side of the module: when enabled, the same snap that aims the arrows becomes the evidence that the rotations are scripted rather than human."
+    }
+  ]
+}

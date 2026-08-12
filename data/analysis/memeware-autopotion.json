@@ -1,0 +1,64 @@
+{
+  "module": "Auto Potion",
+  "client": "Memeware 7.3",
+  "category": "autopot",
+  "source_rel": "me/memewaredevs/client/module/combat/AutoPotion.java",
+  "overview": "Memeware's Auto Potion is a health-gated splash-heal thrower driven by a two-phase UpdateEvent handler and a static doThrow flag. Below 9.0 health the pre phase scans the hotbar for a splash potion whose effects contain Instant Health; if the hotbar is empty it window-clicks one from the main inventory (C0E, mode 2 hotbar swap), then arms doThrow and forces the local pitch to 90 so the throw appears straight up. The post phase of the next event fires the actual throw as a three-packet burst in one tick: C09 to the pot slot, C08 with the held stack (the single-stack constructor, so block position ORIGIN and face 255 - the use-item form), then C09 back to the previous slot. A 500ms Timer with reset() on arming sets the cooldown. The module has no open-container guard on its window click and never sends a look packet with the pitch change, so the splash is thrown at the server's last-synced rotation while the client renders a straight-up lob - the visual and the wire disagree.",
+  "sections": [
+    {
+      "h": "Two-phase throw cycle",
+      "p": "The handler splits work across update phases. The pre phase gates on health < 9.0 and non-creative, then (if the 500ms timer has elapsed) locates a potion: hotbar scan 0-8 for an ItemPotion that isSplash() and whose effects list contains Potion.heal, falling back to a container scan 9-35 whose first hit is swapped into hotbar slot 1 with mc.playerController.windowClick(windowId, j, 1, 2) - mode 2 SWAP, button 1. It then re-scans the hotbar, remembers the first pot slot in the instance field slot, calls timer.reset() and sets the static doThrow, and finally event.setPitch(90.0f) - a local-only rotation change. The post phase consumes the flag: if doThrow, it queues C09(slot), C08(getStackInSlot(slot)) and C09(inventory.currentItem) back-to-back through addToSendQueue and clears doThrow. The static flag doubles as a public isPotting() query other modules can poll. Because the throw packets fire on the post of the same tick that armed them, the C09-C08-C09 triple is one 50ms window of traffic."
+    },
+    {
+      "h": "C08 use-item form and rotation split",
+      "p": "The C08 is built with the one-argument constructor, which serializes BlockPos.ORIGIN (0, 0, 0) with face index 255 (-1) and the current stack. That face value is the protocol's 'use item in hand' marker: the server's processPlayerBlockPlacement routes it to ItemPotion.onItemRightClick, which spawns the splash entity for a splash potion. The packet carries the potion stack itself, so the server validates the throw against the item the client claims to hold - and because the module switched the held slot with C09 immediately before, the carried stack matches the announced slot. The pitch is applied only to the local player (event.setPitch) with no C05/C06 look packet, so the server processes the throw with the last rotation it received; the client meanwhile renders the potion lobbing straight up from the forced 90 pitch. That split - throw direction diverging from the synced rotation - is a local/remote desync a rotation-checking anticheat can measure, though the module never claims the 90-degree pitch on the wire."
+    },
+    {
+      "h": "Cooldown and window-click edge cases",
+      "p": "The Timer here behaves as a real period, unlike Auto Armor's: arming calls timer.reset(), so delay(500f) gates the next search to 500ms after the previous arm. Two edge cases follow from the ordering: the window-click refill path uses mc.thePlayer.openContainer.windowId with no windowId != 0 guard, so with a chest open the swap click targets the chest window's slot j instead of the inventory (the container scan 9-35 also walks chest slots in that state), and the throw still fires regardless. And isValidPotion is called twice per candidate with an overload that re-casts the stack's item, a redundancy that costs nothing but signals the copy-paste origin. The health gate is a hard 9.0 (4.5 hearts) with no setting; the module only ever throws heal splash, so it is a pure panic-heal bot rather than a buff module."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement",
+    "C09PacketHeldItemChange",
+    "C0EPacketClickWindow"
+  ],
+  "files": [
+    {
+      "label": "AutoPotion.java (module)",
+      "rel": "me/memewaredevs/client/module/combat/AutoPotion.java",
+      "explanation": "The whole module is the UpdateEvent handler (lines 27-81) plus the potion predicates. Lines 30-32 gate on health >= 9.0 and creative. The post-phase throw (lines 33-40) sends the C09-C08-C09 triple and clears the static doThrow. The pre-phase search (lines 41-65) applies the 500ms timer, scans the hotbar for a valid heal splash, and on failure window-clicks the first inventory hit into hotbar slot 1 (line 61, mode 2 SWAP). Lines 66-74 re-scan the hotbar to fix the actual slot, lines 75-80 bail if none, else reset the timer, set doThrow and force pitch 90. isValidPotion (lines 83-97) requires isSplash() and a Potion.heal effect; isPotting() (lines 99-101) exposes the static flag. Note the module never checks openContainer.windowId before the refill click and never sends a look packet with the pitch."
+    },
+    {
+      "label": "Timer.java (cooldown gate)",
+      "rel": "me/memewaredevs/client/util/misc/Timer.java",
+      "explanation": "The same Timer class Auto Armor uses, but here it behaves as a genuine period because the module calls reset() on every arm (line 78): delay(500f) only passes once 500ms has elapsed since the last reset, so potion searches cannot re-arm within half a second of a throw. The class itself is a comparison-only helper - constructor reset, delay() with no side effect - and its utility depends entirely on whether the caller resets. isPotting() consumers on the same client can therefore rely on a stable 500ms cadence between throws, which is the fingerprint the countering checks measure."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ItemSwitchSpeed (C09 after item use)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/item/ItemSwitchSpeed.java",
+      "explanation": "Hawk's ItemSwitchSpeed is the canonical check for the auto-pot slot dance - the source comment literally notes it 'might rename this to AutoUse'. The check maintains a per-player lastSwitchTick map and a usedSomething set: an InteractItemEvent or InteractWorldEvent adds the player to usedSomething, and the next ItemSwitchEvent then compares the tick delta against MIN_SWITCH_TICKS (default 1); a switch within that window of a use is a punish (1 VL, cancelless). Memeware's module produces the worst-case input: C09(pot slot), C08 (the use), C09(back) are all queued in the same post-update tick, so the switch-back ItemSwitchEvent arrives in the same or the immediately following tick as the InteractItemEvent generated by the C08 - well inside MIN_SWITCH_TICKS. Every throw is therefore a guaranteed violation, and because the module re-arms on a 500ms cooldown whenever health stays under 9, sustained low-health combat accumulates VL without human-like spacing. There is no randomization or delay setting to widen the gap; the only escape is throwing less often than the check's window, which defeats the module's purpose."
+    },
+    {
+      "label": "UseItemAdapter (C08 face-255 and C09 resync)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "NCP's ProtocolLib adapter is the layer that classifies C08 traffic into block places and item uses, and it is the C09-sensitive half of NCP's item-use state machine. handleBlockPlacePacket (line 382) reads the pre-1.9 C08 face index: a face <= 5 means a genuine block place and clears data.mightUseItem, while any other face - including the 255 the module's one-argument constructor serializes - sets mightUseItem = true, marking the player as possibly using an item. The subsequent PlayerInteractEvent (RIGHT_CLICK_AIR for the potion throw) then drives onItemInteract, which for splash potions hits the pre-1.9 durability guard (line 277, durability > 16384) and skips setItemInUse entirely - an accurate gap: NCP deliberately does not track splash throws as item-use. What the adapter does catch is the slot churn: the module's C09 to the pot slot and C09 back fire onChangeSlot (line 366), and any real slot change while an item use is in flight calls pData.requestItemUseResync(), forcibly releasing the server-side item-use state. The same-tick C09-C08-C09 cycle is exactly the sequence the adapter's state machine exists to reconcile, and the resync it triggers is the server reasserting its inventory/use state against the client's rapid manipulation."
+    },
+    {
+      "label": "FastConsume (consume-time ledger)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/inventory/FastConsume.java",
+      "explanation": "Arc v2's FastConsume measures the time between the first right-click on a consumable and its completion, flagging when the interval is shorter than the configured consume-time. The feed is InventoryListener.onInteract (Arc v2): a RIGHT_CLICK_AIR or RIGHT_CLICK_BLOCK with a POTION or edible in hand stamps InventoryData.consumeTime, and PlayerItemConsumeEvent is where FastConsume.check compares the elapsed time. For Memeware's module the ledger interaction is lopsided: the C08 throw fires a PlayerInteractEvent with the potion in hand, so consumeTime is stamped on every throw, but a splash potion never produces a PlayerItemConsumeEvent - the item is consumed instantly server-side - so the completion half of the ledger never arrives and the check's cancel path (which resets via getFirstConsumableItemInHand) is never exercised. The stamping still matters: the module's 500ms cooldown is the only thing separating consecutive consumeTime stamps, and Arc v2's AutoHeal path (PacketListener, gated on Material.MUSHROOM_SOUP) ignores potions entirely - so Arc v2 sees the module's throws only as a repeated consume-start signal with no completion, a pattern its inventory timing was built to scrutinize even though the soup-gated check does not flag it directly."
+    },
+    {
+      "label": "UseItemStatusHandle (use-item classifier)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/ai/idealistic/spartan/listeners/protocol/UseItemStatusHandle.java",
+      "explanation": "Spartan's UseItemStatusHandle classifies every C08/use-item packet into Spartan's useItemPacket state. For pre-1.9 C08 traffic it reads the block position; a real block place (Y != -1) returns immediately without touching the flag. The module's throw - C08 with position ORIGIN - has Y == 0, so it falls through to the item inspection, which only sets useItemPacket = true for shields and edible items (with the food-level and golden-apple carve-outs). A splash potion is neither, so the throw leaves useItemPacket untouched. That is the honest summary of this check against the module: the potion use is not a shield block and not food, so Spartan's item-use status machine does not mark it, and the check is a gap rather than a counter for Memeware's Auto Potion. The value of the file is diagnostic - it shows the exact classification boundary the module exploits: the C08 use-item form passes through Spartan's status layer without being recorded as an item use, so downstream checks that key on useItemPacket never see the throw."
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "module": "FastBow",
+  "client": "Sigma 4.11",
+  "category": "fastbow",
+  "source_rel": "info/sigmaclient/module/impl/combat/FastBow.java",
+  "overview": "Sigma's FastBow has two modes behind one OPTIONS setting: Guardian and Basic. Guardian is the anti-rotation-reset variant: while the bow is in use it rewrites the yaw and pitch of every incoming S08PacketPlayerPosLook to the client's current rotations, and every 500ms, standing grounded, it fires 11 pairs of C04PacketPlayerPosition to posY plus 16 and back with onGround true, then releases with C07PacketPlayerDigging RELEASE_USE_ITEM. Basic skips the vertical excursion and the S08 eater: it zeroes rightClickDelayTimer and pushes 20 plain C03PacketPlayer(true) per tick, then releases through the same C07 path. Both modes run their release from a shared statement after the mode branches.",
+  "sections": [
+    {
+      "h": "Guardian mode",
+      "p": "Guardian combines three mechanisms. The EventPacket handler rewrites S08PacketPlayerPosLook yaw and pitch to the client's current rotations whenever a bow is held, so server teleports cannot snap the aim mid-charge. The EventUpdate pre-phase, while using the bow, grounded and collided vertically with MoveUtils.isOnGround at a 0.0001 epsilon, zeroes rightClickDelayTimer and, gated by a 500ms Timer, writes the raised position into the event's y and pushes 11 pairs of C04s: one at posY plus 16 with onGround true, one back at posY with onGround true, for 22 packets per burst. The 16-block claim exceeds the vanilla moved-too-quickly squared bound of 100, so the mode only survives where the server does not enforce that bound."
+    },
+    {
+      "h": "Basic mode",
+      "p": "Basic is the volume mode: zero rightClickDelayTimer and push 20 instances of C03PacketPlayer(true) per tick, which serialize only the onGround byte set to true, then fall through to the shared release. The rightClickDelayTimer reset lets the client re-arm the item use immediately, so the module fires every tick rather than waiting the vanilla four-tick use delay. The onGround true claims carry no position, so the burst is flag noise plus the release."
+    },
+    {
+      "h": "Release path and aim",
+      "p": "Both modes converge on one shared statement: C07PacketPlayerDigging RELEASE_USE_ITEM at BlockPos.ORIGIN facing DOWN, followed by mc.thePlayer.stopUsingItem() for the client-side state. The facing differs from Memeware's Fast Bow, which uses UP; the server does not validate the facing for a release, so the choice is cosmetic. The arrow fires along the server's current look, which the Guardian C04 pairs do not carry (they keep the existing rotation), so Guardian relies on the client's camera state surviving the teleports, which is exactly what the S08 eater preserves."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "FastBow.java",
+      "rel": "info/sigmaclient/module/impl/combat/FastBow.java",
+      "explanation": "The module registers both EventUpdate and EventPacket and dispatches on the instance type. The EventPacket branch handles the Guardian S08 eater: when a bow is held and the mode is Guardian, incoming S08PacketPlayerPosLook instances get their yaw and pitch overwritten with the client's current rotation. The EventUpdate pre-phase holds the two mode branches: Guardian's grounded gate with MoveUtils.isOnGround at 0.0001, the 500ms timer, the event y write and the 11 C04 pairs, and Basic's rightClickDelayTimer zeroing with 20 C03(true) sends. The release statement after the branches is shared, followed by stopUsingItem.\n\nThe MODE setting is an Options value with the selected string read per event through getSelected, and setSuffix exposes the mode name in the module's displayed name. The Timer field is declared at class level and reset inside the Guardian branch after each burst, which is what paces the 500ms cadence."
+    },
+    {
+      "label": "MoveUtils.java (ground gate)",
+      "rel": "info/sigmaclient/management/MoveUtils.java",
+      "explanation": "The utility that backs the Guardian mode's ground gate. isOnGround with the 0.0001 epsilon performs the client-side ground check that authorizes the vertical excursion, and it is the only util call in the Guardian branch besides the Timer. The epsilon matters: 0.0001 is a strict bound, so the gate only opens when the player is essentially resting on a surface, which matches the collision and onGround checks stacked around it.\n\nThe same utility class serves the rest of the Sigma movement modules, and its isOnGround implementation is the client's own ground model rather than the server's; the countering checks below are the server-side equivalent of the same question, which is the point of the matchup."
+    }
+  ],
+  "countering": [
+    {
+      "label": "UseItemAdapter (release-item rate gate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "The adapter flags releases that arrive within timeBetweenRL (70ms default) of the previous release, setting isHackingRI for the movement layer to consume. Basic mode releases every tick, which is 50ms, so its releases trip the gate from the second shot onward. Guardian is the honest exception: the 500ms Timer paces its releases at exactly twice the threshold, so the release gate alone does not flag Guardian, and that is the correct reading of the mode's design.\n\nThe adapter also tracks the block-place sentinel that both modes' use flow generates, keeping the item-use state model consistent across the burst. For Guardian the enforcement therefore has to come from the movement envelope, which is the next check, because the release cadence is deliberately legal."
+    },
+    {
+      "label": "SurvivalFly (vertical envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "Guardian's C04 pairs are the envelope's direct target. The first packet of each pair claims a 16-block ascent in one move; vDistRel allows only the named physics envelopes, and a 16-block y delta against an allowed change of a few tenths produces a yDistanceAboveLimit around 16, which times the 100 multiplier gives a violation score near 1600 on the first pair. The immediate consequence is a violation and a set-back, and the alternating return packet does not help because each move is scored independently.\n\nThe check derives ground state from the block cache, so the onGround true stamps on both the raised and the returned claims earn nothing the server did not verify. This is the hard counter for Guardian: the mode's whole premise is the vertical excursion, and the envelope rejects it on the first packet. Basic's flag-only burst, by contrast, has no coordinates for the envelope to score, which is why Basic is handled by the rate check."
+    },
+    {
+      "label": "MorePackets (burst rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "Both modes violate the rate model. Guardian sends 22 C04s per 500ms burst, which is 44 per second sustained against a 22 per second ceiling, and the 22 packets that land inside one half-second bucket exceed the 15-packet burst threshold with a direct violation at 10. Basic sends 20 packets per tick, 400 per second, which trips both the window accumulator and the burst path immediately. The content-blind accounting means the identical positions in the Guardian pairs and the single-byte shape of the Basic sends score identically.\n\nThe default actions cancel from vl 2 upward, so neither mode survives on an NCP-protected server. The pairing with SurvivalFly is the complete answer: the envelope kills Guardian's vertical claim while the rate check kills both modes' send volume."
+    },
+    {
+      "label": "Reach (melee geometry on the attack surface)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Reach.java",
+      "explanation": "The reach check validates C02 attacks against a lag-compensated ray trace to the target's hitbox with a precision inset, and it is the C02-corpus check that constrains the combat surface this module feeds. The honest boundary is that the bow shot itself carries no C02: the arrow entity is server-side and its hit is computed by the server, so reach never scores the arrow. What reach does constrain is the melee the fastbow user mixes in, where the module's target lock and the Guardian camera preservation keep the aim planted while the attack arrives.\n\nThe S08 eater does not help against reach because the check builds its geometry from the server's own position history and the lag-compensated target location, not from the client's rotation. The practical statement is that the arrow damage is unconstrained by reach, and the melee that accompanies it is bounded to the vanilla attack distance, which is the standard asymmetry of fastbow counterplay."
+    }
+  ]
+}

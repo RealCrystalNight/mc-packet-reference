@@ -1,0 +1,62 @@
+{
+  "module": "Blink",
+  "client": "Spicy",
+  "category": "blink",
+  "source_rel": "info/spicyclient/modules/player/Blink.java",
+  "overview": "Spicy's Blink cancels every outgoing packet except C00PacketKeepAlive, C00Handshake and C00PacketLoginStart in the pre stage of EventSendPacket, stores them in a static ArrayList, and replays them through NetHandlerPlayClient.addToSendQueue when disabled. The keepalive exemption is the connection lifeline: buffering the echoes too would starve the server's ping validation and earn a timeout kick, so the module deliberately leaves the keepalive stream intact while freezing everything else. The flush path is the subtle part: addToSendQueue funnels into NetworkManager.sendPacket, which fires EventSendPacket again, but the event dispatcher only invokes onEvent for toggled modules, so the replayed packets pass through unmolested while the module is off. A singleplayer guard toggles the module back off with a warning notification, and the static buffer is cleared on enable.",
+  "sections": [
+    {
+      "h": "Buffer scope",
+      "p": "The pre check returns early for the three exempt classes and cancels everything else: C03 moves, C02 attacks, C08 placements, C0F confirmations, C0B entity actions, the whole gameplay stream parks in the list. The list is static, so it survives module restarts and is cleared only in onEnable, and the module's own singleplayer check prevents misuse in a world the client controls."
+    },
+    {
+      "h": "Flush path and re-entrancy",
+      "p": "onDisable iterates the buffer and calls addToSendQueue, which delegates to NetworkManager.sendPacket. sendPacket fires EventSendPacket at the top of the method and returns early when cancelled, so the flush re-enters the module's own hook; SpicyClient.onEvent dispatches to onEvent only when the module is toggled on and to onEventWhenDisabled otherwise, and since the module toggled off before the flush, the re-entrant event reaches only the empty disabled handler. The packet is sent, the for-each over the live list never sees a concurrent modification, and nothing re-buffers."
+    },
+    {
+      "h": "Detection surface",
+      "p": "While enabled the server sees a player standing still with keepalives flowing, which is the cleanest fake-lag signature an anticheat can key on. The disable flush replays the whole buffer in one tick, and the longer the blink, the larger the first-move delta from the last server-tracked position; rate checks see the burst and envelope checks see the jump."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Blink.java",
+      "rel": "info/spicyclient/modules/player/Blink.java",
+      "explanation": "The pre-send hook cancels all packets except C00PacketKeepAlive, C00Handshake and C00PacketLoginStart, which keeps the connection alive while the gameplay stream freezes. onDisable replays the static list through NetHandlerPlayClient.addToSendQueue, onEnable clears the list, and the singleplayer guard shows a warning notification and toggles the module back off. The module never checks its own enabled state inside the hook, which is why the flush relies on the dispatcher routing re-entrant events to the disabled handler."
+    },
+    {
+      "label": "NetworkManager.java (send event and flush path)",
+      "rel": "net/minecraft/network/NetworkManager.java",
+      "explanation": "sendPacket fires EventSendPacket at the top of the method and returns early when the event is cancelled; that interception point is what the module hooks to buffer packets, and it is also the reason the flush works. When onDisable replays through addToSendQueue, the network manager fires the same event, but the module is untoggled, so the dispatcher routes it to the no-op onEventWhenDisabled instead of the buffering onEvent, and the packet goes out on the channel."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (flush burst)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NoCheatPlus MorePackets buckets every arriving move into 500ms windows against a 22 packets per second ceiling and a 15-packet half-second burst path. The disable flush delivers the entire blink buffer in one tick: seconds of movement compressed into a single burst, which trips the newest-bucket burst path and pushes the window accumulator above the ceiling, and a blink long enough to accumulate hundreds of packets crosses the direct-violation and kick thresholds. The keepalive exemptions do not help because the movement replay is the entire buffer at once."
+    },
+    {
+      "label": "SurvivalFly (stale replay envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly builds the allowed envelope from the server-side tracked location, not the packet flags. The first replayed move of the flush is a jump from the last tracked position equal to the whole distance walked while the module was on, and the per-move allowances from prepareSpeedEstimation and vDistRel are physics-sized, so any blink that lasted more than a tick or two produces a first move far over the allowance, a violation, and a set-back teleport. The replayed path after the first move is physically consistent, so the first move is where the check lands."
+    },
+    {
+      "label": "MovingListener (set-back teleports)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/MovingListener.java",
+      "explanation": "NoCheatPlus enforces violations by teleporting the player through SchedulerHelper.teleportEntity with the correction-of-position cause while prepareSetBack records the target. If a set-back lands while the client is mid-blink, the client keeps walking locally, and the replay starts from the pre-correction position, so the flushed path diverges from the corrected server position and the envelope flags the same divergence again. The module has no S08 handling at all, so the correction applies and the replay pays for it."
+    },
+    {
+      "label": "PlayerEventListener (pending teleport ledger)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/module/PlayerEventListener.java",
+      "explanation": "Hawk records every server teleport in a pending list and, in MoveEvent construction, drops moves until one matches the pending teleported location; a move farther than 64 blocks squared from the last accepted position triggers resync, and a pending teleport that is never matched clears after the player's ping plus 40 ticks. The first flushed move after a long blink exceeds the 64-block bound, so Hawk discards the replay and resyncs the player, and every move that precedes the resync is dropped while the pending teleport sits unanswered."
+    }
+  ]
+}
