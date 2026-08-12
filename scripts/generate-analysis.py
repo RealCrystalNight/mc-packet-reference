@@ -77,11 +77,20 @@ def load_analyses(targets=None):
             a["files"].insert(0, {"label": a["module"] + ".java", "rel": a["source_rel"],
                                   "explanation": a.get("file_explanation", "")})
         for f in a["files"]:
-            f["path"] = os.path.join(SOURCES_ROOT, a["client"], f["rel"])
-            with open(f["path"], encoding="utf-8", errors="replace") as fh:
-                f["code"] = fh.read()
-            f["lines"] = f["code"].count("\n") + (0 if f["code"].endswith("\n") else 1)
-            f["gh_url"] = gh_url(a["client"], f["rel"])
+            if a.get("ac"):
+                # anticheat-side analysis: resolve against the AC root
+                f["path"] = os.path.join(AC_ROOT, a["client"], f["rel"])
+                with open(f["path"], encoding="utf-8", errors="replace") as fh:
+                    f["code"] = fh.read()
+                f["lines"] = f["code"].count("\n") + (0 if f["code"].endswith("\n") else 1)
+                repo = AC_REPOS.get(a["client"])
+                f["gh_url"] = "https://github.com/" + repo if repo else None
+            else:
+                f["path"] = os.path.join(SOURCES_ROOT, a["client"], f["rel"])
+                with open(f["path"], encoding="utf-8", errors="replace") as fh:
+                    f["code"] = fh.read()
+                f["lines"] = f["code"].count("\n") + (0 if f["code"].endswith("\n") else 1)
+                f["gh_url"] = gh_url(a["client"], f["rel"])
         # countering anticheat checks: ac dir + rel path inside the AC repo
         countering = []
         for c in a.get("countering", []):

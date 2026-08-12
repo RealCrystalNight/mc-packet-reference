@@ -1,0 +1,63 @@
+{
+  "module": "Criticals",
+  "client": "Rise 5.99",
+  "category": "criticals",
+  "source_rel": "dev/rise/module/impl/combat/Criticals.java",
+  "overview": "Rise 5.99's Criticals is an eight-mode combat module that fabricates the fall distance the server needs to register a critical hit. Packet and Vape AntiCheat fire two-to-four C04 position packets from the attack event (which Rise's Aura dispatches before the C02), Hypixel and Position drift the player upward over three motion ticks, Low, Low 2, Down and Jump perturb or force vertical motion client-side, and every mode is gated by a delay timer plus liquid, ladder and Speed-module checks. The mode family shares one goal: make the server believe the player was airborne when the C02 arrives, using offsets as small as 0.001 blocks so the real position barely moves.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module is a state machine driven by two events. onAttackEvent is the trigger: it requires the jump key up, a 0-1000ms delay timer (500ms default, skipped entirely in Low mode), not being in liquid or on a ladder, and - unless Hypixel mode is selected - the Speed module disabled. When those pass it runs the per-mode action, sets the attacked flag and resets the timer. onPreMotion then consumes the flag over the following ticks: the tick-counting modes (Hypixel, Position, Down) switch on an internal ticks counter, Low runs every tick while the flag is set, and Low 2 and Jump act synchronously inside the attack handler itself. onDisable resets attacked, ticks and the timer so a respawn or module toggle cannot leave a half-finished offset sequence running. The Vape AntiCheat mode is dev-gated: unless Rise.devMode is set, selecting it silently falls back to Packet."
+    },
+    {
+      "h": "Jump offsets and timing",
+      "p": "The offset sequences are mode-specific. Packet sends two C04s from the attack event - y + 0.0625 with onGround true, then y + 0.001 with onGround false (the source comment marks them 'CARPET VALUE'): the first is exactly the 1/16-block tolerance (sqrt(1/256) = 0.0625) the vanilla server applies as its on-ground epsilon, and the second flips the server's ground state with only a millimeter of real displacement. Vape AntiCheat alternates four C04s: +0.04 off-ground, +0.0 onGround, +0.03 off-ground, +0.0 onGround. Hypixel requires onGround and an integer Y (posY % 1 == 0) and spreads +0.046875 + rand/100 and +0.0234375 + rand/100 across two consecutive motion ticks before resetting on the third. Position spreads +0.0625 and +0.015625 the same way. Low manipulates motionY instead of packets - 0.1 + rand/500 upward while on the ground, then -(0.01 - rand/500) on the first off-ground tick - a one-tick micro-hop. Low 2 teleports with setPosition y + (0.3 - rand/500), Down waits five ticks then forces motionY to -MoveUtil.getJumpMotion(0.42F), and Jump simply calls the real jump()."
+    },
+    {
+      "h": "Interaction with attacks",
+      "p": "The timing relative to the C02 is what makes the packet modes work. Rise's Aura calls the AttackEvent manually before it sends the C02 (the Aura source notes the C02 path never fires the event itself), so Criticals' C04s, sent through PacketUtil.sendPacket, reach the wire before the attack packet. The server then processes the lift, sees an off-ground claim with a positive fall distance, and the C02 that follows registers a crit. The 0.0625 onGround-true claim is the anchor: it keeps the server-side fall distance at zero while the actual position is still within the ground epsilon, and the trailing 0.001 off-ground claim turns on the airborne state the crit needs. The motion-based modes rely on the same principle through the real physics pipeline: Low's 0.1 hop and Jump's 0.42 jump put the player genuinely airborne for the tick the C02 lands, at the cost of visibly leaving the ground. The delay timer bounds the rate, and the Hypixel gate on integer Y plus per-tick spreading targets servers that track per-tick y deltas."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "Criticals.java (module logic)",
+      "rel": "dev/rise/module/impl/combat/Criticals.java",
+      "explanation": "The whole module lives in this file. onAttackEvent (line 109) is the single trigger point: the gate at line 110 requires the jump key up, the delay timer (skipped for Low), no liquid, no ladder, and Speed disabled unless Hypixel is selected, then dispatches the mode switch. The Packet branch (line 112) is the classic two-packet critical: for each value in {0.0625, 0.001} it sends a C04 at posY + d with onGround set only when d equals 0.0625, so the first claim lands exactly on the server's ground epsilon and the second flips the state with a 1mm offset - the 'CARPET VALUE' pair. Vape AntiCheat (line 122) sends four C04s alternating 0.04/0.03 lifts with onGround claims at the exact position. The state-machine modes run in onPreMotion (line 39) while the attacked flag is set: Hypixel (line 52) requires posY % 1 == 0 and lifts by 0.046875 + rand/100 then 0.0234375 + rand/100 over two ticks; Position (line 78) does 0.0625 then 0.015625; Low (line 132) sets motionY to 0.1 + rand/500 on the ground and -(0.01 - rand/500) on the first air tick, and resets the offGroundTicks counter whenever the player touches ground; Low 2 (line 146) teleports the player up 0.3 - rand/500; Down (line 42) waits five ticks then negates MoveUtil.getJumpMotion(0.42F); Jump (line 152) calls the real jump(). Every branch ends by setting attacked true and resetting the timer, and onDisable (line 164) clears all three state fields."
+    },
+    {
+      "label": "MoveUtil.java (getJumpMotion helper)",
+      "rel": "dev/rise/util/player/MoveUtil.java",
+      "explanation": "The Down mode's forced fall is built on MoveUtil.getJumpMotion(float motionY): the helper returns the argument unchanged plus 0.1 per jump-potion amplifier level ((amplifier + 1) * 0.1F), so getJumpMotion(0.42F) yields the vanilla 0.42 jump velocity, jump-potion adjusted. Criticals negates the result and assigns it to motionY five ticks after an attack, dragging the player down at jump speed instead of letting gravity take a tick to accelerate. Because the value is written into the client's real motion, the subsequent vanilla C03 packets carry a genuine downward move, which is why Down presents a falling trace to the server rather than a fabricated offset - the same helper family the client's Speed and LongJump modules use for jump-motion math."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (vertical movement envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the allowed vertical movement from physics instead of trusting the packet. The vertical allowance comes from vDistRel (invoked at line 212), which seeds yAllowedDistance from the previous move's momentum and accepts only a few named envelopes: a zero-y move on ground, a real jump, a step-up and a riptide launch; the violation is (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 (line 233) with a set-back to the stored location. The packet modes fail the envelope directly: the 0.0625/0.001 C04 pair is an up-move from a standing position with no jump input, so yAllowedDistance stays 0 and yDistanceAboveLimit is the offset itself, and the Hypixel (0.046875), Position (0.0625/0.015625) and Vape (0.04/0.03) lifts accumulate the same way. The Low micro-hop (0.1 up), Low 2 teleport (0.3 up) and Down forced fall (-0.42) are equally outside the envelope - NCP's own Critical comment says 'Let SurvivalFly catch low-jumps'. Critically, fromOnGround/toOnGround come from RichBoundsLocation.isOnGround(), which ray-traces the block cache instead of reading the packet flag, so the 0.0625 onGround-true claim does not relax the envelope."
+    },
+    {
+      "label": "fight.Critical (critical-hit validation)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Critical.java",
+      "explanation": "NCP's fight.Critical runs whenever the server sees a crit (mcFallDistance > 0) and applies three illegality rules. The divergence rule - Math.abs(ncpFallDistance - mcFallDistance) > 1e-5 while the player is judged on-ground (moveInfo.from.isOnGround() or the touched-ground workaround) - is a direct hit on the packet modes: NCP's own fall accounting (data.noFallFallDistance) says the player never left the ground, while the server-side fallDistance ticks up from the 0.001 off-ground claim, and NCP's ray trace still reports ground, so the difference exceeds the tolerance, criticalVL rises and the configured actions cancel the hit. The jump-phase rule - sfJumpPhase between 1 and the lift-off envelope's max phase, no collision above 0.2, and no block-bounce velocity origin - catches the Jump and Down modes: a full jump needs more than six move events, so attacking within the first phases of a jump is illegal. The reset-condition rule (water, powder snow, bushes, webs, climbables, slow falling) kills crits claimed from blocks where the game would reset fall distance."
+    },
+    {
+      "label": "Criticals (combat-side vertical check)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/Criticals.java",
+      "explanation": "Arc v2's Criticals check is the most direct counter: on every attack it reads Arc's physics-derived ground state (data.isOnGround(), maintained by Arc's own MovingListener from world collision, not from the packet flag) and the vertical speed of the current move; when on the ground and vertical speed is below 0.37 it raises 'critical while onGround'. Every packet-offset mode produces a vertical speed of 0.001-0.0625, orders of magnitude under the 0.37 floor that a real jump (0.42) clears - the 0.0625/0.001 pair, the Vape 0.04/0.03 alternation, and the Hypixel/Position per-tick drifts all violate on the first attack. Only the Jump mode's genuine 0.42 jump passes the vertical threshold, and that is the one mode NCP's jump-phase rule is waiting for. The check is purely combat-side, so the sub-pixel offsets that hide from movement thresholds do not help."
+    },
+    {
+      "label": "SmallHop (mini-jump detection)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/SmallHop.java",
+      "explanation": "Hawk's SmallHop exists specifically because 'small jumps can be exploited to bypass other checks such as speed and criticals'. It flags a move where wasOnGround is true, deltaY is in (0, 0.4), prevDeltaY <= 0, the player is not flying, not in accepted knockback and not on a slime bounce, no ladder/vine or adjacent solid is involved, and AdjacentBlocks.onGroundReally at the destination is false - then punishes and rubberbands. The Position mode's 0.0625 hop, the Low micro-hop's 0.1 rise, the Low 2 teleport's 0.3 jump and the Vape mode's 0.04/0.03 lifts are all textbook matches: each starts from ground with a non-negative previous delta and ends with the feet in air. The 0.42 real jump escapes the deltaY < 0.4 bound by design, which is why the Jump mode needs the NCP jump-phase rule rather than this check. A rubberband also breaks the tick sequences the Hypixel/Position modes rely on, because the S08-style teleport resets their state."
+    }
+  ]
+}

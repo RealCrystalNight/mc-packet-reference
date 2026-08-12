@@ -1,0 +1,58 @@
+{
+  "module": "AntiBot",
+  "client": "November Recode 2.0",
+  "category": "antibot",
+  "source_rel": "feature/module/impl/combat/AntiBotModule.java",
+  "overview": "November Recode 2.0's AntiBot module is a spawn-and-tab-list bot filter with three modes: WATCHDOG, TAB_TICKS and NPC. It keeps a concurrent set of flagged entity ids, rebuilt from the player entity list on every walking update, and exposes a public bot(int) predicate that the KillAura module calls from its validTarget filter. WATCHDOG flags invisible players missing from the tab list and then picks one bot within 10 blocks vertically to watch, with a packet listener that reacts to its destroy or spawn; TAB_TICKS flags players older than a configured age that never appeared in the tab list; NPC flags names carrying CIT-, [NPC] or color-code markers plus players missing from the tab list.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module declares a Mode setting with WATCHDOG, TAB_TICKS and NPC values, plus a tabTicks number setting and a noTab boolean that are only visible for their modes. bots is a ConcurrentSet of entity ids, aboveEntityId and aboveDespawn track the watched bot in WATCHDOG mode, and disable() clears all three. The update listener skips the first five ticks after the player spawns, then rebuilds the set from mc.theWorld.playerEntities, and the packetIn listener handles S13PacketDestroyEntities and S0CPacketSpawnPlayer, both gated to WATCHDOG mode. The tabList helper scans the send queue's player info map for a matching game profile name, and bot(int) is the query the combat module calls."
+    },
+    {
+      "h": "Bot detection heuristics",
+      "p": "WATCHDOG flags every invisible player that is not in the tab list, then scans the flagged set for the first entity within 10 blocks vertically of the local player, stores its id in aboveEntityId and prints a chat message naming it. The packet listener then reacts to that specific id: an S13 destroy prints 'was removed from the world. Staff?' and clears aboveEntityId, while an S0C spawn adds the new entity id to bots when aboveDespawn is set. aboveDespawn is never assigned true anywhere in the class, so the spawn branch is unreachable dead code, and the 'todo i have no clue' comment marks the mode as unfinished.\n\nTAB_TICKS flags any player whose ticksExisted exceeds the tabTicks setting (default 50) while the tab list never contained their name, which targets bots that are spawned server-side and never registered as players. NPC mode flags names starting with CIT-, containing [NPC], or containing a section-sign color code, plus any player missing from the tab list when noTab is on, which covers NPC plugins and renamed entities. All three modes share the tabList scan, so a player that appears in the tab list under the same name is always treated as real."
+    },
+    {
+      "h": "Interaction with killaura targeting",
+      "p": "KillAuraModule.validTarget fetches the AntiBotModule instance from the November module registry and rejects any entity whose id is in the bot set while the module is toggled on. The check runs before the range and line-of-sight tests, so a flagged entity is removed from the candidate stream entirely and never influences the sort comparator. Because the bot set is keyed by entity id and rebuilt every walking tick, an entity that stops matching its mode's heuristic, for example by appearing in the tab list, is attackable on the next tick. The WATCHDOG autoblock interaction is separate: the killaura's own WATCHDOG block mode cancels C02 attacks during hurt time, while this module only removes candidates."
+    }
+  ],
+  "packets": [
+    "S0CPacketSpawnPlayer",
+    "S13PacketDestroyEntities"
+  ],
+  "files": [
+    {
+      "label": "AntiBotModule.java (module logic)",
+      "rel": "feature/module/impl/combat/AntiBotModule.java",
+      "explanation": "The entire module is this one class. The Mode setting and the tabTicks and noTab settings define the three filter modes, the update listener rebuilds the bots set from mc.theWorld.playerEntities every walking tick after a five-tick grace period, and the packetIn listener handles the WATCHDOG-mode entity lifecycle events. The tabList helper compares game profile names against the send queue's player info map, and the public bot(int) predicate is the single query point that KillAuraModule calls from validTarget.\n\nThe dead code is part of the analysis: aboveDespawn is declared, cleared and tested, but never set to true, so the S0CPacketSpawnPlayer branch that would add a spawned entity id to bots can never execute. The WATCHDOG mode therefore only ever flags invisible entities missing from the tab list and reports the one it watches; the S13 branch still works, printing a staff warning when the watched entity is destroyed. The Printer import is used only for those two chat messages."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Grim PacketEntityReplication (spawn mirroring)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/events/packets/PacketEntityReplication.java",
+      "explanation": "PacketEntityReplication is Grim's server-side mirror of everything the client knows about entities. Every outgoing spawn packet, including SPAWN_PLAYER for named players, is captured and added to compensatedEntities with its id, uuid, type, position, rotations and metadata, and the follow-up relative moves, teleports and rotations update the replicated boxes each tick. The replication is transaction-aware: despawning is deferred so the client never sees a ghost entity, and the boxes are interpolated through ReachInterpolationData for the reach checks.\n\nThis is the structural counter to the module's WATCHDOG heuristic, which guesses which S0CPacketSpawnPlayer spawns are bots by combining invisibility with tab-list absence. Grim does not guess: every spawn is a real entity with a replicated box, and the Reach and Hitboxes checks validate attacks against those boxes regardless of whether the client filtered the entity out of its aura target list. A bot that the client refuses to attack simply generates no C02, while a bot that slips through the filter is judged by geometry, not by the client's opinion of it.\n\nThe module's S13 handling also intersects with Grim's despawn tracking: when the watched entity is destroyed, Grim removes its replicated state in the same transaction flow, so there is no window where the client still holds the entity while the server does not."
+    },
+    {
+      "label": "NCP Fight NoSwing (arm swing accounting)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/NoSwing.java",
+      "explanation": "NoSwing requires an arm swing between attacks. Each attack increments noSwingCount; the first increment is rewarded by shrinking noSwingVL by ten percent, and every subsequent consecutive no-swing attack resets the counter and raises noSwingVL by one, executing noSwingActions when the level crosses the configured threshold. A single swing resets the count, so the check tolerates dropped swing packets as long as they are not consecutive.\n\nNovember's killaura sends a swingItem call before each attack on the BASIC clicking path, and the ADVANCED and UPDATED clicking modes attack on every walking update tick with no randomization. At a full 20-tick rate the module sustains up to 20 attacks per second, and every attack that is not preceded by a swing packet in the same tick contributes to the no-swing counter. The swing item packet, C0APacketAnimation, is what NCP sees, and the WATCHDOG autoblock mode's C08 and C07 traffic does not substitute for it.\n\nThe bot filter does not interact with this check at all: it only removes candidates from the aura, and the attacks that survive still need their swings. An entity that stays filtered simply produces fewer attacks, which reduces the counter rather than feeding it."
+    },
+    {
+      "label": "Arc KillAura (attack rate)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/KillAura.java",
+      "explanation": "Arc's Speed sub-check counts attacks and attack packets per second. Every attack adds to totalAttacks, and once a second the check compares the total against max-attacks, resetting the counter; checkFrequency separately compares attackPackets against max-attack-packets. Exceeding either raises 'Kill Aura (Speed)'.\n\nNovember's ADVANCED and UPDATED clicking modes attack on every walking update, which at a normal tick rate is up to 20 attacks per second, far beyond a typical max-attacks ceiling around 14 to 16. The BASIC mode randomizes the delay from the CPS settings, but the timer still sustains attacks near the configured rate. The autoblock modes add packets around each attack: WATCHDOG and BASIC send C08 placements and C07 releases, so the per-second packet count runs at two to three times the attack count, which is what checkFrequency scores.\n\nFiltering bots reduces the number of valid targets but not the attack rate: with a single real target the module still attacks it on every walking tick in the fast modes. The bot filter therefore cannot tune the module under the rate ceiling; only the CPS settings or the clicking mode change the count."
+    },
+    {
+      "label": "Hawk FightHitbox (server-side hit validation)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightHitbox.java",
+      "explanation": "FightHitbox re-checks each player-versus-player attack by ray tracing from the attacker's eye along the direction carried by the next movement packet. The victim's position is rewound through Hawk's lag compensator to match the ping at attack time, the hitbox is expanded by 0.005, and the ray must intersect it within 3.1 blocks, or 5.0 in creative. A miss with CHECK_BOX_INTERSECTION enabled punishes 'Did not hit hitbox.', an intersection beyond the reach reports the distance in meters, and the optional occlusion pass flags hits whose ray crosses a solid block first.\n\nNovember's killaura spoofs rotations through the rotation manager at HIGH priority and attacks targets it cannot see at WallRange, so hits can be aimed through walls and at targets outside the visual cone. Hawk derives the direction from the movement packet that follows the C02, and the box is where the victim was when the attacker's view of it was formed, so a wall-hit either misses the box or lands beyond 3.1. The bot filter selects the target client-side, but the server-side ray test applies to every C02 that arrives."
+    }
+  ]
+}

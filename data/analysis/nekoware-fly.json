@@ -1,0 +1,62 @@
+{
+  "module": "Fly",
+  "client": "Nekoware v1 private",
+  "category": "fly",
+  "source_rel": "me/nekoWare/client/module/movement/Fly.java",
+  "overview": "Nekoware v1 private's Fly is a three-mode flight module driven from an UpdateEvent pre handler, with an onEnable damage sequence for the Damage mode and a PacketOutEvent handler that cancels C0F confirm-transactions and C00 keepalives outright. Vanilla mode pins motionY from input (jump or sneak) and the horizontal Speed setting (default 2.5 blocks per tick), with an optional 700ms Anti-Kick cycle that reports the Y down to ground level and back up in 8-block C04 steps. Damage mode triggers fall damage with the classic three-packet sequence on enable and then streams a C0C input plus an onGround C03 every tick while desyncing the local onGround flag. Verus mode floats on a fake C08 block placement with a 0.36 horizontal pin and a zeroed motionY.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module state is a Timer and a y counter. All movement logic lives in the UpdateEvent pre phase: the handler branches on the mode and rewrites motionY, the horizontal motion fields and - in Damage mode - the send queue. The Damage mode's onEnable runs before the tick loop and fires the damage sequence directly through sendQueue.addToSendQueue: C04 at posY + 3.05 with onGround false, C04 back at posY with onGround false, then C04 at posY + 0.41999998688697815 with onGround true, followed by a client-side setPosition 0.5 blocks up. The PacketOutEvent handler cancels every C0FPacketConfirmTransaction and C00PacketKeepAlive and resets the timer on each cancel, which starves the server of transaction and keepalive confirmations while the module is active. onDisable only zeroes the motion fields - it does not restore the cancelled packet streams."
+    },
+    {
+      "h": "Vanilla and Damage modes",
+      "p": "Vanilla mode is a straight flight pin: on every pre update it sets motionY to speed * 0.5 while jump is held, -speed * 0.5 while sneaking, and 0 otherwise, and calls MovementUtils.setMoveSpeed(speed) to write the horizontal motion from the yaw - at the default 2.5 blocks per tick that is roughly eight times vanilla sprint, with a perfect hover when no input is held. The Anti-Kick toggle runs on a 700ms Timer: MovementUtils.fallPacket() sends C04 packets at every 8-block step from the current Y down to the ground level (onGround true), then ascendPacket() sends the same ladder back up, so the server's vertical tracking is reset twice a second. Damage mode performs the fall-damage ritual in onEnable (the 3.05 drop plus the 0.42 bounce-back) and then, on every pre update, injects a C0CPacketInput and a C03PacketPlayer(true) into the queue, sets the client's own onGround flag to false so local physics keep the motion alive, and applies the same motionY/setMoveSpeed logic - riding the server's post-damage velocity state instead of fighting the flight envelope."
+    },
+    {
+      "h": "Verus mode and packet cancels",
+      "p": "Verus mode is the packet-based variant: every pre update it sends a C08PacketPlayerBlockPlacement aimed 1.5 blocks under the player (block face 1, an ItemStack of stone, Y offset 0.94) - a fake item-use that some servers' flight heuristics treat as scaffolding contact - pins the horizontal speed to 0.36, sets motionY to 0 every tick, and cycles a y counter 0..11. The mode never actually changes the reported Y, so it is a hover with a fake block-place cover. The C0F/C00 cancels in the PacketOutEvent are shared by all three modes and reset the timer on every cancellation, which keeps the Anti-Kick cycle from firing while transactions are being suppressed. The module has no teleport handling and no onGround spoofing outside the Damage mode's local desync."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Fly.java (module)",
+      "rel": "me/nekoWare/client/module/movement/Fly.java",
+      "explanation": "The module is three handlers plus the enable sequence. eventConsumer1 (UpdateEvent pre) implements all three modes: Vanilla and Damage share the same motionY-from-input and setMoveSpeed(speed) logic, differing only in that Damage first injects C0C + C03(true) into the send queue and flips the local onGround to false, while Verus sends the fake C08 placement and holds motionY at 0 with a 0..11 cycle counter. eventConsumer11 (PacketOutEvent) cancels every C0F confirm-transaction and C00 keepalive and resets the timer on each, which is the module's only packet-level evasion - it removes the two packet classes servers commonly use to fingerprint movement flags. onEnable is where the Damage mode differs: the three C04 packets (y+3.05 false, y false, y+0.41999998688697815 true) plus the 0.5-block setPosition deliver the fall damage that the mode then exploits, while Vanilla and Verus have no enable-time traffic. onDisable only calls setMoveSpeed(0)."
+    },
+    {
+      "label": "MovementUtils.java (motion writes and Anti-Kick ladder)",
+      "rel": "me/nekoWare/client/util/movement/MovementUtils.java",
+      "explanation": "MovementUtils is the shared movement helper. setMoveSpeed(double) writes motionX and motionZ directly from the yaw and normalized WASD state (with the sin/cos diagonal blend), which is what the Fly module calls with its Speed setting - at 2.5 the horizontal pin is written into the physics fields every tick, so air friction never decays it. fallPacket() and ascendPacket() are the Anti-Kick ladder: fallPacket sends a C04 at every 8-block step from the current Y down to the ground level and ascendPacket sends the same ladder back up, both with onGround true, so the server sees a synthetic descent and re-ascent every 700ms that resets its vertical-velocity tracking. getGroundLevel() scans the world downward from the player for the first colliding block to anchor the ladder, and getBaseMoveSpeed returns the 0.2873 potion-scaled sprint baseline that other movement modules multiply against."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (vertical + horizontal envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly compares every move against a physics envelope rebuilt from the world. vDistRel initializes the allowed vertical distance from the previous move's momentum and only accepts a few named envelopes (zero-y move on ground, jump, step-up, riptide); a zero-y hover in mid-air inherits no momentum, so the allowed distance is near zero and the module's hover produces yDistanceAboveLimit around zero but the horizontal side destroys it: the 2.5 blocks-per-tick pin versus the ~0.31 sprint prediction gives hDistanceAboveLimit around 2.2, and the combined violation (max(hdist,0) + max(ydist,0)) * 100 fires at 200+ with a set-back on the first move. The Anti-Kick ladder is worse: each C04 in the 8-block fall/ascend pair is an 8-block vertical move with onGround true, and because NCP derives ground from a block ray trace rather than the flag, the claimed ground is ignored - yDistanceAboveLimit lands around 7.7 and the violation is in the hundreds per packet. The Damage mode's 3.05 fall is legal (it is real fall damage), but the post-damage flight is measured by the same envelope and flags identically."
+    },
+    {
+      "label": "Flight (hover, ascension, glide)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Flight.java",
+      "explanation": "Arc v2's Flight checks the vertical profile of every move. hoverCheck fires when both the last and current vertical speeds are exactly 0.0 and airTicks passes maxHover - which is the Vanilla mode's resting state: holding no jump or sneak key pins motionY to 0, so the module hovers and the check names the flag Flight (Hover). While moving up, the ascension branch compares vertical against getMaxJump (maxHeight, +0.4 with a jump potion): the Vanilla mode's motionY of speed * 0.5 reaches 1.25 at the default setting, so vertical > max flags Flight (Ascension) ascending_too_fast on the first rising move, and the ascendingMoves counter and distanceFrom ground limit flag sustained climbs even at lower settings. The descending branch requires glideDelta = |vertical - lastVertical| to match a gravity-derived polynomial; the module's instant 0 -> 1.25 -> 0 vertical switches make glideDelta zero or enormous, tripping Flight (Glide) vertical_not_changing or descend_expected. The damage-mode C03(true) spam does not help: Arc's ground state also comes from its own calculation, and the 1.25 ascent flags the same way."
+    },
+    {
+      "label": "Fly (predicted-velocity discrepancy)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Fly.java",
+      "explanation": "Hawk's Fly runs a per-player vertical simulation. In air it predicts the next velocity as estimatedVelocity = (prevEstimatedVelocity - 0.08) * 0.98 (the vanilla gravity step) and integrates it into an estimated position; the reported Y is compared against that estimate, and any discrepancy over DISCREPANCY_THRESHOLD (0.0001) is punished with punishAndTryRubberband. The Vanilla mode's motionY control defeats the model instantly: a 1.25 blocks-per-tick ascent is far outside the gravity-decayed estimate, and the hover state (0 velocity while airborne) diverges from the predicted -0.0784-per-tick fall within one tick. The landing path is also checked: when the client reports onGround, the Y must fall between the previous Y and the estimated position, and the Damage mode's setPosition +0.5 on enable plus the C03(true) ground claims land outside that window. The no-move tracking tolerates at most MAX_NO_MOVES (20) ticks without a position update, so the module cannot hide by skipping updates either."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets scores every serverbound move packet into morePacketsFreq, an ActionFrequency with 500ms buckets, and NetStatic.morePacketsCheck accumulates the window against cc.morePacketsEPSMax (22/s, 20 ideal) with a burst path on the newest half-second bucket (15 packets, 10 direct-violation). The Damage mode is the clearest target: on every tick it injects a C0C input and a C03(true) on top of the normal movement packets, a sustained rate around 60 serverbound packets per second - nearly three times the ceiling - so the window accumulator stays positive and the burst path trips on the first second of flight. The Anti-Kick ladder adds its own bursts: each 700ms cycle fires roughly (height / 8) * 2 C04 packets in the same instant, which lands as a concentrated burst regardless of the horizontal rate. Even the Vanilla mode without Anti-Kick stays near the 20/s baseline, but the moment any packet-injecting option is enabled the count gives the module away independently of the physics checks."
+    }
+  ]
+}

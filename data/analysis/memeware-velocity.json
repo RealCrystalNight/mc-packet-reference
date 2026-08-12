@@ -1,0 +1,59 @@
+{
+  "module": "Velocity",
+  "client": "Memeware 7.3",
+  "category": "velocity",
+  "source_rel": "me/memewaredevs/client/module/combat/Velocity.java",
+  "overview": "Memeware 7.3's Velocity is a bare receive-side cancel module with no settings, no modes and no scaling. A single @Handler Consumer<PacketInEvent> field subscribes to the client's LWJEB event bus; on the incoming path the patched NetworkManager.channelRead0 fires PacketInEvent before processPacket and drops the packet if any handler cancelled the event. The handler cancels S27PacketExplosion unconditionally - before any entity check, so every explosion knockback is eaten - and cancels S12PacketEntityVelocity only when the entity id matches the player, which is a full cancel: the vanilla handler never sees the knockback vector. onEnable and onDisable are empty.\n\nBecause there is no configuration, the module's behavior is constant: a user who enables it takes zero knockback from hits and explosions until they toggle it off.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module is a single event subscription. The update field is declared as Consumer<PacketInEvent> with the @Handler marker from me.hippo.api.lwjeb, which registers it on the event bus when the module is enabled. The interception point is the client's patched NetworkManager: channelRead0 constructs a PacketInEvent wrapping the incoming packet, fires it on the bus, and returns without calling processPacket when the event's cancelled flag is set. The Event base class (me.memewaredevs.client.event.Event) carries that flag with cancel()/isCancelled() - the handler's e.cancel() is what the network layer honors.\n\nState is nonexistent: no counters, no stored vectors, no mode string. The only logic is the packet-type checks and the entity-id comparison (func_149412_c() against mc.thePlayer.getEntityId())."
+    },
+    {
+      "h": "Cancellation surface",
+      "p": "The S27 branch runs first and cancels every explosion packet with no entity check - explosions have no entity id, so the module eats all explosion knockback. The S12 branch then cancels only self-entity velocity. Both are full cancels: the packet is dropped before the vanilla handler, so the client never applies any part of the vector, and there is no percentage path to reduce rather than remove.\n\nThis differs from the other two velocity modules in the same lineage: Sigma's AntiVelocity only cancels S27 in Basic mode and can scale the S12, and Nekoware's copy gates the entire handler behind a mode selection. Memeware's version has neither gate - enabling the module is the whole configuration."
+    }
+  ],
+  "packets": [
+    "S12PacketEntityVelocity",
+    "S27PacketExplosion"
+  ],
+  "files": [
+    {
+      "label": "Velocity.java (module)",
+      "rel": "me/memewaredevs/client/module/combat/Velocity.java",
+      "explanation": "The entire module is this file. The @Handler Consumer<PacketInEvent> field is the subscription: the LWJEB bus invokes it on every incoming packet. The body guards on mc.thePlayer being non-null, cancels S27 unconditionally, then for S12 compares func_149412_c() (the entity id) to the player and cancels when they match. There is no other logic: no settings constructor body beyond the base class call, no state, empty onEnable/onDisable.\n\nThe two-branch order matters: S27 is cancelled before the S12 entity check, so explosion packets never even reach the entity comparison. And because cancel() sets the flag on the event rather than mutating the packet, the module depends entirely on the patched NetworkManager honoring isCancelled - which is the supporting file below."
+    },
+    {
+      "label": "NetworkManager.java (patched receive path)",
+      "rel": "net/minecraft/network/NetworkManager.java",
+      "explanation": "The client patches the vanilla receive path to host the event bus. channelRead0 constructs a PacketInEvent from the incoming packet, fires it through EventAPI.fire, and when the event's cancelled flag is set, returns before processPacket is ever called - so a cancelled S12 or S27 never reaches NetHandlerPlayClient and the vanilla velocity application never runs. The same hook also fires PostPacketInEvent after processing for post-handlers.\n\nThis file is what makes the module's cancel effective: without the patch, e.cancel() would only set a flag nobody reads. It is also the reason the module is invisible to the server in one sense (the server already sent the packet and records the knockback server-side) and fully visible to prediction-based checks (the client's motion simply never contains the vector the server sent)."
+    }
+  ],
+  "countering": [
+    {
+      "label": "KnockbackHandler (AntiKB, required-velocity prediction)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/velocity/KnockbackHandler.java",
+      "explanation": "Grim's KnockbackHandler sandwiches every ENTITY_VELOCITY between two server transactions: sendTransaction() before the velocity and a second transaction via tasksAfterSend after it. The vector is recorded into firstBreadMap keyed by the first transaction id and promoted into lastKnockbackKnownTaken when a larger transaction echo proves the client received it - from then on the vector is required movement. onPredictionComplete measures the prediction offset against offsetToFlag (default 0.001), accumulates it with decay 0.999 into a threshold capped at maxAdvantage 1, and set-backs the player when the offset reaches 0.1 (immediate-setback-threshold).\n\nMemeware's full cancel is the plainest possible failure: the server sent the S12, the sandwich confirmed delivery, and the client's predicted motion never contains the vector, so the offset accrues from the first missed move and the player is set back. There is no partial-reduction gray zone because the module has no scaling path. The check's own leniency - a knockback recorded while Grim is sending its own setback (isSetback) is not required - does not help here, because the packet was sent by the server in normal play, not during a Grim setback. The known bypass is transaction eating (suppressing the transaction echo so the vector never leaves firstBreadMap), which this module does not implement."
+    },
+    {
+      "label": "ExplosionHandler (required explosion velocity)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/velocity/ExplosionHandler.java",
+      "explanation": "Grim's ExplosionHandler applies the same transaction-sandwich model to S27 explosion knockback. The explosion vector is read from the packet, recorded into the same firstBreadMap ledger with entity id -1 (explosions are not entity-targeted), and promoted into lastExplosionsKnownTaken once the transaction echo confirms receipt, after which getFutureExplosion feeds it to the prediction engine as required motion alongside entity knockback. getFirstBreadAddedExplosion merges the explosion vector with a concurrently pending entity-knockback entry so both are required together.\n\nThis is the check that uniquely targets Memeware's unconditional S27 cancel. The module drops every explosion packet before the vanilla handler, so the client never moves along the explosion vector, and the required-velocity offset accrues exactly as with entity knockback. Among the three lineage velocity modules, only Memeware cancels S27 without a mode gate - Sigma restricts it to Basic and Nekoware to Packet mode - so an enabled Memeware Velocity is the one configuration where this check fires on every explosion with no condition attached."
+    },
+    {
+      "label": "AntiVelocityBasic (pending knockback matching)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/AntiVelocityBasic.java",
+      "explanation": "Hawk's MoveEvent tracks pending knockback entries per player, each a vector plus the time the server sent it. Every move's delta (to - from) is matched in order against the pending list: Y within 0.01 (unless colliding, jumping, swimming or stepping), X and Z inside maxDiscrepancy = weirdConstant * baseMultiplier * sprintMultiplier + 0.003, where weirdConstant is 0.098 on ground (0.2518462 jump-sprinting, 0.0196 swimming), baseMultiplier is 5 * walkSpeed * speed-pot multiplier (10 * flySpeed when flying) and sprintMultiplier 1.3 (2 while flying). Any entry older than ping + 200ms with no matching move sets failedKnockback (outside vehicles); AntiVelocityBasic.check then punishes at VL 5. The class comment documents detection down to a 10% difference.\n\nA full cancel leaves the pending entry with no matching move, so it ages out and flags. The module offers no scaling, so there is no way to land a move inside the discrepancy window - the only forgiveness is the ping + 200ms window itself, and a hit whose knockback the player genuinely could not have moved into yet. The same handler also powers AntiVelocityJump's accepted-knockback logic, which is irrelevant here because no knockback is ever accepted."
+    },
+    {
+      "label": "VelocityListener (claimed velocity feed)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/ai/idealistic/spartan/listeners/protocol/VelocityListener.java",
+      "explanation": "Spartan's VelocityListener is a MONITOR-priority ProtocolLib adapter on ENTITY_VELOCITY that records, for the self entity, the server-sent vector (fixed-point ints divided by 8000.0) into a CPlayerVelocityEvent. VelocityEvent.event stores it as protocol.claimedVelocity, pushes it onto the claimedVeloGravity and claimedVeloSpeed queues (capped at two entries) and feeds Spartan's checks through executeRunners. The checks that consume the queues compare the player's reported movement against the claimed vector, with gravity applied to the gravity queue; the listener itself is the feed, not the verdict.\n\nCancelling the S12 receive-side - the only thing Memeware can do - does not cancel the server's record, so the claimed vector is always present and the movement is always measured against it. A full cancel produces a total deficit: the queues expect the knockback trajectory and the player reports none. The tolerance surface is the two-entry queue cap: only the last two claims are compared, so a user who toggles the module off between hits can present clean windows, but a continuously enabled Memeware Velocity never does."
+    }
+  ]
+}

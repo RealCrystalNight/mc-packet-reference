@@ -1,0 +1,59 @@
+{
+  "module": "Velocity",
+  "client": "Nekoware v1 private",
+  "category": "velocity",
+  "source_rel": "me/nekoWare/client/module/combat/Velocity.java",
+  "overview": "Nekoware v1's private-client Velocity is the mode-gated sibling of Memeware's bare cancel module, sharing the same event API (me.hippo.api.lwjeb @Handler, the identical Event.cancel()/isCancelled() base class, and the same patched NetworkManager receive path). The constructor registers a single mode string, 'Packet', via addModes, and the entire @Handler Consumer body sits inside an isMode(\"Packet\") gate: when the mode is selected the handler cancels S27PacketExplosion unconditionally and cancels S12PacketEntityVelocity when the entity id matches the player; when the mode is not selected the module is fully inert even while enabled. Both cancels are complete - no scaling, no modification, no state beyond the mode check.\n\nThe behavioral difference from Memeware is the gate: Memeware eats explosions and knockback the moment the module is enabled, Nekoware only while the Packet mode is active, so a user can carry the module enabled with interception switched off.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module's constructor calls this.addModes(\"Packet\") to create the mode list, and the handler field is declared exactly like Memeware's: a Consumer<PacketInEvent> annotated with @Handler, invoked by the LWJEB bus for every incoming packet. The entire body - the mc.thePlayer null guard, the S27 cancel, the S12 entity comparison and cancel - is nested inside if (this.isMode(\"Packet\")). The canceled flag is honored by the patched NetworkManager.channelRead0, which fires PacketInEvent before processPacket and drops the packet when isCancelled() is true.\n\nThe gate is the entire state machine. There are no counters, no stored vectors, no per-mode behaviors other than on/off; isMode(\"Packet\") is the only branch in the handler. The shared lineage with Memeware is visible in the identical event classes and network patch - the two clients differ only in the gate and the package names."
+    },
+    {
+      "h": "Cancellation surface",
+      "p": "Inside the mode gate the surface is identical to Memeware's: S27PacketExplosion is cancelled unconditionally (no entity check - explosions carry no entity id), and S12PacketEntityVelocity is cancelled when func_149412_c() equals the player's entity id. Both are full cancels dropped before the vanilla handler.\n\nOutside the gate nothing happens: with the module enabled and the mode deselected, the handler returns on the first isMode check, so both S12 and S27 reach processPacket untouched. That conditional behavior is the only real difference from Memeware's always-on cancel - and it is the detail the countering checks below key on, since the mode-off state produces no interception signal at all."
+    }
+  ],
+  "packets": [
+    "S12PacketEntityVelocity",
+    "S27PacketExplosion"
+  ],
+  "files": [
+    {
+      "label": "Velocity.java (module)",
+      "rel": "me/nekoWare/client/module/combat/Velocity.java",
+      "explanation": "The module is this single file. The constructor adds the 'Packet' mode; the @Handler Consumer<PacketInEvent> field holds the subscription; the body checks isMode(\"Packet\"), guards on mc.thePlayer, cancels S27 unconditionally, then cancels S12 when the entity id matches. The mode gate wraps even the S27 branch, which is the one structural difference from Memeware's version: in Memeware the S27 cancel is outside any mode check, here it only runs while the mode is selected.\n\nThe handler returns early on a non-matching entity id inside the gate, so other entities' velocity packets pass through untouched even in Packet mode. onEnable/onDisable are empty, and no settings or state fields exist beyond the inherited module machinery."
+    },
+    {
+      "label": "NetworkManager.java (patched receive path)",
+      "rel": "net/minecraft/network/NetworkManager.java",
+      "explanation": "The private client ships the same receive-path patch as Memeware: channelRead0 wraps the incoming packet in a PacketInEvent, fires it on the LWJEB bus, and returns before processPacket when the cancelled flag is set, so a cancelled S12 or S27 never reaches NetHandlerPlayClient. A PostPacketInEvent fires after processing for post-handlers, and the outbound path at line 347 runs the same event for outgoing messages.\n\nThis file is the enforcement point for the module's cancel: the handler's e.cancel() only sets a flag, and this patch is what turns that flag into a dropped packet. It is also why the cancellation is invisible to the server's own record - the server already sent the velocity and keeps it in its ledger - which is exactly the asymmetry the prediction-based countering checks exploit."
+    }
+  ],
+  "countering": [
+    {
+      "label": "KnockbackHandler (AntiKB, required-velocity prediction)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/velocity/KnockbackHandler.java",
+      "explanation": "Grim's KnockbackHandler makes every ENTITY_VELOCITY a required movement once delivery is proven. It sends a transaction before the velocity and a second after it; the vector enters firstBreadMap keyed by the first transaction id and is promoted into lastKnockbackKnownTaken when the client echoes a larger id. From then the prediction engine demands the vector in the player's motion, measuring the offset against config Knockback.threshold (0.001), accumulating with decay 0.999 into a threshold capped at maxAdvantage 1, and set-backing at an offset of at least 0.1.\n\nWhile Packet mode is active, the S12 cancel is indistinguishable to Grim from any other anti-knockback: the server sent the vector, the sandwich confirmed it, and the motion never contains it, so the offset accrues and the player is set back. The mode gate does not help - the cancel either happens (and is caught) or does not (and there is no module), so there is no partial state that could slip under the threshold. A knockback recorded during one of Grim's own setbacks is forgiven, but the server's ordinary S12 here is not issued during a setback, so that leniency never applies. Transaction eating remains the theoretical bypass, and this module does not attempt it."
+    },
+    {
+      "label": "AntiVelocityBasic (pending knockback matching)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/AntiVelocityBasic.java",
+      "explanation": "Hawk's MoveEvent maintains a per-player pending knockback list and matches every move against it. A kb entry is eligible while the elapsed time is within the player's ping plus 200ms; the move's Y must be within 0.01 of the kb's Y (unless the player collides, jumps, swims or steps) and X and Z must fall inside maxDiscrepancy = weirdConstant * baseMultiplier * sprintMultiplier + 0.003 (weirdConstant 0.098 on ground, 0.2518462 jump-sprinting, 0.0196 swimming; baseMultiplier 5 * walkSpeed * speed-potion factor or 10 * flySpeed; sprintMultiplier 1.3 or 2 flying). An entry that ages past ping + 200ms with no matching move sets failedKnockback and AntiVelocityBasic.check flags at VL 5; detection is documented down to a 10% difference.\n\nIn Packet mode the cancelled S12 leaves the entry with no matching move, so it expires and flags - the full cancel has no tolerance path. In the mode-off state the module intercepts nothing and the player takes the knockback normally, so the entry is consumed and the check rewards; that clean on/off split is the one thing that keeps a mode-toggling user under this check between hits. The ping + 200ms window itself is the only forgiveness for a genuine network-stalled move."
+    },
+    {
+      "label": "UnusedVelocity (unused knockback ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/UnusedVelocity.java",
+      "explanation": "NCP's movement model queues the vertical velocity the server applied and consumes it to explain the player's movement afterward. checkUnusedVelocity reads the pos and neg UnusedTracker instances of the SimpleAxisVelocity vertical tracker; UnusedTracker.addValue records a violation amount only when the direction has been blocked since the entry was added - the server pushed velocity in a direction the player never moved - and quickCheckDirection reports the violation count, the accumulated amount and the update count, then resets the results.\n\nIn this build the check is a debug ledger: quickCheckDirection logs through DebugUtil and returns false with a TODO for a real frequency or amount check, so it cannot fail a player yet. The mechanism it models is exactly the mode-on state: a cancelled S12 in Packet mode leaves the vertical push un-consumed, so the tracker accumulates unused velocity on every hit. The mode-off state consumes it normally, which keeps the ledger clean. As shipped, the module faces NCP's SurvivalFly envelope rather than this check, and the honest statement is that NCP's velocity accounting is where the detection would land once the TODO is implemented."
+    },
+    {
+      "label": "VelocityListener (claimed velocity feed)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/ai/idealistic/spartan/listeners/protocol/VelocityListener.java",
+      "explanation": "Spartan's VelocityListener is a MONITOR-priority ProtocolLib adapter on ENTITY_VELOCITY that converts the self-entity vector (fixed-point ints / 8000.0) into a CPlayerVelocityEvent, forwards the packet's cancellation state, and dispatches it through VelocityEvent.event onto the CheckThread. The event lands in protocol.claimedVelocity and the claimedVeloGravity/claimedVeloSpeed queues (two entries each), which Spartan's movement checks compare against the player's reported movement - the listener is the feed those checks consume.\n\nThe claimed vector is recorded from the server's own send, so the client-side cancel in Packet mode cannot erase it: the queues expect the knockback trajectory and the player reports none, a total deficit that accumulates on every hit while the mode is on. The two-entry queue cap is the tolerance surface - only the last two claims are compared - so a user who drops the mode between hits presents clean windows, which is the one escape the gate offers. With the mode off, no interception occurs and no deficit exists at all."
+    }
+  ]
+}

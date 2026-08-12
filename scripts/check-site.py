@@ -108,9 +108,9 @@ if os.path.isdir(an_data):
         for f in files:
             if not f.get("explanation") or len(f["explanation"]) < 60:
                 errors.append("%s: file '%s' missing real explanation" % (slug, f["rel"]))
-            src = open(os.path.join(
-                os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "sources")),
-                data["client"], f["rel"]), encoding="utf-8", errors="replace").read()
+            root = os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "anticheats")) if data.get("ac") else \
+                   os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "sources"))
+            src = open(os.path.join(root, data["client"], f["rel"]), encoding="utf-8", errors="replace").read()
             # the page renders each code line HTML-escaped inside its own row, so
             # verify per-line escaped presence rather than a raw whole-file substring
             def esc(s):
