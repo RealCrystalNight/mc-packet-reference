@@ -187,6 +187,26 @@ function renderDetail(p) {
   return parts.join('\n');
 }
 
+function mtime(p) {
+  try { return fs.statSync(p).mtime.toISOString().slice(0, 10); }
+  catch (e) { return new Date().toISOString().slice(0, 10); }
+}
+
+function analysisSitemap() {
+  // Analysis pages (if any) — hub + each module analysis
+  const idxPath = path.join(BASE, 'data', 'analysis', 'index.json');
+  if (!fs.existsSync(idxPath)) return '';
+  let out = '  <url><loc>' + SITE + '/analysis/</loc><lastmod>' + mtime(path.join(BASE, 'analysis', 'index.html')) + '</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>\n';
+  try {
+    const idx = JSON.parse(fs.readFileSync(idxPath, 'utf8'));
+    (idx.analyses || []).forEach(function(slug) {
+      const data = JSON.parse(fs.readFileSync(path.join(BASE, 'data', 'analysis', slug + '.json'), 'utf8'));
+      out += '  <url><loc>' + SITE + '/analysis/' + data.category + '/' + slug + '.html</loc><lastmod>' + mtime(path.join(BASE, 'analysis', data.category, slug + '.html')) + '</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>\n';
+    });
+  } catch (e) { /* keep hub entry only */ }
+  return out;
+}
+
 function main() {
   const files = fs.readdirSync(PACKETS_DIR).filter(f => f.endsWith('.json'));
   const allPkts = files.map(function(f) { return JSON.parse(fs.readFileSync(path.join(PACKETS_DIR, f), 'utf8')); });
@@ -311,10 +331,6 @@ function main() {
   }
 
   // Sitemap — use real file mtimes, priority by module density
-  function mtime(p) {
-    try { return fs.statSync(p).mtime.toISOString().slice(0, 10); }
-    catch (e) { return new Date().toISOString().slice(0, 10); }
-  }
   const sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
     + '  <url><loc>' + SITE + '/</loc><lastmod>' + mtime(path.join(BASE, 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>1.0</priority></url>\n'
     + '  <url><loc>' + SITE + '/packets/</loc><lastmod>' + mtime(path.join(BASE, 'packets', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.9</priority></url>\n'
@@ -325,6 +341,7 @@ function main() {
       const freq = mc >= 4 ? 'weekly' : 'monthly';
       return '  <url><loc>' + SITE + '/packets/' + p.id + '/</loc><lastmod>' + mtime(path.join(PACKETS_DIR, p.id + '.json')) + '</lastmod><changefreq>' + freq + '</changefreq><priority>' + prio + '</priority></url>';
     }).join('\n') + '\n'
+    + analysisSitemap()
     + '</urlset>\n';
 
   fs.writeFileSync(path.join(BASE, 'sitemap.xml'), sitemap);

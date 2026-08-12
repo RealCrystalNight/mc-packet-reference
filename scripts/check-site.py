@@ -80,6 +80,42 @@ robots = open(os.path.join(BASE, "robots.txt"), encoding="utf-8").read()
 if SITE + "/sitemap.xml" not in robots:
     errors.append("robots.txt sitemap URL is wrong")
 
+# analysis pages: hub + every registered analysis + assets
+an_data = os.path.join(BASE, "data", "analysis")
+if os.path.isdir(an_data):
+    idx = json.load(open(os.path.join(an_data, "index.json")))
+    hub = os.path.join(BASE, "analysis", "index.html")
+    if not os.path.exists(hub):
+        errors.append("missing analysis/index.html")
+    for slug in idx["analyses"]:
+        data = json.load(open(os.path.join(an_data, slug + ".json")))
+        page = os.path.join(BASE, "analysis", data["category"], slug + ".html")
+        if not os.path.exists(page):
+            errors.append("missing analysis page: %s" % slug)
+            continue
+        ph = open(page, encoding="utf-8").read()
+        if 'class="cv-row"' not in ph:
+            errors.append("%s: no code viewer rows" % slug)
+        if "highlight.min.js" not in ph or "github-dark.min.css" not in ph:
+            errors.append("%s: highlight.js assets missing" % slug)
+        if "Line-by-Line Annotations" not in ph:
+            errors.append("%s: missing annotations section" % slug)
+        # every non-blank non-brace line must be annotated
+        src = open(os.path.join(
+            os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "sources")),
+            data["client"], data["source_rel"]), encoding="utf-8", errors="replace").read().split("\n")
+        covered = set()
+        for a in data["annotations"]:
+            for ln in range(a["start"], a["end"] + 1):
+                covered.add(ln)
+        miss = [i + 1 for i, l in enumerate(src)
+                if (i + 1) not in covered and l.strip() and l.strip() not in ("{", "}")]
+        if miss:
+            errors.append("%s: %d lines without annotations (first: %s)" % (slug, len(miss), miss[:8]))
+    for asset in ["analysis/assets/highlight.min.js", "analysis/assets/github-dark.min.css"]:
+        if not os.path.exists(os.path.join(BASE, asset)):
+            errors.append("missing %s" % asset)
+
 # packet-data.js integrity
 pd_path = os.path.join(BASE, "js", "packet-data.js")
 pd = open(pd_path, encoding="utf-8").read()
