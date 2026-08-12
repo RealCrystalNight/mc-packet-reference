@@ -1,0 +1,56 @@
+{
+  "module": "Speed",
+  "client": "November Recode 2.0",
+  "category": "movement",
+  "source_rel": "feature/module/impl/movement/SpeedModule.java",
+  "overview": "November Recode 2.0's Speed is a two-mode movement module driven entirely from one EventMove listener, with no packet sends of its own. BHOP lifts the player with the vanilla 0.42 jump velocity on every ground tick and then pins the horizontal speed to a constant setting (default 0.5 blocks per tick) by writing both the event delta and the motionX/motionZ fields, so air friction never decays it. STRAFE preserves the current horizontal magnitude on every tick and adds 0.2 blocks per tick on each jump tick, so speed ratchets upward hop by hop until it hits the player's chosen ceiling. All direction math lives in MoveUtils.strafe, which converts rotationYaw plus WASD input into a [-sin, cos] vector pair.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module state is three settings and one listener. Mode (BHOP or STRAFE) picks the behavior, Speed (0.1 to 5.0 blocks per tick, default 0.5, only visible in BHOP) is the constant horizontal target, and Jump (default true, only visible in STRAFE) enables the per-hop boost. The @Subscribe Listener<EventMove> branches on the mode enum and both branches are gated by MoveUtils.moving(), which checks moveForward and moveStrafe on the movementInput; holding no key disables the module entirely. The module never constructs a packet: it rewrites the movement delta the client is about to report, and MoveUtils.setSpeed writes both event.setX/setZ and mc.thePlayer.motionX/motionZ, so the position the server sees and the velocity the local physics integrate are the same vector. The EventMove firing site is a mixin not present in this source snapshot, but the module's behavior only needs the event's x/y/z setters and the motion fields."
+    },
+    {
+      "h": "Ground + air strafe mechanics",
+      "p": "BHOP is a constant-speed hop. On each ground tick while moving it sets motionY to 0.42f (exactly the vanilla jump velocity) and mirrors it into event.setY, then calls MoveUtils.setSpeed(event, speed) with the configured value, so the horizontal magnitude is re-pinned to 0.5 blocks per tick every single tick. The write-through to motionX/motionZ is what matters: vanilla applies 0.91 air friction and block slipperiness to the motion fields each tick, but the module overwrites them before the physics step, so the magnitude can never decay and every ground contact re-jumps. STRAFE is the ratchet variant. On the ground tick, if Jump is enabled, it boosts to MoveUtils.speed() plus 0.2 and immediately re-applies MoveUtils.speed() (which reads back the motion fields just written, so the boost sticks); on every subsequent tick, air or ground, the unconditional MoveUtils.setSpeed(event, MoveUtils.speed()) preserves whatever magnitude was reached. Direction comes from MoveUtils.directional(): moving backward flips the yaw 180 degrees, forward is halved as the diagonal blend factor (treated as 1.0 when zero), and a strafe key shifts the yaw by 90 degrees times that factor, then strafe() returns [-sin(direction) * speed, cos(direction) * speed]."
+    },
+    {
+      "h": "Anticheat targeting",
+      "p": "The default 0.5 blocks per tick is 1.78x vanilla sprint (0.2806), and the module offers no low-profile mode: the horizontal pin is a brute-force speed with no packet manipulation, no timer abuse and no onGround spoofing. The 0.42 jump is legal everywhere it is checked, because it is exactly the vanilla jump velocity and NCP even grants a jumpDelay window (MAX_JUMP_DELAY = 10 ticks) for immediate re-jumps, so the vertical side of every counter passes. The horizontal side does not. NCP SurvivalFly predicts an allowed distance near sprint speed from 1.8 friction math and flags any excess as hdistrel with a set-back. Arc v2 Speed builds a per-stage expected speed from baseMove 0.2873 plus a stage that depends on vertical velocity, so a descending hop at 0.5 exceeds the 0.3673 expected and trips the BunnyHop branch. Hawk Speed models momentum as friction times last speed plus input force, so the instant 0.5 pin on a ground tick is a discrepancy that accumulates over its 0.1 threshold and rubber-bands the player."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "SpeedModule.java (module)",
+      "rel": "feature/module/impl/movement/SpeedModule.java",
+      "explanation": "The entire module is this file: a mode enum, three settings and one EventMove listener. The BHOP branch jumps with 0.42f and pins the horizontal speed to the Speed setting on every ground tick while moving; the STRAFE branch adds 0.2 to the current speed on each jump tick and then preserves the current magnitude on every tick. Because MoveUtils.setSpeed writes both the event delta and the motion fields, the server-reported C03 positions and the client physics stay in lockstep, which is why the module works at all: the movement packet the server validates is exactly the strafe vector the module computed. The Jump setting only gates STRAFE, and the Speed setting only renders in BHOP, so the GUI hides each slider where it does nothing."
+    },
+    {
+      "label": "MoveUtils.java (strafe math)",
+      "rel": "utility/player/MoveUtils.java",
+      "explanation": "MoveUtils is the only helper the module touches (the sole non-Minecraft import besides EventMove). strafe(double) turns a scalar speed into a horizontal vector [-sin(direction) * speed, cos(direction) * speed]; directional() derives that heading from rotationYaw and the WASD state, flipping 180 degrees when moving backward, halving forward as the diagonal blend factor, and offsetting 90 degrees per strafe key; and speed() returns the current horizontal magnitude sqrt(motionX^2 + motionZ^2), which the STRAFE mode uses as the base for its 0.2 boost. setSpeed is the write-through: it sets the event x/z deltas and the player motionX/motionZ to the same strafe vector, so the module's velocity survives the friction step and the server sees the same delta the client moved. The same utility powers FlightModule, which pins motionY instead of the horizontal plane."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (horizontal speed envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the client's physics from the world and compares the reported move against it. In check() the horizontal allowance comes from prepareSpeedEstimation, which picks inertia and acceleration by medium (air uses AIR_HORIZONTAL_INERTIA 0.91 and on-ground friction cubed, with walkSpeed accelerated by 30 percent while sprinting) and feeds them into estimateNextSpeed to predict the per-tick distance; handlePredictableMove then computes offset = hDistance - hAllowedDistance against a prediction epsilon. The violation is (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 with a set-back to the stored location, so every move that exceeds the prediction is both flagged and rolled back. November's default 0.5 blocks per tick is far beyond the roughly 0.28 to 0.31 sprint prediction, so the offset is about 0.19 and the violation about 19 on the first move, with no way to hide it because the module re-pins the speed every tick. The 0.42 jump is accepted by the vDistRel jump envelope (PhysicsEnvelope.isJumpMotion sets isJump and arms the 10-tick jumpDelay), so the vertical side stays clean and the hdistrel tag is the only signal."
+    },
+    {
+      "label": "Speed (BunnyHop / onGround expected)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Speed.java",
+      "explanation": "Arc v2's Speed compares thisMove, the horizontal distance of the current move, against expectations built from getBaseMoveSpeed (0.2873) plus stage values. Off the ground the stage is chosen from vertical speed: 0.049 when vertical is zero, 0.08 when descending below 0.34, 0.3261 while still rising; expected = baseMove + stage, and thisMove above it flags the BunnyHop branch. November's default 0.5 passes the rising ticks (expected 0.6134 with vertical at 0.34 or above) but fails the descending part of every hop, where expected drops to 0.2873 + 0.08 = 0.3673 and the check names the flag BunnyHop with the measured and expected values in the message. On the ground, expected = thisMove / groundTime + baseMove with groundTime capped at 8, so STRAFE with Jump disabled, which keeps 0.5 pinned without ever leaving the ground, exceeds 0.5 / 8 + 0.2873 = 0.3498 once groundTicks reaches 5 and trips the onground_expected branch; the hasBlock + jumping branch against blockMoveMax 0.6699 is the one path the default speed stays under. The check stores the from location as set-back whenever it does not fail, so a flagged hop snaps the player back."
+    },
+    {
+      "label": "Speed (momentum model, discrepancy accumulator)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed treats movement as momentum conservation: expected = friction * lastSpeed * handleMultipliers + (maxForce + handleAdders + EPSILON), where friction is the block slipperiness or 0.91 in air, maxForce is the maximum input acceleration the move could receive, and sprinting while jumping adds a 0.2 handle adder. The current speed minus expected is a Discrepancy that accumulates into a per-player map across moves, and when the total passes DISCREPANCY_THRESHOLD (default 0.1) the check calls punishAndTryRubberband with VL scaled by discrepancy * 10, which snaps the player back to the server position. November's constant 0.5 pin defeats the model on the ground: with block friction 0.6 and a pinned lastSpeed of 0.5, expected lands near 0.33, so the jump tick alone contributes a discrepancy around 0.17 and the accumulated total exceeds 0.1 on the first updatePos move. STRAFE is worse, because the +0.2 ratchet per hop makes the discrepancy grow on every ground contact. The jump and step exemptions only forgive the vanilla sprint-jump adder, not a magnitude pinned 0.2 blocks per tick above it."
+    }
+  ]
+}

@@ -1,0 +1,86 @@
+{
+  "module": "Aura (Kill Aura)",
+  "client": "Memeware 7.3",
+  "category": "killaura",
+  "source_rel": "me/memewaredevs/client/module/combat/Aura.java",
+  "overview": "Memeware 7.3's Aura is a three-mode killaura dispatcher: a single onUpdate handler forwards every UpdateEvent to one of three static helper classes, and each mode runs its own attack cadence and blocking logic. Single mode is a blockhit cycle that releases the held item with a C07 dig packet, attacks with C02 on the following tick, then re-blocks with a C08 use-item placement, all clocked by a shared 1000 / Click Speed timer. Multi mode gathers every living entity in range and sweeps the whole list with a C02 attack per target on each timer cycle, preceded by a silent C18PacketSpectate carrying a hardcoded CubeCraft UUID, with blocking gated by a Block Chance roll. Hypixel mode is the server-specific implementation: it randomizes the click window to between Click Speed minus 2 and Click Speed, snaps rotationYawHead and renderYawOffset in addition to the movement-packet look, and sends its re-block C08 to a random double-precision position so the server-side block state and the client-side flag stay decoupled. All modes share static state through Aura.isBlocking and Aura.currentEntity, and the module's onDisable releases the sword with a C07 RELEASE_USE_ITEM whenever the Single path left it raised.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "Aura.java registers 'Kill Aura' with a ModeSetting holding Single, Multi and Hypixel plus Click Speed (12, 1-20), Block Chance (60, 1-100), Range (6, 1-8), Auto Block, Keep Sprint and the Players/Animals/Monsters/Invisibles/Teams toggles. Its @Handler onUpdate is one lambda that branches on isMode and calls SingleAura.doUpdate, MultiAura.doUpdate or HypixelAura.doUpdate with the module, the event and the Minecraft instance. Module state lives in two public statics on Aura itself - isBlocking and currentEntity - while each helper keeps its own private statics: SingleAura owns a Timer and the block/unblock/unblocked flags, MultiAura owns a Timer, the target list, a rotating targetIndex and a Random for the block-chance roll, and HypixelAura owns a Timer plus block and stopServerBlocking. Because the helpers are stateless classes, switching modes mid-fight hands the next event to a fresh set of flags but keeps the shared isBlocking/currentEntity that render code and onDisable read. onDisable clears both statics and, when SingleAura.unblock is set, sends a C07 RELEASE_USE_ITEM at BlockPos(0.221, 0.221, 0.213) facing UP so a disable between a release and a re-block does not leave the player stuck blocking server-side. Notably the Teams setting is read nowhere: all three modes hardcode teams = false, and the target scans ignore the Players/Monsters/Animals flags, so the module attacks any qualifying living entity regardless of the UI toggles."
+    },
+    {
+      "h": "Mode dispatch and Hypixel specifics",
+      "p": "The three modes differ in cadence and in how aggressively they hide the block state. Single mode targets one entity (first match in the loaded entity list, no sorting and no visibility test) and cycles C08 re-block on post updates, C07 release plus C02 attack on timer-fired pre updates. Multi mode rotates its aim through the target list one index per cycle while attacking every entry in the list on each timer fire, so its look direction (targets.get(targetIndex)) is usually not the entity it is actually hitting (Aura.currentEntity is set to targets.get(0)). Hypixel mode is the per-server special: it computes the effective click speed as MathUtils.getRandom(cps - 2, cps) when the setting is above 2, so at the default 12 the inter-attack interval is randomized between 50ms and 60ms, breaking the fixed period that consistency checks look for; below 3 the setting is used verbatim. It also writes rotations into three places at once - the UpdateEvent yaw/pitch for the movement packet plus rotationYawHead, rotationPitchHead and renderYawOffset - so the server sees the snap in the look packet while the render and head-tracking fields agree. Blocking state is tracked with the local stopServerBlocking flag: it arms when a target appears, and when the target list empties with autoBlock on, the mode sends a C07 RELEASE_USE_ITEM at BlockPos.ORIGIN facing DOWN so the server-side block is dropped on target loss, mirroring what Single mode's onDisable does on module disable."
+    },
+    {
+      "h": "Attack and autoblock packets",
+      "p": "Single mode: on a post-phase update, if Aura.isBlocking (sword in hand, Auto Block on, CombatUtil.canBlock within range + 4) and the block flag is set, it sends C08PacketPlayerBlockPlacement with the fixed BlockPos(-0.2223, -0.132, -0.312), facing 255, the held item and a zero hit vector - the classic use-item-on-air right-click - and raises the unblock flag; when the timer fires on a pre update it sends C07 RELEASE_USE_ITEM at the same position offset down one block, swings (C0A), clears block, and the C02 ATTACK lands on the following update. Multi mode gates blocking on chance(Block Chance): on pre it queues C07 RELEASE_USE_ITEM at BlockPos.ORIGIN facing UP, on post it calls setItemInUse plus playerController.sendUseItem (which emits its own C08), and on each timer fire it loops the whole target list sending, per target, a silent C18PacketSpectate(CubeUtil.CUBECRAFT_UUID) followed by swingItem and a C02 ATTACK - so the sweep rate is targets-per-cycle times cycles-per-second. Hypixel mode condenses the cycle into one tick: on pre, when the randomized timer fires, it releases with C07 at BlockPos.ORIGIN facing DOWN, swings and attacks; on the same tick's post phase it re-blocks with C08 at a BlockPos built from RandomUtils.nextDouble(Double.MIN_VALUE, Double.MAX_VALUE) on every axis, coordinates no real block can occupy, toggling Aura.isBlocking back on."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity",
+    "C07PacketPlayerDigging",
+    "C08PacketPlayerBlockPlacement",
+    "C0APacketAnimation"
+  ],
+  "files": [
+    {
+      "label": "Aura.java (mode dispatcher)",
+      "rel": "me/memewaredevs/client/module/combat/Aura.java",
+      "explanation": "The module shell: registers 'Kill Aura' with the Single/Multi/Hypixel mode selector and the Click Speed, Block Chance, Range, Auto Block, Keep Sprint and entity-type settings, then dispatches every UpdateEvent to the matching helper's static doUpdate. It owns the shared statics Aura.isBlocking and Aura.currentEntity that all three helpers write and that the rest of the client reads, and its onDisable clears them before sending a C07 RELEASE_USE_ITEM at BlockPos(0.221, 0.221, 0.213) facing UP when SingleAura.unblock is true, so a disable between a release and a re-block drops the server-side block. The Teams setting registered here is never consulted by any mode; every helper hardcodes teams = false."
+    },
+    {
+      "label": "SingleAura.java (general mode)",
+      "explanation": "doUpdate implements the single-target blockhit state machine: it computes Aura.isBlocking from the held-item, Auto Block and canBlock(range + 4) conditions, fires the C08 use-item-on-air placement on post updates while the block flag is set, re-arms block every update, short-circuits while AutoPotion.isPotting(), snaps the event's yaw/pitch to RotationUtils.getRotations of the first in-range entity, and gated by the unblocked flag sends swingItem plus C02 ATTACK on the update after a timer-fired C07 RELEASE_USE_ITEM at the fixed position offset down one block. The C02 never fires from the blocking state, and the fixed BlockPos(-0.2223, -0.132, -0.312) with facing 255 makes the C08 a block-hold instead of a placement. It also exposes the public unblock flag that Aura.onDisable consumes.",
+      "rel": "me/memewaredevs/client/module/combat/aura/SingleAura.java"
+    },
+    {
+      "label": "MultiAura.java (multi-target mode)",
+      "explanation": "doUpdate collects every qualifying living entity in range via CombatUtil.getTargets, gates blocking on a Random roll against Block Chance (in addition to the sword/auto-block/canBlock conditions), releases with C07 at BlockPos.ORIGIN facing UP on pre updates and re-blocks through setItemInUse plus playerController.sendUseItem on post updates, and on each timer fire iterates the whole target list sending a silent C18PacketSpectate carrying the hardcoded CubeUtil.CUBECRAFT_UUID, swingItem and a C02 ATTACK per target. The look is aimed at targets.get(targetIndex) with targetIndex advancing once per cycle while Aura.currentEntity is set to targets.get(0), so rotation and victim diverge as the index walks, and the mode returns early on post updates so attacks only fire from the pre phase.",
+      "rel": "me/memewaredevs/client/module/combat/aura/MultiAura.java"
+    },
+    {
+      "label": "HypixelAura.java (Hypixel-specific mode)",
+      "explanation": "The server-specific implementation. It randomizes the effective click speed with MathUtils.getRandom(Click Speed - 2, Click Speed) whenever the setting exceeds 2, so the inter-attack delay jitters instead of being a fixed 1000 / cps period; snaps rotationYawHead, rotationPitchHead and renderYawOffset alongside the event yaw/pitch so the head and render fields agree with the movement-packet look; arms stopServerBlocking while a target exists and sends a C07 RELEASE_USE_ITEM at BlockPos.ORIGIN facing DOWN when the target list empties; and on each timer-fired pre update releases, swings and attacks, then re-blocks on the same tick's post phase with a C08 whose BlockPos is built from RandomUtils.nextDouble(Double.MIN_VALUE, Double.MAX_VALUE) on all three axes - coordinates no real block can occupy - toggling Aura.isBlocking through the whole cycle. The canBlockSword expression is effectively always true with a sword equipped, which is what lets the re-block fire every cycle.",
+      "rel": "me/memewaredevs/client/module/combat/aura/HypixelAura.java"
+    },
+    {
+      "label": "RotationUtils.java",
+      "explanation": "getRotations aims at the target's position plus half its eye height and hands the delta to getRotationFromPosition, which subtracts a fixed 1.2-block eye offset from the player's posY and converts the horizontal and vertical deltas into yaw and pitch with atan2, returning both as an instant snap with no smoothing or turn-speed limit. Every mode writes these values into the UpdateEvent, so the next movement packet carries the full snap, and Hypixel mode additionally copies them into the head and render fields. doScaffoldRotations and getBowAngles are unrelated helpers sharing the same atan2 math, used by other modules, not by Aura.",
+      "rel": "me/memewaredevs/client/util/combat/RotationUtils.java"
+    }
+  ],
+  "countering": [
+    {
+      "label": "FightSpeed (attack-rate window)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightSpeed.java",
+      "explanation": "Hawk's FightSpeed measures the gap between consecutive C02 ATTACK interactions in client ticks. It only logs a click when the gap is at most RECORD_SENSITIVITY (4) ticks, accumulates 10 samples, and computes the average CPS as 1 / ((sum / 10) / 20); an average above MAX_CPS (16 by default) punishes and rewards otherwise. Against Multi mode this is a guaranteed flag: the mode sends one C02 per target in the same tick, so consecutive deltas are 0, the sum is 0, and the CPS computation divides by zero and produces Infinity, which the check punishes outright. Single and Hypixel modes hit the same wall at the top of the range: a sustained 18-20 CPS trips the 16 CPS cap after 10 samples, and Hypixel's randomized window (cps - 2 to cps) does not help because the average still lands at the setting. The default 12 CPS with a roughly 50ms per-tick jitter sits under the cap, which is the config the module ships with."
+    },
+    {
+      "label": "FightHitbox (lag-compensated hitbox ray trace)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightHitbox.java",
+      "explanation": "FightHitbox re-derives hit validity server-side instead of trusting the client. It defers each attack to the next MoveEvent so the ray uses the yaw the client actually attacked with (1.8 sends the C02 before the look update that describes it), then casts from the attacker's eye location along that direction against the victim's hitbox, rewound through Hawk's lag compensator by the attacker's ping and expanded by a 0.005 epsilon. maxReach defaults to 3.1 blocks (5.0 in creative); an intersection beyond it punishes the measured reach, a miss punishes 'Did not hit hitbox.', and with occlusion enabled a block before the victim punishes 'Interacted through <block>'. Every mode here attacks at Range 6-8 with no canEntityBeSeen call, so each hit is 3-5 blocks over the cap and every wall hit is a block occlusion, which means the check fires on essentially every C02 from any of the three modes until the user drops Range to 3 or below."
+    },
+    {
+      "label": "MultiAction (interact while blocking)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/MultiAction.java",
+      "explanation": "MultiAction flags interactions that arrive while the server-side item-use state says the player is blocking or using an item. It triggers on InteractEntityEvent, InteractWorldEvent, BlockDigEvent and InteractItemEvent, and for 1.8 clients punishes and resyncs when a C02 or C08 arrives while HawkPlayer.isBlocking() or isConsumingOrPullingBowMetadataIncluded() is true. The module's blockhit order is built to dodge exactly this: every mode sends the C07 RELEASE_USE_ITEM before the C02 sweep, clearing the use-item state first, which is why default-configured Hawk stays quiet. The hole is in Multi mode: the release only fires inside the isBlocking gate, and when the Block Chance roll or canBlock fails, no release is queued while the C02s still sweep, leaving the previous re-block active server-side so the attacks land while blocking. The check is disabled by default in this tree (enabled = false in the constructor), so it only bites on servers that turn it on."
+    },
+    {
+      "label": "Angle (attack-stream window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Angle.java",
+      "explanation": "NCP's Angle builds an AttackLocation per damage event with the player's position, yaw, the victim id and the deltas to the previous entry, keeps a 1000ms window, and scores four signals: average movement below 0.2 blocks, average time between attacks below 150ms, average yaw change above 50 degrees, and switch speed counted whenever the victim id changes with a yaw jump over 30 degrees. Each signal that exceeds its configured threshold feeds data.angleVL, which decays by 0.98 on clean checks and executes actions past its violation level. Multi mode scores maximum on every signal: the whole sweep happens in one tick (time near 0), the player does not move between victims (movement near 0), and consecutive victims are different entities in different directions (id changes with large yaw jumps), so with detection-tuned thresholds the accumulated VL crosses the cancel line within a handful of cycles. The stock thresholds in this tree (move 100, time 150, yaw 60, switch 50) sit above the 20-30 maximum per-call scores, so the check only acts when an admin lowers them, which standard NCP detection configs do."
+    },
+    {
+      "label": "KillAura (multi-target / reach / speed)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/KillAura.java",
+      "explanation": "Arc v2's composite check runs on the damage event and scores four sub-conditions. The Multi branch is the direct hit on MultiAura: when two consecutive attacked entities differ, it measures the angle difference between their vectors from the player and flags 'Kill Aura (Multi)' if it exceeds max-direction-angle (1.2 radians default) while the victims are within max-reach (4.2). MultiAura attacks every target in the same tick regardless of where the look points, so consecutive victims sit at different angles and the branch fires on the first sweep. The Reach branch measures the distance to the entity minus its current velocity, so the module's 6-8 block Range exceeds the 4.2 cap on every hit even mid-knockback. The Speed branch counts attacks per second (max-attacks 16) and, via checkFrequency, attack packets per second (max-attack-packets 20): Multi mode with two or more targets at 12-20 cycles per second blows past both. Direction and NoSwing pass because the module snaps the look onto the target and swings before every C02."
+    }
+  ]
+}
