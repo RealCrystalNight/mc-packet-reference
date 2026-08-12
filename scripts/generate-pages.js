@@ -186,6 +186,8 @@ function renderDetail(p) {
   if (p.notes) {
     parts.push('<div class="detail-section"><h3>Notes</h3><div class="notes-box">' + p.notes + '</div></div>');
   }
+  // Full vanilla MCP source of the packet class, above the Deep Dive analysis
+  parts.push(renderVanillaSource(p));
   if (p.implementation) {
     var impl = p.implementation;
     if (impl.writeup && impl.writeup.length) parts.push(renderWriteup(impl.writeup));
@@ -370,7 +372,6 @@ function main() {
       + '    </div>\n'
       + '    <div class="detail-body" id="detailBody">\n'
       + renderDetail(pkt) + '\n'
-      + renderVanillaSource(pkt) + '\n'
       + '    </div>\n'
       + '    <div style="margin-top:32px;text-align:center">\n'
       + '      <a href="../../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to all packets</a>\n'

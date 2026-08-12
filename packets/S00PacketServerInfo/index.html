@@ -83,64 +83,6 @@
 </div></div>
 <div class="detail-section"><h3>Handler Interface</h3><div class="mcp-block"><div class="mcp-row"><span class="mcp-label">HND</span><code>INetHandlerStatusClient</code></div></div></div>
 <div class="detail-section"><h3>Notes</h3><div class="notes-box">The JSON response includes: version (name + protocol number), players (max + online + optional sample list), description (MOTD ChatComponent), and optionally favicon (base64-encoded PNG with 'data:image/png;base64,' prefix). For modded servers, may include Forge mod info.</div></div>
-<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
-<h4>Role in the protocol</h4>
-<p>The STATUS-state reply to C00PacketServerQuery. NetHandlerStatusServer.processServerQuery answers with <code>sendPacket(new S00PacketServerInfo(this.server.getServerStatusResponse()))</code>; the payload is one String holding the full ServerStatusResponse JSON: version name and protocol number, online/max player counts with an optional sample list, the MOTD as a serialized ChatComponent, an optional base64 favicon data URI, and the Forge mod list on modded servers. It is the only clientbound STATUS packet that carries data; S01PacketPong carries only a timestamp echo.</p>
-<h4>Vanilla handling</h4>
-<p>NetHandlerStatusClient.handleServerInfo is reached through the anonymous INetHandlerStatusClient that OldServerPinger installs per ping. It stores the parsed ServerStatusResponse into the ServerData entry (serverMOTD, gameVersion, playerList), records the current system time, and immediately sends C01PacketPing with that timestamp. The connection is then driven toward close: S01PacketPong returns, the latency is computed, and the channel closes with "Finished". RealmsServerStatusPinger uses the same handler shape for the Realms list.</p>
-<h4>Why clients touch it</h4>
-<p>None of the 8 reference clients touches it. Every corpus hit for S00PacketServerInfo is a net/minecraft vanilla file (OldServerPinger, EnumConnectionState registration, INetHandlerStatusClient, the packet class, RealmsServerStatusPinger, NetHandlerStatusServer). The reason is structural: the STATUS handshake runs before the module system exists, mc.thePlayer is null, and the 8 clients dispatch module events only in the PLAY state. Server detection in these clients (Hypixel checks, brand sniffing) happens later via ServerData after the list entry is filled by the vanilla handler, or in PLAY state via S02PacketChat.</p>
-<h4>Exploit surface</h4>
-<p>There is no timing or state abuse available to a client here: the server builds the response, the client renders it. The interesting abuse runs the other direction. A malicious server can stuff the JSON with oversized favicon data (bandwidth cost per ping), hostile chat JSON, or a protocol number far from 47 to force the incompatibility screen. Vanilla 1.8.9 rate-limits nothing on processServerQuery, which is why proxy plugins and BungeeCord fronts exist to absorb ping floods. Anti-cheats have no stake in the STATUS state; the packet is invisible to movement checks.</p>
-</div></div>
-<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>NetHandlerStatusServer.processServerQuery responds to every C00PacketServerQuery with <code>new S00PacketServerInfo(this.server.getServerStatusResponse())</code>. getServerStatusResponse caches the JSON string until the next tick; favicon and player-sample data are rebuilt on the server tick. There is no per-connection rate limit in the vanilla handler; a flood of queries simply gets a flood of responses, which is why ping-protection plugins and proxy fronts intercept the STATUS state.</p></div></div>
-<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Wire format: one String (VarInt length prefix + UTF-8) containing the JSON. The protocol number inside version.protocol must match the client's protocol (47 for 1.8.9) or the client shows an incompatibility screen before the MOTD renders. Ordering: the server sends S00 only in reply to the query; the client then sends C01PacketPing; S00 and S01 are not required to be adjacent, but vanilla always answers them in order. The favicon is a data URI ('data:image/png;base64,...') so the JSON length cap of 32767 bytes applies to the whole response.</p></div></div>
-<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>None. The STATUS state precedes encryption, authentication, and world state, so no anti-cheat measures this packet. The practical constraints are plugin-side: ping limits (per-IP query caps), MOTD/favicon validation, and protocol-version gating. A client module gains nothing by intercepting this packet, and none of the 8 clients does.</p></div></div>
-<div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
-<p class="impl-pattern">The STATUS-state server info reply. All 8 reference clients are byte-identical vanilla here: the corpus contains zero module files for this packet because the STATUS handshake runs before any module system loads. Server detection that these clients do perform happens later, in PLAY state.</p>
-<div class="impl-clients">All 8 clients ship the stock 1.8.9 handler tree unchanged: identical OldServerPinger anonymous handler, identical EnumConnectionState registration at clientbound id 0, identical RealmsServerStatusPinger. No client has forked any of these files.</div>
-</div>
-<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
-<p class="impl-pattern">The STATUS-state server info reply is invisible to server-side anticheats: it predates encryption and world state, and the corpus shows only registration and wrapper plumbing. Artemis maps the packet in its repository and wraps PacketStatusOutServerInfo for its packet library, Negativity lists SERVER_INFO in its packet type registry, and NoCheatPlus keeps deprecated protect-clients MOTD config constants that never became checks. Nothing client-controlled flows through the response, so there is no detection surface.</p>
-<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Status packet registration and wrapper (Artemis)</span>
-<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
-</div>
-<p class="impl-pattern">Registers PacketStatusServerInfo in Artemis's packet repository and wraps the raw status response so the library can read the packet stream.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketRepository maps SERVER_STATUS + 1 to PacketStatusServerInfo.class and HardcodeMap binds the NMS name PacketStatusOutServerInfo to that interface. The wrapper class PacketStatusServerInfoServer extends GPacket and implements ReadableBuffer, giving the status packet a typed slot in the library.</p>
-<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> No detection logic. The wrapper exists so STATUS-state traffic is fully typed; no Artemis check subscribes to it.</span></p>
-<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.packet.spigot/src/main/java/cc/ghast/packet/wrapper/packet/status/PacketStatusServerInfoServer.java</span></p>
-<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.packet.spigot/src/main/java/cc/ghast/packet/wrapper/packet/status/PacketStatusServerInfoServer.java =====
-package cc.ghast.packet.wrapper.packet.status;
-
-import ac.artemis.packet.protocol.ProtocolVersion;
-import cc.ghast.packet.buffer.ProtocolByteBuf;
-import ac.artemis.packet.spigot.wrappers.GPacket;
-import cc.ghast.packet.wrapper.packet.ReadableBuffer;
-
-import java.util.UUID;
-
-public class PacketStatusServerInfoServer extends GPacket implements ReadableBuffer {
-
-    public PacketStatusServerInfoServer(UUID player, ProtocolVersion version) {
-        super("PacketStatusOutInfoServer", player, version);
-    }
-
-
-    @Override
-    public void read(ProtocolByteBuf byteBuf) {
-
-    }
-}
-
-// NOTE (AI): The wrapper is registry plumbing. Artemis never reads the JSON payload of this packet in any check.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
-<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Negativity's PacketType lists SERVER_INFO ("OutServerInfo") alongside its proxy-side ServerInfo model, and NoCheatPlus carries deprecated PROTECT_CLIENTS_MOTD_ACTIVE and PROTECT_CLIENTS_MOTD_ALLOWALL constants in ConfPaths. Neither inspects the response.</span></div>
-</div>
-</div>
-<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
-<a class="related-chip" href="../C00PacketServerQuery/">C00PacketServerQuery</a>
-<a class="related-chip" href="../C01PacketPing/">C01PacketPing</a>
-<a class="related-chip" href="../S01PacketPong/">S01PacketPong</a>
-</div></div>
 <div class="detail-section"><h3>Vanilla Source</h3>
 <div class="code-viewer"><div class="cv-toolbar"><span class="cv-file">S00PacketServerInfo.java</span><span class="cv-meta">56 lines · MCP 1.8.9</span><button class="cv-copy">Copy</button><a class="cv-link" href="https://github.com/Marcelektro/MavenMCP-1.8.9/blob/master/src/main/java/net/minecraft/network/status/server/S00PacketServerInfo.java" target="_blank" rel="noopener">Original ↗</a></div><div class="cv-body"><table class="cv-table"><tr class="cv-row"><td class="cv-ln"><span class="cv-num">1</span></td><td class="cv-code"><pre><code>package net.minecraft.network.status.server;</code></pre></td></tr>
 <tr class="cv-row"><td class="cv-ln"><span class="cv-num">2</span></td><td class="cv-code"><pre><code></code></pre></td></tr>
@@ -199,6 +141,64 @@ public class PacketStatusServerInfoServer extends GPacket implements ReadableBuf
 <tr class="cv-row"><td class="cv-ln"><span class="cv-num">55</span></td><td class="cv-code"><pre><code>    }</code></pre></td></tr>
 <tr class="cv-row"><td class="cv-ln"><span class="cv-num">56</span></td><td class="cv-code"><pre><code>}</code></pre></td></tr></table></div></div>
 <p style="font-size:0.75rem;color:var(--text-muted);margin-top:6px">Deobfuscated MCP 1.8.9 source of <code>S00PacketServerInfo</code>, fetched directly from <a href="https://github.com/Marcelektro/MavenMCP-1.8.9" target="_blank" rel="noopener" style="color:var(--accent)">Marcelektro/MavenMCP-1.8.9</a> (net/minecraft/network/status/server/S00PacketServerInfo.java) at build time and verified present.</p></div>
+<div class="detail-section"><h3>Deep Dive</h3><div class="writeup-block">
+<h4>Role in the protocol</h4>
+<p>The STATUS-state reply to C00PacketServerQuery. NetHandlerStatusServer.processServerQuery answers with <code>sendPacket(new S00PacketServerInfo(this.server.getServerStatusResponse()))</code>; the payload is one String holding the full ServerStatusResponse JSON: version name and protocol number, online/max player counts with an optional sample list, the MOTD as a serialized ChatComponent, an optional base64 favicon data URI, and the Forge mod list on modded servers. It is the only clientbound STATUS packet that carries data; S01PacketPong carries only a timestamp echo.</p>
+<h4>Vanilla handling</h4>
+<p>NetHandlerStatusClient.handleServerInfo is reached through the anonymous INetHandlerStatusClient that OldServerPinger installs per ping. It stores the parsed ServerStatusResponse into the ServerData entry (serverMOTD, gameVersion, playerList), records the current system time, and immediately sends C01PacketPing with that timestamp. The connection is then driven toward close: S01PacketPong returns, the latency is computed, and the channel closes with "Finished". RealmsServerStatusPinger uses the same handler shape for the Realms list.</p>
+<h4>Why clients touch it</h4>
+<p>None of the 8 reference clients touches it. Every corpus hit for S00PacketServerInfo is a net/minecraft vanilla file (OldServerPinger, EnumConnectionState registration, INetHandlerStatusClient, the packet class, RealmsServerStatusPinger, NetHandlerStatusServer). The reason is structural: the STATUS handshake runs before the module system exists, mc.thePlayer is null, and the 8 clients dispatch module events only in the PLAY state. Server detection in these clients (Hypixel checks, brand sniffing) happens later via ServerData after the list entry is filled by the vanilla handler, or in PLAY state via S02PacketChat.</p>
+<h4>Exploit surface</h4>
+<p>There is no timing or state abuse available to a client here: the server builds the response, the client renders it. The interesting abuse runs the other direction. A malicious server can stuff the JSON with oversized favicon data (bandwidth cost per ping), hostile chat JSON, or a protocol number far from 47 to force the incompatibility screen. Vanilla 1.8.9 rate-limits nothing on processServerQuery, which is why proxy plugins and BungeeCord fronts exist to absorb ping floods. Anti-cheats have no stake in the STATUS state; the packet is invisible to movement checks.</p>
+</div></div>
+<div class="detail-section"><h3>Server-Side Handling</h3><div class="callout callout-server"><p>NetHandlerStatusServer.processServerQuery responds to every C00PacketServerQuery with <code>new S00PacketServerInfo(this.server.getServerStatusResponse())</code>. getServerStatusResponse caches the JSON string until the next tick; favicon and player-sample data are rebuilt on the server tick. There is no per-connection rate limit in the vanilla handler; a flood of queries simply gets a flood of responses, which is why ping-protection plugins and proxy fronts intercept the STATUS state.</p></div></div>
+<div class="detail-section"><h3>Protocol Analysis</h3><div class="callout callout-proto"><p>Wire format: one String (VarInt length prefix + UTF-8) containing the JSON. The protocol number inside version.protocol must match the client's protocol (47 for 1.8.9) or the client shows an incompatibility screen before the MOTD renders. Ordering: the server sends S00 only in reply to the query; the client then sends C01PacketPing; S00 and S01 are not required to be adjacent, but vanilla always answers them in order. The favicon is a data URI ('data:image/png;base64,...') so the JSON length cap of 32767 bytes applies to the whole response.</p></div></div>
+<div class="detail-section"><h3>Anti-Cheat Landscape</h3><div class="callout callout-ac"><p>None. The STATUS state precedes encryption, authentication, and world state, so no anti-cheat measures this packet. The practical constraints are plugin-side: ping limits (per-IP query caps), MOTD/favicon validation, and protocol-version gating. A client module gains nothing by intercepting this packet, and none of the 8 clients does.</p></div></div>
+<div class="impl-section"><h3><span class="impl-badge">implementation</span> Implementation Cases</h3>
+<p class="impl-pattern">The STATUS-state server info reply. All 8 reference clients are byte-identical vanilla here: the corpus contains zero module files for this packet because the STATUS handshake runs before any module system loads. Server detection that these clients do perform happens later, in PLAY state.</p>
+<div class="impl-clients">All 8 clients ship the stock 1.8.9 handler tree unchanged: identical OldServerPinger anonymous handler, identical EnumConnectionState registration at clientbound id 0, identical RealmsServerStatusPinger. No client has forked any of these files.</div>
+</div>
+<div class="impl-section ac-section"><h3><span class="impl-badge ac">anticheat</span> Anti-Cheat Checks</h3>
+<p class="impl-pattern">The STATUS-state server info reply is invisible to server-side anticheats: it predates encryption and world state, and the corpus shows only registration and wrapper plumbing. Artemis maps the packet in its repository and wraps PacketStatusOutServerInfo for its packet library, Negativity lists SERVER_INFO in its packet type registry, and NoCheatPlus keeps deprecated protect-clients MOTD config constants that never became checks. Nothing client-controlled flows through the response, so there is no detection surface.</p>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">Status packet registration and wrapper (Artemis)</span>
+<span class="impl-module-clients">(artemisac-artemis-minecraft-anticheat)</span>
+</div>
+<p class="impl-pattern">Registers PacketStatusServerInfo in Artemis's packet repository and wraps the raw status response so the library can read the packet stream.</p>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">PacketRepository maps SERVER_STATUS + 1 to PacketStatusServerInfo.class and HardcodeMap binds the NMS name PacketStatusOutServerInfo to that interface. The wrapper class PacketStatusServerInfoServer extends GPacket and implements ReadableBuffer, giving the status packet a typed slot in the library.</p>
+<p class="impl-meta" style="margin:4px 0"><span><strong>Detects:</strong> No detection logic. The wrapper exists so STATUS-state traffic is fully typed; no Artemis check subscribes to it.</span></p>
+<p class="impl-meta" style="font-size:0.75rem"><span><strong>Source:</strong> artemisac-artemis-minecraft-anticheat — ac.artemis.packet.spigot/src/main/java/cc/ghast/packet/wrapper/packet/status/PacketStatusServerInfoServer.java</span></p>
+<div class="impl-code-wrap collapsed"><div class="impl-code"><code>// ===== FILE: artemisac-artemis-minecraft-anticheat — ac.artemis.packet.spigot/src/main/java/cc/ghast/packet/wrapper/packet/status/PacketStatusServerInfoServer.java =====
+package cc.ghast.packet.wrapper.packet.status;
+
+import ac.artemis.packet.protocol.ProtocolVersion;
+import cc.ghast.packet.buffer.ProtocolByteBuf;
+import ac.artemis.packet.spigot.wrappers.GPacket;
+import cc.ghast.packet.wrapper.packet.ReadableBuffer;
+
+import java.util.UUID;
+
+public class PacketStatusServerInfoServer extends GPacket implements ReadableBuffer {
+
+    public PacketStatusServerInfoServer(UUID player, ProtocolVersion version) {
+        super("PacketStatusOutInfoServer", player, version);
+    }
+
+
+    @Override
+    public void read(ProtocolByteBuf byteBuf) {
+
+    }
+}
+
+// NOTE (AI): The wrapper is registry plumbing. Artemis never reads the JSON payload of this packet in any check.</code></div><button class="code-expand-btn" onclick="var w=this.parentNode;w.classList.toggle('collapsed');w.classList.toggle('expanded');this.querySelector('.expand-label').textContent=w.classList.contains('collapsed')?'Show more':'Show less'"><svg class="expand-icon-collapsed" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg><svg class="expand-icon-expanded" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="18 15 12 9 6 15"/></svg><span class="expand-label">Show more</span></button></div>
+<div class="impl-meta" style="margin-top:4px"><span><strong>Variations:</strong> Negativity's PacketType lists SERVER_INFO ("OutServerInfo") alongside its proxy-side ServerInfo model, and NoCheatPlus carries deprecated PROTECT_CLIENTS_MOTD_ACTIVE and PROTECT_CLIENTS_MOTD_ALLOWALL constants in ConfPaths. Neither inspects the response.</span></div>
+</div>
+</div>
+<div class="detail-section"><h3>Related Packets</h3><div class="related-list">
+<a class="related-chip" href="../C00PacketServerQuery/">C00PacketServerQuery</a>
+<a class="related-chip" href="../C01PacketPing/">C01PacketPing</a>
+<a class="related-chip" href="../S01PacketPong/">S01PacketPong</a>
+</div></div>
     </div>
     <div style="margin-top:32px;text-align:center">
       <a href="../../" style="color:var(--accent);font-size:0.85rem">← Back to all packets</a>
