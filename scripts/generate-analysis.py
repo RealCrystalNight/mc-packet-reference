@@ -25,7 +25,9 @@ Usage:
 """
 import json
 import os
+import re
 import sys
+import time
 import urllib.parse
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -191,6 +193,18 @@ def render_page(a, analyses):
         packets_html = '<div class="detail-section"><h3>Packets This Module Uses</h3><div class="related-list">' + chips + '</div></div>'
     sections_html = "".join('<h4>' + esc(s["h"]) + '</h4>' + render_prose(s["p"]) for s in a.get("sections", []))
     total_lines = sum(f["lines"] for f in a["files"])
+    # dates for article structured data: data-file mtime (modified), git first commit (published)
+    import subprocess as _sp
+    data_path = os.path.join(DATA, a["slug"] + ".json")
+    mod_date = time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(data_path)))
+    pub_date = mod_date
+    try:
+        _d = _sp.run(["git", "log", "--diff-filter=A", "--format=%cI", "-1", "--", "data/analysis/%s.json" % a["slug"]],
+                     cwd=BASE, capture_output=True, text=True, timeout=10).stdout.strip()
+        if _d:
+            pub_date = _d[:10]
+    except Exception:
+        pass
     # every file box: viewer + explanation section below the code
     file_blocks = []
     for f in a["files"]:
@@ -227,6 +241,10 @@ def render_page(a, analyses):
 <meta name="theme-color" content="#0a0a0a">
 <link rel="canonical" href="%s/analysis/%s/%s.html">
 <meta property="og:title" content="%s %s \u2014 Full Source Analysis">
+<meta property="og:locale" content="en_US">
+<meta property="article:published_time" content="%s">
+<meta property="article:modified_time" content="%s">
+<meta name="keywords" content="Minecraft, 1.8.9, %s, %s, module, packet, anticheat, analysis, source code">
 <meta property="og:type" content="article">
 <meta property="og:url" content="%s/analysis/%s/%s.html">
 <meta property="og:image" content="%s/assets/og-image.png">
@@ -238,7 +256,10 @@ def render_page(a, analyses):
 <link rel="stylesheet" href="../../assets/github-dark.min.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"%s %s \u2014 Full Source Analysis","description":"%s","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"%s/analysis/%s/%s.html"},"author":{"@type":"Organization","name":"MC Packet Reference"},"publisher":{"@type":"Organization","name":"MC Packet Reference"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"}}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"%s %s \u2014 Full Source Analysis","description":"%s","datePublished":"%s","dateModified":"%s","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"%s/analysis/%s/%s.html"},"author":{"@type":"Organization","name":"MC Packet Reference"},"publisher":{"@type":"Organization","name":"MC Packet Reference"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"}}
+</script>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"%s/"},{"@type":"ListItem","position":2,"name":"Module Analysis","item":"%s/analysis/"},{"@type":"ListItem","position":3,"name":"%s %s","item":"%s/analysis/%s/%s.html"}]}
 </script>
 <style>
 .analysis-body h4 { font-size:0.82rem; font-weight:600; color:var(--text-primary); margin:18px 0 6px; text-transform:uppercase; letter-spacing:0.04em; }
@@ -339,11 +360,12 @@ def render_page(a, analyses):
 </html>""" % (
         esc(a["client"]), esc(a["module"]), esc(meta_desc),
         SITE, a["category"], a["slug"],
-        esc(a["client"]), esc(a["module"]),
+        esc(a["client"]), esc(a["module"]), pub_date, mod_date, esc(a["client"]), esc(a["module"]),
         SITE, a["category"], a["slug"],
         SITE,
-        esc(a["client"]), esc(a["module"]), esc(meta_desc),
+        esc(a["client"]), esc(a["module"]), esc(meta_desc), pub_date, mod_date,
         SITE, a["category"], a["slug"],
+        SITE, SITE, esc(a["client"]), esc(a["module"]), SITE, a["category"], a["slug"],
         sidebar,
         esc(a["client"]), esc(a["module"]),
         len(a["files"]), total_lines,
@@ -393,7 +415,7 @@ def main():
 
     hub = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "analysis-hub-template.html"), encoding="utf-8").read()
     with open(os.path.join(OUT, "index.html"), "w", encoding="utf-8") as f:
-        f.write(hub % (SITE, SITE, SITE, build_sidebar(all_analyses, None, "hub"), render_hub(all_analyses)))
+        f.write(hub % (SITE, SITE, SITE, SITE, build_sidebar(all_analyses, None, "hub"), render_hub(all_analyses)))
     print("wrote analysis/index.html")
 
 

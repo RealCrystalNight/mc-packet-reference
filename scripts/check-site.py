@@ -123,6 +123,20 @@ if os.path.isdir(an_data):
                               % (slug, f["rel"], len(missing_lines)))
         if "annotation" in json.dumps(data).lower():
             errors.append("%s: stale annotation fields present" % slug)
+        # analysis-page SEO invariants: breadcrumbs, dates, valid schema.org JSON-LD
+        if "BreadcrumbList" not in ph:
+            errors.append("%s: missing BreadcrumbList JSON-LD" % slug)
+        if "article:published_time" not in ph:
+            errors.append("%s: missing article dates" % slug)
+        if "https://***@type" in ph or "https://***" in ph:
+            errors.append("%s: malformed JSON-LD context" % slug)
+        for m in re.finditer(r'<script type="application/ld\+json">\n(.*?)\n</script>', ph, re.S):
+            try:
+                dd = json.loads(m.group(1))
+                if dd.get("@context") != "https://schema.org":
+                    errors.append("%s: JSON-LD context not schema.org" % slug)
+            except Exception:
+                errors.append("%s: invalid JSON-LD block" % slug)
         # countering anticheat checks: every entry must exist in the AC root and
         # appear in the page with a real explanation
         for c in data.get("countering", []):
