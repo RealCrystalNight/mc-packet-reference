@@ -33,8 +33,20 @@ DATA = os.path.join(BASE, "data", "analysis")
 OUT = os.path.join(BASE, "analysis")
 DEFAULT_SOURCES = os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "sources"))
 SOURCES_ROOT = os.environ.get("SOURCES_ROOT") or DEFAULT_SOURCES
+DEFAULT_AC_ROOT = os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "anticheats"))
+AC_ROOT = os.environ.get("AC_ROOT") or DEFAULT_AC_ROOT
 SITE = "https://realcrystalnight.github.io/mc-packet-reference"
 GH_BASE = "https://github.com/iroot3/mc-client-sources/blob/main/sources"
+
+# anticheat dir name -> github repo (from the anticheat manifest)
+AC_REPOS = {}
+try:
+    for entry in json.load(open(os.path.join(AC_ROOT, "manifest.json"))):
+        g = entry.get("github", "")
+        if g:
+            AC_REPOS[g.replace("/", "-")] = g
+except Exception:
+    pass
 
 
 def esc(s):
@@ -70,6 +82,20 @@ def load_analyses(targets=None):
                 f["code"] = fh.read()
             f["lines"] = f["code"].count("\n") + (0 if f["code"].endswith("\n") else 1)
             f["gh_url"] = gh_url(a["client"], f["rel"])
+        # countering anticheat checks: ac dir + rel path inside the AC repo
+        countering = []
+        for c in a.get("countering", []):
+            cpath = os.path.join(AC_ROOT, c["ac"], c["rel"])
+            if not os.path.isfile(cpath):
+                print("WARN %s: countering file missing: %s" % (slug, cpath), file=sys.stderr)
+                continue
+            with open(cpath, encoding="utf-8", errors="replace") as fh:
+                c["code"] = fh.read()
+            c["lines"] = c["code"].count("\n") + (0 if c["code"].endswith("\n") else 1)
+            repo = AC_REPOS.get(c["ac"])
+            c["repo_url"] = "https://github.com/" + repo if repo else None
+            countering.append(c)
+        a["countering"] = countering
         out.append(a)
     return out
 
@@ -119,7 +145,7 @@ def render_prose(s):
     return "".join("<p>%s</p>" % esc(p.strip()) for p in s.split("\n\n") if p.strip())
 
 
-def render_viewer(f):
+def render_viewer(f, ac_repo=None):
     rows = []
     lines = f["code"].rstrip("\n").split("\n")
     for i, line in enumerate(lines, 1):
@@ -131,12 +157,16 @@ def render_viewer(f):
     # file made it into the page; <textarea> content is RCDATA, so Java code
     # cannot break out of it
     raw = '<textarea class="cv-raw" hidden>%s</textarea>' % f["code"].rstrip("\n")
+    if ac_repo:
+        link = '<a class="cv-link" href="' + ac_repo + '" target="_blank" rel="noopener">Repo \u2197</a>'
+    else:
+        link = '<a class="cv-link" href="' + f["gh_url"] + '" target="_blank" rel="noopener">Original \u2197</a>'
     return ('<div class="code-viewer" id="codeViewer">'
             '<div class="cv-toolbar">'
             '<span class="cv-file">' + esc(f["rel"].split("/")[-1]) + '</span>'
             '<span class="cv-meta">' + str(f["lines"]) + ' lines \u00b7 Java</span>'
             '<button class="cv-copy" data-copy="%d">Copy</button>'
-            '<a class="cv-link" href="' + f["gh_url"] + '" target="_blank" rel="noopener">Original \u2197</a>'
+            + link +
             '</div>'
             '<div class="cv-body"><table class="cv-table" id="cvTable">' + "\n".join(rows) + '</table></div>'
             + raw
@@ -161,6 +191,22 @@ def render_page(a, analyses):
                            (('<h4>What this file does</h4>' + render_prose(f["explanation"])) if f.get("explanation") else "")
                            + '</div>')
     files_html = "\n".join(file_blocks)
+    # countering anticheat checks: full AC source that counteracts the module
+    counter_blocks = []
+    for c in a.get("countering", []):
+        counter_blocks.append('<div class="detail-section file-section ac-section">'
+                              '<h3><span class="file-badge ac">anticheat</span> ' + esc(c["label"]) + '</h3>'
+                              + render_viewer(c, c.get("repo_url")) +
+                              (('<h4>How it counteracts this module</h4>' + render_prose(c["explanation"])) if c.get("explanation") else "")
+                              + '</div>')
+    counter_html = ""
+    if counter_blocks:
+        counter_html = ('<div class="detail-section">'
+                        '<h3><span class="file-badge ac">anticheat</span> Countering Checks</h3>'
+                        '<p style="font-size:0.85rem;color:var(--text-secondary);line-height:1.65;margin-bottom:12px">'
+                        'The anticheat code that detects or counters the techniques this module uses. Full source, '
+                        'with the detection mechanism explained below each box.</p></div>'
+                        + "\n".join(counter_blocks))
     return """<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
@@ -191,6 +237,8 @@ def render_page(a, analyses):
 .file-section h4 { font-size:0.82rem; font-weight:600; color:var(--accent); margin:14px 0 6px; text-transform:uppercase; letter-spacing:0.04em; }
 .file-section p { font-size:0.87rem; color:var(--text-secondary); line-height:1.7; margin-bottom:10px; }
 .file-badge { font-size:0.6rem; background:var(--accent-dim); color:var(--accent); padding:1px 6px; border-radius:4px; font-weight:600; text-transform:uppercase; vertical-align:middle; }
+.file-badge.ac { background:var(--red-dim); color:var(--red); }
+.ac-section h3 { color:var(--red); }
 .code-viewer { border:1px solid var(--border); border-radius:var(--radius-sm); overflow:hidden; margin:12px 0; background:#0d1117; }
 .cv-toolbar { display:flex; align-items:center; gap:12px; padding:8px 14px; background:#161b22; border-bottom:1px solid var(--border); font-size:0.78rem; }
 .cv-file { font-family:var(--font-mono); color:var(--text-primary); font-weight:600; }
@@ -240,6 +288,7 @@ def render_page(a, analyses):
       <h4>Overview</h4>%s
       %s
     </div>
+    %s
     %s
     <div style="margin-top:32px;text-align:center">
       <a href="../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to Analysis Hub</a>
@@ -294,6 +343,7 @@ def render_page(a, analyses):
         packets_html,
         render_prose(a["overview"]), sections_html,
         files_html,
+        counter_html,
     )
 
 

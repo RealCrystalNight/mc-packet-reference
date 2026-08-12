@@ -123,6 +123,22 @@ if os.path.isdir(an_data):
                               % (slug, f["rel"], len(missing_lines)))
         if "annotation" in json.dumps(data).lower():
             errors.append("%s: stale annotation fields present" % slug)
+        # countering anticheat checks: every entry must exist in the AC root and
+        # appear in the page with a real explanation
+        for c in data.get("countering", []):
+            if not c.get("explanation") or len(c["explanation"]) < 60:
+                errors.append("%s: countering '%s' missing real explanation" % (slug, c.get("label")))
+            ac_src = os.path.join(
+                os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "anticheats")),
+                c.get("ac", ""), c.get("rel", ""))
+            if not os.path.isfile(ac_src):
+                errors.append("%s: countering file not found: %s" % (slug, ac_src))
+                continue
+            if "Countering Checks" not in ph:
+                errors.append("%s: missing Countering Checks section" % slug)
+            raw = open(ac_src, encoding="utf-8", errors="replace").read().rstrip("\n")
+            if raw not in ph:
+                errors.append("%s: countering file '%s' code not present in page" % (slug, c.get("rel")))
     for asset in ["assets/highlight.min.js", "assets/github-dark.min.css"]:
         if not os.path.exists(os.path.join(BASE, asset)):
             errors.append("missing %s" % asset)
