@@ -477,7 +477,27 @@ function main() {
     + '</body>\n</html>';
   fs.writeFileSync(path.join(path.join(BASE, 'packets'), 'index.html'), packetsIndex);
 
-  console.log('Generated ' + allPkts.length + ' standalone packet pages + module index (' + modNames.length + ' modules) + packet listing + sitemap');
+  // ============================================================
+  // Inject static packet links into the home page (crawlability:
+  // works for crawlers that do not execute JavaScript)
+  // ============================================================
+  const homePath = path.join(BASE, 'index.html');
+  let home = fs.readFileSync(homePath, 'utf8');
+  const staticLinks = GROUPS.map(function(g) {
+    const pkts = allPkts.filter(function(p) { return p.state === g.state && p.dir === g.dir; });
+    if (!pkts.length) return '';
+    return '<div class="overview-section"><h3 style="font-size:0.85rem;font-weight:600;margin:14px 0 8px;color:var(--text-primary)">' + g.label + '</h3>'
+      + '<div class="static-packet-links">'
+      + pkts.map(function(p) { return '<a class="static-packet-link" href="packets/' + p.id + '/">' + p.id + '</a>'; }).join('')
+      + '</div></div>';
+  }).join('');
+  const block = '<div class="detail-section" id="staticPacketIndex">' + staticLinks + '</div>';
+  if (home.indexOf('<!-- PACKET_LINKS -->') !== -1) {
+    home = home.replace('<!-- PACKET_LINKS -->', block);
+    fs.writeFileSync(homePath, home);
+  }
+
+  console.log('Generated ' + allPkts.length + ' standalone packet pages + module index (' + modNames.length + ' modules) + packet listing + static home links + sitemap');
 }
 
 main();
