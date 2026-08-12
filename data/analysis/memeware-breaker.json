@@ -1,0 +1,62 @@
+{
+  "module": "Breaker",
+  "client": "Memeware 7.3",
+  "category": "breaker",
+  "source_rel": "me/memewaredevs/client/module/misc/Breaker.java",
+  "overview": "Breaker, registered in the module list under the display name BlockFucker, is a C07 dig-packet spammer: every UpdateEvent it scans a 10 by 10 by 10 block cube around the player and, for every cake or end stone inside, sends a START_DESTROY_BLOCK followed immediately by STOP_DESTROY_BLOCK, both with the facing hardcoded to north. The packets go out through PacketUtil.sendPacketSilent, which writes straight to the NetworkManager and bypasses the client event bus. The Target Blocks selection and the Cake Check toggle are registered but never read; the handler is hardcoded to cake and end stone, and the breakBlock, pickaxeSlot, cakeBesideOrAt and cakeCovered helpers are dead code.",
+  "sections": [
+    {
+      "h": "Scan and emission",
+      "p": "The triple loop runs x from -5 to 4, y from 5 down to -4, and z from -5 to 4 relative to the player's block position, up to 1000 lookups per tick. Every block that is exactly Blocks.cake or Blocks.end_stone gets the START/STOP pair in the same tick with EnumFacing.NORTH, so a dense cake field emits two C07 packets per target per tick with no swing, no tool switch, and no facing that matches where the block actually sits."
+    },
+    {
+      "h": "Dead settings and dead helpers",
+      "p": "The constructor registers a Target Blocks BlockSelectionSetting with cake, bed, wool and end stone defaults, but the handler never reads it: it fetches the setting object and then ignores it, testing the hardcoded pair instead. Cake Check is registered and never consulted. The private helpers breakBlock, pickaxeSlot, cakeBesideOrAt and cakeCovered implement a more careful breaker that never runs; pickaxeSlot even returns -10 as a sentinel. The shipped behavior is the bare cube scan, which means the module breaks blocks it is not looking at, never faces them, and never swings."
+    },
+    {
+      "h": "Silent send path",
+      "p": "PacketUtil.sendPacketSilent calls mc.getNetHandler().getNetworkManager().sendPacket(packet), the same direct path the vanilla NetworkManager uses for queued traffic. Because it does not go through addToSendQueue or the client's packet event bus, no module that hooks outgoing packets (anti-bot filters, packet cancels) sees the dig stream, and the module cannot be throttled or filtered by its own client. The START/STOP pair is the module's entire wire footprint: no C0A swings accompany any dig."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging"
+  ],
+  "files": [
+    {
+      "label": "Breaker.java",
+      "rel": "me/memewaredevs/client/module/misc/Breaker.java",
+      "explanation": "The module file shows both the shipped behavior and the abandoned design. The UpdateEvent handler contains the live logic: the triple scan loop, the hardcoded cake and end stone test, and the two sendPacketSilent calls that emit the START/STOP pair with EnumFacing.NORTH. The constructor registers Target Blocks and Cake Check, which the handler never consults, and the four private helpers below the handler are unreachable dead code. The module constructs with the display name BlockFucker under the misc category and no key binding."
+    },
+    {
+      "label": "PacketUtil.java (silent send)",
+      "rel": "me/memewaredevs/client/util/packet/PacketUtil.java",
+      "explanation": "PacketUtil is the two-line send wrapper the module uses for every C07. sendPacketSilent resolves the player's NetworkManager through the net handler and calls sendPacket directly, which is why the dig stream bypasses addToSendQueue and the client event bus; sendPacket is the normal queued path used elsewhere in the client. The distinction matters because the silent path keeps the Breaker's traffic invisible to the client's own packet hooks, so no other module can filter or react to the dig stream."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastBreak (zero-duration digs)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/FastBreak.java",
+      "explanation": "FastBreak runs inside BlockBreakListener.onBlockBreak, so it only sees digs that end in a real harvest, which is the module's whole purpose. The check computes the expected breaking time from the block's hardness (round of getBreakingDuration times fastBreakModSurvival over 100) and compares it with the elapsed time since the first damage packet. The module's START/STOP pair in one tick presents an elapsed time of a few milliseconds against cake's roughly 750ms and end stone's roughly 1.2 second expectations when dug by hand, so every harvest adds a missingTime penalty of about 740 to 1190ms to the fastBreakPenalties bucket.\n\nThe bucket tolerates a grace of 2000ms of accumulated missing time (fastBreakGrace default) before the violation tier triggers, so isolated breaks pass. A cake farm with several cakes in the cube harvests dozens of blocks per second and exhausts the grace in a fraction of a second; after that, every pair adds to the violation. The honest caveat is the event path: servers or plugins that reject the instant dig never fire BlockBreakEvent, and on those setups this check (and the other NCP blockbreak checks) stays silent while packet-level checks elsewhere in the stack are the ones that see the stream."
+    },
+    {
+      "label": "NoSwing (digs without arm movement)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/NoSwing.java",
+      "explanation": "NCP requires one arm swing between breaks. NoSwing increments a per-player counter on every break check and decrements it when a PlayerAnimationEvent (a C0A swing) arrives; a counter above 1 at break time is a violation, otherwise the violation level decays. The module never sends a swing, so the counter climbs on every consecutive harvest and the check flags the second break onward, adding 1 to noSwingVL per pair.\n\nBecause the scan emits pairs for every cake and end stone in the cube each tick, consecutive harvests are guaranteed whenever two or more targets exist, and even a single target produces back-to-back flags once a second sweep lands in the same tick window. The check counts swings and breaks only, so the silent send path does not hide it."
+    },
+    {
+      "label": "Direction (facing of the clicked face)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/Direction.java",
+      "explanation": "The module claims EnumFacing.NORTH for every dig regardless of where the block sits relative to the player. NCP's direction check computes the distance between the clicked face and the ray cast from the player's eye position along the current look direction, and accumulates that distance into directionVL, decaying it by 0.9 per event when the ray does hit the claimed face. A block above, below, or behind the player with a NORTH claim fails the ray test by the full face-to-ray distance.\n\nOnly a block whose north face happens to intersect the player's current view ray passes, which for a fixed facing means exactly the thin slice directly north of the eye. Every other harvest in the cube adds its face-to-ray distance to the violation, and with the per-tick multi-block emission the accumulation is effectively continuous. The check runs from the same BlockBreakEvent path, so it shares the caveat that a server rejecting the instant dig sees nothing."
+    },
+    {
+      "label": "Reach (dig distance)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/Reach.java",
+      "explanation": "NCP blockbreak Reach enforces a survival interaction distance of 5.2 blocks from the eye to the block (5.6 in creative). The scan's wide offsets put many targets past that bound: a block four blocks out on x and z at eye level measures about 5.7 blocks, and the far corners with a vertical offset of 4 reach 6.1 to 6.6 blocks from an eye at 1.62. Each out-of-range harvest adds the excess (distance minus 5.2) to reachVL, with the level decaying by 0.9 on in-range breaks.\n\nThe reach profile is therefore a function of where the targets sit: cakes at the scan edge are always violations, cakes close to the player pass. A bedwars or cake-farm setup where the target clusters sit several blocks away produces a steady violation stream, and the first tier of the default actions cancels the break once the level crosses its threshold. Like the other blockbreak checks, it fires on real harvests, so the module's own function, breaking the blocks, is what exposes it."
+    }
+  ]
+}

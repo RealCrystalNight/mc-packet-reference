@@ -1,0 +1,56 @@
+{
+  "module": "Step",
+  "client": "Sigma 4.11",
+  "category": "step",
+  "source_rel": "info/sigmaclient/module/impl/movement/Step.java",
+  "overview": "Sigma 4.11's Step is a four-mode step-height module built on the EventStep pre/post phase contract. NCP mode (default) raises the client step height to the NCP Height setting (2.5 default) and, once the bounding box actually climbs, injects staged C04PacketPlayerPosition ladders with onGround false whose offsets scale with the measured rise, then drops the client timer for the next step cycle. Vanilla and Cubecraft modes only set the step height (Cubecraft adds a 60ms jump-cancel window and a single C04); AAC mode runs its own decaying offset ladder with a slower timer. Every packet mode emits C03-family positions only, never a modified movement delta, and the module reads the actual climb height from the bounding box before choosing a ladder.",
+  "sections": [
+    {
+      "h": "Modes and settings",
+      "p": "The constructor registers four mode strings (NCP, Vanilla, AAC, Cubecraft), a shared Step Height setting for Vanilla and Cubecraft (default 2, increment 0.5, range 1 to 10), the NCP Height setting (default 2.5, capped at 2.5), the NCP timer (default 0.37, range 0.2 to 1) and a step delay (default 0.5 seconds). The registered suffix tracks the selected mode. The delay gates every step attempt through a Sigma Timer, and the module skips the whole mechanism while the player is in liquid. The vanilla step-height abuse is the fallback: set the height and let the client physics climb."
+    },
+    {
+      "h": "Phase contract and packet ladders",
+      "p": "EventStep fires twice per climb. In the pre phase the module grants es.setStepHeight(stepValue) only when the player is collided vertically, is not holding jump, and the delay timer has elapsed; this is what lets the client physically climb 2.5 blocks. In the post phase it measures rheight as the bounding box minY minus posY and proceeds only when that is at least 0.625. For climbs under 1.1 blocks NCP mode sends two C04s at +0.42 (the vanilla epsilon 0.41999998688698) and +0.75, scaled by the height and clamped to 0.425 and 0.78 with a 0.49 floor. Climbs from 1.1 to 1.6 send five cumulative offsets, 1.6 to 2.1 send eight absolute offsets, and anything above 2.1 sends ten, all with onGround false. The offsets are chosen so each individual C04 delta stays under per-move step thresholds while the merged climb covers the full height. If Killaura is mid-setup-tick with minis or hminis criticals enabled, the post phase additionally queues a C06PacketPlayerPosLook claiming onGround true so the packet crits can register a grounded attack."
+    },
+    {
+      "h": "Timer and jump interplay",
+      "p": "After a successful NCP-mode step the module drops mc.timer.timerSpeed to the TIMER setting (0.37 default), reduced further by a height-proportional term when the climb is a block or more, with a hard floor of 0.05, and arms the resetTimer flag so the next step pre-phase restores timerSpeed to 1. The slow playback stretches the client's subsequent ticks so the reported positions converge without a visible spike. Cubecraft mode uses the same pattern with a 0.6 or 0.3 timer, and AAC mode uses 0.5 or a height-scaled value. The Cubecraft mode also cancels EventJump within 60ms of the last step (lastStep timer), which suppresses the vanilla jump that would otherwise interfere with the next climb, and the AAC ladder adds a forward nudge at its apex by projecting the movement input 0.3 blocks along the yaw."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Step.java (module)",
+      "rel": "info/sigmaclient/module/impl/movement/Step.java",
+      "explanation": "The whole module is this file. The EventStep handler is the only logic: the pre phase grants the configured step height through the event, the post phase measures the real climb from the bounding box and dispatches to ncpStep, cubeStep or aacStep, each of which queues C04PacketPlayerPosition packets with onGround false through the vanilla send queue. The ladder choice depends on the measured height: two scaled offsets under 1.1, five cumulative offsets under 1.6, eight absolute offsets under 2.1, ten above. The EventJump handler cancels the vanilla jump inside the Cubecraft 60ms window, and the Killaura interplay queues an onGround-true C06 for minis criticals.\\n\\nThe timer management is split across the phases: the post phase drops timerSpeed to the setting (floor 0.05) and sets resetTimer, and the next pre phase restores it to 1. onDisable restores timerSpeed unconditionally. The imports of BlockUtils, MoveUtils and ChatUtil are unused in this snapshot; the module's only external helper is PlayerUtil.isInLiquid, which gates the whole mechanism."
+    },
+    {
+      "label": "EventStep.java (phase carrier)",
+      "rel": "info/sigmaclient/event/impl/EventStep.java",
+      "explanation": "EventStep is the event object the module lives on. The client's movement hook fires it twice per step attempt: fire(true, stepHeight) marks the pre phase and fire(false, stepHeight) the post phase, with stepHeight carrying the height the physics engine is about to climb. The pre/post flag is the isPre() read the module switches on, and setStepHeight and setActive are the write side: mutating stepHeight before the event returns is what actually changes the client's step behavior, because the hook reads the field back after firing.\\n\\nThe module relies on this mutation contract for both of its tricks. The pre-phase setStepHeight(2.5) makes the vanilla physics climb 2.5 blocks in one move, and the post phase's realHeight read (the bounding-box delta) tells the module which packet ladder to send. Without this file the phase semantics, especially that the pre-phase height write is authoritative for the climb, would be invisible in the module source."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (step envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly's vDistRel grants the step envelope only through isStepUpByNCPDefinition: a move qualifies as a step when both endpoints are grounded per NCP's own block ray trace (never the packet flag) and the y-distance is at most the configured sfStepHeight (0.6 by default for 1.8 players), or when NCP's collide-based couldStepUp simulation reproduces the climb. The module's injected C04s claim onGround false, so they cannot enter the envelope at all; the +0.42 move is only forgiven when a real jump was registered in the previous move, and a step-up is not a jump.\\n\\nWhen the ladders are folded into the tick's merged move, the ground-to-ground climb of 0.625 to 2.5 blocks dwarfs the 0.6 step bound, the envelope fails, and vDistRel measures the rise against the gravity model: yDistanceAboveLimit lands near the climb height and the (max(hdist, 0) + max(ydist, 0)) * 100 violation fires with a set-back. The staged offsets do not help because the check evaluates the merged move, not each C04 in isolation, and the 0.37 timer only slows the client; it does not change what the merged move contains. The minis-criticals C06 that claims onGround true is equally ignored: NCP ray-traces the claimed spot."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts every serverbound move packet into morePacketsFreq, an ActionFrequency with 500ms buckets, and scores the window against cc.morePacketsEPSMax (22/s, 20 ideal) with a burst path on the newest half-second bucket (15 packets, 10 direct-violation). Each NCP-mode step injects two C04s, and tall climbs inject five, eight or ten on top of the regular move in the same tick. On flat ground the 20/s baseline leaves headroom, but a staircase or a sequence of full climbs, one step every one or two ticks, turns the sustained rate into 40 to 60 serverbound packets per second, blowing through the 22/s window and tripping the burst path on the first concentrated climb.\\n\\nBecause the check is content-blind, the staged offsets and the onGround false flags provide no cover: the count is the count. The timer slowdown does not reduce the number of packets sent per climb either, and the AAC mode's forward-nudge C04 at the apex adds one more packet per tall step. The only configuration that keeps the rate down is short, infrequent climbs at the default delay."
+    },
+    {
+      "label": "Step (grounded vertical bound)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Step.java",
+      "explanation": "Hawk's Step check examines moves where the client and Hawk both consider the player on the ground and Hawk's own step test says the move is not a step, then flags any dY above 0.6 or below -0.0784 with punishAndTryRubberband. Hawk's testStep (MoveEvent) rejects a candidate step as soon as the climbed block top is more than 0.6 above the previous Y, so a 0.625 to 2.5 climb is never a step for Hawk. The module's intermediate C04s escape the guard because they claim onGround false and the check returns early when the client does not claim ground, but the C03 that carries the player's real position, the one-tick ground-to-ground rise, has both sides grounded, is not a step, and exceeds the 0.6 bound, so the check fires and rubber-bands the player to the server position.\\n\\nThe Vanilla and Cubecraft stepHeight abuse fails the same way: any rise above 0.6 with both sides grounded and no accepted step is a violation, and the 60ms jump-cancel window does not touch Hawk's move-level check. The honest gap is the same one every step module shares: a sub-0.6 climb (the scaled ladder under the 0.49 floor region) stays inside the bound, which is why the module's height settings default far above it."
+    }
+  ]
+}

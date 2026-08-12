@@ -1,0 +1,62 @@
+{
+  "module": "FastPlace",
+  "client": "LiquidSense Dev",
+  "category": "fastplace",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/world/FastPlace.kt",
+  "overview": "LiquidSense Dev's FastPlace is a value holder whose consumption lives in the client's Minecraft mixin. The module class carries a single IntegerValue named Speed (default 0, range 0 to 4) and no logic of its own; MixinMinecraft shadows the vanilla rightClickDelayTimer field and injects into rightClickMouse immediately after vanilla writes its 4-tick cooldown, overwriting the timer with the module's speed value whenever the module is enabled. At speed 0 the timer reads zero after every right-click, so the run-tick held-use gate passes every tick and a held right click fires at the 20 per second tick rate; at higher speeds the timer is only clamped down to the configured value.",
+  "sections": [
+    {
+      "h": "The holder",
+      "p": "The module is 16 lines: the ModuleInfo declaration under ModuleCategory.WORLD and a single IntegerValue field, speedValue, with name 'Speed', default 0 and range 0 to 4. There is no onEnable, no event handler and no packet code. LiquidBounce modules of this era defer their behavior to the mixin layer, and FastPlace is the canonical example: the value is read from the module object by name (LiquidBounce.moduleManager.getModule(FastPlace.class)) at the injection site, so the module file itself is only the setting surface."
+    },
+    {
+      "h": "The mixin injection",
+      "p": "MixinMinecraft declares a shadow field for the vanilla rightClickDelayTimer, and an injection on rightClickMouse targeting the FIELD write to that field with shift AFTER runs the replacement logic at the exact point vanilla has just stored its 4-tick cooldown. The injected body registers the click with the CPSCounter, looks up the FastPlace module, and when the module state is enabled writes rightClickDelayTimer = fastPlace.getSpeedValue().get(), so every click action carries the reduced timer instead of 4.\n\nVanilla's gate then does the rest: the run-tick loop decrements the timer once per tick and only fires the held-use branch while it reads exactly 0. With the value at 0, each tick's poll passes and a held right click fires every tick (20 per second); with the value at 2, the timer drops to 2 after each click and the 2-tick wait halves the rate. The same gate and timer touchpoints are stock 1.8.9 (rightClickMouse writes 4, decrement once per tick, held-use at 0), verified in the shared MCP sources."
+    },
+    {
+      "h": "Wire effect",
+      "p": "The accelerated clicks emit a denser C08PacketPlayerBlockPlacement stream with untouched payloads: real placements carry position, facing and stack exactly like vanilla, so the only server-visible fingerprint is the inter-placement interval collapsing from the 200ms vanilla grid toward 50ms. The gate governs item use too, so the module also speeds food and bow interaction when the player holds anything else, producing the use-item C08 form (origin position, facing 255) and, for consumables, the C07 release pair."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "FastPlace.kt",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/world/FastPlace.kt",
+      "explanation": "The module is the setting surface: the ModuleInfo declaration registers it under ModuleCategory.WORLD with the description 'Allows you to place blocks faster.', and the only member is speedValue, an IntegerValue named 'Speed' with default 0 and range 0 to 4. No handler exists in the class; the value is consumed entirely by the Minecraft mixin, which reads it through LiquidBounce.moduleManager.getModule(FastPlace.class) when the module is enabled.\n\nThis is the classic LiquidBounce split: Kotlin modules are thin declarations and the Forge mixin layer carries the behavior, so the analysis of the module's effect has to follow the value into MixinMinecraft rather than stop at this file."
+    },
+    {
+      "label": "MixinMinecraft.java (the timer write)",
+      "rel": "net/ccbluex/liquidbounce/injection/forge/mixins/client/MixinMinecraft.java",
+      "explanation": "The mechanism file. Line 89 shadows the vanilla field with @Shadow public int rightClickDelayTimer, and the rightClickMouse injection (line 228) targets the FIELD write to that field with shift AFTER, so the injected code runs right after vanilla stores its 4-tick cooldown. The body registers the click with CPSCounter and, when the FastPlace module is enabled, overwrites the timer with the module's speed value (line 235).\n\nThe same mixin file carries the client's other Minecraft hooks (middleClickMouse click counting, the loadWorld event), which is why the FastPlace behavior sits in the shared Minecraft mixin rather than in the module package."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastPlace (placement-rate window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/FastPlace.java",
+      "explanation": "NCP's placement-rate check scores every real placement. BlockPlaceListener invokes FastPlace.check from the Bukkit BlockPlaceEvent path, and each invocation adds 1f into data.fastPlaceBuckets, an ActionFrequency(2, 1000) pair of half-second buckets (BlockPlaceData line 53). The window score is compared against cc.fastPlaceLimit, 15 placements per second by default, and a short-term tick counter separately caps 6 placements inside 10 ticks (fastPlaceShortTermLimit and fastPlaceShortTermTicks, lines 59-89 of the check). The violation is the larger of the two excesses, and the default actions start cancelling from vl 5 and escalate to a kick.\n\nThe mixin at speed 0 sustains up to 20 placements per second, so the window score sits above 15 and the short-term counter reaches 10 inside 10 ticks: both paths trip. The check only fires through the BlockPlaceEvent path, so the accelerated item-use C08s (facing 255, air coordinates) never reach it; the pressure lands on real block placements, which is exactly the surface the module accelerates when the player holds a block."
+    },
+    {
+      "label": "Direction (facing validation)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Direction.java",
+      "explanation": "The placement-direction check extends AbstractBlockDirectionCheck and scores the angular distance between the placement's claimed facing and the player's actual look direction, accumulating blockplace VL with a per-hit cooldown. A single placement with an honest facing passes; the check matters as the companion to the rate window because a placement stream that has to track a moving cursor forces look updates that lag the packets, and the sustained mismatch is what accumulates.\n\nStanding-still fast place is invisible to it: the module places straight ahead of the cursor with correct facings, so Direction only contributes when the accelerated stream is combined with strafing or scaffold-style placement, where the cursor moves faster than the look can follow. On its own the rate window does the real work against this module."
+    },
+    {
+      "label": "UseItemAdapter (item-use classification and release gate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "The item-use side of the accelerated stream is classified by the protocol adapter. handleBlockPlacePacket reads the C08's facing integer and, for the pre-1.9 format, treats faceIndex 5 or below as a real placement (mightUseItem set false) and anything else as a potential item use (mightUseItem set true); handleDiggingPacket stamps releaseItemTime on every RELEASE_USE_ITEM and sets isHackingRI when a second release arrives within timeBetweenRL (default 70ms) of the first. The isHackingRI flag then routes through SurvivalFly's noslow penalty path.\n\nThe mixin accelerates item use exactly like placement when the player holds anything but a block, so holding right click on food or a bow produces the use-item C08 form plus per-tick C07 releases inside the 70ms window, which trips isHackingRI from the second release. The honest boundary: with a block in hand the adapter sees the placement form and stays inert, so the placement-only configuration is countered by the rate window rather than by this adapter."
+    },
+    {
+      "label": "Reach (blockplace distance)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Reach.java",
+      "explanation": "The blockplace reach check bounds the placement distance at 5.2 blocks in survival and 5.6 in creative, measured from the eye to the center of the targeted block, and decays the violation level on every in-range placement. The module changes nothing about the player's geometry: the accelerated clicks place inside the existing interaction range, so the check constrains the module the same way it constrains a manual builder.\n\nIts role in the set is to close the geometry side: a fastplace cannot extend the placement distance, so the rate stream is bounded to whatever blocks sit within vanilla reach, and a player who stacks the fastplace with a placement-reach hack surfaces here."
+    }
+  ]
+}

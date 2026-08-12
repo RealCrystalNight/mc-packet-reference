@@ -1,0 +1,63 @@
+{
+  "module": "Timer",
+  "client": "Sigma 4.11",
+  "category": "timer",
+  "source_rel": "info/sigmaclient/module/impl/other/Timer.java",
+  "overview": "Sigma 4.11's Timer is a one-line tick-rate scaler. Every EventTick it writes the GAMESPEED setting into mc.timer.timerSpeed, and onEnable and onDisable both restore 1. The setting defaults to 0.3 with a range of 0.1 to 5 in 0.05 steps, so the module is tuned for slow motion out of the box, but the top of the range scales the whole game loop to five times the vanilla rate. Because the write is re-asserted on every tick, the movement packet stream follows the multiplier exactly.",
+  "sections": [
+    {
+      "h": "Tick-rate scaling",
+      "p": "The field is the multiplier in the fork's vanilla Timer. updateTimer() clamps the frame delta to [0, 1] and accumulates elapsedPartialTicks += frameDelta * timerSpeed * ticksPerSecond (line 99 of the Sigma fork's net/minecraft/util/Timer.java), then drains the integer part into elapsedTicks, which the main loop executes as game ticks. EventTick fires once per client tick, so the module's handler runs every tick and the write is self-correcting against any external reset of the field. A speed of 2 executes roughly 40 game ticks per real second; the 5 maximum executes about 100."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "Each accelerated tick runs the fork's EntityPlayerSP update, which fires EventUpdate and then sends one C03 variant per tick based on the position and look deltas, so the movement packet rate scales linearly with the multiplier. Keepalive echoes and transaction confirmations stay bound to the server's own S00 and S32 cadence. Because the whole loop accelerates, non-movement timers ride along too: eating, natural regen and potion durations all complete faster, which is the module's value beyond raw speed."
+    },
+    {
+      "h": "Detection surface",
+      "p": "The checks that catch a speed-up live on the C00 and C0F corpora. NCP MorePackets caps the movement packet rate at 22 per second with a 20 ideal. NCP KeepAliveFrequency keeps the keepalive echo ledger that other checks gate on. Frequency TimerA measures the inter-movement delay against the 50ms tick expectation. Grim Timer accrues 50ms of balance per movement packet against a clock anchored to the C0F transaction stream. The sub-1 default slips under the one-directional clock checks, which is exactly why the module ships at 0.3."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive",
+    "C0FPacketConfirmTransaction"
+  ],
+  "files": [
+    {
+      "label": "Timer.java",
+      "rel": "info/sigmaclient/module/impl/other/Timer.java",
+      "explanation": "The entire module is this file. The constructor registers one setting under the key GAMESPEED with default 0.3, description 'The value the mc timer will be set to.', an increment of 0.05 and a range of 0.1 to 5. onEnable and onDisable both write 1F into mc.timer.timerSpeed, and the handler registered for EventTick assigns the setting value to the field on every tick.\n\nThe module has no other state and no mode logic; it is a pure pass-through from the setting to the tick clock. The default of 0.3 makes the module a slow-motion utility on first enable, which slows the game loop enough to stretch timing-sensitive actions, and raising the setting past 1 turns it into the classic speed-up. Because the write is unconditional on every tick, the value survives any concurrent module that also touches the field only until the next EventTick."
+    },
+    {
+      "label": "Timer.java (vanilla tick clock)",
+      "rel": "net/minecraft/util/Timer.java",
+      "explanation": "This is the vanilla class the module mutates, shipped in the Sigma 4.11 fork. updateTimer() takes the system-clock delta, syncs the high-resolution clock once per second, clamps the frame delta to [0, 1], and accumulates elapsedPartialTicks += frameDelta * timerSpeed * ticksPerSecond (line 99), then moves the integer part into elapsedTicks capped at 10. The timerSpeed field is the only thing the module writes, and because the field multiplies the whole accumulation, a speed of 2 doubles the number of game ticks per real second.\n\nThe class also documents the multiplier contract the module relies on: the field comment says 0.5 makes the game run at half speed, and the constructor takes ticksPerSecond = 20, the vanilla tick rate. The 10-tick cap bounds how many ticks a single frame can produce, so extreme speeds still spread their tick debt across frames rather than bursting all at once."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts serverbound movement packets content-blind. MovingListener invokes morePackets.check on every processed move, feeding data.morePacketsFreq, an ActionFrequency with 500ms buckets (MovingData line 321), and the window accumulator compares against cc.morePacketsEPSMax, default 22 packets per second with 20 ideal (DefaultConfig lines 458-459). A second ActionFrequency(12, 5000) backs a burst path with 15 packets per half second, 10 direct-burst events and 95 burst events per minute (MovingData line 322, DefaultConfig lines 460-462), and a violation returns the morePacketsSetBack location seeded from the SurvivalFly set-back.\n\nSigma's range makes this the bluntest counter. A speed of 2 raises the C03 stream to about 40 packets per second, nearly double the ceiling, so the window accumulator runs positive and the default actions cancel at vl > 2. At the 5 maximum the stream reaches roughly 100 packets per second, which trips the half-second burst path on the first burst bucket. The sub-1 half of the range is the safe zone: 0.3 emits about 6 packets per second, far under the ideal, and the idle window burns the excess, so the default configuration is invisible to the rate check. The check never inspects position or content, so the module cannot shed rate by changing what it sends."
+    },
+    {
+      "label": "KeepAliveFrequency (keepalive echo ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java",
+      "explanation": "KeepAliveFrequency is the ledger over the C00 stream and the gate for the inter-delay timer checks. Every incoming echo is timestamped into data.keepAliveFreq, an ActionFrequency with 20 one-second buckets, the check bails while a reply is still expected unless the id is a duplicate, and a newest-bucket score above 1 flags a violation. The server issues S00 at its own cadence and the client answers each one, so a timer speed-up does not raise the echo rate by itself.\n\nThe module trips the ledger only in its failure modes: the accelerated loop can drain a batched delivery of keepalives into one tick, landing several echoes in the same second, or a reply can arrive with a duplicate or aged-out id once the request window no longer recognizes it. Its structural role for the timer family is the keepalive-accept gate on Frequency TimerA: that check refuses to run unless a keepalive was accepted for the current server tick. Sigma's Timer never touches the keepalive stream, so the ledger stays clean and the timer checks stay armed."
+    },
+    {
+      "label": "TimerA (movement delay deviation)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/timer/TimerA.java",
+      "explanation": "Frequency TimerA measures the delay between consecutive movement packets against the 50ms tick expectation. Each flying packet adds the inter-packet delay to a MovingStats(20) window, and the check runs only when the player is not exempt (TPS, teleporting, lagging) and the connection manager has an accepted keepalive for the current server tick. When the delay standard deviation stays under 7.07, the square root of the 50ms expectation, an allowance accumulates 50ms per packet minus the measured delay, and a fail fires once the allowance exceeds the floor of that threshold.\n\nA speed of 2 halves the inter-move delay to about 25ms, so every packet adds roughly 25ms to the allowance and the check fails on the first burst packet. The 5 maximum produces 10ms delays and fails just as fast. The sub-1 half of the range is the designed blind spot: 0.3 stretches delays to roughly 166ms, which drains the allowance instead of filling it, so the module's default slow motion passes this check by design. The keepalive gate is a hard dependency, so the check goes dormant if the echo stream is broken."
+    },
+    {
+      "label": "Timer (transaction-anchored balance)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java",
+      "explanation": "Grim's Timer accrues 50ms of balance for every counted movement packet and flags when the balance passes real time, cancelling the packet and running a setback. The clock is anchored to the player's transaction stream: knownPlayerClockTime is refreshed only after a movement is followed by a PONG or WINDOW_CONFIRMATION (the C0F), so ping fluctuations and server lag do not shift the baseline, and a limitFallBehind clamp holds the balance within clockDrift, default 120ms, of the player clock.\n\nAt 2x the balance accrues 50ms per packet while only 25ms of real time passes, so the surplus exceeds the 120ms drift within about five packets and the check flags immediately. The check is one-directional: a slow timer makes the balance fall behind, which the drift clamp absorbs, so the module's sub-1 range and its 0.3 default are invisible here. Standing still also stops the accrual, which is why idle periods before a speed phase do not accumulate."
+    }
+  ]
+}

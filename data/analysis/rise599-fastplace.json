@@ -1,0 +1,57 @@
+{
+  "module": "FastPlace",
+  "client": "Rise 5.99",
+  "category": "fastplace",
+  "source_rel": "dev/rise/module/impl/player/FastPlace.java",
+  "overview": "Rise 5.99's FastPlace clamps the vanilla right-click cooldown down to a configurable ceiling. On every pre-motion pass, a blocksOnly gate first requires an ItemBlock in the held hand, then the FastPlace Delay setting decides the behavior: at the default 0 the module writes mc.rightClickDelayTimer = 0 unconditionally, and above 0 it only lowers the timer when it exceeds the setting, which makes the setting a ceiling clamp rather than a fixed value. The Randomize toggle redraws the delay from RandomUtils.nextInt(0, delay), a range that can only shorten the timer and an empty range at the default delay of 0. Vanilla sets the timer to 4 at the top of rightClickMouse, decrements it once per tick, and only lets a held right click through when it reads exactly 0, so a held click fires 5 times per second at stock; pinning the timer to zero lifts sustained placements toward the 20 per second tick rate.",
+  "sections": [
+    {
+      "h": "The clamp logic",
+      "p": "The pre-motion handler reads the delay setting into a local, and the blocksOnly gate returns early unless the held item exists and is an ItemBlock, so the module defaults to placement-only. At delay 0 the timer is written to 0 every pass, which makes every tick's held-use check pass; above 0 the write only happens when mc.rightClickDelayTimer exceeds the setting, so the timer is capped at the configured ceiling but free to run below it. The Randomize toggle is the subtle part: it redraws the delay as RandomUtils.nextInt(0, delay), which at any non-zero setting produces a value in [0, delay) and therefore can only ever lower the ceiling further, and at the default setting of 0 it calls the draw with an empty range, which Apache commons-lang3 rejects with IllegalArgumentException: enabling Randomize without first raising the delay is a latent crash."
+    },
+    {
+      "h": "The vanilla gate",
+      "p": "Rise 5.99's snapshot ships only the dev tree, so the gate facts come from the shared 1.8.9 MCP sources (the Memeware fork carries the identical touchpoints). rightClickMouse opens by writing rightClickDelayTimer = 4 (line 1326), the run-tick input section decrements the timer once per tick (lines 1452-1453), and the held-use branch only invokes rightClickMouse while the timer reads exactly 0 and the player is not already using an item (line 1790). The result is a 200ms action grid: one right-click action, then a 4-tick wait. The module's write lands between the decrement and the poll, so the gate passes every tick and the inter-action wait collapses."
+    },
+    {
+      "h": "Wire effect",
+      "p": "The accelerated clicks become a denser C08PacketPlayerBlockPlacement stream. Real placements carry the targeted BlockPos, the facing, and the held stack, and the module never touches the payload, so every packet is structurally identical to a vanilla placement; the only fingerprint is timing: sustained placements collapse from the 200ms grid toward a 50ms scatter, up to 20 per second. With blocksOnly off the same gate accelerates item use (food, potions, bow pulls), which produces the use-item C08 form (origin position, facing 255) and, for food and bows, C07 release traffic that the item-use layer sees."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "FastPlace.java",
+      "rel": "dev/rise/module/impl/player/FastPlace.java",
+      "explanation": "The whole module is one pre-motion handler with three settings. blocksOnly gates the pass on an ItemBlock in the held hand, delay (default 0, range 0 to 4 in tenths) selects between the unconditional zero and the ceiling clamp, and randomize redraws the delay from RandomUtils.nextInt(0, delay) before the write. The delay-0 branch writes the timer unconditionally; the non-zero branch writes only when the timer exceeds the setting, which is what makes the setting a ceiling rather than a fixed value.\n\nThe module imports no util classes and touches no packet classes: the effect is entirely the mc.rightClickDelayTimer write. The class carries the Alan Wood 2021 copyright header shared by the Rise module family and registers under Category.PLAYER with the description 'Changes the right click delay timer'."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastPlace (placement-rate window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/FastPlace.java",
+      "explanation": "NCP's placement-rate check scores every real placement. BlockPlaceListener invokes FastPlace.check from the Bukkit BlockPlaceEvent path, and each invocation adds 1f into data.fastPlaceBuckets, an ActionFrequency(2, 1000) pair of half-second buckets (BlockPlaceData line 53). The window score is compared against cc.fastPlaceLimit, 15 placements per second by default, and a short-term tick counter separately caps 6 placements inside 10 ticks (fastPlaceShortTermLimit and fastPlaceShortTermTicks, lines 59-89 of the check). The violation is the larger of the two excesses, and the default actions start cancelling from vl 5 and escalate to a kick (cancel vl>5, log fastplace, cmdc:kickfastplace at vl>80).\n\nThe module at delay 0 sustains up to 20 placements per second, so the window score sits above 15 and the short-term counter reaches 10 inside 10 ticks: both paths trip. The check only fires through the BlockPlaceEvent path, so the accelerated item-use C08s (facing 255, air coordinates) never reach it; the pressure lands on real block placements, which is exactly the surface the module accelerates with blocksOnly on."
+    },
+    {
+      "label": "Direction (facing validation)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Direction.java",
+      "explanation": "The placement-direction check extends AbstractBlockDirectionCheck and scores the angular distance between the placement's claimed facing and the player's actual look direction, accumulating blockplace VL with a per-hit cooldown. A single placement with an honest facing passes; the check matters as the companion to the rate window because a placement stream that has to track a moving cursor forces look updates that lag the packets, and the sustained mismatch is what accumulates.\n\nStanding-still fast place is invisible to it: the module places straight ahead of the cursor with correct facings, so Direction only contributes when the accelerated stream is combined with strafing or scaffold-style placement, where the cursor moves faster than the look can follow. On its own the rate window does the real work against this module."
+    },
+    {
+      "label": "UseItemAdapter (item-use classification and release gate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "The item-use side of the accelerated stream is classified by the protocol adapter. handleBlockPlacePacket reads the C08's facing integer and, for the pre-1.9 format, treats faceIndex 5 or below as a real placement (mightUseItem set false) and anything else as a potential item use (mightUseItem set true); handleDiggingPacket stamps releaseItemTime on every RELEASE_USE_ITEM and sets isHackingRI when a second release arrives within timeBetweenRL (default 70ms) of the first. The isHackingRI flag then routes through SurvivalFly's noslow penalty path.\n\nWith blocksOnly on (the default), the module only accelerates placements, the adapter sees the placement form and stays inert, and this surface is an honest gap. With blocksOnly off, holding right click on food or a bow produces the use-item C08 form plus per-tick C07 releases inside the 70ms window, which trips isHackingRI from the second release: the accelerated item-use mode is the one configuration of the module this check does counter."
+    },
+    {
+      "label": "Reach (blockplace distance)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Reach.java",
+      "explanation": "The blockplace reach check bounds the placement distance at 5.2 blocks in survival and 5.6 in creative, measured from the eye to the center of the targeted block, and decays the violation level on every in-range placement. The module changes nothing about the player's geometry: the accelerated clicks place inside the existing interaction range, so the check constrains the module the same way it constrains a manual builder.\n\nIts role in the set is to close the geometry side: a fastplace cannot extend the placement distance, so the rate stream is bounded to whatever blocks sit within vanilla reach, and a player who stacks the fastplace with a placement-reach hack surfaces here."
+    }
+  ]
+}

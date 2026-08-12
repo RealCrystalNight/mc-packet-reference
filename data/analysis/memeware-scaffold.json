@@ -1,0 +1,65 @@
+{
+  "module": "Scaffold",
+  "client": "Memeware 7.3",
+  "category": "scaffold",
+  "source_rel": "me/memewaredevs/client/module/player/Scaffold.java",
+  "overview": "Memeware 7.3's Scaffold is a two-phase UpdateEvent consumer. The pre phase walks the inventory, refills the hotbar with a window click when it holds no block, resolves the support cell below the player and writes the aim into the pre-event yaw/pitch plus the head-model fields; the post phase fires the placement through the fork's onPlayerRightClick3d once per tick, which emits C08PacketPlayerBlockPlacement with a randomized hit vector, followed by a manually queued C0APacketAnimation. The slot switch is a raw currentItem field write, and the C09 the server expects comes only from syncCurrentPlayItem inside that fork hook, so it appears once per slot change. The tower branch re-asserts motionY 0.42 on every placement tick while the jump key is held, a re-apply pattern rather than a floor-snap, and the 75ms Timer is a one-shot latch that is never reset, so the real cadence is one C08 per tick, not the 13/s the delay value suggests.",
+  "sections": [
+    {
+      "h": "Event pipeline and cadence",
+      "p": "The fork's EntityPlayerSP.func_175161_p fires the pre UpdateEvent carrying position, rotation and ground state, then sends the C03 variant selected by the deltas, then fires the post UpdateEvent. The module's @Handler-marked consumer lambda runs both phases: the pre branch computes the aim and calls event.setYaw/setPitch, so the same tick's C03 (a C05PacketPlayerLook when stationary, a C06PacketPlayerPosLook while moving) carries the scaffold look while rotationYaw/rotationPitch stay untouched, a silent rotation; rotationYawHead, rotationPitchHead and renderYawOffset mirror the aim for the visible model. The post branch places. The placement gate is this.timer.delay(75L), and Timer.delay never resets prevMS and Scaffold never calls reset(), so after 75ms from construction the gate is permanently true and the module places on every post tick, roughly 20 C08s per second; the 75ms value only postpones the first placement. The slot scan loop that calls getStack() on slots 0-44 and discards the result is leftover code with no effect."
+    },
+    {
+      "h": "Placement and silent slot",
+      "p": "The target cell is BlockPos(posX, posY - 0.9, posZ); when it is air, ScaffoldUtils.getBlockData searches the cell below, then the four side cells, then a second ring, and returns the first support block with the EnumFacing pointing from that support into the target (UP for the below cell, EAST/WEST/SOUTH/NORTH for the sides). RotationUtils.doScaffoldRotations atan2s the delta from the eye to the target cell center and wraps it onto the current yaw/pitch, which is why the aim tracks the cell, not the clicked face. The placement itself goes through the fork's onPlayerRightClick3d, a copy of the vanilla right-click method that takes a Vec3d hit vector: it calls syncCurrentPlayItem (which sends C09PacketHeldItemChange only when the server-tracked slot diverges, i.e. once per switch), checks the world border and canPlaceBlockOnSide, then queues C08PacketPlayerBlockPlacement with the position, face index, held stack and the three face offsets from getVec3d, whose hit coordinates are randomized within +-0.305 of the face. On success the module queues C0APacketAnimation itself and restores currentItem to the old slot. When invCheck() reports no valid block in the hotbar, the module window-clicks an inventory slot onto hotbar slot 7 (mode 2), which emits C0EPacketClickWindow; the blacklist is duplicated and slightly divergent between the module and ScaffoldUtils."
+    },
+    {
+      "h": "Tower branch",
+      "p": "With the jump key held, no movement keys and no forward input, the post branch zeroes motionX and motionZ and sets motionY to 0.41999998688697815, the double widening of the float 0.42f, on every placement tick. Because the impulse is re-asserted each tick the player is airborne instead of being applied once at a ground snap, the vertical motion is a constant re-apply pattern: the first jump impulse is a normal jump, and every following re-assertion happens while the player is still airborne. There is no posY % 1 floor-snap anywhere in the module, so the player never returns to a grounded state between impulses. The tower code only runs inside the placement branch, so the vertical impulse is tied to placement ticks."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement",
+    "C09PacketHeldItemChange",
+    "C0APacketAnimation",
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Scaffold.java",
+      "rel": "me/memewaredevs/client/module/player/Scaffold.java",
+      "explanation": "The whole module in one class: the two-phase UpdateEvent consumer, the hotbar refill via windowClick, the blockBlacklist, the support search and rotation calls, the per-tick placement and the tower branch. It also shows the two bugs that shape the fingerprint: the 75ms Timer that is never reset, which makes the placement rate one C08 per tick, and the slot scan loop over slots 0-44 whose getStack() results are discarded. The @Handler-marked field holds a Consumer<UpdateEvent>, the client's event API style."
+    },
+    {
+      "label": "PlayerControllerMP.java (onPlayerRightClick3d fork)",
+      "rel": "net/minecraft/client/multiplayer/PlayerControllerMP.java",
+      "explanation": "The fork hook that turns the module's field writes into a server-visible placement. onPlayerRightClick3d (line 404) is a copy of vanilla onPlayerRightClick that accepts a Vec3d hitVec: it calls syncCurrentPlayItem at the top, which emits C09PacketHeldItemChange whenever the actual currentItem diverges from the server-tracked slot, checks the world border and canPlaceBlockOnSide, then queues C08PacketPlayerBlockPlacement with the hit position, face index, held stack and the three offset floats computed from the hitVec. Every C08 the module sends leaves through this method, so it defines both the packet emission and the C09 sync behavior."
+    }
+  ],
+  "countering": [
+    {
+      "label": "NCP blockplace Scaffold check (angle / time / sprint / rotate / tool-switch)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Scaffold.java",
+      "explanation": "NoCheatPlus's dedicated scaffold detector gates on a bridging profile in BlockPlaceListener: the placement face must be horizontal, the placed block must land 1-2 blocks below the player's previous y, be solid and sit within 2.0 blocks, so a straight tower with a DOWN face is skipped and fought by movement checks instead. The Angle sub-check compares the look direction against the placed face normal and flags above MAX_ANGLE = 90 degrees; Memeware's aim point is the center of the air cell below the player, which forces a steep downward pitch, and the angle between that look and the UP face normal of the support block exceeds 90 on essentially every placement. The Time sub-check records the placement tick whenever pitch is above 70, the player is not sneaking and has no speed potion, and flags when the average placement interval drops below scaffoldTimeAvg; the module places once per tick, so the average sits near 1 tick and the violation fires immediately, and because the module has no sneak emulation at all, the sneakTime exemption (NCP refreshes sneakTime every tick the player stays sneaking) never applies. The Sprint sub-check flags a placement within 8 ticks of sprinting with yDistance under 0.1 and jumpPhase under 4, which bites any bridge attempted mid-sprint."
+    },
+    {
+      "label": "NCP blockplace FastPlace (placement rate window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/FastPlace.java",
+      "explanation": "FastPlace scores every accepted placement into an ActionFrequency(2, 1000), two one-second buckets forming the window, and flags when the window score exceeds cc.fastPlaceLimit, with a parallel short-term counter that counts placements within fastPlaceShortTermTicks of each other. The module places once per client tick, about 20 per second at default tick rate, so each bucket collects near 20 while the limit sits far below, and the window stays over the ceiling for the whole time the module bridges. The dead 75ms Timer latch matters here: the delay value suggests a 13/s spread but never re-arms, so there is no place-delay dial lowering the score, and the module runs no timerSpeed multiplier, so the rate is exactly one C08 per tick. Because FastPlace only counts placements that pass the other blockplace checks, the cancelNextPlace chain from the Scaffold Rotate/ToolSwitch sub-checks also starves it on servers that enable those sub-checks."
+    },
+    {
+      "label": "NCP blockplace Direction (look ray vs clicked face)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Direction.java",
+      "explanation": "Direction is the angle-of-attack check: AbstractBlockDirectionCheck ray-traces from the player's eye using the server-side yaw/pitch carried by the last C03PacketPlayer against the block the player claims to have clicked, via the FlyingQueueLookBlockChecker so the look is sampled at the correct point in the movement queue, and accumulates the per-axis angular deviation into directionVL with a 0.9 per-tick decay. The interaction with Memeware's silent rotation is precise: the module writes its aim into the pre event, so the same tick's C03 carries a look at the target cell, and when the aim is fresh the ray from the server-side look passes through the clicked face and the check stays quiet. The failure modes are where the C03 rotation and the C08 face disagree: the aim is only refreshed in the pre phase of the tick that places, so a turn while bridging leaves the previous tick's look on the packet; the hitVec randomization in getVec3d never affects the server ray, which reads only the C03 look; and there is no smoothing or gcd quantization, so any client-side lag between the scan and the placement tick produces a stale look. At one placement per tick the violations accumulate faster than the 0.9 decay pulls them back."
+    },
+    {
+      "label": "NCP SurvivalFly (jump envelope vs tower)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the vertical physics envelope instead of trusting the packet: vDistRel initializes the allowed vertical distance from the previous move's momentum and only accepts named envelopes, among them the jump, which requires the move's yDistance to equal the predicted jump gain within NCP's prediction epsilon and the ground state fromOnGround && !toOnGround, with ground state read from the block cache, not the packet flag. Every credited jump arms data.jumpDelay to MAX_JUMP_DELAY = 10 ticks, so a second jump impulse inside that window is not credited and falls to the momentum prediction, where an allowed distance of a few hundredths of a block meets the module's re-asserted 0.42 yDistance, producing a yDistanceAboveLimit around 0.32 and an immediate violation of 30+ with a set-back. Memeware's tower re-applies 0.42 on every placement tick while airborne and never snaps to a block boundary, so after the first credited impulse every following one is a re-apply inside the window. The horizontal side is not the tell: flat bridging at sprint speed stays inside the horizontal envelope, and the set-back location is adjusted for scaffold-created ground, so legitimately placed columns do not cascade set-backs."
+    }
+  ]
+}

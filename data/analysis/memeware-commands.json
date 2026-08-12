@@ -1,0 +1,56 @@
+{
+  "module": "Commands",
+  "client": "Memeware 7.3",
+  "category": "commands",
+  "source_rel": "me/memewaredevs/client/module/misc/Commands.java",
+  "overview": "Memeware 7.3's Commands module is a chat-packet firewall: one LWJEB handler on the outgoing packet bus watches every C01PacketChatMessage, cancels any message whose text starts with the '.' prefix before it can reach the wire, and dispatches the stripped command word to a hardcoded switch table. The server never sees the client's command language at all - the cancellation happens on the local event bus, so commands like .vclip, .hclip, .t and .toggle are purely client-side state changes. What the server does see is the residue: .say re-sends its payload as a fresh C01 prefixed with the private-use character U+F705, and the clip commands teleport the player through the normal movement path, both of which are ordinary, legitimate-looking traffic.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The whole module is a single public field, eventConsumer0, a Consumer<PacketOutEvent> annotated with LWJEB's @Handler, so it runs synchronously for every outbound packet. The body filters on C01PacketChatMessage, splits the message on one-or-more spaces into args, and derives the command word as args[0] with every '.' removed (String.replace, not replaceFirst, so a first token like '..help' also resolves to 'help'). The 'say' boolean gate is a dead flag: it is declared false, never written anywhere, so the interception branch is always taken. Cancellation is ordered before dispatch - event.cancel() runs first, then the switch - so even a command branch that throws leaves the packet dead and the server none the wiser. The prefix is an instance field defaulting to '.', mutated only by the .prefix command itself."
+    },
+    {
+      "h": "Command dispatch",
+      "p": "The switch covers eleven commands. .bind resolves a module by name, looks up an LWJGL key index, and writes the bind into the module's key field; .help prints a hardcoded command list; .vclip and .hclip parse a double and teleport the player - vclip via setPositionAndUpdate, which immediately enqueues a position packet, hclip via setPosition, whose offset is picked up by the next movement tick; .name copies the player name to the AWT system clipboard; .t and .toggle both resolve a module by (possibly multi-word) name and call toggle(); .clientname and .clientedition rewrite the public static branding strings that other parts of the client display; .prefix changes the instance prefix. Two bugs are worth noting: .bind guards with args[2] != null, but String.split never returns null elements, so a two-token invocation throws ArrayIndexOutOfBoundsException instead of hitting the usage branch (harmless server-side because the packet was already cancelled), and the .say branch rebuilds its payload from args[1..] and re-sends it via sendChatMessage with U+F705 prepended, which is why .say output is not re-intercepted: the re-emitted message starts with the private-use character, not the dot prefix."
+    },
+    {
+      "h": "Server-visible residue",
+      "p": "From the server's point of view the module mostly does not exist: dot-prefixed chat never arrives, so no anticheat check on incoming chat can attribute .bind, .t or .prefix to the user. The leak surface is threefold. .say turns 'hello' into a message that begins with the Unicode private-use code point U+F705, a character no legitimate client produces, visible to any server that inspects chat text. The clip commands move the player through C03/C06 position packets the same way a manual teleport would, so a movement anticheat sees an instantaneous position change of exactly the requested amount. Everything else the user types passes through untouched, which is the module's real value: it taxes the user's outgoing chat stream without adding any distinguishing traffic of its own."
+    }
+  ],
+  "packets": [
+    "C01PacketChatMessage"
+  ],
+  "files": [
+    {
+      "label": "Commands.java (dot-prefix interceptor)",
+      "rel": "me/memewaredevs/client/module/misc/Commands.java",
+      "explanation": "The entire module is the eventConsumer0 field: a @Handler consumer over PacketOutEvent that filters C01PacketChatMessage, cancels any message starting with the dot prefix, and dispatches the stripped first token through the switch. The dispatch targets only local state: Module key binds, Module.toggle(), the clipboard, the static clientName and editionName branding strings, and the instance prefix field. The position commands are the only branches with a network effect, and even those go through the vanilla movement path rather than a crafted packet. The 'say' field is never assigned, so the interception branch always runs; the args[2] null guard on .bind is ineffective because split never yields nulls, and the resulting AIOOBE propagates out of the consumer after the packet is already cancelled. The .say branch joins args[1..], prepends U+F705, and calls sendChatMessage, producing a second C01 that escapes re-interception because it no longer starts with '.'. ChatUtil.printChat is the output channel for every branch's feedback line."
+    },
+    {
+      "label": "ChatUtil.java (command feedback channel)",
+      "rel": "me/memewaredevs/client/util/ChatUtil.java",
+      "explanation": "ChatUtil is the local output path every Commands branch uses. printChat appends a '[Memeware]'-prefixed ChatComponentText to the local player's chat via addChatComponentMessage - purely client-side rendering, never a packet. printChatFlag does the same with a '[MAC]' prefix, and is the channel the HackerDetect module reuses for its flag lines. sendChat is the one method with a wire effect: it builds a C01PacketChatMessage and pushes it straight through mc.thePlayer.sendQueue.addToSendQueue, the same queue path vanilla chat uses. The Spammer module calls sendChat once per second, and because those messages never start with '.', they pass the Commands interceptor's startsWith check untouched. The class implements MinecraftUtil, which supplies the mc field, and its three methods are static so any module can call them without a reference."
+    }
+  ],
+  "countering": [
+    {
+      "label": "NoCheatPlus Commands (server-side command rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/chat/Commands.java",
+      "explanation": "NCP's Commands check (CheckType.CHAT_COMMANDS) is the server-side counterpart to this module, and its own comment states the premise: 'We listen to PlayerCommandPreprocess events because commands can be used for spamming too.' It scores every '/'-prefixed input with a weight of 1.0 into data.commandsWeights, an ActionFrequency (line 66), and separately accumulates commandsShortTermWeight over a window of cc.commandsShortTermTicks (lines 67-88), resetting the short-term counter when TickTask lag exceeds 1.3. The violation is max(windowScore - cc.commandsLevel, shortTermWeight - cc.commandsShortTermLevel) (line 91); a positive value adds to commandsVL and either arms a captcha (when CHAT_CAPTCHA is active and captchaSkipCommands is off, lines 53-61) or runs cc.commandsActions (line 102).\n\nThe honest limitation is structural: the Memeware module cancels its dot-commands on the client event bus before the C01 is ever enqueued, so no server event, including PlayerCommandPreprocessEvent, can fire for them. This check therefore only governs the command traffic the module does not touch - normal '/' commands the same user types, and any other command the client forwards. What it still does is bound that residue: a user who mixes server commands into the same session is scored like anyone else, and the short-term window catches bursts of '/'-prefixed input the way the module's own switch table never could, because the client has no equivalent rate limit on what it lets through."
+    },
+    {
+      "label": "NoCheatPlus Text (message content and frequency)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/chat/Text.java",
+      "explanation": "NCP's Text check (CheckType.CHAT_TEXT) runs on every AsyncPlayerChatEvent at LOWEST priority (ChatListener.onPlayerChat) and scores the message content itself. A per-message score is built from letter statistics: upperCase ratio beyond a third of the message (line 150), letter-count ratio and word-partition ratio for messages longer than 4 characters (lines 157-169), and per-word length and notLetter scores, the latter squared (lines 209-231). Every message then feeds two ActionFrequency accumulators, chatFrequency and chatShortTermFrequency, each with a minimum score floor and a weighted window score compared against cc.textFreqNormLevel / cc.textFreqShortTermLevel (lines 257-265); a violation adds to textVL and triggers a captcha or the configured actions (lines 267-294). The same message text is also compared for similarity against the player's previous message within 8000ms via StringUtil.isSimilar(..., 0.8f) (lines 174-179), and flat penalties apply for chatting within 8 seconds of joining and after 8 seconds without moving (lines 194-202).\n\nFor this module the check sees exactly the residue the interceptor lets through. The .say output starts with U+F705, a private-use code point that is not a letter, so the first word carries a non-letter ratio that is squared into the per-word score, and repeated .say invocations re-emit identical text that trips the 8-second repeat-similarity comparison. The frequency accumulators score every chat message the user sends between commands at the module's normal chat rate. The dot-commands themselves stay invisible: cancellation happens client-side, so NCP's Bukkit event never sees them."
+    },
+    {
+      "label": "NoCheatPlus Captcha (chat gate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/chat/Captcha.java",
+      "explanation": "Captcha is the enforcement arm both chat checks share. shouldStartCaptcha (lines 105-108) returns true while CHAT_CAPTCHA is active and no captcha has been started, and Text calls it on every violation (Text line 278), while the Commands check arms it directly when captchaSkipCommands is disabled (Commands lines 53-61). sendNewCaptcha generates a random string of cc.captchaLength characters from cc.captchaCharacters, stores it in data.captchaGenerated, and sends the question to the player (lines 65-70). checkCaptcha then accepts exactly one answer: message.equals(data.captchaGenerated) (line 41). Anything else increments captchTries and captchaVL, re-displays the question, and once captchTries exceeds cc.captchaTries executes cc.captchaActions (lines 47-61) - the configured kick/ban ladder.\n\nThe module has no captcha-answer path: it is a switch table over local commands, and a user in the middle of a command session who trips either chat check must type the exact generated string to clear the flag. There is no command in the switch that can echo the captcha text, so the gate stays armed until the user manually types the answer - which is precisely the interaction a chat-automation client is built to avoid."
+    }
+  ]
+}

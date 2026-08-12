@@ -1,0 +1,56 @@
+{
+  "module": "HighJump",
+  "client": "Rise 5.99",
+  "category": "highjump",
+  "source_rel": "dev/rise/module/impl/movement/HighJump.java",
+  "overview": "Rise 5.99's HighJump is a two-mode launch module. Fireball mode (default) runs a scripted fire-charge sequence: it switches the held slot to a fire_charge, places the charge into the world, switches the slot back, and on the fifth tick overwrites motionY with 3.9 plus a hair of randomness while strafing at 1.9, then keeps adding roughly 0.02 to 0.03 of vertical lift every tick while the fall distance stays under 3 and resets the fall distance with a fake onGround claim once it passes 4. Boat mode is a single-shot boost for mounted players that writes the Vertical Motion setting into motionY and the Horizontal Motion setting into forward speed exactly once per enable. Both modes are pure client-side physics writes; the server only ever sees the resulting C03 movement packets.",
+  "sections": [
+    {
+      "h": "Fireball sequence",
+      "p": "The Fireball branch only arms while grounded: onEnable toggles the module back off if the player is in the air, and an Auto Disable option turns it off on landing after any off-ground ticks. The launch itself is a tick-counted script. At tick 2, if the player has not just been hit (hurtTime at 0), PlayerUtil.findItem locates a fire_charge and a C09PacketHeldItemChange puts it in the hand. Tick 3 places the charge with a C08PacketPlayerBlockPlacement carrying the item stack. Tick 4 switches back to the original slot with a second C09. Tick 5 sets motionY to 3.9 plus a random fraction and calls MoveUtil.strafe(1.9), which rewrites the horizontal velocity along the look direction. The fire charge explodes near the player a moment later, so the server-side knockback lands on top of the client-side boost."
+    },
+    {
+      "h": "Sustained lift and the fake ground",
+      "p": "After the launch, every pre-motion tick keeps the flight alive with branch-conditional velocity adds. With fallDistance at zero the module adds 0.027 minus a random fraction to motionY and lowers speedInAir to 0.023; with fallDistance under 3 it adds 0.0235 and pins speedInAir at 0.02; and while hurtTime equals 9, the tick the fireball detonated, it adds 0.0265. Once fallDistance exceeds 4 the module zeroes the local fall distance and calls event.setGround(true), so the next C03 claims onGround while the player is still over open air, and the lift branches re-engage. The Timer Speed setting (default 1) scales mc.timer.timerSpeed by the configured value minus a random hundredth, and onDisable restores timerSpeed to 1 and clears the camera offset flag."
+    },
+    {
+      "h": "Boat mode and camera",
+      "p": "Boat mode hooks onRender2DEvent instead of the motion pipeline. The first render frame after enable, if the player is not already riding something, the handler writes verticalMotion (default 0.25, range 0 to 8) into motionY, pushes the player forward at horizontalMotion with MoveUtil.forward, and latches isInBoat so the boost never re-applies until the module is toggled again. The Smooth Camera option is cosmetic: while the player rises above the position captured at enable, it sets the static cameraYPosition to that anchor plus 0.42, which only moves the third-person camera. The module constructs no movement packets itself; the C03 stream that carries both modes is the client's regular move packet with the boosted deltas baked in."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "HighJump.java (module)",
+      "rel": "dev/rise/module/impl/movement/HighJump.java",
+      "explanation": "The module is one PreMotionEvent handler plus a render handler. onPreMotion counts ticks, guards the Fireball launch behind the grounded and not-recently-hit checks, sends the C09/C08/C09 item sequence with PacketUtil, and then runs the sustained-lift branches that keep the flight alive. The fake ground is a single event.setGround(true) paired with a local fallDistance reset, and the Auto Disable option folds the module off the first tick the player is grounded again after leaving it. The static camera fields written here are consumed by the fork's EntityPlayer rendering code.\\n\\nThe packet footprint is small and entirely scripted: two C09 held-item switches and one C08 placement at ticks 2 through 4, then nothing but the boosted C03 movement stream. The Fireball mode also publishes a notification and refuses to enable in the air, which makes the module a one-shot launch rather than a sustained fly. The Mode setting toggles which of the two handlers carries the physics writes, and the Timer Speed setting leaks into mc.timer for the whole duration unless left at 1."
+    },
+    {
+      "label": "MoveUtil.java (strafe and forward)",
+      "rel": "dev/rise/util/player/MoveUtil.java",
+      "explanation": "MoveUtil is the LiquidBounce-derived movement helper the module leans on. strafe(speed) decomposes the current movement input into horizontal velocity components along the yaw and writes them into motionX and motionZ, preserving the look direction, and the no-argument strafe() simply re-applies the current speed. forward(speed) does the same for pure forward input, which is what Boat mode uses. The module calls strafe(1.9) at the launch tick to convert the fireball boost into a horizontal sprint and strafe() every following tick to keep the speed alive.\\n\\nBecause these helpers write the client motion fields rather than packets, the effect reaches the server through the regular C03 position stream, and the horizontal component is a second, independent tell on top of the vertical lift. The same utility backs the Rise Speed, LongJump and Scaffold modules, so the strafe math here is the shared lineage rather than HighJump-specific code."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (vertical envelope and ray-traced ground)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "NCP SurvivalFly rebuilds the player's allowed vertical movement from the world rather than the packet. vDistRel carries the vertical allowance from the previous move's momentum and only accepts the named envelopes: a grounded zero-y move, a real jump (isJumpMotion arms a 10-tick jumpDelay), a step-up and a riptide launch. Crucially, fromOnGround and toOnGround come from RichBoundsLocation.isOnGround(), which scans the block cache at minY minus yOnGround, never from the packet flag, so the module's event.setGround(true) after every 4-block fall is simply ignored: the claimed ground is air, and the reset buys nothing from the envelope.\\n\\nThe sustained lift is the real exposure. After the launch the module adds 0.02 to 0.03 of vertical velocity every tick, which keeps the reported y deltas positive long after a ballistic arc should be descending; a momentum model that only knows gravity sees yDistanceAboveLimit near the accumulated lift and fires the (max(hdist, 0) + max(ydist, 0)) * 100 violation with a set-back. The one honest caveat is the first tick: the fire charge detonation is server-applied knockback that NCP credits to the player, so the initial 3.9 rise is partially shielded as legitimate velocity. Everything after the explosion is client-authored lift, and no velocity credit covers a stream of re-lifts."
+    },
+    {
+      "label": "Flight (ascension bounds)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Flight.java",
+      "explanation": "Arc v2's Flight check classifies vertical motion into states. The rising branch fires whenever the measured vertical speed exceeds getMaxJump, the configured maximum legitimate jump velocity (maxHeight, raised by 0.4 under a jump potion): that is the Ascension violation with the ascending_vertical message, and sustained ascent also trips the ascending_moves time bound and the ascending_distance distance-from-ground bound. The module's 3.9 launch is nearly ten times the vanilla 0.42 jump, so the very first air move after the explosion flags it.\\n\\nThe descending side closes the loop. Arc expects a gravity polynomial for the reported air-tick count, and any deviation beyond 0.02 or below 0.001 in the glide term flags descend_expected. The module's fallDistance reset does not change the wire vertical speed, so the descent after the boosted arc is measured against a curve that never included the launch or the mid-fall re-lifts, and the alternating rise, 4-block drop, rise pattern presents the check with a vertical profile no legitimate flight state produces. The horizontal strafe does not matter here; Flight keys on vertical speed only."
+    },
+    {
+      "label": "Fly (per-player vertical simulation)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Fly.java",
+      "explanation": "Hawk's Fly check runs a per-player vertical simulation of the 1.8 gravity model. Each air tick the estimated velocity becomes (previous estimate minus 0.08) times 0.98, integrated into an estimated position, and any discrepancy between the reported y and the estimate above DISCREPANCY_THRESHOLD (0.0001) triggers punishAndTryRubberband. A vanilla jump launches at 0.42 and the simulation tracks it exactly, which is why ordinary jumps pass. The module's 3.9 launch against a predicted 0.42 first-tick velocity is a discrepancy of about 3.4, tens of thousands of times the threshold, so the check flags and rubber-bands on the first air move.\\n\\nThe simulation is equally unforgiving to the module's post-launch behavior: every per-tick lift of 0.02 to 0.03 pushes the reported position further from the integrated estimate, and the fake-ground resets do not reconcile anything because Hawk derives its own ground state from the position trace. The landing path check, which requires the reported ground y to fall between the previous y and the estimated position, fires on the way down if the arc was already rubber-banded mid-flight. The module ships no concealment, no staged C04s and no timer trick that could pull the reported stream back onto the simulation's curve."
+    }
+  ]
+}

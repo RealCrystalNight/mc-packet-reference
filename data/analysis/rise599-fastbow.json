@@ -1,0 +1,63 @@
+{
+  "module": "FastBow",
+  "client": "Rise 5.99",
+  "category": "fastbow",
+  "source_rel": "dev/rise/module/impl/player/FastBow.java",
+  "overview": "Rise 5.99's FastBow collapses the bow charge loop into a per-tick packet sequence aimed at every visible target. While the player is on the ground with the use key held, the pre-motion pass lists targets through PlayerUtil.getEntities (range 40 by default, player, non-player and invisibility filters, no team filter) and keeps only those that pass a client-side canEntityBeSeen ray trace. For each target it sends a C08 use-item sentinel (origin position, facing 255) to re-arm the server's item use, an optional C04 half-block downward position under timerBypass, then up to 20 C06PacketPlayerPosLook packets carrying a computed aim at the target's predicted position, a double windowClick swap of slot 9 that resets the held-stack state, and finally a C07PacketPlayerDigging RELEASE_USE_ITEM to fire the shot. The module never emits C02PacketUseEntity: the arrow is a server-side entity and the C06 burst is what aims it.",
+  "sections": [
+    {
+      "h": "The per-shot sequence",
+      "p": "The gate requires mc.thePlayer.onGround and the use key physically held, then getEntities(range, players, nonPlayers, true, invisibles, false) feeds the target list, filtered by canEntityBeSeen. Each target gets the full sequence in order: the C08 single-argument constructor serializes BlockPos.ORIGIN with facing 255, which is the use-item form (the constructor forwards to the six-argument form with the origin and 255), so the server's tryUseItem path arms the bow. timerBypass then inserts a C04 claiming posY minus 0.5 with onGround false, perturbing the server's vertical state between the arm and the release. The C06 burst follows with the aim rotations, the swap pair resets the stack, and the C07 release fires."
+    },
+    {
+      "h": "The aim math",
+      "p": "Each C06 carries the same position and a fresh rotation computed from the target's predicted location: x and z extrapolate the target's velocity from its lastTick position delta, the vertical term starts from the same prediction plus target eye height times 1.75 minus the local eye height, clamped to between minus 1.4 and 0.1 relative to the local player (the negative direction biases the aim downward for the arrow's arc), and yaw and pitch come from atan2 with wrapAngleTo180_float normalization. The burst sends up to 20 copies per target per tick with these rotations, so the server's entity sees a locked look at shot time.\n\nThe prediction clamp is the anti-slop detail: the y term is capped at -1.4 below and +0.1 above the player, which makes the aim degrade gracefully for targets at very different heights instead of snapping to extreme pitches. The swap helper calls playerController.windowClick with mode 2, which emits a C0E click-window packet per call; calling it twice with the same hotbar slot bounces the held stack out and back, re-syncing the slot state around the shot."
+    },
+    {
+      "h": "Charge and release",
+      "p": "The server computes the arrow's power at release time. The C08 routes through tryUseItem to ItemBow.onItemRightClick, which calls setItemInUse with the bow's max use duration of 72000, and EntityPlayer.onUpdate decrements itemInUseCount once per tick; the C07 release calls stopUsingItem, and ItemBow.onPlayerStoppedUsing computes j as 72000 minus the remaining itemInUseCount, f as ((j/20) squared plus j/10) over 3 capped at 1.0, spawns the arrow at f times 2 velocity, marks it critical at exactly 1.0, and returns without firing when f is below 0.1. The per-tick re-arm keeps the server count near 72000, so a release processed in the same server tick as its arm reads j of 0 and fires nothing; the shots that materialize are the ones whose release straddles a server tick boundary after an accepted arm, which bounds the module's real throughput on a stock server.\n\nThe C07 release carries BlockPos.ORIGIN with facing DOWN; the server does not validate facing on a release, so the direction is cosmetic. The module's wire traffic is the C03 family (the C04 and the C06s) plus C08, C0E and C07; no C02 is ever constructed, and the C02 chip on this page exists because the attack-packet corpus is where the aim-side rotation checks live."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "FastBow.java",
+      "rel": "dev/rise/module/impl/player/FastBow.java",
+      "explanation": "The module is one pre-motion handler and a swap helper. onPreMotion gates on ground and the use key, builds the target list through PlayerUtil.getEntities with the dead flag fixed true and team filtering off, filters with canEntityBeSeen, and for every survivor runs the sequence: C08 use sentinel, the timerBypass C04, the C06 burst (packets setting, default 20, range 1 to 25), the double swap, and the C07 release. All sends go through PacketUtil.sendPacket, so the burst is re-entrant-safe against the outgoing event bus.\n\nswap calls playerController.windowClick with mode 2 and the current hotbar slot as the button, which swaps the clicked slot (9, the first main-inventory slot) with the held hotbar slot and emits C0E traffic; the two consecutive calls cancel out on the server while re-syncing the stack state between shots. The Targets, Packets, Range, Timer Bypass, Invisibles, Players and Non Players settings are all read live in the handler."
+    },
+    {
+      "label": "PlayerUtil.java (target filter)",
+      "rel": "dev/rise/util/player/PlayerUtil.java",
+      "explanation": "The entity source for the target list. getEntities(range, players, nonPlayers, dead, invisibles, ignoreTeammates) streams mc.theWorld.loadedEntityList, keeps EntityLivingBase instances, applies the player and non-player toggles, the invisible filter, the dead and deathTime filter, the ticksExisted-below-2 filter, drops entities on the AntiBot list and the client's friend list, and excludes the local player; the module calls it with dead true and ignoreTeammates false. The same utility supplies findSword for AutoTool and isBlockUnder for NoVoid, so the file is the shared player-module dependency.\n\nThe module layers its own canEntityBeSeen ray trace on top of the list, so the target set is visibility-filtered as well as range-filtered, and the Range setting (default 40, up to 60) is what bounds the aim burst's reach."
+    }
+  ],
+  "countering": [
+    {
+      "label": "UseItemAdapter (release-item rate gate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "The adapter timestamps the release half of the shot sequence. handleDiggingPacket on PlayerDigType.RELEASE_USE_ITEM stamps releaseItemTime, and a second release arriving within timeBetweenRL (default 70ms) of the first sets CombinedData.isHackingRI, with the threshold tunable through setuseRLThreshold; handleBlockPlacePacket separately classifies the C08 use sentinel. The design intent is explicit in the javadoc: a minimum time between releases for exactly this exploit family.\n\nThe module releases once per target per tick, 50ms apart at the standard tick rate, so from the second shot onward every release lands inside the 70ms window and isHackingRI stays set while the key is held. The release gate keys purely on cadence, so no position or rotation trick in the C06 burst affects it: this is the direct counter for the module's core loop."
+    },
+    {
+      "label": "SurvivalFly (rapid-release penalty path)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "The isHackingRI flag is consumed by the movement layer: the next SurvivalFly move check tags the move 'noslowpacket' and runs Improbable.check against the horizontal distance under the tag 'moving.survivalfly.noslow', resetting the horizontal data (lines 877-883). Rapid item release is treated as the no-slowdown pattern family, and the penalty is folded into the standard violation and set-back machinery.\n\nThe penalty path runs on the move that follows every flagged release, which for this module is every tick while firing. The design intent is visible in the tag: NCP classifies rapid release as the speed-while-using exploit, so the fastbow's output degrades the player's accepted movement model rather than just logging a counter."
+    },
+    {
+      "label": "MorePackets (charge-spam rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "The burst is the module's loudest signature. Each shot emits one C08, one C04 under timerBypass, up to 20 C06s, two C0Es and one C07: roughly 25 packets per target per tick, and the C06s are C03-family moves, so the movement rate check counts them. The window accumulator uses 500ms buckets against a 22 packets per second ceiling with 20 ideal, and the half-second burst path flags 15 packets in a bucket by default with a direct violation at 10; with the default 20-packet burst, a single target already trips the burst path in the first tick, and multiple targets multiply the count into the hundreds per second.\n\nThe check is content-blind, so the repeated positions and the onGround stamps do not matter: the count alone is the violation, and the default actions cancel from low violation levels, so the module cannot hold the key down on an NCP-protected server."
+    },
+    {
+      "label": "Angle (attack-stream rotation deltas)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Angle.java",
+      "explanation": "The aim side of the burst is scored by the attack-stream rotation check. Angle accumulates per-call signal over a 1000ms window and flags when the yaw and pitch deltas between consecutive attack-bound updates exceed the configured thresholds; the aim profile the C06 burst delivers is what the check was built to recognize. When the user mixes melee attacks between shots, the fastbow's locked, predicted aim feeds those C02s, and the snap between targets is the rotation evidence.\n\nThe honest caveat is the stock configuration in this tree: the move, time, yaw and switch thresholds sit at 100, 150, 60 and 50, which leave per-call scores far below trip level, so the check is dormant until an admin lowers them. The mechanism still matters because it is the C02-corpus check that constrains the aim side of the module when enabled."
+    }
+  ]
+}

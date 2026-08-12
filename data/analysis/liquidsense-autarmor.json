@@ -1,0 +1,63 @@
+{
+  "module": "AutoArmor",
+  "client": "LiquidSense Dev",
+  "category": "autarmor",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/combat/AutoArmor.java",
+  "overview": "AutoArmor ranks every armor item in the 36 inventory slots with the static ArmorComparator and shift-clicks the best piece per armor type into place from a Render3DEvent handler. The gate chain blocks the whole routine while flying, while the shared InventoryUtils.CLICK_TIMER has not passed the randomized delay, or while any window other than the player inventory container is open. Equips run newest-first (boots, legs, chest, helmet) and every click is followed by a fresh TimeUtils.randomDelay draw so the click train reads as human-paced. Candidates living in the hotbar skip the window entirely: the module switches the held slot to the armor, sends a C08 use-item packet that equips it server-side, and switches back, a C09-C08-C09 ceremony that never opens a window.",
+  "sections": [
+    {
+      "h": "Selection and gating",
+      "p": "onRender3D returns while the player flies, while InventoryUtils.CLICK_TIMER.hasTimePassed(delay) is false, or while mc.thePlayer.openContainer.windowId is not 0. The candidate stream is IntStream.range(0, 36): hotbar slots 0-8 are always eligible, inventory slots 9-35 only when the IItemStack getItemDelay watermark (itemDelayValue, default 0) has passed, and each slot must hold an ItemArmor. The pieces are grouped by ArmorPiece.getArmorType and the best of each group is chosen with max(ARMOR_COMPARATOR), the shared comparator instance. The replacement loop walks armorSlot 3 down to 0, so boots are resolved before the helmet, and compares the worn stack against the best piece with ARMOR_COMPARATOR.compare(oldArmor, armorPiece) < 0; a worn piece is moved out of the armor row first (move(8 - armorSlot, true)) and the new piece is equipped second (move(armorPiece.getSlot(), false)), each move returning early so at most one click is sent per render frame."
+    },
+    {
+      "h": "Two packet ceremonies",
+      "p": "move() branches on the candidate slot. For a hotbar candidate (item < 9) with hotbarValue set, it queues C09PacketHeldItemChange(item), then C08PacketPlayerBlockPlacement with the armor stack, then C09PacketHeldItemChange(currentItem): the server processes the use-item as an equip and the client never opens a window, at the cost of two C09 switches per armor. Everything else goes through the window path, guarded against NoMove (MovementUtils.isMoving) and invOpenValue (only GuiInventory screens allowed). With simulateInventory on and no GuiInventory open, the module first queues C16PacketClientStatus(OPEN_INVENTORY_ACHIEVEMENT), then calls playerController.windowClick(windowId 0, slot, 0, 1) which serializes a C0E mode-1 shift-click, then queues C0DPacketCloseWindow when it opened the inventory itself. The container slot mapping is slot + 36 for hotbar indexes and the raw index for the main inventory, and armor-row moves pass the container slots 5-8 directly."
+    },
+    {
+      "h": "Packet fingerprint",
+      "p": "The window path emits one C0E per empty slot and two per replaced slot (move-out then move-in), wrapped in a C16/C0D open-close ceremony only when the GUI was not actually open, so a server that tracks inventory-open state sees window-0 clicks arriving with no prior container-open. Every click is spaced by a fresh uniform delay in [minDelay, maxDelay] milliseconds (defaults 100-200) sampled from TimeUtils.randomDelay, and the module aborts the whole cycle if the shared CLICK_TIMER was reset by any other module's window click or C08 in between. The hotbar path is the one place C09 appears: the switch-to, use, switch-back trio emits two held-slot changes per equipped armor with no C0E at all."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoArmor.java",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/combat/AutoArmor.java",
+      "explanation": "onRender3D is the whole driver: gate checks, armor ranking via the shared ARMOR_COMPARATOR, and the two move() ceremonies. The early returns after each move mean the module sends at most one inventory action per render frame, which the randomized delay plus the CLICK_TIMER gate turn into a paced click train rather than a burst."
+    },
+    {
+      "label": "InventoryUtils.java (CLICK_TIMER pacing)",
+      "rel": "net/ccbluex/liquidbounce/utils/InventoryUtils.java",
+      "explanation": "The static CLICK_TIMER is the module's rate limiter and the client-wide inventory cooldown. onClick resets it on every ClickWindowEvent and onPacket resets it on any outgoing C08PacketPlayerBlockPlacement, so AutoArmor's hasTimePassed(delay) gate naturally defers to any other module that clicked a window or sent a use-item packet in the meantime."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastClick (window-click ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "FastClick scores every C0E into an ActionFrequency(5, 200L) short-term bucket set plus a 15/s normal window, with shift-click MOVE_TO_OTHER_INVENTORY actions discounted through detectTweaks1_5, and feeds Improbable when fastClickImprobableWeight is set. AutoArmor's 100-200ms randomized spacing lands around 5-10 clicks per second, which the short-term buckets forgive, so the real pressure is the container-interaction rule: checkContainerInteraction flags window clicks that arrive without a preceding container-open, exactly the fingerprint of simulateInventory mode on a server that tracks open state."
+    },
+    {
+      "label": "InventoryListener (open-state ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/InventoryListener.java",
+      "explanation": "NCP's first-click heuristic stamps inventoryOpenTime on the first click and assumes the window is open from that moment, which is precisely the fiction simulateInventory mode fabricates with its C16/C0D pair. The Open check force-closes on any break, place or interact while the ledger believes a window is open, so the C0D close packet races the ledger: a close NCP never saw leaves the open state behind, and the next window-0 click is scored against an unopened window."
+    },
+    {
+      "label": "InventoryActions (window-0 click punishment)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/inventory/InventoryActions.java",
+      "explanation": "Hawk punishes a ClickInventoryEvent whenever hasInventoryOpen() is 0, so the C0E shift-clicks of the window path are a direct hit when no GUI is open: the check raises VL and calls e.resync(), which undoes the local armor swap by re-syncing the inventory and defeats the equip in the same tick. The hotbar path evades it completely because it never opens a window, which is the honest bypass surface to note."
+    },
+    {
+      "label": "InventoryEvent (click runner feed)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/ai/idealistic/spartan/listeners/bukkit/standalone/InventoryEvent.java",
+      "explanation": "Spartan routes every InventoryClickEvent into p.executeRunners, feeding the INVENTORY_CLICKS and IMPOSSIBLE_INVENTORY checks registered in CheckEnums. The per-check executor classes are absent from the clone, so thresholds are not quotable, but the listener is the feed that would classify the window-0 shift-clicks, and the C16-achievement open is the anomaly it sees first."
+    }
+  ]
+}

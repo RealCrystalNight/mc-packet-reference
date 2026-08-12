@@ -1,0 +1,62 @@
+{
+  "module": "Velocity",
+  "client": "LiquidSense Dev",
+  "category": "velocity",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/combat/Velocity.kt",
+  "overview": "LiquidSense Dev's Velocity is the classic LiquidBounce knockback controller with eight modes selected by a ListValue: Simple scales or cancels the S12 packet outright, AAC and AACZero defer cancellation into the tick handler with motion rewrites, AACPush divides the incoming XZ motion and drains Y while hurt, Reverse and SmoothReverse preserve or gently damp the knockback through strafe and speedInAir manipulation, AAC4.4.0 halves horizontal motion in air, Jump converts the knockback into a launch, and Glitch cancels the packet and rides noClip for a few ticks. The packet handler also cancels every S27 explosion packet and every S06 health update unconditionally, with a TODO comment noting explosion velocity support is unimplemented.",
+  "sections": [
+    {
+      "h": "Packet-side handling",
+      "p": "The onPacket handler watches S12PacketEntityVelocity for the self entity. Simple mode rewrites the packet's motion fields: with Horizontal and Vertical both at 0 it cancels the packet entirely, otherwise it scales each motion component by the matching value with integer fixed-point math, so the server still applies a reduced knockback. Glitch cancels the packet only while onGround and sets the velocityInput flag that the update handler turns into noClip. Every other mode just records velocityInput, hurt or the timer reset and defers the actual motion work to the tick handler. The handler also cancels S27PacketExplosion and S06PacketUpdateHealth with no mode check at all, which suppresses explosion knockback and health sync on every mode."
+    },
+    {
+      "h": "Tick-side modes",
+      "p": "The onUpdate handler implements the deferred modes. AAC waits 80ms then multiplies motionX and motionZ by the Horizontal value, leaving Y alone. AACPush divides motionX and motionZ by the AACPushXZReducer while hurtResistantTime is at least 19, subtracts 0.014999993 from motionY each tick while hurt and the Speed module is off, and forces the local onGround true while hurt to fool ground checks. AACZero adds velocity 0, -1, 0 and sets onGround true while hurt, and cancels the JumpEvent during the hurt window. Reverse strafes at the current speed times ReverseStrength while airborne, SmoothReverse sets speedInAir to the SmoothReverseStrength value during the hurt window, and AAC4.4.0 multiplies horizontal motion by 0.6 in air. Jump sets motionY to 0.42 and adds a 0.2 directional boost whenever hurtTime is positive and the player is onGround."
+    },
+    {
+      "h": "State and disable behavior",
+      "p": "velocityInput is the master flag the packet handler arms and the update handler consumes: Reverse and AAC modes check it before acting, SmoothReverse resets speedInAir to 0.02 when it is false, and Glitch assigns noClip = velocityInput each tick so the player becomes non-colliding for exactly as long as the flag stays set. Two MSTimer fields pace the 80ms deferrals, and onDisable resets speedInAir to 0.02F. The JumpEvent handler cancels the vanilla jump for AACPush, AAC4.4.0 and AACZero during the hurt window, which stops the vanilla jump from masking the module's motion work."
+    }
+  ],
+  "packets": [
+    "S12PacketEntityVelocity"
+  ],
+  "files": [
+    {
+      "label": "Velocity.kt (module)",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/combat/Velocity.kt",
+      "explanation": "The entire module is this file. onPacket handles the S12 rewrite or cancel plus the unconditional S27 and S06 cancels, onUpdate implements the eight tick-side mode branches with the motion math for each, and onJump coordinates the AAC-family jump suppression. The value declarations at the top define every knob: Horizontal and Vertical scale factors, ReverseStrength, SmoothReverseStrength, AACPushXZReducer and the AACPushYReducer toggle, and the mode ListValue with its default Simple. The tag property mirrors the selected mode into the HUD, and onDisable's speedInAir reset is the cleanup contract the countering checks rely on."
+    },
+    {
+      "label": "MovementUtils.java (strafe math)",
+      "rel": "net/ccbluex/liquidbounce/utils/MovementUtils.java",
+      "explanation": "The Reverse and AACPush modes consume the utility's motion math. getSpeed returns the horizontal magnitude of the current motion, and strafe(speed) rewrites motionX and motionZ as -sin(direction) times speed and cos(direction) times speed, using the client's directional yaw blending from getDirection. Reverse mode calls strafe(MovementUtils.getSpeed() times ReverseStrength) every airborne tick, so the knockback magnitude is preserved along the player's chosen direction, and the same helper underlies the AACPush strafe behavior. The file also carries the potion-aware base-speed helpers used by the client's speed modules, but Velocity only touches getSpeed, strafe and getDirection."
+    }
+  ],
+  "countering": [
+    {
+      "label": "KnockbackHandler (required knockback prediction)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/velocity/KnockbackHandler.java",
+      "explanation": "Grim's KnockbackHandler brackets the ENTITY_VELOCITY packet with two transactions and once the client's echo proves receipt, the vector becomes REQUIRED in the predicted motion. onPredictionComplete offsets the actual motion against the required vector with the Knockback threshold at 0.001, accumulating with a 0.999 decay toward a max advantage of 1 and setting back at 0.1. The Simple mode with both values at 0 cancels the S12 outright, so the required vector never appears in the predicted motion and the offset is the full knockback magnitude on the first hurt tick. Every scaling mode produces a proportional offset, because the server-side record of the vector is unaffected by the client's rewrite.\n\nThe Reverse and SmoothReverse modes are the honest pass surface: they preserve the knockback magnitude while redirecting it through strafe, so Grim's required-vector prediction sees the motion arrive and the offset stays near zero. AACPush's Y drain of 0.014999993 per tick is a small vertical deficit that accumulates slowly, which is why the mode is the tuned one, while AACZero and Glitch cancel the packet like Simple and flag the same way."
+    },
+    {
+      "label": "ExplosionHandler (S27 sandwich)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/velocity/ExplosionHandler.java",
+      "explanation": "Grim's ExplosionHandler applies the same transaction sandwich to S27PacketExplosion, with the entity id at -1 because explosions are not entity-targeted, and feeds the vector into lastExplosionsKnownTaken so the required motion is enforced against the prediction. The LiquidSense module cancels every S27 unconditionally in its packet handler, with a TODO comment admitting explosion velocity support was never written, so every explosion knockback is suppressed and every one of those suppressed vectors is a required-motion deficit for this check.\n\nThe honest contrast with the entity-knockback path is the gate structure: modules like Sigma's AntiVelocity cancel S27 only in one mode, and Nekoware's only in its Packet mode, but LiquidSense cancels it in all eight modes with no configuration that restores explosion knockback. That makes the ExplosionHandler the one check that bites every mode equally, including the Reverse and SmoothReverse modes that pass the entity-knockback prediction."
+    },
+    {
+      "label": "AntiVelocityBasic (pending knockback matching)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/AntiVelocityBasic.java",
+      "explanation": "Hawk's AntiVelocityBasic is a thin wrapper over MoveEvent.hasFailedKnockback with punishment at VL 5, and the mechanics live in MoveEvent.handlePendingVelocities: each pending server knockback is matched against the player's moves in order, with Y within 0.01 and X and Z inside a maxDiscrepancy built from a weirdConstant times a base multiplier plus 0.003. A knockback entry older than ping plus 200ms with no matching move marks the failure. Simple mode with full cancel produces no matching move at all, so the first hurt tick after the S12 ages the entry and the failure fires.\n\nThe honest tolerance is the class comment claiming detection down to a 10 percent difference: percentage reductions below that line, like the small Horizontal scaling values near 1.0, sit inside the discrepancy band and pass. AACPush's division by a reducer of 2 is above the tolerance and fails the match, while the Reverse modes preserve the full magnitude and match cleanly. The mode choice therefore decides which side of this check a player lands on."
+    },
+    {
+      "label": "MovingListener and VelocityData (knockback feed)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/listener/moving/MovingListener.java",
+      "explanation": "Arc v2 has no dedicated anti-knockback check in this snapshot, and its MovingListener is the honest evidence: onVelocity (line 165) stamps the knockback into VelocityData.addVelocityTime, and the movement checks consume that feed. Flight reads data.getVelocityData().hasVelocity() and the current and last velocity values, and only grants its vertical-move exemption while a knockback is recorded and the player is not on a step, climbing or in liquid; on landing it clears the velocity state. Speed uses the same feed to widen its horizontal expectation around a fresh knockback.\n\nWhen the LiquidSense module cancels or rewrites the S12, Arc's listener never records the knockback, so Flight's validVerticalMove gate stays false and the post-hit motion is judged against the normal envelope with no knockback allowance. That is the honest mechanism of this entry: the pressure is not a velocity check flagging the cancel, it is the movement checks losing the exemption that a real knockback would have armed, which turns every cancelled hit into ordinary motion to be measured."
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "module": "NoVoid",
+  "client": "Rise 5.99",
+  "category": "novoid",
+  "source_rel": "dev/rise/module/impl/player/NoVoid.java",
+  "overview": "Rise 5.99's NoVoid is a nine-mode fall saver gated on a void check: when no block sits under the player (PlayerUtil.isBlockUnder, with an optional voidCheck override), fall distance passes the configured threshold (default 5), and the sneak key, fly capabilities, Fly and HighJump modules are all inactive, the pre-motion pass runs one save per fall episode. The modes split into three families: position manipulation (Flag sends a no-arg C04 whose coordinates stay at the origin, Position adds the fall distance to the outgoing y, Matrix snaps motionY to the block grid), state claims (Ground and Boost stamp onGround true over open air, Boost also zeroes fallDistance and sets motionY to 1), and traffic suppression (Blink buffers C03 and C0F packets while falling, snaps the client back to the last server-acknowledged position, and drops the buffered movement when the ground reappears; Hypixel rewrites every falling C03 into the bare onGround-false form). A saved flag alternates per pass so the save fires once per fall, and every successful save increments Rise.amountOfVoidSaves.",
+  "sections": [
+    {
+      "h": "The save gate",
+      "p": "The pre-motion gate runs before any mode logic: (!isBlockUnder || !voidCheck) with fallDistance greater than the Fall Distance setting, plus negative checks on the sneak key, capabilities.isFlying, Fly and HighJump. isBlockUnder sweeps the player's bounding box downward from posY plus eye height in 2-block steps against getCollidingBoundingBoxes, so a player over open air or a shaft wider than the box reads as void. The saved field alternates per pre-motion pass: the first pass that trips the gate performs the save and sets saved true, the next pass resets it, which spaces saves one per fall episode rather than every tick."
+    },
+    {
+      "h": "Mode families",
+      "p": "Flag sends new C03PacketPlayer.C04PacketPlayerPosition() with no arguments, and the no-arg constructor sets only the moving flag, leaving x, y and z at zero with onGround false: a position claim at the world origin designed to push the server's processPlayer rejection path, whose moved-too-quickly handler logs and calls setPlayerLocation to snap the player back to the last accepted position (lastPosX, lastPosY, lastPosZ). Position adds the current fallDistance to the pre-motion y so the next C03 or C06 claims a climb of several blocks. Matrix snaps motionY to the grid: when the fall would carry the entity below floor(posY) it sets motionY to floor(posY) minus posY, which keeps the entity on the block grid, and claims ground when the snap is zero. Ground and Boost both stamp the outgoing onGround flag true; Boost also zeroes the local fallDistance and sets motionY to 1. Hypixel replaces every qualifying C03 with the two-argument false form, which drops the onGround claim without touching the position."
+    },
+    {
+      "h": "Blink suppression",
+      "p": "Blink is the packet-level mode. The packet-send handler cancels and queues every C03-family packet and C0F transaction while the fall conditions hold (fallDistance at most 6, no block under, the same module gates), capturing lastServerPosition from the player's position on the first suppressed packet. When the conditions clear, the flush drops every queued C03 (the fall is erased from the server's view entirely) unless a block reappeared under the player mid-buffer, then re-sends the remaining packets through sendPacketWithoutEvent and clears the buffer. The save branch in the pre-motion pass performs the client-side half: setPosition to lastServerPosition, fallDistance zero, motionY zero, MoveUtil.stop, and the aBoolean marker that lets the flush keep the buffered movement. The server never learns about the fall, so the client-side snap lands on the server's stale position with no S08 teleport involved."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "NoVoid.java",
+      "rel": "dev/rise/module/impl/player/NoVoid.java",
+      "explanation": "The module is a mode switch plus a packet-send branch. onPreMotion applies the gate and runs the active mode: Flag's origin-position C04, Position's y lift, Ground's ground claim, Matrix's grid snap, Boost's motionY write and ground claim, Blink's client-side snap, and the empty Hypixel case (the Hypixel logic lives in the packet-send handler instead, and Jump simply calls the local jump method). The saved alternation, the lastGround ledger and the notification path (registerNotification plus Rise.amountOfVoidSaves) round out the state.\n\nonPacketSend handles the two traffic modes. Blink cancels C03-family and C0F packets while falling, queues them, and on recovery drops the movement entries and flushes the rest through sendPacketWithoutEvent so the outgoing event does not re-capture them; Hypixel swaps every qualifying C03 for the bare onGround-false form. The static packets queue is shared by all instances, which mirrors the classic blink-buffer pattern. The module never constructs S08PacketPlayerPosLook: the receive-side teleport only appears when the server reacts to the movement outliers the other modes provoke, and the Blink suppression exists to avoid it."
+    },
+    {
+      "label": "PlayerUtil.java (void sweep)",
+      "rel": "dev/rise/util/player/PlayerUtil.java",
+      "explanation": "The void detector behind the whole module. isBlockUnder walks offset 0 up to posY plus eye height in steps of 2, offsets a copy of the player's bounding box downward by each step, and returns true the moment getCollidingBoundingBoxes reports any collision, so the sweep catches terrain within the player's column and tolerates the 2-block step size. The same utility feeds AutoTool's findSword and FastBow's getEntities, which is why the player-module family shares this file.\n\nThe 2-block step is a real tolerance: a ledge sitting exactly between two sample points can be skipped, which is the honest gap the module's gate lives in, and the blink condition reuses the same sweep for its fall-distance-6 buffering window."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (movement envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the movement envelope from the block cache instead of trusting the packet. The vertical allowance comes from vDistRel (invoked around line 212, defined at line 1839), which seeds the allowed distance from the previous move's momentum (lastMove.yDistance) and accepts only a short list of named envelopes: a zero-y move on ground, a jump, a step-up and a riptide launch. fromOnGround and toOnGround come from RichBoundsLocation.isOnGround, which scans the actual block cache at minY minus yOnGround, so the packet's onGround flag never relaxes the envelope. The violation is (max(hDistanceAboveLimit, 0) plus max(yDistanceAboveLimit, 0)) times 100 with a set-back to the stored location.\n\nEvery mode family runs into this. Position's y lift of the full fall distance (5 by default) is a multi-block vertical claim seeded from falling momentum, so yDistanceAboveLimit lands near the lift height and the violation fires on the first packet. Ground and Boost stamp onGround true over open air, and the block cache reports air, so the claim is ignored and the fall keeps accumulating against the envelope. Flag's origin-position C04 is a per-move delta orders of magnitude beyond any envelope, so it violates immediately and the set-back lands on NCP's tracked location: the module gets its snap-back, but as a violation with a set-back instead of a free teleport."
+    },
+    {
+      "label": "NoFall (server-side fall bookkeeping)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/NoFall.java",
+      "explanation": "NCP's movement NoFall keeps its own fall-height bookkeeping server-side: noFallMaxY tracks the highest point of the fall episode and noFallFallDistance accumulates the descent, and handleOnGround compares the pair (yDistance is max(noFallMaxY minus y, noFallFallDistance)) to decide when to deal the damage itself. The client's fallDistance field is never trusted: the module's fallDistance = 0 reset and its onGround claims change the packet, not NCP's counters.\n\nThis is the direct hit on the state-claim modes. Ground, Boost and Matrix all present a fall to NCP: the module's ground claim and local fall-distance reset do not stop noFallMaxY from tracking the descent, and when the episode crosses the damage threshold NCP applies the fall damage through its own path regardless of what the client claimed. The honest boundary is that the module saves the player from vanilla fall death while NCP still counts the fall, so the two disagree on the outcome of every save."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "The movement packet rate check catches the traffic side of the save modes. Every C03-family packet is scored into data.morePacketsFreq, an ActionFrequency with 500ms buckets, against a ceiling of 22 packets per second with 20 ideal (NetStatic.morePacketsCheck), plus a burst path on the newest half-second bucket (15 packets default, direct violation at 10) and lag adaption through TickTask. Violations return the morePacketsSetBack location seeded from the SurvivalFly set-back.\n\nFlag and Position add one extra C04 per save episode, which is negligible to the window; the real traffic signature is Blink. The suppression erases the fall from the server's view, but the flush re-sends every queued C0F transaction (and any surviving C03s) in one concentrated burst when the ground reappears, which is precisely the profile of the half-second burst path: a dozen-plus packets inside one bucket. The burst fires once per fall episode, so sustained void hopping accumulates the bucket score and eventually the window violation."
+    },
+    {
+      "label": "GroundSpoof (ground-truth cross-check)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/GroundSpoof.java",
+      "explanation": "Hawk's ground-truth check handles both packet shapes: position-bearing updates use the lag-compensated isOnGroundReally trace, and flag-only updates fall back to AdjacentBlocks.onGroundReally on the predicted position with a 0.001 velocity tolerance. On a claim-versus-trace mismatch it re-tests the pre-move position at the clipped Y (the client clips Y before setting onGround), skips the step and web-phasing cases, then punishes and rubber-bands. With preventNoFall enabled it additionally rewrites the raw packet bytes to force onGround false on the wire.\n\nThe module's ground claims are exactly the mismatch this check is built to score: Ground and Boost claim ground while the trace over void air reports none, so the re-test fails and the player is rubber-banded with the flag, and the wire rewrite actively converts the module's claimed onGround true into false so the server-side fall bookkeeping proceeds. Claims within 0.02 of real terrain pass, which is the legitimate-landing band; the module's claims sit over open air, outside it."
+    }
+  ]
+}

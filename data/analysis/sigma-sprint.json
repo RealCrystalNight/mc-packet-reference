@@ -1,0 +1,62 @@
+{
+  "module": "Sprint",
+  "client": "Sigma 4.11",
+  "category": "sprint",
+  "source_rel": "info/sigmaclient/module/impl/movement/Sprint.java",
+  "overview": "Sigma 4.11's Sprint is an auto-sprint module with an omni option. The OMNIDIR setting, default true, allows sprinting backward, and a public static backward flag mirrors the setting for other modules. On the pre phase of every EventUpdate, when the player is moving, the food level is above 6, the forward key is held (unless omni is on), and the Scaffold module does not claim control, it calls mc.thePlayer.setSprinting(true). The fork's EntityPlayerSP then diffs the sprint state and emits the C0B START_SPRINTING packet in the same tick, and because the fork's setSprinting resets the 600-tick sprintingTicksLeft expiry on every call, the sprint never lapses while the module is enabled.",
+  "sections": [
+    {
+      "h": "Event hook and packet emission",
+      "p": "The fork's EntityPlayerSP movement update fires EventUpdate at the top, before the sprint-state diff. The module's pre handler calls setSprinting(true) when its conditions hold; after the event completes, the fork compares isSprinting() against the last-known server state (field_175171_bO) and sends C0B START_SPRINTING or STOP_SPRINTING on the transition. So the module emits exactly one START per state change, not one per tick, and the emission is guaranteed to happen on the same tick as the event because the diff runs later in the same method."
+    },
+    {
+      "h": "Omni and the food gate",
+      "p": "canSprint requires PlayerUtil.isMoving() and a food level above 6, which matches the vanilla sprint rule, plus the forward key when OMNIDIR is off; with the default omni on, backward and sideways movement are sprint-eligible. Scaffold.shouldSprint() yields control when the Scaffold module is enabled in Legit or Cubecraft mode, so the tower logic owns the sprint state there. The fork's setSprinting also sets sprintingTicksLeft to 600 on every call, and onLivingUpdate decrements it and stops the sprint at zero, so the per-tick re-assertion from the module keeps the vanilla 30-second expiry from ever firing."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The C0B stream carries one START per enable and one STOP per disable, exactly like a vanilla sprint toggle, which makes the packet stream itself look clean. The distinguishing signal is the direction: with omni on, the START accompanies backward or sideways motion, and the C03 stream carries sprint-speed deltas with the server-side sprint state true. The food gate keeps the sprint legitimate against hunger checks, so the observable anomaly is directional rather than state-based."
+    }
+  ],
+  "packets": [
+    "C0BPacketEntityAction"
+  ],
+  "files": [
+    {
+      "label": "Sprint.java",
+      "rel": "info/sigmaclient/module/impl/movement/Sprint.java",
+      "explanation": "The module is entirely this file. The constructor registers the OMNIDIR setting, default true with the description 'Sprint backward.', and the static backward field mirrors the setting value for other modules to read. The handler registered for EventUpdate runs on every update event: on the pre phase it copies the setting into backward, then calls setSprinting(true) when canSprint() and Scaffold.shouldSprint() both hold.\n\ncanSprint enforces the two gates: without omni, the forward key must be pressed, and in all cases the player must be moving with food above 6. Scaffold.shouldSprint returns false only when the Scaffold module is enabled in Legit or Cubecraft mode, which hands the sprint state to the scaffold logic. The module never sends a packet directly; every C0B is emitted by the fork's vanilla update path as a side effect of the flag write."
+    },
+    {
+      "label": "EntityPlayerSP.java (fork tick machinery)",
+      "rel": "net/minecraft/client/entity/EntityPlayerSP.java",
+      "explanation": "The fork's EntityPlayerSP is the file that turns the module's flag write into the C0B stream. Its movement update fires EventUpdate first, then diffs isSprinting() against field_175171_bO and enqueues C0B START_SPRINTING or STOP_SPRINTING on the transition, so the module's pre-phase setSprinting call lands before the diff and produces the packet in the same tick. setSprinting itself (lines 447-451) calls the superclass flag setter and then sets sprintingTicksLeft to 600 or 0, and onLivingUpdate decrements that counter and stops the sprint at zero.\n\nThe 600-tick expiry is the mechanism the module defeats: vanilla would drop the sprint 30 seconds after the last trigger, but the module re-asserts the flag on every tick, which resets the counter to 600 each time, so the sprint is held indefinitely while enabled. The file also shows why holding the flag produces no repeated traffic: the state diff only emits packets on change."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ToggleFrequency (entity-action rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/ToggleFrequency.java",
+      "explanation": "NCP handles the C0B stream through the ProtocolLib EntityActionAdapter, which adds one point to data.playerActionFreq per entity-action packet and runs ToggleFrequency.check on the window. The check scores the full window against cc.toggleActionLimit, default 25 actions per second (NET_TOGGLEFREQUENCY_LIMIT, DefaultConfig line 578), with the configured actions cancelling at vl > 10, and it does not discern action types, so sprint, sneak and bed-leave toggles share one bucket.\n\nSigma's module emits one START per enable and one STOP per disable through the vanilla state diff, so the sustained rate is one or two actions per toggle cycle, far under the 25 per second limit. The check only bites when toggles concentrate: rapid re-enabling, or combination with a sprint-reset module that forces STOP and START pairs, is what accumulates VL here. As with the Rise port, this entry is the honest C0B rate baseline; the direction and hunger checks below are where the module actually surfaces."
+    },
+    {
+      "label": "OmniSprint (direction vs sprint state)",
+      "ac": "AimbotPvP-azure-anticheat",
+      "rel": "src/main/java/us/skidrevenant/azure/check/checks/motion/OmniSprint.java",
+      "explanation": "Azure's OmniSprint runs on PlayerMoveEvent and returns immediately unless the Bukkit player is sprinting, the server-side state set by the C0B START_SPRINTING packet. When sprinting, it compares the move delta's quadrant against the yaw quadrant and flags the four mismatched pairs with a 60000ms cooldown. It is a direction validator: sprint state is trusted, and movement that contradicts the facing is punished.\n\nSigma's default omni mode is a direct hit. The module always lets the C0B through (there is no silent filter in this port), so the server marks the player sprinting, and backward movement presents a delta whose quadrant contradicts the yaw, raising the violation on the first backward move. The non-omni configuration with forward-only sprinting is the clean side: the delta always agrees with the yaw, so the check stays dormant. The module's OMNIDIR default true is therefore exactly the configuration this check exists to catch."
+    },
+    {
+      "label": "SprintA (hunger-gated sprint)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/sprint/SprintA.java",
+      "explanation": "Grim's SprintA is a post-prediction hunger check: after the movement prediction completes, it flags when the player's food is at or below 6.0 while the player is sprinting, with setback 0, and rewards when not sprinting, with flying players and camel riders exempt. The sprint state Grim maintains for the player is the server-visible claim, so the check measures the sprint against hunger.\n\nSigma's canSprint requires food above 6 before it ever calls setSprinting, so the module's own gate keeps the sprint state false whenever SprintA would flag; the check's reward path applies instead. This is a designed non-event: the module does not need to bypass the check because it never produces the flagged state. The gate also matches the vanilla stop rule, so the sprint is legitimate on the hunger axis in every configuration."
+    },
+    {
+      "label": "Arc v2 (no entity-action consumer)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/com/comphenix/packetwrapper/WrapperPlayClientEntityAction.java",
+      "explanation": "Vrekt-Arc v2 has no entity-action consumer at all. The only artifact of the C0B packet in its tree is the ProtocolLib wrapper WrapperPlayClientEntityAction, a generated data holder that is never constructed by the anticheat: PacketListener subscribes only to FLYING, POSITION and POSITION_LOOK, USE_ENTITY, ARM_ANIMATION, HELD_ITEM_SLOT and BLOCK_PLACE (the soup auto-heal branch). No check reads the sprint action, validates sprint state, or measures toggle frequency, so the module's C0B traffic is invisible to Arc v2.\n\nThe honest consequence is that Arc v2 exerts no pressure on the sprint claim itself; its movement layer (Speed and MorePackets) sees only the position stream, where sprint-speed deltas are not distinguished from ordinary speed. This entry documents the gap rather than a counter: on Arc v2 servers the module's sprint state and its omni direction both pass without any C0B-side detection."
+    }
+  ]
+}

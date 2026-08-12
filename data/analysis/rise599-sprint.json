@@ -1,0 +1,62 @@
+{
+  "module": "Sprint",
+  "client": "Rise 5.99",
+  "category": "sprint",
+  "source_rel": "dev/rise/module/impl/movement/Sprint.java",
+  "overview": "Rise 5.99's Sprint is an auto-sprint module. On every StrafeEvent it forces the sprint keybind's pressed flag true and, in All Directions mode, sets the EntityPlayerSP allowMultiDirSprint flag so the player moves at sprint speed in every direction. Silent mode cancels the C0B START_SPRINTING packet whenever the forward key is not held, so omni-sprinting sideways or backward never informs the server of the sprint state, and Only In Air restricts the multi-dir flag to airborne movement with a two-tick ground grace. onDisable restores the real keyboard state and clears the flag.",
+  "sections": [
+    {
+      "h": "Key forcing",
+      "p": "The handler runs on StrafeEvent, the per-movement-tick event. It maintains an onGroundTicks counter for the Only In Air gate, then unconditionally writes keyBindSprint.setKeyPressed(true), which makes the vanilla sprint-start logic treat the key as held. The vanilla EntityPlayerSP update diffs the sprint state against its last-known server state and emits C0B START_SPRINTING when the state changes, so the wire effect is one START per enable cycle, not a packet per tick. The forced key also keeps the vanilla conditions (moving, not collided, food above the stop threshold) as the effective gates on whether the sprint actually engages."
+    },
+    {
+      "h": "Multi-directional sprint",
+      "p": "All Directions sets allowMultiDirSprint, the client field that lets the movement code apply sprint speed while strafing or moving backward, gated on the module being enabled, the player not sneaking, MoveUtil.isMoving() and no horizontal collision, with Only In Air further requiring fewer than two grounded ticks. Silent mode then filters the C0B stream: when the forward key is not down, a START_SPRINTING packet is cancelled, so the server-side sprint state stays false for sideways and backward motion. When the forward key IS held, the C0B goes through and the server sees a sprinting player moving diagonally, which is the state that direction-aware checks can measure."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The clean fingerprint is one C0B START and one STOP per toggle cycle. In silent multi-dir use the C0B stream is suppressed almost entirely while the C03 deltas still show sprint-speed motion in arbitrary directions, which is the sharper anomaly: the server-side sprint state says not sprinting while the position stream moves faster than walk speed. The module never sends anything else; it only mutates the keybind, the client flag and the outgoing C0B."
+    }
+  ],
+  "packets": [
+    "C0BPacketEntityAction"
+  ],
+  "files": [
+    {
+      "label": "Sprint.java",
+      "rel": "dev/rise/module/impl/movement/Sprint.java",
+      "explanation": "The module is entirely this file. The constructor registers All Directions (false default), Only In Air (false) and Silent (true), and onUpdateAlwaysInGui hides Only In Air and Silent unless All Directions is enabled, so the UI only exposes them when they can matter. onStrafe is the main handler: it updates the grounded tick counter, forces the sprint keybind pressed, and evaluates the allowMultiDirSprint flag from the multi-dir gates.\n\nonPacketSend holds the silent filter: with All Directions and Silent enabled and the forward key released, any C0B with the START_SPRINTING action is cancelled, which keeps the server-side sprint state false during omni movement. onDisable restores the sprint keybind to the physical keyboard state and clears allowMultiDirSprint, so a toggle-off mid-sprint drops the state cleanly. The onPreMotion stub is empty; the module does all of its work from the strafe and packet events."
+    },
+    {
+      "label": "StrafeEvent.java (per-tick cadence)",
+      "rel": "dev/rise/event/impl/other/StrafeEvent.java",
+      "explanation": "StrafeEvent is the per-movement-tick event the module hooks, carrying the forward and strafe input magnitudes and the friction value the movement code will apply, with setSpeed helpers that other movement modules use to rewrite the player's velocity. The event bus fires it on each movement tick the client processes, which is the cadence the Sprint handler uses: every fired event re-asserts the keybind and re-evaluates the multi-dir flag, so the sprint state cannot lapse between events.\n\nThe class implements InstanceAccess for the Minecraft singleton. For Sprint the event is a pure trigger; the handler reads the input state from the keyboard rather than from the event's own fields, so the event's role in this module is the per-tick cadence rather than the data it carries."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ToggleFrequency (entity-action rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/ToggleFrequency.java",
+      "explanation": "NCP handles the C0B stream through the ProtocolLib EntityActionAdapter, which adds one point to data.playerActionFreq per entity-action packet and then runs ToggleFrequency.check on the accumulated window. The check scores the full window against cc.toggleActionLimit, default 25 actions per second (NET_TOGGLEFREQUENCY_LIMIT, DefaultConfig line 578), with the configured actions cancelling at vl > 10. The adapter deliberately does not discern action types, so sprint, sneak and bed-leave toggles all feed the same bucket.\n\nAgainst auto-sprint the check is mostly dormant: both Rise modes emit one START per enable and one STOP per disable, so the sustained rate is well under 25 per second, and the silent filter removes even those events for omni use. The check is the counter to rapid toggle spam, which is the wtap family, not the auto-sprint family; a player who binds the module to a key and taps it quickly, or combines it with a sprint-reset module, is what accumulates VL here. This entry is the honest baseline for the C0B rate, with the real pressure on these modules coming from the state checks below."
+    },
+    {
+      "label": "OmniSprint (direction vs sprint state)",
+      "ac": "AimbotPvP-azure-anticheat",
+      "rel": "src/main/java/us/skidrevenant/azure/check/checks/motion/OmniSprint.java",
+      "explanation": "Azure's OmniSprint runs on PlayerMoveEvent and returns immediately unless the Bukkit player is sprinting, which is the server-side state set by the C0B START_SPRINTING packet. When sprinting, it compares the move delta's quadrant against the yaw quadrant: the four mismatched pairs in the condition, where the delta moves into the quadrant opposite the facing, raise a violation with a 60000ms cooldown. The check is a direction validator: it trusts the sprint state and punishes movement that contradicts the facing.\n\nRise's module splits on the silent filter. With the forward key held, the C0B goes through and the server marks the player sprinting, so a diagonal strafe under All Directions presents a delta that contradicts the yaw and flags. With the forward key released, the silent filter cancels the START, the server-side sprint state stays false, and the check returns at its first line, so the pure sideways and backward sprint is invisible to it. The module's default Silent mode is therefore the designed bypass for this check, and disabling Silent for visible omni sprinting is what Azure punishes."
+    },
+    {
+      "label": "SprintA (hunger-gated sprint)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/sprint/SprintA.java",
+      "explanation": "Grim's SprintA is a post-prediction hunger check: after the movement prediction completes, it flags when the player's food is at or below 6.0 while the player is sprinting, with setback 0, and rewards when not sprinting. Players who can fly and camel riders are exempt. The sprint state Grim maintains for the player is the server-visible claim, so the check measures the sprint against the hunger level.\n\nRise's module has no food gate of its own; it forces the keybind unconditionally, so whether the sprint holds while starving depends on the fork's vanilla stop logic. Rise 5.99 ships only the dev/ tree, so that stop logic is not verifiable from the snapshot; if the fork keeps the vanilla rule that hunger at or below 6 cancels sprinting, the module's forced key is overridden and SprintA never sees a starving sprint, and if not, the START packet with food below the threshold flags. Either way the honest statement is that the module contributes no hunger defense of its own, unlike the Sigma port which gates on food."
+    },
+    {
+      "label": "Arc v2 (no entity-action consumer)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/com/comphenix/packetwrapper/WrapperPlayClientEntityAction.java",
+      "explanation": "Vrekt-Arc v2 has no entity-action consumer at all. The only artifact of the C0B packet in its tree is the ProtocolLib wrapper WrapperPlayClientEntityAction, a generated data holder that is never constructed by the anticheat: PacketListener subscribes only to FLYING, POSITION and POSITION_LOOK, USE_ENTITY, ARM_ANIMATION, HELD_ITEM_SLOT and BLOCK_PLACE (the soup auto-heal branch). No check reads the sprint action, validates sprint state, or measures toggle frequency, so the module's C0B traffic is invisible to Arc v2.\n\nThe honest consequence is that Arc v2 exerts no pressure on the sprint claim itself; its movement layer (Speed and MorePackets) sees only the position stream, where a sprint-speed delta without a sprint state is not distinguished from ordinary speed. This entry documents the gap rather than a counter: servers running Arc v2 get no detection from the C0B side of this module, and the module's silent filter does not need to hide anything from this anticheat."
+    }
+  ]
+}

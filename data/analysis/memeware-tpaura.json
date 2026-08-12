@@ -1,0 +1,63 @@
+{
+  "module": "TP Aura",
+  "client": "Memeware 7.3",
+  "category": "tpaura",
+  "source_rel": "me/memewaredevs/client/module/combat/TPAura.java",
+  "overview": "Memeware 7.3 TP Aura is a teleport attack module: on a CPS-gated clock it streams C04 position packets along a computed path to every player within 218 blocks, swings, sends C02 attacks from the faked position, then streams the path in reverse to return. The path is built by the client's A* PathFinder with waypoints no more than 5 blocks apart, each carried with onGround true, so the vanilla moved-too-quickly gate (which tolerates position jumps up to 100 blocks) accepts every hop while the server-side position silently relocates next to each target. An optional NoHitDelay Breaker multiplies the attack to 10 C02 packets per target.",
+  "sections": [
+    {
+      "h": "Path construction",
+      "p": "computePath walks the PathFinder node list and collapses it into dash waypoints: the endpoints are always kept, and an interior node is only kept when the swept AABB between the last dash point and the candidate contains an invalid block or the segment exceeds 5 blocks (squareDistanceTo greater than 25). Each kept waypoint is shifted by 0.5 on x and z so the stream lands on block centers rather than corners, and if the starting block is solid the path origin is lifted one block first. The result is a chain whose hops are all at most 5 blocks, which is exactly the maximum the dash compression allows."
+    },
+    {
+      "h": "Attack sequence and clock",
+      "p": "One shared Timer gates the whole sweep: when 1000 divided by the CPS setting has elapsed, every target returned by CombatUtil.getTargets(false, Targets, true, true, 218.0, true) is attacked in sequence. The target scan only accepts EntityPlayer instances, includes invisible players, skips dead and zero-health entities, and filters the client's bot list. Per target the module streams the forward C04 chain, swings, sends the C02 (or 10 C02s when NoHitDelay Breaker is on), then streams the chain backwards, so the entire round trip happens inside one timer fire and the server sees the player snap out to the victim and back."
+    },
+    {
+      "h": "Range and vanilla acceptance",
+      "p": "The range argument is 218.0, widened to 220.0 for targets whose feet sit more than one block above the player (CombatUtil adds 2 in that case). All C04s carry onGround true even over open air, and vanilla processPlayer only rejects position deltas above 100 blocks per packet, so each 5-block hop passes the vanilla gate. The module never rotates toward the target, so the attack direction is wherever the player happens to face at fire time."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity",
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "TPAura.java",
+      "rel": "me/memewaredevs/client/module/combat/TPAura.java",
+      "explanation": "The module file contains the whole mechanism: the waypoint compressor, the path validation loop, and the single UpdateEvent handler that runs the sweep. The handler reads the CPS setting through the shared Timer, iterates the target list, and for each target sends the forward C04 chain, the swing, the C02 attack (with the 10-packet variant behind the NoHitDelay Breaker toggle), and the reversed chain back. The canPassThrough predicate defines which materials a waypoint may sit in (air, plants, vine, ladder, water and signs), and it is the only place the module consults world state beyond the target scan. The packet sends go through addToSendQueue, so every C04 and C02 is visible to the client's own outgoing-packet events."
+    },
+    {
+      "label": "PathFinder.java (path search)",
+      "rel": "me/memewaredevs/client/util/pathfinding/PathFinder.java",
+      "explanation": "PathFinder is the A* search the module runs between the player and each target. The module calls compute() and then walks getPath() to obtain the raw node chain that computePath compresses into dash waypoints, and it calls the static isValid() during the swept-box validation of each candidate segment. The search is block-grid based and returns node positions that the module recenters with a 0.5 offset on x and z before serializing them into C04 packets. The 5-block dash limit in computePath is what keeps the hop count bounded on long paths."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Reach (attack distance from the tracked position)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Reach.java",
+      "explanation": "The attack is only in range because the C04 stream relocates the server-side player next to the victim, and that relocation is exactly what NCP rejects. The SurvivalFly envelope, which runs per move in the same pipeline, rebuilds the allowed distance from the physics model: each 5-block hop with onGround true exceeds the predicted sprint distance of about 0.28 blocks by a wide margin, so the first C04 of the stream triggers a violation and a set-back to the stored location. By the time the C02 arrives, the tracked position is the reverted origin, and the reach check measures the attack from there: hundreds of blocks against the 4.02 survival distance (DefaultConfig line 366).\n\nThe reachMod adaption cannot forgive this. The reduce band (reachReduceDistance 0.8, reachReduceStep 0.14) only steps reachMod down for hits between roughly 3.22 and 4.02 blocks, and the silent-cancel path only fires while the distance stays under the limit times reachMod. A 218-block attack is orders of magnitude past both, so reachVL grows by the full violation on every sweep and the first cancel tier (vl greater than 1) stops the attacks. The honest caveat is config-shaped: on a server that disables the movement envelope, the C04s are accepted, the attack measures from the faked position, and this check passes by design. The module's reach claim is only as good as the teleports that precede it."
+    },
+    {
+      "label": "EntityInteractDirection (facing cone)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/entity/EntityInteractDirection.java",
+      "explanation": "The module never rotates toward its victims, and Hawk scores the interaction against the direction the server actually observed. EntityInteractDirection builds the direction ray from the player's server-side yaw and pitch (the 1.8 fork updates cursor yaw per tick, so no extrapolation is needed) and requires the victim's AABB, expanded by the 0.2 boxExpand setting, to sit between the current and previous direction vectors. A target that the player is not facing fails the cone test no matter how close the teleport brought the attacker.\n\nIn practice the module attacks every player in range in one sweep, so only victims that happen to lie inside the current facing cone pass; everyone behind or off to the side of the fixed yaw adds a violation. The one honest escape is directional: a player who aims at the crowd before each fire keeps the cone over at least some targets, and those particular attacks pass. The check also inherits the 1.8 attack-before-yaw ordering (the C02 precedes the look update that describes it), which is exactly the ordering this module produces."
+    },
+    {
+      "label": "EntityInteractReach (lag-compensated AABB distance)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/entity/EntityInteractReach.java",
+      "explanation": "Hawk's reach check compares the victim AABB distance against maxReach 3.1 using the player's position history, with lag compensation enabled by default. Because the C04 stream precedes the C02 in the same tick, the history contains the teleported position, so the measured distance is the sub-block gap between the faked spot and the victim and the attack passes. This entry documents the boundary rather than a catch: a purely geometric reach check validates whatever position the movement layer just accepted.\n\nThe check only bites when the teleports are reverted or dropped. If the movement layer rejects the C04s and the server keeps the origin position, the history never contains a spot near the victim and the measured distance is the full 218 blocks, which flags instantly. The two Hawk checks therefore split along the same fault line as NCP: geometry alone is blind to the module, and the movement envelope is what makes the geometry checks see it."
+    },
+    {
+      "label": "Angle (attack-stream window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Angle.java",
+      "explanation": "Angle scores the attack stream in a 1000ms window (maxTimeDiff) against four signals: average movement between attacks, average time between attacks, average yaw change, and target-switch speed. The module's sweep pattern maximizes every signal: all targets are attacked from the same position within one timer fire, so avgmove sits near zero, the 50ms gaps at 20 CPS sit far under the 150ms time threshold, yaw never changes between attacks, and switching victims without turning feeds the switch signal.\n\nThe honest limitation is the stock configuration. The thresholds in this tree (move 100, time 150, yaw 60, switch 50) dwarf the per-call signal scores, which cap at 20-30, and angleVL decays at 0.98 per tick, so at defaults the check never fires. Detection configs that lower the thresholds turn the module's deterministic sweep into a constant flag source, which is the standard deployment this analysis assumes."
+    }
+  ]
+}

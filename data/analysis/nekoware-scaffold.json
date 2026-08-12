@@ -1,0 +1,65 @@
+{
+  "module": "Scaffold",
+  "client": "Nekoware v1 private",
+  "category": "scaffold",
+  "source_rel": "me/nekoWare/client/module/player/Scaffold.java",
+  "overview": "Nekoware v1's Scaffold is a byte-for-byte port of the Memeware 7.3 module with four deltas that break it. The event phases are swapped: the inventory scan, support search and rotation write run in the post event, and the placement runs in the pre event. The probe cell sits at posY - 0.5 instead of posY - 0.9. The placement gate is a 900ms Timer latch that, like its sibling, is never reset. And the rotation writes use rots[1] for yaw, pitch, head yaw, head pitch and render offset alike, so the head model shows the pitch value as its yaw. Because the post event fires after the tick's C03 has already been sent, the computed rotations never reach the server: the C03 stream carries the player's natural look and only local head fields change. The tower branch multiplies motionX and motionZ by 0.1 and never touches motionY, so the tower is inert, and an unused S0BPacketAnimation import completes the port's dead code.",
+  "sections": [
+    {
+      "h": "Broken phase wiring",
+      "p": "The port swapped isPre and isPost relative to Memeware: the pre branch now runs the placement, and the post branch runs the scan, the rotation computation and the writes. In the fork's func_175161_p the pre event is fired before the C03 variant send and the post event after it, so the yaw/pitch the module writes with event.setYaw and event.setPitch land on the post event object that no packet builder consumes. The server-side look is therefore never aimed at the bridge, and only rotationYawHead, rotationPitchHead and renderYawOffset change locally. The scan in the post phase also means the placement data is one tick stale: data computed in the post event of tick N is consumed by the pre-event placement of tick N+1. The probe at posY - 0.5 resolves to the cell containing the feet, so when the player stands on solid ground the air test fails and the module idles; it only places when the feet cell itself is air, which happens while falling into a gap or bridging off an edge, so on flat ground the module mostly does nothing."
+    },
+    {
+      "h": "Rotation index bug",
+      "p": "doScaffoldRotations returns a float pair {yaw, pitch}, and the Memeware original assigns rots[0] to yaw-bearing fields and rots[1] to pitch. Nekoware assigns rots[1] to everything: rotationYawHead, rotationPitchHead, renderYawOffset, event.setYaw and event.setPitch. The visible head therefore yaws by the pitch angle, and because the event writes are post-phase and inert, the only observable effect of the rotation code is the wrong head model. The bug is a pure copy-paste artifact, and it makes the module's rotation layer dead twice over: wrong value, wrong phase."
+    },
+    {
+      "h": "Dead tower and dead imports",
+      "p": "The tower branch, which in Memeware sets motionY to 0.41999998688697815, here only multiplies motionX and motionZ by 0.1 while the jump key is held; motionY is never assigned, so there is no vertical gain and the branch cannot tower. The 900ms Timer latch is never reset either, so the placement gate is permanently true after nine tenths of a second and the module places on every pre tick when the air test passes, roughly 20 C08s per second. The import of S0BPacketAnimation is unused, and the slot scan loop over slots 0-44 that discards its getStack() results is inherited from the original. The parts that survive the port intact are the C0A swing after a successful placement and the C08 emission through the fork's onPlayerRightClick3d, including its syncCurrentPlayItem C09 sync."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement",
+    "C09PacketHeldItemChange",
+    "C0APacketAnimation",
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Scaffold.java",
+      "rel": "me/nekoWare/client/module/player/Scaffold.java",
+      "explanation": "The port with its four deltas: the swapped isPre/isPost branches, the posY - 0.5 probe, the 900ms never-reset Timer latch, and the rots[1] rotation assignments. It also carries the dead S0BPacketAnimation import and the inert tower branch that only dampens motionX/motionZ. The @Handler-marked consumer field and the blacklist are otherwise identical to the Memeware original, which makes the port relationship easy to diff."
+    },
+    {
+      "label": "ScaffoldUtils.java (block search and swap)",
+      "rel": "me/nekoWare/client/util/blocks/ScaffoldUtils.java",
+      "explanation": "The support-block search the module depends on: getBlockData probes the cell below the target, then the four side cells, then a second ring, and returns the first non-blacklisted support with the EnumFacing pointing into the target; getVec3d computes the randomized hit vector passed into onPlayerRightClick3d; getBlockSlot and invCheck drive the hotbar refill, and swap performs the windowClick that emits C0EPacketClickWindow. The file is byte-identical to the Memeware copy except for the package, confirming the port lineage, and its blacklist is shorter than the module's own duplicated list."
+    }
+  ],
+  "countering": [
+    {
+      "label": "NCP blockplace Direction (look ray vs clicked face)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Direction.java",
+      "explanation": "Direction is the strongest detector of this specific port because the module's rotation layer is inert. AbstractBlockDirectionCheck ray-traces from the player's eye using the server-side yaw/pitch of the last C03PacketPlayer against the block the player claims to have clicked, and the module never writes into that stream: the event yaw/pitch assignments happen in the post phase, after the tick's C03 was already sent, so the server-side look is the player's natural aim, which while bridging does not point at the face below. Every placement therefore presents a claimed clicked block that the server-side ray does not cross, directionVL accumulates on each of the roughly 20 placements per second, and the 0.9 per-tick decay cannot pull the total back. The one caveat is that NCP only samples the look from the movement queue, so the check needs the module to be actively placing to accumulate; when the posY - 0.5 probe idles on flat ground, there are no placements and nothing to flag."
+    },
+    {
+      "label": "NCP blockplace FastPlace (placement rate window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/FastPlace.java",
+      "explanation": "FastPlace scores accepted placements into an ActionFrequency(2, 1000) two-second window plus a short-term tick counter, and flags when the window score exceeds cc.fastPlaceLimit. The 900ms Timer latch never re-arms, so the module's placement rate is one C08 per tick whenever the air test passes, roughly 20 per second, which keeps the window several times over the limit for as long as the module is over air. The check is look-independent, so it does not care that the rotations are broken. The honest limitation is the same as for the Direction check: on flat ground the posY - 0.5 probe fails and the module stops placing, so FastPlace only engages during actual bridging or gap-falling."
+    },
+    {
+      "label": "NCP blockplace Scaffold check (angle / time / sprint / tool-switch)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Scaffold.java",
+      "explanation": "The sub-checks of the dedicated detector hit this port unevenly because the look is unmodified. The Angle sub-check flags when the angle between the player's natural look and the placed face normal exceeds MAX_ANGLE = 90 degrees, so it trips on any downward gaze while placing on an UP face but stays quiet for a player looking at the horizon; the Time sub-check only records placement ticks when pitch is above 70, so it never records for a horizon-looking user and cannot build its average, while a user looking down while bridging trips it immediately because the module places every tick; the ToolSwitch sub-check flags a held-slot change between placements and sets cancelNextPlace, and the C09 stream from syncCurrentPlayItem plus the window-click refill produce exactly that when the hotbar rotates; the sneak exemption never applies because there is no sneak emulation. The honest summary: this port's visibility depends on the user's real aim, which is exactly the axis Direction exploits unconditionally."
+    },
+    {
+      "label": "NCP SurvivalFly (jump envelope; vestigial tower)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly's vertical envelope is the check that a working tower would face: the jump envelope credits only impulses matching the predicted jump gain with a from-ground state, arms a 10-tick jumpDelay window, and flags re-applied jump motion inside that window with a set-back. Nekoware's tower branch never asserts motionY at all, only multiplying motionX and motionZ by 0.1 while the jump key is held, so there is no vertical impulse for the envelope to judge and the module cannot tower regardless of the check. The horizontal 0.1 dampening during the jump key keeps the player under the predicted horizontal envelope, so this check has nothing to flag against the module as written. It is a genuine gap entry: the check defeats the tower pattern the module inherited but broke."
+    }
+  ]
+}

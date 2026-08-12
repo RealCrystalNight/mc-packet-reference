@@ -1,0 +1,63 @@
+{
+  "module": "AutoTool",
+  "client": "Rise 5.99",
+  "category": "autotool",
+  "source_rel": "dev/rise/module/impl/player/AutoTool.java",
+  "overview": "Rise 5.99's AutoTool puts the fastest hotbar item in the player's hand at the moment a block break starts and swaps back to the best sword as soon as the break ends. The block-break handler runs a 9-slot scan that scores each stack with ItemStack.getStrVsBlock against the targeted block's IBlockState and records the winner, the pre-motion pass writes that slot into mc.thePlayer.inventory.currentItem directly and clears the pending break, and the attack handler feeds PlayerUtil.findSword, a sharpness-weighted damage ranking, into the same restore path with a guard that keeps the sword from fighting an active mining click. The module constructs no packets of its own: the direct currentItem write surfaces on the wire as C09PacketHeldItemChange when the vanilla PlayerControllerMP.syncCurrentPlayItem diff detects the change on the next interaction, and the break itself is the normal C07 digging sequence, so the module's only server-visible signature is the slot-change pairing around each break.",
+  "sections": [
+    {
+      "h": "Event wiring and the tool scan",
+      "p": "onBlockBreak receives the targeted BlockPos, reads mc.theWorld.getBlockState, and iterates hotbar slots 0 through 8 keeping the first stack whose getStrVsBlock speed exceeds the current best. bestSpeed starts at 1F, so only items that actually out-perform a bare hand qualify, and the strictly-greater comparison makes the lowest-index best slot win. The winning slot and the block position are stored, and the next pre-motion pass applies the switch and nulls both fields, so the restore runs exactly once per break. onAttackEvent records PlayerUtil.findSword() into the sword field, and the pre-motion restore for the sword is gated: it only fires when the attack key is not held down on a block, so a player mid-mining click does not get yanked back to the sword while the break is still progressing."
+    },
+    {
+      "h": "Packet fingerprint",
+      "p": "All slot writes go through the public currentItem field, never through a packet constructor. The C09 that carries the change is emitted by the vanilla sync path: PlayerControllerMP.syncCurrentPlayItem compares the tracked currentPlayerItem against inventory.currentItem and sends C09PacketHeldItemChange on divergence, and the sync hook runs at the top of every interaction entry point in the controller, including clickBlock, onPlayerDamageBlock and onPlayerRightClick. Because the module writes the tool before the break and the sword after it, a mining session produces a C09 to the tool, the C07 START_DESTROY_BLOCK and STOP_DESTROY_BLOCK pair, and a C09 back to the sword: two slot changes around one break. Releasing the mining click early can land the sword C09 while the break is still running, which is exactly the pairing a server-side slot ledger would key on."
+    },
+    {
+      "h": "What the module buys",
+      "p": "The gain is bounded by the vanilla breaking table. getStrVsBlock returns the per-tool efficiency against the block material, and the server computes break duration from the same table with the item actually in the main hand, so the module's best-tool break completes at the maximum legal speed: the same speed a player who manually scrolls to the right slot achieves. It grants no reach, no insta-break and no swing-rate advantage; its real value is consistency and the automatic sword restore between breaks, which is why the countering surface is the checks that bound break speed, break count and reach rather than any tool-specific detector in NCP's tree."
+    }
+  ],
+  "packets": [
+    "C09PacketHeldItemChange",
+    "C07PacketPlayerDigging"
+  ],
+  "files": [
+    {
+      "label": "AutoTool.java",
+      "rel": "dev/rise/module/impl/player/AutoTool.java",
+      "explanation": "The module is four handlers plus the scan. onBlockBreak stores the best-slot result for the targeted block, onPreMotion applies the pending tool switch first and the sword restore second (the sword branch refuses to overwrite the slot while the attack key is held down on a block), and onAttackEvent records the sword slot from PlayerUtil.findSword. getBestItem is the scan: bestSpeed starts at 1F so a bare-hand or a wrong tool never qualifies, and the strictly-greater comparison keeps the lowest-index best slot. The stored tool and blockPos pair is cleared after the pre-motion apply, so each break triggers exactly one switch and one restore.\n\nThe module writes mc.thePlayer.inventory.currentItem directly and never touches a packet class, so the C09 on the wire comes from the vanilla sync path, not from this file. The gate order matters for the fingerprint: the tool switch is applied before the sword restore in the same pre-motion pass, and the sword restore additionally checks the attack key and the object-mouse-over block so the restore cannot interrupt a mining click still aimed at a block."
+    },
+    {
+      "label": "PlayerUtil.java (sword ranking)",
+      "rel": "dev/rise/util/player/PlayerUtil.java",
+      "explanation": "The sword source for the attack-side restore. findSword walks hotbar slots 0 through 7 (the 9th slot is skipped, a quirk of this implementation), keeps stacks whose item is an ItemSword, and ranks them by damage: getDamageVsEntity plus 1.25 per sharpness level from EnchantmentHelper, with a durability tie-break against the base damage. The module stores the returned slot in the sword field on every attack event and lets the pre-motion restore apply it.\n\nThe same file supplies isBlockUnder, the 2-block-step AABB sweep used by NoVoid, and getEntities, the entity filter used by FastBow, so the utility is shared across the player-module family; only findSword is exercised by AutoTool."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastBreak (tool-calibrated break duration)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/FastBreak.java",
+      "explanation": "The blockbreak duration check is calibrated to the tool the server believes the player holds. FastBreak.check computes expectedBreakingTime from BlockProperties.getBreakingDuration(blockType, player), which reads the item in the main hand and walks the material table (tool type, efficiency level, haste, aqua affinity, on-ground and in-water penalties) to produce the legal break duration for that exact loadout, scales it by fastBreakModSurvival, and compares it against the elapsed time tracked from the first damage event (fastBreakfirstDamage and fastBreakBreakTime). When elapsedTime plus the configured delay is still below the expectation, the missing time is scored into fastBreakPenalties buckets and a sustained overrun trips the violation; the insta-break path (isInstaBreak) handles one-hit breaks separately, and server lag is folded in through TickTask.\n\nAutoTool is invisible to this check by construction: its break uses the best tool for the block, so the server's expectation is computed with that same tool in hand and the elapsed time lands inside the allowance. The check is the honest boundary of the module's effect: it defines that breaking at the per-tool maximum is legal, which is exactly the envelope the module operates inside. A real fastbreak hack, which completes blocks faster than the held tool's table allows, trips the elapsed-time comparison immediately; the module only ever presents the legal maximum."
+    },
+    {
+      "label": "Frequency (blocks per time frame)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/Frequency.java",
+      "explanation": "The companion limit on blocks broken per time frame. Frequency.check scores every completed break into data.frequencyBuckets with an interval weight of 45 in survival by default and compares the window score against the bucket window duration, plus a short-term counter that allows 7 break events inside 5 ticks (frequencyShortTermLimit and frequencyShortTermTicks defaults) before adding violation weight; the configured actions start cancelling from vl 5 and escalate to a kick. The check counts break events, not tool changes, so AutoTool's slot switching contributes nothing to the counters.\n\nThe module breaks one block at a time and waits for each break to complete at the tool's rate, so a mining session stays inside both windows: the per-break cadence is the tool duration, and even a vein with instant-respawn blocks cannot exceed one break every few ticks. Only a hack that completes many blocks per tick (multi-block nuker style) accumulates the short-term counter or the full-period score."
+    },
+    {
+      "label": "Reach (blockbreak distance)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/Reach.java",
+      "explanation": "The blockbreak reach check bounds where the accelerated break can target. It computes the eye-to-block-center distance (TrigUtil.distance against the block center at 0.5 offsets) and compares it against 5.2 blocks in survival and 5.6 in creative, accumulating reachVL per out-of-range break with the standard 0.9 decay. AutoTool changes nothing about the player's position or interaction range: the tool switch happens inside the existing interaction distance, so the check constrains the module the same way it constrains a manual break.\n\nIts role in the countering set is to close the geometry side of the fingerprint: a fast tool switch still has to happen within vanilla reach, and the module cannot extend the targeted block distance by switching. A player who combines the autotool with a reach cheat would surface here, which is the only interaction this check has with the module's behavior."
+    },
+    {
+      "label": "UseItemAdapter (held-slot handler)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "The only NCP code that reacts to a held-slot change in this tree is the protocol adapter's onChangeSlot: on PlayerItemHeldEvent with a real previous-to-new slot difference it calls pData.requestItemUseResync(), which forcibly releases whatever item the player is mid-use of, replacing an older commented-out branch that reverted the slot with setHeldItemSlot. The intent is to close the no-slowdown family of bypasses where a player switches slots while using an item to drop the use state; the adapter keys on the change event, not on the pairing with digging.\n\nAutoTool's switches happen outside any item use: the tool swap precedes the break and the sword restore follows it, so the resync never fires and the adapter stays inert. The blockplace Scaffold check has a ToolSwitch sub-check, but it only compares the held slot between block placements and is never invoked from the digging path. The honest gap: no NCP check in this tree scores the C09-to-C07 pairing that is the module's actual fingerprint, so the countering pressure on a stock NCP setup is the break-speed, break-count and reach envelope rather than any tool-specific detector."
+    }
+  ]
+}

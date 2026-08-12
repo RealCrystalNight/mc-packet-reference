@@ -1,0 +1,57 @@
+{
+  "module": "AutoGap",
+  "client": "Rise 5.99",
+  "category": "autogap",
+  "source_rel": "dev/rise/module/impl/combat/AutoGap.java",
+  "overview": "Rise 5.99's AutoGap eats golden apples in a single pre-motion burst: when ticks exceed 10 and health is below the Health setting (default 10), it queues a C07 release, a C09 switch to the gap slot, a C08 use, a burst of 31 empty C03PacketPlayer packets, a C09 switch back, and a closing C07 release - all through addToSendQueue in one tick. The C03 burst is the module's signature: 31 position-less movement packets hammer the server in the same instant as the use, which is what collapses the vanilla eat window on servers that process use-duration per received packet. A companion PacketSendEvent handler cancels every C0A swing while the gap slot is armed, suppressing swing traffic for the duration of the eat burst. Slot selection is PlayerUtil.findGap(), matching hotbar stacks whose display name contains 'Golden' and which are ItemFood.",
+  "sections": [
+    {
+      "h": "One-tick burst eat",
+      "p": "The entire eat sequence is queued inside a single onPreMotion when the gate opens: C07PacketPlayerDigging RELEASE_USE_ITEM at BlockPos.ORIGIN facing down (cancelling any in-progress use), C09PacketHeldItemChange(gap) when switchSlot is enabled, C08PacketPlayerBlockPlacement with the gap stack (the use), then a for loop queuing 31 new C03PacketPlayer() packets - the no-argument constructor, so each is a position-less ground=false movement packet - then the switch-back C09 when switchSlot is on, and a trailing C07 RELEASE_USE_ITEM. gap is reset to -37 at the end of the same tick, and ticks is zeroed so the next cycle needs another 11 ticks. All sends go through mc.getNetHandler().addToSendQueue or addToSendQueueWithoutEvent, bypassing the module's own event bus."
+    },
+    {
+      "h": "The C03 burst and swing suppression",
+      "p": "The 31 C03PacketPlayer() packets carry no position, look, or ground data - they are pure movement-tick traffic. Their purpose is to flood the server with packet processing during the use so that servers which advance item-use duration per received packet complete the gap's 32-tick eat window almost instantly, making the trailing release finish the consumption in the same tick as the use began. On vanilla the burst is redundant (the release after an under-32-tick use does not complete the eat), but the wire fingerprint is unmistakable: 31 empty C03s in a single tick. The onPacketSend handler meanwhile cancels every C0APacketAnimation while gap != -37, which suppresses swing packets emitted by other modules during the eat window, keeping the burst clean of animation traffic."
+    },
+    {
+      "h": "Slot finder and cycle gate",
+      "p": "findGap() scans hotbar container slots 36-44 for a stack that is non-null, has stackSize above 0, is an ItemFood, and whose display name contains 'Golden', returning the first match as a container index; the module subtracts 36 for the hotbar index and treats -37 as not-found (findGap -1 minus 36). The cycle gate is ticks > 10 plus health below the threshold; ticks is incremented every pre-motion regardless of whether a gap was found, so the module polls the hotbar once per tick while low, and after a successful eat resets ticks to 0, imposing an 11-tick (roughly 550ms) cooldown between eats."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoGap.java",
+      "rel": "dev/rise/module/impl/combat/AutoGap.java",
+      "explanation": "onPreMotion (lines 36-59) is the whole eat engine. The ticks counter (line 37) gates the cycle, and the sequence at lines 43-52 is the burst: leading C07 release, C09 to the gap slot (when switchSlot is on), C08 use with the gap stack, the for loop over i <= 31 queuing empty C03PacketPlayer objects, the switch-back C09, and the trailing C07 release. All sends use the net handler directly - addToSendQueueWithoutEvent for the leading release, addToSendQueue for the rest - so the packets bypass the module's own event stream; that is why the C0A cancel in onPacketSend (lines 62-66) cannot intercept the module's own sends and exists to catch swings from other modules during the armed window. gap is a public static field, reset to -37 at the end of every tick (line 58), so the C0A suppression window lasts exactly one tick.\\n\\nThe 31 C03PacketPlayer() instances are the no-argument constructor: onGround defaults to false and no position, yaw or pitch is set, so each is a bare flying packet. The module never opens a window and never sends C0E; its entire interaction surface is C09/C08/C07/C03 traffic against the hotbar. onDisable only clears the sentinel, leaving the real slot untouched if the module is disabled mid-cycle."
+    },
+    {
+      "label": "PlayerUtil.java (findGap slot finder)",
+      "rel": "dev/rise/util/player/PlayerUtil.java",
+      "explanation": "findGap (lines 297-307) scans container slots 36 to 44, the hotbar in the player inventory container, and returns the first stack that is non-null, has stackSize above 0, is an ItemFood, and whose display name contains 'Golden'. The display-name predicate is what separates golden apples from other ItemFood items, and the ItemFood requirement excludes non-edible 'Golden' items. The return value is a container index, so the module subtracts 36 to obtain the hotbar index used in the C09 and the inventory.getStackInSlot(gap) lookup for the C08 payload.\\n\\nOnly the hotbar is scanned: gaps in the main inventory are never considered, so the module depends on the player pre-loading golden apples into the hotbar. The same class provides findSoup and findHead for the sibling AutoSoup and AutoHead modules with the identical slots-36-to-44 scan pattern."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ItemSwitchSpeed (same-tick switch-back)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/item/ItemSwitchSpeed.java",
+      "explanation": "Hawk's ItemSwitchSpeed marks a player as having used something on InteractItemEvent or InteractWorldEvent, then checks the next ItemSwitchEvent against the stored lastSwitchTick, punishing when the gap is under minSwitchTicks (default 1).\\n\\nAutoGap queues the C09 switch, the C08 use, and the switch-back C09 all inside one tick, so the switch-back ItemSwitchEvent lands in the same tick as the C08 that armed usedSomething: the delta is 0 ticks, below the default minimum of 1, and the check punishes on every eat burst. The module's own cooldown (ticks reset to 0, next burst after 11 ticks) does not help, because each burst re-triggers the punish and Hawk's VL accumulates across bursts. This is the most reliable counter in the set: the same-tick slot restore is structurally incompatible with the check's minimum switch gap."
+    },
+    {
+      "label": "FastConsume (consume duration)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/inventory/FastConsume.java",
+      "explanation": "Arc v2's FastConsume stamps InventoryData.consumeTime on a RIGHT_CLICK_AIR or RIGHT_CLICK_BLOCK with an edible item and flags a PlayerItemConsumeEvent arriving within consume-time (default 1280ms) of the stamp.\\n\\nAutoGap sends the C08 use and the trailing C07 release in the same tick, roughly 50ms apart, so on servers where the golden apple consumption completes at release - which is precisely the server model the 31-C03 burst is designed to force - the consume event lands within a few tens of milliseconds of the stamp, far under the 1280ms floor, and the check fires. On vanilla the burst cannot shorten the fixed 32-tick use window, no consume event fires, and the check stays silent; the honest split is that FastConsume catches the module exactly on the instant-gap servers it targets, and the C03 burst is what makes the eat 'instant' in the first place."
+    },
+    {
+      "label": "FastClick (window click rate, missed)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "NoCheatPlus FastClick counts C0E inventory clicks into an ActionFrequency with five 200ms buckets, comparing the newest bucket against the short-term limit of 4 and the one-second window against the normal limit of 15. Only window-click traffic feeds the ledger.\\n\\nAutoGap never sends C0E: slot selection is C09, the use is C08, and the burst is C03s, so FastClick's ledger never increments no matter how often the module eats. The check exists to stop click-spam inventory shuffles, and this implementation's hotbar-only design is invisible to it. The countering consequence is that NCP's inventory defense against AutoGap rests on the use-item adapters and the movement-rate checks that see the 31-packet C03 burst, not on the click-rate path; the burst's movement-packet rate is the fingerprint NCP's MorePackets family would measure."
+    }
+  ]
+}

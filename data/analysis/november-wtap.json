@@ -1,0 +1,63 @@
+{
+  "module": "WTap",
+  "client": "November Recode 2.0",
+  "category": "wtap",
+  "source_rel": "feature/module/impl/ghost/WTapModule.java",
+  "overview": "November Recode 2.0's WTap re-asserts the sprint flag around each melee attack so the server treats the attacker as freshly sprinting when it applies the vanilla sprint-knockback multiplier. An EventPacket.Out listener watches every C02 attack against an EntityLivingBase and, while the local player is sprinting and the Delay timer has elapsed, either queues a C0B STOP_SPRINTING then START_SPRINTING pair in SILENT mode or drops the local sprint flag for the Hold Delay window in LEGIT mode. Both modes produce the STOP then START sequence that resets the server-side sprint state; the difference is delivery: SILENT pushes both C0Bs straight into the send queue in one tick, while LEGIT flips keyBindSprint.pressed and setSprinting through the vanilla flag path so the pair is emitted by the normal C0B mirror and split across ticks.",
+  "sections": [
+    {
+      "h": "Mode split and state",
+      "p": "The module keeps two timers and one boolean: timer gates how often a wtap can fire, holdTimer measures how long LEGIT mode keeps sprint dropped, and canWTap tracks whether the flag is currently down. disable() restores sprint through legitSprint(true) whenever the module is turned off mid-hold, so a disabled module never leaves the player de-sprinted. The Mode setting defaults to LEGIT; the Delay setting (default 250ms, scale 0.5, range 0-5000ms) is the cooldown between wtaps and the Hold Delay setting (same defaults, visible only while Mode is LEGIT) is how long the sprint stays dropped before the update listener calls legitSprint(true) again."
+    },
+    {
+      "h": "SILENT delivery",
+      "p": "When Mode is SILENT, the C02 listener builds a C0BPacketEntityAction STOP_SPRINTING and immediately queues a START_SPRINTING behind it through mc.thePlayer.sendQueue.addToSendQueue, both in the same tick, and sets canWTap true so the hold path never engages. The pair ends with the sprint flag true, which is what the server needs to see for the next attack to count as sprinting, and because both packets are queued back to back they arrive in one server tick. The client-side sprint flag is never touched, so sprint movement continues at full speed through the whole exchange."
+    },
+    {
+      "h": "LEGIT delivery",
+      "p": "LEGIT mode calls legitSprint(false), which sets keyBindSprint.pressed false and thePlayer.setSprinting(false). The setSprinting call mirrors into a C0B STOP through the vanilla EntityPlayerSP path, and the hold timer starts; when holdTimer passes the Hold Delay the update listener flips canWTap back and calls legitSprint(true), whose setSprinting(true) emits a C0B START roughly five ticks later at the default 250ms hold. The pair is therefore event-visible and tick-split, which is the quieter fingerprint, at the cost of a brief local speed loss while the flag is down."
+    }
+  ],
+  "packets": [
+    "C0BPacketEntityAction",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "WTapModule.java (module)",
+      "rel": "feature/module/impl/ghost/WTapModule.java",
+      "explanation": "The whole module lives in this one file. The C02 packetOut listener is the trigger: it requires an ATTACK action, an EntityLivingBase target, the local player sprinting, and the Delay timer elapsed, then dispatches SILENT (two queued C0Bs) or LEGIT (flag drop plus hold restore). legitSprint is the shared helper both modes and disable() use, and the two Timer fields implement the cooldown and hold windows. The mode enum and the visibility lambda on Hold Delay are all here, so the file is the complete behavioral spec for the countering section."
+    },
+    {
+      "label": "Timer.java (cooldown and hold clocks)",
+      "rel": "utility/math/timer/Timer.java",
+      "explanation": "Both rate gates ride on this nanoTime timer. reset() stamps System.nanoTime into lastSetTime, elapsedTimeMs() divides the elapsed delta by 1,000,000, and passed(ms) compares elapsedTimeMs against the argument. The Delay and Hold Delay settings feed passed() with their millisecond values, so the wtap cadence and the LEGIT hold window are literally the elapsed-time comparisons this class performs. The class also carries a static measure helper used for logging elsewhere in the client, but the module only consumes passed and reset."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ActionToggleSpeed (sprint toggle rate)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/ActionToggleSpeed.java",
+      "explanation": "Hawk's ActionToggleSpeed listens for PlayerActionEvent and tracks the tick of the last sprint toggle per player in a map shared by START and STOP. A new SPRINT_START or SPRINT_STOP that lands less than one tick after the previous sprint toggle punishes. The November SILENT mode queues STOP then START inside one C02 handler, so both arrive in the same server tick: the STOP stamps the current tick and the START that follows sees a gap of zero, which is below 1, and punishes on the second packet of every pair. That makes the check a direct one-to-one hit on the default SILENT delivery.\n\nLEGIT mode is the quieter variant and the honest bypass surface: the STOP is emitted by setSprinting(false) and the START by the later legitSprint(true) after the Hold Delay, so at the default 250ms hold the two packets are about five ticks apart and the gap test passes. Hawk only sees the same-tick burst, so the tick-split flag mirror is exactly what the check is designed not to catch."
+    },
+    {
+      "label": "ToggleFrequency (entity action rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/ToggleFrequency.java",
+      "explanation": "NoCheatPlus counts every C0B through EntityActionAdapter, which feeds each action into NetData.playerActionFreq, an ActionFrequency with one-second buckets (NetData line 229), and ToggleFrequency.check scores the window against toggleActionLimit, default 25 per second (DefaultConfig line 578). November sends exactly two C0Bs per wtap and gates the pair with the Delay timer, so at the default 250ms delay the sustained rate is 8 C0B per second, far below the 25/s ceiling.\n\nThe check therefore constrains sustained chains rather than single hits: a player who lowers Delay toward the 0ms minimum, or chains attacks through multiple targets so the timer resets every 250ms, doubles and then triples the rate, and only then does the window accumulate toward the limit. The default configuration sits comfortably inside the envelope, which is the honest gap to state for this counter."
+    },
+    {
+      "label": "BadPacketsF (duplicate sprint status)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsF.java",
+      "explanation": "Grim's BadPacketsF tracks the server-side sprint state and flags a START while the tracked state is already true, or a STOP while it is already false, with a one-packet exemption for the first unknown state. The November pair is a strict STOP from a true state followed by a START from a false state, so a clean alternating burst passes the check by construction. The failure mode is overlap: if a second wtap fires while the previous pair's state has not settled, or the player's own sprint toggle interleaves with the module's pair, the stream stops alternating and a duplicate START or STOP arrives, which flags and cancels the packet.\n\nThe SILENT mode's unconditional pair is also exposed when the player is not actually sprinting, because the C02 listener requires isSprinting and so never fires in that state; the exposure is instead latency jitter collapsing two pairs into one tick, which turns a valid alternation into a duplicate. This is the honest both-sides statement: the clean case passes, the jitter case flags."
+    },
+    {
+      "label": "SprintA (hunger gate)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/sprint/SprintA.java",
+      "explanation": "SprintA runs after prediction and flags whenever the server-side sprint flag is true while the player's food level is at or below 6.0. November's module has no food gate: the C02 listener only checks isSprinting, so it keeps re-asserting START through long engagements while sprinting itself drains hunger, and a sustained fight naturally crosses the line. A vanilla player would have been forced out of sprint by the hunger system well before that point, so the module's persistence is what the check catches.\n\nThe honest boundary is that the module cannot avoid this by configuration: dropping the flag below the hunger threshold would also disable the knockback trick, because the whole point is to keep the server-side sprint state true at attack time. Grim's threshold and the module's requirement are the same rule seen from opposite sides."
+    }
+  ]
+}

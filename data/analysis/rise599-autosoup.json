@@ -1,0 +1,57 @@
+{
+  "module": "AutoSoup",
+  "client": "Rise 5.99",
+  "category": "autosoup",
+  "source_rel": "dev/rise/module/impl/combat/AutoSoup.java",
+  "overview": "Rise 5.99's AutoSoup is a health-gated soup chugger that selects the stew hotbar slot with a C09 held-item change, fires a use with C08, and on the following tick sends the C07 release, an optional drop, and the switch back. The gate is ticksExisted greater than 10 and getHealth() below the Health setting (default 15), and the cycle repeats on a randomized delay between Min Delay and Max Delay (defaults 300-500ms). There are no window clicks anywhere: the entire mechanism is C09/C08/C07 slot traffic against the player's own hotbar, which is what separates this implementation from soup modules that shuffle inventory with C0E window clicks. The drop-bowl toggle additionally emits a C07 DROP_ITEM after the release, which discards the empty bowl from the held slot.",
+  "sections": [
+    {
+      "h": "Two-tick eat cycle",
+      "p": "The eat is split across two pre-motion events. The first tick, gated on ticksExisted > 10 and getHealth() below the threshold, locates soup with PlayerUtil.findSoup(), converts the container slot to a hotbar index (findSoup() - 36, with -37 as the not-found sentinel), and sends C09PacketHeldItemChange(soup) followed by C08PacketPlayerBlockPlacement with the soup stack, arming the switchBack flag. The next tick's switchBack branch sends C07PacketPlayerDigging RELEASE_USE_ITEM at BlockPos.ORIGIN facing down, then optionally a second C07 DROP_ITEM when dropBowl is enabled, then C09 back to the player's real held slot. The release and the slot restore are thus always one full tick after the use, never in the same tick as it."
+    },
+    {
+      "h": "Delay and sentinel handling",
+      "p": "The cycle is clocked by a TimeUtil and a decidedTimer millisecond value. When the gate opens, the module computes delayFirst as floor of the lower bound and delaySecond as ceil of the upper bound, then picks RandomUtils.nextInt(delayFirst, delaySecond) and resets the timer, so the default 300-500ms settings yield roughly 2-3 eat cycles per second while health stays low. If findSoup() returns -1, soup stays at the -37 sentinel and the C09/C08 pair is skipped, but the delay is still re-rolled, so an empty hotbar does not accelerate the loop. The ticksExisted > 10 guard suppresses eating during the first half-second after spawn or respawn."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "Each successful cycle emits, across two ticks: C09(soup), C08(use with the soup stack), then C07 RELEASE_USE_ITEM, C07 DROP_ITEM (if enabled), C09(real slot). No C0E window clicks are ever sent, because the module only ever touches hotbar slots already selected by C09. The C08 payload is the itemstack constructor (use on air), and the C07s use BlockPos.ORIGIN with EnumFacing.DOWN, the canonical use/release positions. The release arriving one tick after the use is the module's defining timing property, and the drop makes the bowl disappear from the held slot in the same tick as the release."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoSoup.java",
+      "rel": "dev/rise/module/impl/combat/AutoSoup.java",
+      "explanation": "The module is one pre-motion handler with two phases. The switchBack branch (lines 40-47) fires first when the flag from the previous tick is set: it sends the C07 release, optionally the C07 drop, the C09 slot restore, and clears the flag, then returns so the eat tick cannot run in the same event. The gate (lines 49-64) only runs when the flag is clear: ticksExisted > 10 and health below the threshold, then findSoup() - 36 into the hotbar index, the C09 + C08 pair, and the delay re-roll with RandomUtils.nextInt over floor(min) to ceil(max) followed by timer.reset().\\n\\nThe -37 sentinel (findSoup returns -1 for no soup, minus 36 stays -37) is how the module distinguishes 'no soup found' from hotbar slot -1, which does not exist. The drop is a second C07 with Action.DROP_ITEM, thrown after RELEASE_USE_ITEM in the same tick, so the empty bowl leaves the hotbar slot while the release is being processed. onDisable clears both switchBack and the sentinel so a mid-cycle disable cannot leave the slot stuck on soup."
+    },
+    {
+      "label": "PlayerUtil.java (findSoup slot finder)",
+      "rel": "dev/rise/util/player/PlayerUtil.java",
+      "explanation": "findSoup (lines 325-335) scans container slots 36 to 44, which is the hotbar in the player inventory container, and returns the first slot whose stack is non-null, has stackSize above 0, is an ItemFood, and whose display name contains 'Stew'. The display-name match is what distinguishes mushroom stew and rabbit stew from other food; the ItemFood requirement excludes non-edible items. The returned value is a container index, which is why the module subtracts 36 to get the hotbar index used in C09.\\n\\nfindSoup only looks at the hotbar: soup stored in the main inventory is never considered, so the module's effectiveness depends entirely on the player pre-loading stew into the hotbar. The same class provides findGap and findHead for the sibling AutoGap and AutoHead modules, which share the identical scan pattern over slots 36-44 with different display-name predicates."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastConsume (consume duration)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/inventory/FastConsume.java",
+      "explanation": "Arc v2's FastConsume enforces a minimum time between starting and finishing an item use. The InventoryListener stamps InventoryData.consumeTime on a RIGHT_CLICK_AIR or RIGHT_CLICK_BLOCK interaction with an edible item (soup qualifies), and the consume handler runs FastConsume.check on PlayerItemConsumeEvent; the check flags when now minus the stamped time is below consume-time, which defaults to 1280ms in config.yml, raising 'consume time less than allowed.'\\n\\nRise's cycle sends C08 (use) and the C07 release one tick later, roughly 50ms apart, so on any server where soup consumption completes at release the PlayerItemConsumeEvent lands about 50ms after the right-click that armed the timer, far under the 1280ms floor. On vanilla servers the one-tick release is too early for the 32-tick use window, no consume event fires, and the check stays silent; the split is honest: the counter bites exactly on the instant-soup servers the module is written for. The drop-bowl C07 does not affect the timing because it is a DROP_ITEM action, not another release."
+    },
+    {
+      "label": "ItemSwitchSpeed (switch after use)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/item/ItemSwitchSpeed.java",
+      "explanation": "Hawk's ItemSwitchSpeed tracks slot switches that follow an item interaction. InteractItemEvent or InteractWorldEvent adds the player to usedSomething; the next ItemSwitchEvent then compares the current tick against the stored lastSwitchTick and punishes if the gap is under minSwitchTicks (default 1), rewarding otherwise, and always consumes the usedSomething entry.\\n\\nRise's cycle sends C09(soup) and the C08 use in the same tick, then the switch-back C09 one tick later. The switch-back's delta is exactly 1 tick, so with the default minSwitchTicks of 1 the check rewards it: the module deliberately delays the slot restore by a full tick, and that delay is what keeps it under the default gate. Raising minSwitchTicks to 2 makes every eat cycle flag, because the switch-back then lands inside the forbidden window. The drop-bowl C07 is not a switch and does not feed the check. This entry documents the module's margin: it passes at defaults by exactly one tick."
+    },
+    {
+      "label": "FastClick (window click rate, missed)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "NoCheatPlus FastClick counts inventory clicks into an ActionFrequency with five 200ms buckets, comparing the newest bucket against the short-term limit of 4 and the one-second window against the normal limit of 15, with lag division via TickTask. Only real window clicks (C0E) feed the ledger; each click adds a weighted amount via getAmountWithAction.\\n\\nThis module never sends a C0E packet. Slot selection is done with C09 held-item changes and the use with C08, so FastClick's ledger never increments regardless of eat rate; the counter that exists to stop autosteal-style click spam is structurally blind to a C09/C08/C07 implementation. The check matters here as the reason soup modules either shuffle inventory with window clicks (and get counted) or, like this one, restrict themselves to hotbar traffic (and stay invisible to the window-rate path). The consequence is that NCP's inventory countering for this module falls entirely on Open and the use-item adapters rather than FastClick."
+    }
+  ]
+}

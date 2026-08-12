@@ -1,0 +1,63 @@
+{
+  "module": "AutoGApple",
+  "client": "Sigma 4.11",
+  "category": "autogapple",
+  "source_rel": "info/sigmaclient/module/impl/combat/AutoGApple.java",
+  "overview": "Sigma 4.11's AutoGApple eats a golden apple when health drops below the HEALTH threshold and the regeneration effect is not active. A pre-update event scans the player container for item id 322, and on the first eligible tick swaps the apple into hotbar slot 6 with a mode-2 C0E window click, sets the local currentItem to 6 without sending a C09 for the switch, and starts eating through mc.rightClickMouse, which emits the C08 use-item form. After 35 times 50 milliseconds it calls onStoppedUsingItem, sending the C07 release, restores the previous slot and confirms it with a single C09 held-slot change. The cycle is gated by a 350ms DELAY setting between eats and a regen-potion check that prevents double healing.",
+  "sections": [
+    {
+      "h": "Swap and eat ceremony",
+      "p": "getGAppleFromInventory scans container slots 1 through 44 and returns the last slot holding item 322. The eligible branch swaps that slot into hotbar position 6 via swap(slot, 6), which is playerController.windowClick with button 6 and mode 2, the hotbar-swap form that emits C0E traffic on the player's own window. The module then records prevSlot, sets inventory.currentItem to 6 directly with no C09 confirmation of the switch, and starts the eat with mc.rightClickMouse so the C08 use-item packet carries the apple. The two commented-out direct send lines show the author considered explicit C08 and sendUseItem calls and replaced them with the vanilla right-click path."
+    },
+    {
+      "h": "Release and restore",
+      "p": "The finish branch triggers when eatTimer.getDifference() exceeds 35 times 50, which is 1750 milliseconds. It calls mc.playerController.onStoppedUsingItem, sending the C07 RELEASE_USE_ITEM dig packet, sets inventory.currentItem back to prevSlot, clears the prevSlot state, and sends a C09PacketHeldItemChange for the restored slot through the normal queue. The trailing C09 is the only held-slot packet in the whole cycle because the switch to slot 6 was done client-side, so the server's tracked slot never sees the apple slot at all; the restore C09 simply confirms the slot the server already believed was held."
+    },
+    {
+      "h": "Gates and cadence",
+      "p": "The cycle is guarded by three conditions plus the two timers. The apple must exist, prevSlot must be negative so a cycle is not already running, health must be below the HEALTH setting (default 3, compared against getHealth which counts half-hearts), and the regeneration potion must be inactive so the apple is not wasted on an already-healing player. The DELAY setting (default 350ms) gates the start through timer.delay, and eatTimer measures the fixed 1750ms eat window. The result is a single C0E, C08, C07, C09 ceremony per apple with at least 350ms of dead time between cycles."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoGApple.java (module)",
+      "rel": "info/sigmaclient/module/impl/combat/AutoGApple.java",
+      "explanation": "The complete ceremony lives here. onEvent handles the pre-update dispatch and both cycle branches, swap implements the mode-2 hotbar swap that emits C0E, getGAppleFromInventory scans for item 322, and the two Timer fields implement the 350ms re-arm gate and the fixed 1750ms eat window. The file also shows the deliberate design choices: the client-side currentItem switch with no C09, the vanilla rightClickMouse C08 path, and the onStoppedUsingItem C07 release, all of which define the packet signature the countering checks see."
+    },
+    {
+      "label": "Timer.java (gate and eat clocks)",
+      "rel": "info/sigmaclient/util/Timer.java",
+      "explanation": "Both cadence gates are this nanoTime timer. delay(milliSec) returns true once getTime minus prevMS reaches the argument, reset() re-stamps prevMS, and getDifference() exposes the elapsed window that the eat branch compares against 1750. The DELAY setting feeds delay() on the start side and the same object measures the eat, so every timing constant in the module is literally an elapsed-time comparison on this class. The module never calls setDifference, so the timer is pure monotonic wall-clock pacing with no look-back manipulation."
+    }
+  ],
+  "countering": [
+    {
+      "label": "InventoryActions (window clicks while closed)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/inventory/InventoryActions.java",
+      "explanation": "Hawk's InventoryActions directly targets the module's swap. The check punishes any ClickInventoryEvent that arrives while the player's inventory is closed, and the module's C0E swap is exactly that: the windowClick targets the player container with no GUI open, because the module never opens an inventory screen and performs the swap from normal gameplay. When Hawk sees the click it punishes and calls e.resync, which undoes the local inventory mutation, so the apple swap is rolled back on the server side.\n\nThe honest constraint is the vanilla legitimacy boundary: hotbar swaps through window 0 are legal while the inventory screen is open, which is the state Hawk uses hasInventoryOpen to verify. Sigma's module deliberately skips the screen, so every swap is a closed-window click and every cycle produces a violation. There is no timing parameter in the module that avoids this, because the check is state-based rather than rate-based."
+    },
+    {
+      "label": "FastClick (window click rate and container timing)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "NCP's FastClick is the rate ledger for inventory clicks: clicks are scored into short-term and normal window buckets with the fastClickShortTermLimit and fastClickNormalLimit config keys, and checkContainerInteraction (line 165) enforces sane timing between container interactions and the clicks that follow. The AutoGApple cycle produces one C0E per apple and is gated at 350ms minimum, so at roughly three clicks per second the raw rate sits far below the click limits and the bucket path never engages.\n\nThe container-interaction path is the closer call: checkContainerInteraction measures the gap between the last container interaction and the click, and the module's swap is preceded by the vanilla use-item interaction of the previous cycle, so the timing constraint is satisfied by the 1750ms eat window that separates them. This is the honest gap for NCP: the check is structured for rapid click streams and the module's slow ceremony stays inside every window."
+    },
+    {
+      "label": "UseItemAdapter (held-slot change resync)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "NCP's ProtocolLib adapter classifies the item-use traffic the module generates. The C08 use form, sent by rightClickMouse with the default face, is classified through handleBlockPlacePacket where face handling sets the mightUseItem state, and the C07 RELEASE_USE_ITEM ends the use. The C09 side is where the adapter does its real work for this module: onChangeSlot runs on every held-slot change and calls requestItemUseResync whenever the slot actually differs, which forcibly unwinds server-side item-use state.\n\nThe module's single trailing C09 confirms a slot that equals the server's belief, so the resync path sees a no-op slot confirmation rather than a divergent switch. The honest statement is that the adapter's state machine is churned by the ceremony but never violated: one use, one release, one matching slot echo per cycle is exactly the shape the adapter treats as legitimate, and the client-side-only switch to slot 6 is invisible to it because no C09 ever claims slot 6."
+    },
+    {
+      "label": "FastConsume and InventoryListener (consume-time ledger)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/listener/inventory/InventoryListener.java",
+      "explanation": "Arc v2's inventory listener feeds its FastConsume check: onInteract stamps InventoryData.consumeTime for a right-click while holding an edible, and onConsume runs FastConsume.check against the PlayerItemConsumeEvent. The golden apple path differs from the splash-potion autopot modules in a way that matters: the apple actually completes consumption, so the event fires and the ledger closes instead of staying half-open. FastConsume then compares the elapsed time against the consume-time config value, default 1280ms in config.yml line 175.\n\nThe module's fixed 1750ms eat window is deliberately above that threshold, so the consume completes after 1.28 seconds and the check rewards the completion instead of flagging it. The honest bypass surface is the DELAY setting's minimum: the re-arm gate can be lowered toward 50ms, but the eat window itself is hardcoded at 1750ms, so the completion ledger stays clean regardless of how quickly cycles restart. Only an instant-eat server or a future mode change that shortens the eat window would bring this check into play."
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "module": "Timer",
+  "client": "Rise 5.99",
+  "category": "timer",
+  "source_rel": "dev/rise/module/impl/other/Timer.java",
+  "overview": "Rise 5.99's Timer is a tick-rate scaler with two modes. Vanilla mode writes the Timer Speed setting (0.1 to 10, default 1) into mc.timer.timerSpeed on every PreMotionEvent, so the whole game loop accelerates or slows with the value. MMC mode wraps the same field in a balance accumulator: every pre-motion event adds the difference between the expected 50ms tick and the measured inter-event delay to a long balance, the speed-up is only applied while that balance sits below -1000, and sub-1 speeds always apply, so the mode runs slow to drain the balance and then bursts fast until it recovers, holding the long-run packet rate near 20 per second while delivering speed phases. onDisable restores 1F and clears the balance, a disconnect resets the MMC state, and an optional world-change toggle switches the module off on dimension changes.",
+  "sections": [
+    {
+      "h": "Tick-rate scaling",
+      "p": "The field the module writes is the multiplier inside the vanilla tick clock. Timer.updateTimer() computes the frame delta, clamps it to [0, 1], and accumulates elapsedPartialTicks += frameDelta * timerSpeed * ticksPerSecond, then drains the integer part into elapsedTicks. Minecraft's main loop calls updateTimer once per frame and runs that many game ticks, so a timerSpeed of 2 executes about 40 game ticks per real second while the server ticks at 20. The module writes the field from onPreMotion, which fires ahead of the tick's movement processing, so each accelerated tick runs the full movement pipeline and emits its C03 variant; the wire rate follows the multiplier directly."
+    },
+    {
+      "h": "MMC balance pulse",
+      "p": "In MMC mode each pre-motion event records the real milliseconds since the previous one and folds the difference into a balance: balance += 50, balance -= difference. At an exact 20 ticks per second the difference is 50 and the balance is flat; running slow makes the difference exceed 50 and drains the balance negative; running fast makes it positive. The speed-up only applies while the balance is below -1000, otherwise the field is pinned to 1 and a one-shot chat hint tells the user to set the speed below 1 first, and sub-1 values always apply regardless of the gate. The result is a pulse: a slow phase builds a negative balance, the fast phase burns it back toward zero, and the cycle repeats, so a 0.5x slow phase paired with a 2x fast phase averages out near the vanilla rate over the cycle."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The accelerated phase doubles the C03 emission rate while it lasts, and the 25ms inter-move delays of a 2x burst are the cleanest signal on the wire. Keepalive echoes and transaction confirmations ride the same loop but their rate is set by the server's own S00 and S32 cadence, so the movement stream is what the rate and clock checks on the C00 and C0F corpora measure. The MMC pulse is deliberately designed to keep the average under windowed rate checks, which is why the inter-delay checks matter more than the window counters for this mode."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive",
+    "C0FPacketConfirmTransaction"
+  ],
+  "files": [
+    {
+      "label": "Timer.java",
+      "rel": "dev/rise/module/impl/other/Timer.java",
+      "explanation": "The entire module is this file. Three settings are registered in the constructor: Timer Speed (1.0 default, 0.1 to 10 in 0.1 steps), Mode (Vanilla or MMC) and Disable on World Change. onPreMotion is the only handler that writes the tick field; in Vanilla mode it assigns the speed value straight to mc.timer.timerSpeed, and in MMC mode it runs the balance accumulator and applies the value only while the balance is below -1000, with sub-1 speeds applied unconditionally. Because the write happens on every pre-motion event, any external reset of the field is overwritten on the next tick.\n\nThe lifecycle handlers keep the state clean. onDisable restores 1F and zeroes the balance so a speed phase never leaks past the toggle. onPacketReceive resets the balance, the sent-message latch and the last-event timestamp on any S00PacketDisconnect, so a kick or a server restart does not carry stale MMC state into the next session. onWorldChanged toggles the module off when Disable on World Change is enabled. The render-2D handler draws the live balance on the HUD in MMC mode, which is the only place the accumulator is visible to the user."
+    },
+    {
+      "label": "PreMotionEvent.java (per-tick hook)",
+      "rel": "dev/rise/event/impl/motion/PreMotionEvent.java",
+      "explanation": "PreMotionEvent is the per-tick motion event the module hooks, a Lombok data holder carrying the yaw, pitch, ground flag and the x, y, z position that the tick's C03 will report. The handler registration is a method named onPreMotion on the module, and the event bus fires it once per game tick ahead of the movement send, which is what lets a write to mc.timer.timerSpeed inside the handler take effect before the next C03 is composed.\n\nThe firing site is a runtime hook that is not shipped in this snapshot: Rise 5.99 contains only the dev/ tree, with no net/minecraft sources, so the exact call that constructs and dispatches PreMotionEvent is unverifiable from the archive. The event class itself is the verifiable anchor: its five fields are exactly the values the accelerated tick sends, and the module's onPreMotion signature is the contract the bus invokes."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts serverbound movement packets content-blind. MovingListener invokes morePackets.check on every processed move, which feeds data.morePacketsFreq, an ActionFrequency with 500ms buckets (MovingData line 321), and the window accumulator compares against cc.morePacketsEPSMax, default 22 packets per second with 20 ideal (DefaultConfig lines 458-459). A second ActionFrequency(12, 5000) backs a burst path with 15 packets per half second, 10 direct-burst events and 95 burst events per minute (MovingData line 322, DefaultConfig lines 460-462), and a violation returns the morePacketsSetBack location seeded from the SurvivalFly set-back.\n\nVanilla mode at 2x raises the C03 stream to about 40 packets per second, nearly double the 22 per second ceiling, so the window accumulator runs positive for the whole window and the default actions cancel at vl > 2. The MMC pulse is the honest bypass surface: a balanced cycle of a 0.5x slow phase (10 packets per second, which burns window excess) and a 2x burst (40 packets per second) averages near the 20 per second ideal, so the window counter tolerates it, and only the half-second burst path bites when the fast phase concentrates 15 or more packets into one bucket. Higher speeds defeat even the burst window: a 5x burst emits roughly 100 packets per second and trips the direct-burst path immediately. The check never inspects y or content, so position deltas are irrelevant to it; only the raw rate matters."
+    },
+    {
+      "label": "KeepAliveFrequency (keepalive echo ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java",
+      "explanation": "KeepAliveFrequency is the ledger that other checks gate on, not the main trigger for this module. Every incoming C00 echo is timestamped into data.keepAliveFreq, an ActionFrequency with 20 one-second buckets, the check bails while a reply is still expected unless the id is a duplicate, and a newest-bucket score above 1 flags a violation. The echo rate stays tied to the server's own S00 cadence because the server issues keepalives at its own interval and the vanilla client answers each one; a timer speed-up does not raise that rate by itself.\n\nThe module trips it only in the failure modes: when the accelerated loop drains a batched delivery of several keepalives into one tick, landing multiple echoes in the same second bucket, or when a reply arrives with a duplicate or aged-out id that the 30-second request window no longer recognizes. Its structural role for the timer family is the gate on Frequency TimerA, which refuses to run unless a keepalive was accepted for the current server tick, so a module that floods or starves the echo stream disables the inter-delay checks that would otherwise catch it. Rise's Timer never touches the keepalive stream, so it passes the ledger itself and keeps the timer checks armed."
+    },
+    {
+      "label": "TimerA (movement delay deviation)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/timer/TimerA.java",
+      "explanation": "Frequency TimerA measures the delay between consecutive movement packets against the 50ms tick expectation. Each flying packet adds the inter-packet delay to a MovingStats(20) window, and the check runs only when the player is not exempt (TPS, teleporting, lagging) and the connection manager has an accepted keepalive for the current server tick. When the delay standard deviation stays under 7.07 (the square root of the 50ms expectation), an allowance accumulates 50ms per packet minus the measured delay, and a fail fires once the allowance exceeds the floor of that threshold.\n\nVanilla mode at 2x halves the inter-move delay to about 25ms, so every packet adds roughly 25ms to the allowance and the very first burst packet crosses the threshold. The MMC pulse cannot hide from this check: the check measures per-packet delays, not window averages, so the fast phase's 25ms delays accumulate allowance regardless of how slowly the slow phase runs. The slow side is the blind spot: a sub-1x timer stretches delays past 50ms, which drains the allowance instead of filling it, so the slow phases of an MMC cycle and any pure slow-motion use pass by design. The keepalive gate is a hard dependency, so the check goes dormant if the echo stream is broken."
+    },
+    {
+      "label": "Timer (transaction-anchored balance)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java",
+      "explanation": "Grim's Timer accrues 50ms of balance for every counted movement packet and flags when the balance passes real time, cancelling the packet and running a setback. The clock it compares against is anchored to the player's transaction stream: knownPlayerClockTime is refreshed only after a movement is followed by a PONG or WINDOW_CONFIRMATION (the C0F), so ping fluctuations and server lag do not shift the baseline, and a limitFallBehind clamp holds the balance within clockDrift, default 120ms, of the player clock.\n\nAt 2x the balance accrues 50ms per packet while only 25ms of real time passes, so the surplus exceeds the 120ms drift within about five packets and the check flags almost immediately, in both Vanilla mode and the MMC burst phase; the pulse's slow phases do not reset the accrued surplus fast enough to matter because the flag fires inside the burst. The check is deliberately one-directional: a slow timer makes the balance fall behind, which the drift clamp absorbs, so sub-1x use and the slow phase of an MMC cycle are invisible here. Standing still also stops the accrual, which is why idle periods before a speed phase do not accumulate."
+    }
+  ]
+}

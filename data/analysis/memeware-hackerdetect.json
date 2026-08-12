@@ -1,0 +1,53 @@
+{
+  "module": "Hacker Detect",
+  "client": "Memeware 7.3",
+  "category": "hackerdetect",
+  "source_rel": "me/memewaredevs/client/module/misc/HackerDetect.java",
+  "overview": "Memeware 7.3's Hacker Detect is a client-side observer that scans other players' rendered state for one anomaly: an out-of-range pitch. A single UpdateEvent handler iterates mc.theWorld.loadedEntityList every tick, and for each EntityPlayer other than the local player that has existed for more than 50 ticks, it checks whether rotationPitch falls outside [-90, 90]; offenders are reported with a '[MAC]'-tagged client-side chat line via ChatUtil.printChatFlag. The module reads only the client's own entity list - the state that arrived via spawn, entity-look and teleport packets - and emits no packets of its own, so its reports are local-only observations. The more ambitious speed heuristic (one-block-per-tick movement with ice-exemption logic) exists in the source only as commented-out code, and the isMoving helper it would use is never called.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module is one @Handler Consumer<UpdateEvent> plus an EntityLivingBase field reused as a scratch reference. Every tick it iterates the loaded entity list, skips anything that is not an EntityPlayer, skips the local player, and skips players with ticksExisted <= 50 - a grace period that keeps freshly spawned entities out of the check. The single active test is the pitch range: rotationPitch < -90 or rotationPitch > 90 triggers ChatUtil.printChatFlag with the offending player's name and a canned message. The imported movement utilities (MovementUtils), the ice-block and BlockPane types, and the isMoving helper are all vestiges of the disabled speed heuristic, which the author left in place as a comment block marked 'fixing my cancer code here later, lazy rn'. The module holds no per-player state, so the same player is re-flagged on every tick for as long as the bad pitch persists."
+    },
+    {
+      "h": "What the check actually observes",
+      "p": "The rotation values come from the client's own entity simulation, not from any packet the module reads: other players' yaw and pitch are updated client-side from the spawn packet (S0C), entity-look/move packets (S14 family), and teleports (S18), each carrying byte-encoded angles that the client decodes into degrees. The pitch bound it enforces matches the vanilla server-side constraint, but the client never clamps remote entities, so a server or a hacked client that transmits an out-of-range pitch leaves the value visible in the world state - which is what the module detects. The comment block shows the intended second check: flag players whose x or z position moves more than 1 block per tick over non-ice ground while moving and visible, i.e. a crude speed threshold - but that path is dead code in this build. The output channel is printChatFlag, which renders the report locally with a '[MAC]' prefix and never sends a packet."
+    },
+    {
+      "h": "Wire behavior",
+      "p": "Hacker Detect produces no network traffic of its own: it is a pure reader of client-side world state and a local chat renderer. That makes it invisible to server-side anticheats by construction - there is no packet, timing pattern, or server-visible state change to detect, and the module cannot even be inferred from the outside since its reports never leave the client. Its practical value is equally limited: it re-implements, on the observing client, a single narrow check that real anticheats already run server-side against each player's own movement packets, and it only sees what the server already accepted and broadcast. The commented-out speed check would have been equally redundant: the same '>1 block per tick' heuristic is the core of server-side speed validation, minus the ice and piston exemptions the comment block half-remembers."
+    }
+  ],
+  "packets": [
+    "S0CPacketSpawnPlayer",
+    "S14PacketEntity",
+    "S18PacketEntityTeleport"
+  ],
+  "files": [
+    {
+      "label": "HackerDetect.java (client-side rotation observer)",
+      "rel": "me/memewaredevs/client/module/misc/HackerDetect.java",
+      "explanation": "The module is the eventConsumer1 field: a @Handler UpdateEvent consumer that walks the loaded entity list each tick, filters to EntityPlayer instances other than the local player with ticksExisted > 50, and reports any whose rotationPitch lies outside [-90, 90] through ChatUtil.printChatFlag. The active code is that one range test; everything else in the file is scaffolding for a disabled speed detector. The commented block compares per-axis position deltas against 1 block with BlockIce/BlockPackedIce exemptions and an invisibility check, and the private isMoving helper (prevPos vs pos comparison on three axes) exists to serve it but is never invoked. The unused imports - MovementUtils, BlockPane, ChatComponentText - reinforce that the speed path was never finished. Because the module keeps no per-player record, a persistently bad pitch produces the same flag line every tick, and the '[MAC]' prefix ties the output to the same ChatUtil channel the Commands module's feedback uses."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Hawk InvalidPitch (server-side pitch validation)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/InvalidPitch.java",
+      "explanation": "Hawk's InvalidPitch is the server-side twin of the exact test this module runs locally, and the comparison is the honest core of the countering story. On every MoveEvent with a rotation delta (hasDeltaRot), Hawk computes Math.abs(event.getTo().getPitch()) and punishes plus rubber-bands the player when it exceeds 90 (lines 34-41) - the same bound the client module checks against other players' pitch, but validated from the player's own movement packets, per player, with punishment instead of a local chat line. The module's author even labeled it a skid-check: 'Not really an important check. This just stops skids from thinking they're so cool.'\n\nWhat this means for Hacker Detect is that the module is fully redundant and fully undetectable at the same time. Any player whose pitch the module would flag locally is already being punished by Hawk server-side from their own packets, so the module's report adds no information. And because the module sends nothing, no server-side mechanism - this check included - can observe that a client is running it: InvalidPitch measures the player being watched, not the watcher. The only counter to the module is the honest statement that it does not need one."
+    },
+    {
+      "label": "Hawk AimbotPrecision (pitch-delta GCD analysis)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotPrecision.java",
+      "explanation": "AimbotPrecision is the real rotation-validity check in Hawk's look package, and it shows how shallow the client module's pitch-range test is by comparison. The check collects absolute pitch deltas per player, keeps only deltas between 0 and PITCHRATE_LIMIT (0.96 by default) excluding exact +/-90 (lines 79-82), and once SAMPLES (default 10) are gathered computes the rational GCD of the samples via MathPlus.gcdRational (lines 88-90). A GCD that drifts by more than 0.001 from the player's previous GCD fails after one retry seeded with the prior value (lines 93-106), and a GCD below 0.00001 - 'practically unsolvable' - fails outright (lines 109-111). The theory is that human mouse sensitivity quantizes every rotation delta to multiples of a constant, so aim-assist rotations produce a mathematically impossible GCD.\n\nFor this module the relationship is illustrative rather than adversarial: Hacker Detect's pitch-range test is a crude client-side echo of the property class these checks police, catching only values the server already treats as impossible. AimbotPrecision catches the smooth, quantized rotations that a range test can never see, and it does so server-side on the cheater's own packets. The honest conclusion is unchanged: the client module neither helps nor hinders either check, because it never touches the wire."
+    },
+    {
+      "label": "Hawk Speed (movement prediction discrepancy)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed check is the server-side realization of the heuristic the module's author left commented out. It predicts each move from the previous speed, friction, jump/step state, knockback acceptance, and touched-block multipliers (soul sand, hit slowdown, item-use force limits), and accumulates the discrepancy between predicted and actual movement; when totalDiscrepancy exceeds DISCREPANCY_THRESHOLD (default 0.1) and the move is not a possible piston push, the player fails (lines 203-209). The position-only path even clamps stale speeds to MAX_NO_MOVE_DISTANCE so that a player who stopped updating position cannot bank speed (lines 92-96).\n\nThe module's dead code approximated the same idea with a 1-block-per-tick threshold over non-ice ground - vastly cruder, missing friction, knockback, pistons, and vertical movement entirely, and it was never enabled. The honest framing is that even if the author had finished it, the check would only have duplicated, at lower fidelity, what Speed already does server-side against the same movement packets. Like the pitch check, it would have consumed zero additional packets, so the module's detectability remains nil; the countering value of Speed here is as the reference implementation the client's stub was reaching toward."
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "module": "AutoSoup",
+  "client": "Sigma 4.11",
+  "category": "autosoup",
+  "source_rel": "info/sigmaclient/module/impl/combat/AutoSoup.java",
+  "overview": "Sigma 4.11's AutoSoup is a health-gated soup eater built around a single windowClick swap. When health drops below the HEALTH setting (default 3) and the timer allows, it locates mushroom stew (item id 282) anywhere in the player's inventory container, swaps it into hotbar slot 6 with a mode-2 windowClick against window 0, then sends C09(6), C08 use with the now-held stew, and C09 back to the real slot - all in one event. The windowClick emits a C0EPacketClickWindow even though no GUI is ever opened, which is the defining fingerprint of this implementation and the hook Hawk's InventoryActions and NCP's window-state checks use against it. The Timer gate is never reset, so after the first tick the delay check passes on every update while the health condition holds, making the module eat at the full 20-cycle-per-second rate.",
+  "sections": [
+    {
+      "h": "Swap-click routing",
+      "p": "getSoupFromInventory scans container slots 1 to 44, matching item id 282 (mushroom stew), and returns the last match found. The module then calls swap(soupSlot, 6), which is PlayerControllerMP.windowClick(0, slot, 6, 2): window id 0 (the player's own inventory container), button 6, mode 2, which is the swap-with-hotbar action. The server sees this as a C0EPacketClickWindow moving the stew from wherever it sat into hotbar slot 6. C09(6) then selects that hotbar slot, C08 uses the now-current stew stack, and a second C09 restores the player's real held slot. The whole sequence happens inside one pre-update event, so all four packets (C0E, C09, C08, C09) arrive in the same tick."
+    },
+    {
+      "h": "The dead delay",
+      "p": "The Timer gate is delay(DELAY) with DELAY defaulting to 350ms, but AutoSoup never calls timer.reset() and the Timer field's prevMS is never updated by any other code path. delay() computes getTime() - prevMS, and with prevMS frozen at its constructor-time nanoTime-derived value, the elapsed time exceeds any setting within milliseconds of module construction. The result: once the health condition holds and soup exists, the eat cycle runs on every single update event - roughly 20 cycles per second - regardless of the configured delay. The DROP setting is equally inert: it is registered in the settings map but never read in the event handler, so the 'Drop soup after use' toggle does nothing in this build."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "Each cycle emits, in one tick: C0EPacketClickWindow (window 0, slot = soup's container slot, button 6, mode 2), C09PacketHeldItemChange(6), C08PacketPlayerBlockPlacement with the current (stew) stack, and C09PacketHeldItemChange(real slot). The C0E is sent with the inventory closed - no C16 or C0D window traffic precedes it - and no C07 release ever follows the use, so on vanilla servers the 32-tick use window never completes and the eat is server-side a no-op. The C0E-with-closed-inventory combination is the module's tell, and the same-tick C09/C08/C09 burst is what the switch checks measure."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoSoup.java",
+      "rel": "info/sigmaclient/module/impl/combat/AutoSoup.java",
+      "explanation": "The module is a single @RegisterEvent handler on EventUpdate that acts only on the pre phase. Lines 52-59 are the whole eat cycle: find soup, check the health gate and the timer, swap the stew into hotbar slot 6 with windowClick, then queue C09(6), C08(use current item), C09(real slot) straight through the net handler. swap (lines 64-66) is the one-liner that produces the C0E: windowClick with mode 2 and hotbar button 6 against window 0, called directly with no GuiScreen involved.\\n\\nThe dead pieces are the analysis's key details. The Timer (line 26) is constructed once and never reset anywhere in the module, so the 350ms DELAY default is never enforced and the gate is open on every update after the first milliseconds. The DROP setting (line 29, registered at line 38) is never read in onEvent, making the drop toggle cosmetic. getSoupFromInventory (lines 68-83) matches item id 282 and returns the last soup in scan order, and its -1 return value means 'no soup', which the handler checks before doing anything. onDisable is absent, so mid-cycle disables leave the slot state wherever the last event left it."
+    },
+    {
+      "label": "Timer.java (delay gate)",
+      "rel": "info/sigmaclient/util/Timer.java",
+      "explanation": "Sigma's Timer is a monotonic millisecond clock: getTime() reads System.nanoTime() divided by 1e6, so it is immune to wall-clock adjustments, and delay(milliSec) returns whether the elapsed time since prevMS is at least the argument. reset() re-anchors prevMS to the current instant.\\n\\nAutoSoup's flaw is that it calls delay() but never reset(): prevMS stays at the constructor-time value forever, so the elapsed time grows monotonically and delay() returns true on every call once the module has been alive for longer than the configured setting. The Timer class itself is correct - getDifference and setDifference expose the elapsed and re-anchor operations - but the module never uses them, which is why the 350ms default is decorative. The same Timer class is shared across Sigma modules; the ones that reset properly (AutoPot among them) get the configured pacing, while AutoSoup does not."
+    }
+  ],
+  "countering": [
+    {
+      "label": "InventoryActions (click without an open window)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/inventory/InventoryActions.java",
+      "explanation": "Hawk's InventoryActions punishes two patterns: world interaction (InteractEntity, BlockDig, ArmSwing, InteractWorld) while HawkPlayer.hasInventoryOpen() is non-zero, and a ClickInventoryEvent while it is zero. Hawk tracks the open state from the S2D window-open and C16 inventory-command packets, so a chest or the player inventory screen being open moves the flag off zero, and CloseInventoryEvent clears it.\\n\\nSigma's swap() fires windowClick(0, soupSlot, 6, 2) with no GUI ever opened and no C16 preceding it, so the click arrives while Hawk's open state is zero and is punished, with the event resynced to re-sync the container contents. Because the module eats at 20 cycles per second (the dead timer), the check fires on every cycle. This is the direct hit: the C0E window click is exactly the traffic Hawk expects to only ever see from a real open inventory, and the module produces it with the inventory closed."
+    },
+    {
+      "label": "FastClick (window click rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "NoCheatPlus FastClick counts C0E inventory clicks into an ActionFrequency with five 200ms buckets, comparing the newest bucket against the short-term limit of 4 and the one-second window against the normal limit of 15, with lag division via TickTask. Each counted click adds its weighted amount via getAmountWithAction; a mode-2 swap with an empty cursor scores 1.0.\\n\\nSigma's swap produces exactly one counted C0E per eat cycle. Because the timer is never reset, the cycle runs every tick while the health condition holds, so the one-second window accumulates roughly 20 clicks against the 15/s normal limit, pushing fastClickVL up by about 5 per second of sustained eating; the default cancel action at vl > 150 lands after roughly 30 seconds. The short-term bucket path stays quiet at about 4-5 clicks per 200ms bucket. The -999 outside-window drops this module never performs would be exempt (slot < 0 skips counting), but the soup swap is a positive slot, so it counts."
+    },
+    {
+      "label": "ItemSwitchSpeed (same-tick switch-back)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/item/ItemSwitchSpeed.java",
+      "explanation": "Hawk's ItemSwitchSpeed marks a player as having used something on InteractItemEvent or InteractWorldEvent, then checks the next ItemSwitchEvent against the stored lastSwitchTick, punishing when the gap is under minSwitchTicks (default 1).\\n\\nSigma queues C09(6), the C08 use, and C09(real slot) all within one event, so the switch-back ItemSwitchEvent arrives in the same tick as the C08 that armed usedSomething: the delta is 0 ticks, under the default minimum of 1, so every cycle is punished. This is the opposite of Rise 5.99's AutoSoup, which deliberately delays its switch-back by a full tick to pass the same check; Sigma's same-tick restore is the configuration ItemSwitchSpeed was written to catch. The check also never sees a legitimate reason for a slot to change in the same tick an item was used, so there is no reward path."
+    },
+    {
+      "label": "FastConsume (consume duration, conditional)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/inventory/FastConsume.java",
+      "explanation": "Arc v2's FastConsume stamps InventoryData.consumeTime on a RIGHT_CLICK_AIR or RIGHT_CLICK_BLOCK with an edible item and flags a PlayerItemConsumeEvent that arrives within consume-time (default 1280ms) of that stamp, with the violation message 'consume time less than allowed.'\\n\\nSigma's C08 use is followed by C09(real slot) in the same tick, and no C07 release is ever sent, so the item use is aborted by the slot switch on vanilla servers and no consume event fires - the check stays silent there, and the module genuinely fails to eat on vanilla. On soup servers that complete consumption from the use packet itself, the consume event lands within milliseconds of the stamp and the check fires. The dead-timer eating rate does not change this path: FastConsume measures the gap between use and consume, not the cycle rate, so its applicability is purely a function of the server's soup mechanics."
+    }
+  ]
+}

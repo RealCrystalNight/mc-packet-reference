@@ -1,0 +1,62 @@
+{
+  "module": "InvMove",
+  "client": "Rise 5.99",
+  "category": "invmove",
+  "source_rel": "dev/rise/module/impl/movement/InvMove.java",
+  "overview": "Rise 5.99's InvMove lets the player move while a GUI is open. On every PreMotionEvent with a non-chat screen active it writes the real keyboard state into the forward, back, left, right and jump KeyBinding pressed flags, so the vanilla movement pipeline runs while the container is open and the tick's C03 carries nonzero position deltas. A Slow Down setting damps motionX and motionZ while the screen is up, skipped for the client's own ClickGUI and StrikeGUI, and an optional Packet mode rewrites the window-click stream: each C0E click is replaced by a C16 OPEN_INVENTORY_ACHIEVEMENT plus the C0E and a C0D close, while close-window and achievement packets are cancelled, keeping the server-side inventory state consistent with the movement.",
+  "sections": [
+    {
+      "h": "Keybind forcing",
+      "p": "The handler activates whenever mc.currentScreen is non-null and is not GuiChat. For each of the five affected bindings it calls setKeyPressed(GameSettings.isKeyDown(binding)), which mirrors the physical keyboard state into the pressed flags that the vanilla movement code reads. Because the flags are re-asserted on every pre-motion tick, the vanilla EntityPlayerSP update computes motion from the forced keys exactly as if no GUI were open, and the tick's C03 position packet reflects that motion. The jump binding is included, so the module enables hopping while a chest is open, not just walking."
+    },
+    {
+      "h": "Slowdown and packet mode",
+      "p": "The Slow Down setting multiplies motionX and motionZ by its value (0.1 to 1, default 1) while a screen is up, with ClickGUI and StrikeGUI exempt so the client's own GUI does not damp the player. Packet mode changes the wire behavior of inventory interactions: C0D close-window packets are cancelled, every C0E click is replaced by C16 OPEN_INVENTORY_ACHIEVEMENT followed by the original C0E and a C0D close for the inventory window, and C16 achievement packets are cancelled, all routed through PacketUtil.sendPacketWithoutEvent so the rewrite never re-enters the send event. The net effect is that the server-side window stays open across the click, which matters on servers that tie movement validation to inventory state."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The primary signal is the C03 stream itself: position-changing moves while the server-side inventory window is open. The packet mode adds a secondary fingerprint: one extra C16 OPEN_INVENTORY_ACHIEVEMENT per rewritten click, plus the suppressed C0D and C16 traffic. Vanilla has no way to move under an open container, so any position delta attributed to an open window is anomalous, and the C16 spam is itself observable on the C03 corpus where inventory-open state checks live."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "InvMove.java",
+      "rel": "dev/rise/module/impl/movement/InvMove.java",
+      "explanation": "The module is entirely this file. The constructor registers Slow Down (1 default, 0.1 to 1) and Packet (false default), and builds the affectedBindings array from the five movement and jump keybindings. onPreMotion is the movement half: it checks for a non-chat screen, re-asserts the pressed flags from the physical keyboard, and applies the slowdown multiplier to the motion fields, exempting the client's own GUIs.\n\nThe packet half lives in onPacketSend. With Packet enabled, C0D close-window packets are cancelled outright, each C0E click is replaced by the C16 achievement open plus the click and a C0D close for the inventory window, and C16 achievement packets themselves are cancelled, all sent through PacketUtil.sendPacketWithoutEvent so the replacement traffic bypasses the event bus. With Packet disabled the module only forces keys and dampens motion; no inventory traffic is altered."
+    },
+    {
+      "label": "PacketUtil.java (send bypass)",
+      "rel": "dev/rise/util/player/PacketUtil.java",
+      "explanation": "PacketUtil is the send utility the packet mode relies on. sendPacketWithoutEvent routes through addToSendQueueWithoutEvent on the fork's NetHandlerPlayClient, which enqueues a packet for the network thread without firing the client's send event, and sendPacket is the normal event-visible path. The distinction is what makes the C16, C0E and C0D replacement sequence safe: a click rewritten through the silent path is not re-intercepted by InvMove's own onPacketSend, so the injected C16 cannot be cancelled by the module's own C16 branch.\n\nThe class also carries the TimedPacket holder used by other modules for delayed sends. For this module the two send methods are the whole interface: the silent path carries the rewrite, and the event path would be the only way the injected traffic could loop back into the interception logic."
+    }
+  ],
+  "countering": [
+    {
+      "label": "InventoryMoveCheck (open-screen movement)",
+      "ac": "CoolMineman-CheaterDeleter",
+      "rel": "src/main/java/io/github/coolmineman/cheaterdeleter/modules/movement/InventoryMoveCheck.java",
+      "explanation": "CheaterDeleter's InventoryMoveCheck is a modern-version port (1.16+ C2S packet views) that watches for position-changing moves while a screen handler is open. onMovement returns early for fall flying, spectators and players near non-solid collision, then, when the packet changes position and the current screen handler is non-null, it flags 'Inventory Move' at MINOR severity with a 100ms cooldown. The invalidateMove helper grants a 500ms grace after the screen opens, then flags growing horizontal deltas on any axis where the server-side velocity is exactly zero, plus an upward move while the server velocity is falling.\n\nRise's module at the default Slow Down of 1 is a direct hit: full-speed motion under an open container produces per-tick deltas that grow past the previous delta with zero server-side velocity, so the check flags within a few ticks of the grace expiring. The Slow Down setting is the honest bypass surface: damped motion makes each delta smaller than the last, which defeats the growing-delta test, and a close-window packet resets the check's wasOpen state, which the module's packet mode suppresses on purpose. The y-axis branch also catches the forced jump key when the server velocity is falling."
+    },
+    {
+      "label": "InventoryMove (leniency-window movement)",
+      "ac": "Photon-GitHub-AntiCheatAddition",
+      "rel": "src/main/java/de/photon/anticheataddition/modules/checks/inventory/InventoryMove.java",
+      "explanation": "Photon's InventoryMove runs on PlayerMoveEvent with a 0.005 squared-distance gate and a long list of bypasses: vehicles, flying, elytra, liquids, recent damage ticks, recent teleports and low TPS all disable it for the move. Movement past the breaking-time leniency (300ms base plus the speed potion bonus, with an optional ping half) flags at 5 VL with a cancel teleport back to the move origin at 60 VL. A separate jump branch flags upward acceleration at 25 VL, once per open, with slabs and bounce materials exempt.\n\nRise's module at default slowdown moves continuously under the inventory, so every move after the 300ms leniency adds 5 VL and the 60 VL cancel lands after roughly twelve seconds of sustained movement; the packet mode does not change this because the check is event-driven off the position stream, not the window packets. The forced jump key is the sharper hit: the module can hop under a chest, and the jump branch flags at 25 VL whenever the open state has not already consumed the once-per-open allowance. Damped slowdown still moves, so it only stretches the time to the cancel threshold, it does not evade the check."
+    },
+    {
+      "label": "InventoryMoveProtocol (score-accumulated alerts)",
+      "ac": "Elikill58-Negativity",
+      "rel": "src/com/elikill58/negativity/spigot/protocols/InventoryMoveProtocol.java",
+      "explanation": "Negativity's InventoryMoveProtocol alerts on PlayerMoveEvent when an inventory is open. It requires an open inventory view, no trident, elytra, vehicle, water or piston nearby, fall distance under 0.5, and server-side velocity under 0.1, then scores the move: starting to sprint or sneak since the inventory opened adds 5 each, and a horizontal distance at least as large as the previous move and at least the walk speed adds the delta difference plus 1. An alert fires when the time since open reaches 3 ticks and the score exceeds 2.\n\nRise's module at default slowdown walks at full speed under the container, so the distance gate is met every tick and the score stays above 2 from the third tick on; the sprint key also works under the forced bindings, which adds the sprint-transition 5. The Slow Down setting is the designed bypass: damped motion falls below the walk-speed gate once the decay takes hold, and the velocity filter means knockback-assisted movement is not scored. The module's packet mode does not affect this check, which keys off the Bukkit position event rather than the window stream."
+    },
+    {
+      "label": "InventoryMove (sprint-sneak-rotation under GUI)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/InventoryMove.java",
+      "explanation": "Hawk's InventoryMove is a MovementCheck over the MoveEvent stream: it punishes when the move carries a rotation update, sprinting or sneaking while an inventory is open (hasInventoryOpen() != 0) and the move is not a teleport accept, with VL 3 per violation, a rubberband punishment, 0.999 decay and a 5-second timeout. The check comments note the known grace edges: rotation can legitimately persist one tick after opening, and teleport grace is handled by the teleport-accept flag.\n\nRise's module triggers the sprinting branch whenever the player holds the sprint key under a forced keybind state, because the vanilla sprint logic runs under the GUI once the bindings are pressed, and the rotation branch fires if the player looks around while the container is open. The check does not measure distance, so the Slow Down setting is irrelevant to it; any sprinting, sneaking or look rotation under an open inventory accumulates VL. The packet mode's C16 and C0D traffic is invisible to this check, which reads the movement event only."
+    }
+  ]
+}
