@@ -1,0 +1,63 @@
+{
+  "module": "FastBow",
+  "client": "LiquidSense Dev",
+  "category": "fastbow",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/combat/FastBow.kt",
+  "overview": "LiquidSense's FastBow machine-guns arrows by re-arming the bow charge every tick. While the use key is held and a bow is in hand, each UpdateEvent sends C08PacketPlayerBlockPlacement at BlockPos.ORIGIN facing 255 with the equipped item - the use-item sentinel that re-arms the server-side use state - then re-emits the current aim as Packets (default 20, 3-20) identical C05PacketPlayerLook packets with onGround true, then C07PacketPlayerDigging RELEASE_USE_ITEM, and finally sets itemInUseCount to maxItemUseDuration - 1 so the client-side draw state never expires and the cycle repeats next tick. The server consumes the last delivered look when the release fires, so the C05 burst carries the aim of every shot. The burst's yaw and pitch copy RotationUtils.targetRotation when the silent-rotation pipeline is active, which is how BowAimbot's locked aim rides the burst; otherwise they repeat the player's own rotation.",
+  "sections": [
+    {
+      "h": "Per-tick charge cycle",
+      "p": "onUpdate returns unless the player is using an item, then requires the current item to be a bow. The cycle is four steps: the C08 use-item sentinel (BlockPos.ORIGIN, facing 255, the equipped stack, zero hit-vector), the C05 burst, the C07 release (RELEASE_USE_ITEM at BlockPos.ORIGIN facing DOWN), and the itemInUseCount assignment. The C08 is the same packet vanilla sends when a player right-clicks with an item, and its server-side handler starts the item-use state; the C07 release in the same tick clears that state and fires the shot. Setting itemInUseCount to maxItemUseDuration - 1 keeps the client-side countdown from ever reaching zero, so isUsingItem stays true and the whole cycle re-runs on the next tick - one release per tick, about 50ms, against the vanilla one-second draw."
+    },
+    {
+      "h": "Aim and release",
+      "p": "The yaw and pitch for the burst come from RotationUtils.targetRotation when the silent-rotation pipeline has a pending rotation, otherwise from the player's own rotation fields. All Packets C05s carry the identical values with onGround true, so the server's bow-release handler - which launches the arrow along the player's look at release time - receives the burst's aim as the effective look. The onGround true stamps keep the fall-reset flag asserted through the burst. The itemInUseCount write happens after the release, which is what distinguishes the cycle from a single fast shot: the client-side use state is pinned just below expiry, so the module keeps drawing and firing as long as the key is held."
+    },
+    {
+      "h": "Rotation coupling",
+      "p": "The burst inherits whatever rotation the silent pipeline is holding. With BowAimbot active, targetRotation holds the faceBow angle computed that tick, so every arrow in the stream leaves along the locked, predicted aim; without it, the burst repeats the player's current yaw and pitch, which is still the frozen-rotation signature of a scripted burst. The packet count is configurable between 3 and 20 per tick, and the default 20 makes the module's wire footprint one C08, twenty C05s and one C07 every tick while firing - over 400 movement-family packets per second at the default."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "FastBow.kt (module logic)",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/combat/FastBow.kt",
+      "explanation": "The module is a single UpdateEvent handler and one IntegerValue. The value block declares Packets (3-20, default 20), the burst width. The handler is the whole cycle: the using-item guard, the bow check, the C08 sentinel with the equipped stack at facing 255, the yaw/pitch selection between RotationUtils.targetRotation and the player's own rotation, the C05 loop, the C07 release, and the itemInUseCount pin. There is no enable/disable state beyond the base Module class and no timer - the module's clock is the tick itself, which is why the burst width is its only configuration. The file's dependency on RotationUtils is one field read, and its dependency on the client's packet pipeline is two addToSendQueue calls per cycle."
+    },
+    {
+      "label": "RotationUtils.java (targetRotation source)",
+      "rel": "net/ccbluex/liquidbounce/utils/RotationUtils.java",
+      "explanation": "The burst's yaw and pitch are read from the static targetRotation field when the silent-rotation pipeline has one pending, falling back to the player's own rotation fields. targetRotation is written by setTargetRotation, which is what BowAimbot's faceBow calls in its silent mode, so this field is the bridge between the aim module and the burst: the faceBow angle computed for the current target is copied verbatim into all Packets C05s. The class also hosts the serverRotation bookkeeping that the silent pipeline compares against, which is why the copy is exact rather than re-derived. Without BowAimbot the field is usually null and the burst repeats the player's current yaw and pitch - still identical across the burst, which is the signature the rate and rotation checks see."
+    }
+  ],
+  "countering": [
+    {
+      "label": "UseItemAdapter (release-item rate gate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "The adapter watches the two packets that drive item use: the block-dig packet for RELEASE_USE_ITEM and the block-place packet for the use sentinel. handleDiggingPacket stamps releaseItemTime on every RELEASE_USE_ITEM and sets the isHackingRI flag when a second release arrives within timeBetweenRL of the first, with the threshold defaulting to 70ms and tunable through setuseRLThreshold; the javadoc is explicit that this is a minimum-time-between-releases gate for exactly this exploit class. handleBlockPlacePacket tracks the C08 sentinel so the adapter's use-state model stays consistent.\\n\\nFastBow releases once per tick - 50ms at the standard tick rate - so from the second shot onward every release lands inside the 70ms window and isHackingRI is set continuously. The check keys purely on the release cadence, so no position or rotation trick affects it: the C05 burst width, the onGround stamps and the sentinel re-arm are all irrelevant to the gate. This is the direct counter for the module's core behavior."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts the raw rate of serverbound move packets, content-blind. Every processed move is scored into data.morePacketsFreq, an ActionFrequency with 500ms buckets covering the configured window, and the window score is accumulated against cc.morePacketsEPSMax (default 22 packets per second with 20 ideal), plus a burst path on the newest half-second bucket (default 15 packets, direct violation at 10) with lag adaptation via TickTask. A violation returns the morePacketsSetBack location, seeded from the SurvivalFly set-back when one exists.\\n\\nEach FastBow tick emits Packets C05 look packets - 20 at the default - so the very first shot already puts 20 movement packets into one half-second bucket, tripping the burst path instantly, and a held key sustains 20+ per tick against the 22/s window ceiling with vEPSAcc positive for the whole window. The check never inspects the packet contents, so the identical rotations, the onGround stamps and the sentinel are all irrelevant - the count alone is the violation, and the default actions cancel from vl 2 upward. This is the second independent kill on the module alongside the release gate."
+    },
+    {
+      "label": "SurvivalFly (rapid-release penalty path)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "The isHackingRI flag set by the release gate is consumed in the movement layer: the next SurvivalFly move check tags the move 'noslowpacket', runs Improbable.check against the horizontal distance with the tag 'moving.survivalfly.noslow', and resets the horizontal data before returning. The rapid-release pattern is folded into the movement check with the standard violation and set-back machinery, so the fastbow's release spam does not just trip a counter - it degrades the player's accepted movement model.\\n\\nThe penalty path runs on the move that follows the flagged release, which for this module is every tick while firing. The design intent is visible in the tag name: NCP treats rapid item release as the no-slowdown pattern, the same family as speed-while-using, and the movement penalty is what makes the pattern costly rather than merely logged. On a server with the movement actions active, a firing FastBow user is being set back by the movement layer at the same rate the release gate is flagging."
+    },
+    {
+      "label": "AimbotHeuristic (rotation pattern analysis)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotHeuristic.java",
+      "explanation": "AimbotHeuristic records every look delta as a Vector(yawChange, pitchChange) and walks the recent history after a click, scoring speed and the angle between consecutive moves. The first signature - a stutter - fires when a window of moves shows maxSpeed - minSpeed > 4 with minSpeed below 0.01, maxAngle below 0.1, and a preceding move faster than 1: a fast rotation immediately followed by frozen rotations. The other two signatures cover high-speed zigzags and sudden decelerations.\\n\\nThe burst produces exactly the stutter shape whenever the aim moved before it: the snap onto the target (the fast preceding look change) followed by up to 20 identical zero-delta C05s (minSpeed 0, maxAngle 0) satisfies the signature, and with BowAimbot active the burst carries the faceBow snap every tick. The same arming caveat applies as for the other bow modules: the check only scores the look window around entity and world interactions, so a pure bow-spam session never arms it - it fires when the fastbow user mixes melee attacks into the stream, which is the standard LiquidSense fight pattern."
+    }
+  ]
+}

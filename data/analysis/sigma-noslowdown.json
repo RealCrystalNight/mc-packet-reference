@@ -1,0 +1,53 @@
+{
+  "module": "NoSlowdown",
+  "client": "Sigma 4.11",
+  "category": "noslowdown",
+  "source_rel": "info/sigmaclient/module/impl/movement/NoSlowdown.java",
+  "overview": "Sigma 4.11's NoSlowdown keeps the player at full sprint speed while blocking with a sword, using the classic use-item release cycle: every tick, while the player is blocking, moving and grounded, the pre-phase of EventUpdate sends C07PacketPlayerDigging with RELEASE_USE_ITEM (at BlockPos.ORIGIN facing DOWN) and the post-phase immediately sends C08PacketPlayerBlockPlacement with the held item, re-arming the use state before the server can apply the slowdown. Four modes are selectable - NCP, Hypixel, AAC and Vanilla (a no-op). The NCP and Hypixel modes send the pair every tick while MoveUtils.isOnGround(0.42) and no Killaura target is present; the Hypixel variant differs by spoofing the placement position with PlayerUtil.getHypixelBlockpos(username) plus a 255 y-coordinate so the server cannot register a real block interaction; the AAC mode only releases on solid ground and throttles the re-place to every 65ms with a Timer so the burst rate stays low. The module never touches the movement packets themselves - it only manipulates the item-use state machine.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "onEvent registers EventUpdate only. The mode string is read from the MODE Options every event and mirrored into the module suffix. All three active modes share the same gate: mc.thePlayer.isBlocking(), PlayerUtil.isMoving(), and - for NCP and Hypixel - MoveUtils.isOnGround(0.42) and Killaura.blockTarget == null. The pre-phase sends the release, the post-phase sends the re-place; the two halves of the tick are used so the client's own item-use timer sees a complete release/place cycle inside one tick. The AAC mode drops the isOnGround(0.42) requirement in favor of mc.thePlayer.onGround || MoveUtils.isOnGround(0.5), and its post-phase re-place is guarded by a 65ms Timer so at most ~15 placements per second reach the server."
+    },
+    {
+      "h": "The use-item release cycle",
+      "p": "Vanilla applies a 0.6x movement slowdown while a player is actively using an item (blocking, eating, drawing a bow). The release cycle avoids the state: C07 with RELEASE_USE_ITEM tells the server the use ended, and the immediate C08 placement restarts it. Because the restart lands in the same tick, the server-side use state never settles into the 'using' state that would justify the slowdown, while the client never applies the 0.6 factor to its own motion - the movement packets are unchanged and full sprint speed persists. The block position of the release is irrelevant (BlockPos.ORIGIN, DOWN) because no block is actually dug; the placement matters more, and the Hypixel mode deliberately aims it at a garbage position: getHypixelBlockpos hashes the username into a deterministic pseudo-random BlockPos (y = -val % 255, an always-invalid coordinate) and the packet constructor receives 255 as the y offset, so the server discards the placement as out of range instead of validating a block interaction."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging",
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "NoSlowdown.java (module)",
+      "rel": "info/sigmaclient/module/impl/movement/NoSlowdown.java",
+      "explanation": "The entire module is the EventUpdate handler. The gate line (isBlocking, isMoving, isOnGround(0.42), no killaura target) decides whether the cycle runs; the switch on the mode string picks the packet pair. NCP and Hypixel send C07 RELEASE_USE_ITEM in pre and C08 placement in post every tick; Hypixel swaps the placement for PlayerUtil.getHypixelBlockpos(getSession().getUsername()) with a 255 y-value; AAC gates the release on ground state and the placement on a 65ms Timer; Vanilla is an empty case. There is no onEnable/onDisable state and no timer thread - the module is stateless apart from the shared Timer used by the AAC mode."
+    },
+    {
+      "label": "PlayerUtil.java (position spoof helper)",
+      "rel": "info/sigmaclient/util/PlayerUtil.java",
+      "explanation": "PlayerUtil supplies the two helpers the module reads. isMoving() returns whether any movement key is pressed, the gate that keeps the cycle from firing while standing still. getHypixelBlockpos(String) hashes the username: it sums the character values, folds in the string length, the first two characters, and divides by the length, then builds a BlockPos(val, -val % 255, val) - a position that for any real username lands outside the loaded world, and the negative y-offset modulo 255 makes the height invalid too. Combined with the literal 255 passed as the placement y, the Hypixel mode's C08 can never be validated as a real block placement, which is what keeps the release/place cycle from leaving block-place side effects on the server."
+    }
+  ],
+  "countering": [
+    {
+      "label": "NoSlow (required item-slow in prediction)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/movement/NoSlow.java",
+      "explanation": "Grim's NoSlow is a PostPredictionListener: when packetStateData.isSlowedByUsingItem() is true, the prediction engine must have included the item-use slowdown in the player's possible trajectories. The check takes the best prediction offset (the smallest difference between predicted and actual move, fed in via handlePredictionAnalysis) and, once bestOffset exceeds offsetToFlag (threshold config, default 0.001), flags with a set-back after a one-tick confirmation to cut false positives. A 1.8-specific exemption skips the first tick after a slot change, because 1.8 clients are not slowed on the tick they start using an item.\n\nThe module is a direct hit: it sends the release/place pair every tick, so Grim's packet state marks the player as slowed by using an item, but the client's actual moves are at full sprint speed - the prediction set contains only slowed trajectories, the actual move matches none of them, and the offset exceeds 0.001 for as long as the cycle runs. The slot-change exemption does not apply (no slot change), and the one-tick confirmation delay only delays the flag. The release-item half of the cycle is exactly what keeps isSlowedByUsingItem true, so Grim sees a player who is simultaneously 'using an item' and moving at un-slowed speed - the contradiction the check exists for."
+    },
+    {
+      "label": "FastPlace (placement rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/FastPlace.java",
+      "explanation": "NCP's FastPlace counts every block-placement event into data.fastPlaceBuckets (an ActionFrequency bucket queue, 1f per placement) and combines two limits: a full-window score against cc.fastPlaceLimit, and a short-term counter that counts placements within cc.fastPlaceShortTermTicks of each other against cc.fastPlaceShortTermLimit. Lag is folded in via TickTask so server lag does not inflate the counts. A violation adds to fastPlaceVL and executes the configured actions, which include cancellation of the placement.\n\nThe NCP and Hypixel modes feed this check one C08 per tick - roughly 20 placements per second sustained while blocking and moving - because every re-place in the cycle is processed as a block-placement event. The full-window score stays above the limit for the whole duration and the short-term counter trips the moment two placements land within the short-term window. The AAC mode's 65ms throttle is built to dodge exactly this: at ~15/s it stays under the short-term limit and only accumulates slowly against the full window, which is the honest bypass surface of this check. The Hypixel position spoof does not help, because FastPlace counts the events, not the validity of the position."
+    },
+    {
+      "label": "Speed (item-use discrepancy)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed check computes two expectations for every move: expected uses maxForce (which includes the item-use slowdown factor) and expectedNoItemUse uses maxForceNoItemUse (without it). If the player is blocking, consuming an item or pulling a bow and the no-item-use expectation fits the actual speed better, the check concludes the player is moving at normal speed while using an item - and grants exactly one extra tick for the known slot-switch quirk before falling back to the slowed expectation. When the accumulated positive discrepancy crosses DISCREPANCY_THRESHOLD it punishes with a rubber-band, and there is an escalation path: once the player's VL exceeds RELEASE_ITEM_OVER_VL while blocking/consuming/pulling, Hawk calls pp.releaseItem() to force the client out of the use state.\n\nThe module's per-tick release/place cycle is caught by the discrepancy branch: Hawk sees isBlocking true (its packet state tracks the sword block) and the actual move speed matching expectedNoItemUse, so after the one granted quirk tick the discrepancy accumulates against the slowed expectation every tick and crosses the threshold. The releaseItem() escalation is the direct countermeasure - it ends the use state server-side regardless of what the client re-sends, collapsing the cycle."
+    }
+  ]
+}

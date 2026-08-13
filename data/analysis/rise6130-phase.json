@@ -1,0 +1,62 @@
+{
+  "module": "Phase",
+  "client": "Rise 6.1.30",
+  "category": "phase",
+  "source_rel": "com/alan/clients/module/impl/movement/Phase.java",
+  "overview": "Rise 6.1.30's Phase is a ModeValue shell with three modes, default Normal. NormalPhase walks into walls in two stages: while isCollidedHorizontally it nudges the local position by 0.005 along the yaw (x is sin of the yaw, z is cos), an offset below the 0.03 min-move that the server ignores, and once PlayerUtil.insideBlock() turns true it sends a C04PacketPlayerPosition 1.5 blocks forward through the wall with onGround false via sendNoEvent, damps motionX and motionZ by 0.3, and a BlockAABBEvent handler replaces the collision box of air blocks below the player with a giant box so the client neither falls nor gets pushed out. VulcanPhase drops one block into the floor on enable, waits 25 ticks inside the block, nulls the player's AABB while inside, moves at a fixed 0.306 speed (potion-scaled), cancels PushOutOfBlockEvent, and counts S08 teleports until it stops smoothing the camera. WatchdogAutoPhase is a cage exploit driven by S02PacketChat: the 3-seconds message arms a 4-second window during which every PreUpdate calls PingSpoofComponent.blink() and glass-block AABBs are cancelled, so the player walks out of the SkyWars cage while the server still sees the old position.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The ModeValue registers NormalPhase, VulcanPhase and WatchdogAutoPhase and defaults to Normal. The modes share no code: Normal couples a local position nudge with a single sendNoEvent teleport, Vulcan couples client-side AABB removal with S08 teleport counting and a hardcoded in-block speed, and WatchdogAutoPhase reuses the PingSpoofComponent blink machinery with a chat-driven state machine. The dispatcher has no event handlers of its own, so the analysis reads the mode classes for the mechanism."
+    },
+    {
+      "h": "Block-phase mechanics",
+      "p": "NormalPhase computes the wall direction once per PreMotion from the yaw (x = sin, z = cos) and, when horizontally collided, shifts the local position by 0.005 along that vector, which is below the server's 0.03 min-move so only the client-side collision state changes; once insideBlock() is true it sends the C04 1.5 blocks forward (onGround false) and damps horizontal motion to 0.3, and the BlockAABBEvent handler gives air blocks below the player a 30x2x30 box so the client rests on a solid-feeling air cell. VulcanPhase sinks the player one block into the floor on enable (setPosition y minus 1, MoveUtil.stop), increments a timer while inside the block, sets onGround false once the timer passes 25, nulls the AABB for blocks at the player's level so there is no collision, and drives speed 0.306 (or the potion-scaled 0.0765 per amplifier plus 0.306) while inside; jump with hurt time sets motionY 0.99, sneak sets -0.4, and the first S08 marks the phase done while a count over 4 disables the camera smoothing."
+    },
+    {
+      "h": "WatchdogAutoPhase",
+      "p": "The mode parses every S02PacketChat payload: the strings \"The game starts in 3 seconds!\" and its colored variants arm the phase flag and reset a StopWatch, while the \"Cages opened! FIGHT!\" variants disarm it. While armed and within the 4000ms window, every PreUpdate calls PingSpoofComponent.blink(), which buffers the entire C03 family, and the BlockAABBEvent handler cancels collision with BlockGlass blocks entirely, so the client walks out of the glass cage while the server-side position stays frozen at the pre-blink location; when the window expires or the fight starts, dispatch() replays the buffered moves and the player appears outside the cage."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Phase.java",
+      "rel": "com/alan/clients/module/impl/movement/Phase.java",
+      "explanation": "The dispatcher registers the three modes and defaults to Normal, with no logic of its own. The analysis embeds it to show the registered mode set and default, since the mechanism and the countering surface split sharply between NormalPhase's packet teleport, VulcanPhase's client-side AABB removal and S08 handling, and WatchdogAutoPhase's chat-driven blink."
+    },
+    {
+      "label": "NormalPhase.java (default mode)",
+      "rel": "com/alan/clients/module/impl/movement/phase/NormalPhase.java",
+      "explanation": "The default mode carries the whole packet-phase mechanism: the 0.005 yaw-aligned nudge used while collided, the 1.5-block C04 teleport with onGround false sent through sendNoEvent once inside a block, the 0.3 motion damping, and the BlockAABBEvent handler that inflates air blocks below the player into a giant box. This file is what a default Phase configuration puts on the wire, and its C04 stream is what the server-side movement checks measure."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Passable (axis-wise swept ray trace)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/Passable.java",
+      "explanation": "NoCheatPlus traces the move between the previous and current player location with PassableAxisTracing, using margins scaled from the player box (boxMarginVertical times passableVerticalMargins, width over 2 times passableHorizontalMargins), and on an intersection it increments passableVL and applies the passable actions with a set-back location when one exists. The 1.5-block C04 of NormalPhase sweeps a full player box through a solid wall, so the trace intersects the wall's blocks at the entry face and the move is rejected before the client can exit the far side. The honest gap is the nudge stage: the 0.005 offsets are below the server's min-move resolution, the server never applies them, and a phase that stays at the nudge stage forever never produces a traceable segment, which is why the analysis pairs this check with the envelope and rate checks that see the inside-block stream."
+    },
+    {
+      "label": "SurvivalFly (movement envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly's horizontal allowance comes from prepareSpeedEstimation and its vertical allowance from vDistRel seeded by momentum, with the violation (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 and a set-back; ground is derived from the block cache, so the inside-block position claims (onGround false in Vulcan, the C04's flag in Normal) do not relax anything. A 1.5-block teleport presents a horizontal delta far above the allowed distance for the tick, and VulcanPhase's inside-block 0.306 speed plus its 0.098-style motion changes sit outside the envelope once the momentum model anchors to the pre-phase velocity. The set-back is the operative pressure: it teleports the player back to the pre-phase position, and the phase state (insideBlock, timer1, teleportCount) resets on the teleport, so each attempt re-runs from scratch."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets scores every processed move into a half-second-bucket ActionFrequency and accumulates the window against morePacketsEPSMax (default 22 per second, ideal 20), with a burst path on the newest half-second bucket (default 15 packets). NormalPhase's inside-block C04 adds one extra packet per phase tick on top of the regular 20/s, which stays under the window ceiling, so the burst path is the relevant half for it. WatchdogAutoPhase is the direct target: its blink buffers the whole C03 family and dispatch() replays the accumulated moves in one tick, so a 4-second cage walk flushes roughly 80 packets at once, far past the 15-packet burst bound and the 22/s window, which is the same flush signature the blink module carries."
+    },
+    {
+      "label": "Phase (tesseract swept AABB)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Phase.java",
+      "explanation": "Hawk's Phase check builds the player's from and to AABBs, shrinks them (0.1 top, 0.4 bottom, 0.1 sides), inscribes both in a bounding box, and cuts the box with planes along the move direction to form a tesseract that is tested against every solid block's collision box in the swept region, punishing and rubber-banding on the first intersection. A 1.5-block C04 sweeps the shrunk box straight through the wall, so the tesseract intersects the wall blocks and the move is flagged; the same sweep catches VulcanPhase's in-block movement because the server-side position really does travel through solid geometry regardless of the client's AABB nulling. The honest tolerance is the ignored-collision set and the slow-move exemptions (horizontal under 0.4 squared, vertical under 1 with recent block updates), which a slow nudge phase could in principle ride, though the nudge is below min-move and never reaches the server as a position change."
+    }
+  ]
+}

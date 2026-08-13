@@ -1,0 +1,63 @@
+{
+  "module": "AntiVoid",
+  "client": "Spicy",
+  "category": "antivoid",
+  "source_rel": "info/spicyclient/modules/player/AntiVoid.java",
+  "overview": "Spicy's AntiVoid is a two-stage fall saver with a single registered mode (Hypixel). A shared column sweep walks the player's position downward from the current y to y = 0, and only when every sampled block is air does the module consider the player over the void. The receive handler watches for an incoming S08PacketPlayerPosLook while the player is over the void, airborne (MovementUtils.isOnGround(0.001) false) and either below y = 0 or carrying 20 blocks of fall distance, then resets the local fallDistance to zero so the server teleport lands without vanilla damage. The tick handler performs the actual save on the same gate: the first qualifying tick arms a static bounced flag (optionally launching the player with motionY 2.2 when the Jump first setting is on), and the second qualifying tick sends a C03PacketPlayer(true) ground claim plus a C04PacketPlayerPosition that lifts the reported y by 12 blocks, then pins fallDistance to -1. The bounced flag clears only when a block reappears under the player and fall distance is under 2.",
+  "sections": [
+    {
+      "h": "The void gate",
+      "p": "Both handlers share the same predicate. The column sweep starts at the player's position and walks downward to y = 0, flipping isOverVoid to false the moment any block that is not BlockAir is found; a deep shaft or the world edge reads as void because every sample is air. MovementUtils.isOnGround(0.001) offsets the bounding box down by one thousandth of a block and asks the world for collisions, so the airborne test tolerates the vanilla near-ground epsilon. The episode gate requires fallDistance >= 20 or posY < 0, which means the module does nothing during ordinary falls and only arms once the player is genuinely doomed. The receive branch and the tick branch read the same sweep independently, and only the tick branch is gated on the client's Fly module being off, so the S08 reset keeps working while Fly is enabled."
+    },
+    {
+      "h": "The two-stage save",
+      "p": "The save is deliberately spread over two ticks. The first qualifying tick sets the static bounced flag and, when Jump first is enabled, writes motionY 2.2, fallDistance 4 and onGround false so the next movement packet claims a jump launch instead of a fall. The second qualifying tick sends the actual rescue: a bare C03PacketPlayer(true) followed by a C04PacketPlayerPosition at posY + 12 with onGround false, both through the vanilla send queue. The 12-block lift is a single large vertical claim designed to ride the server's moved-too-quickly tolerance, and the fallDistance -1 pin cancels the client-side damage accounting for the rest of the episode. The bounced flag is static, which matches the client's single-instance module design, and the ModeSetting registers exactly one option, so the mode check is a vestige that is always true."
+    },
+    {
+      "h": "Wire behavior",
+      "p": "The module constructs exactly two packets per save episode, both C03-family, and the S08 in its imports is receive-only: the handler never builds one, it only uses the arrival of the server's teleport as a trigger to zero the local fall distance. Nothing in the handler reads the S08 payload, so the reset fires on any qualifying teleport. Between saves the module is wire-silent; its only server-visible effects are the two-packet rescue burst and the onGround true claim it carries. The commented-out alternatives (a y minus 3 descent, a setPosition snap, motion writes) show the author iterated on the lift; the shipped form is the 12-block ascent."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "AntiVoid.java (module)",
+      "rel": "info/spicyclient/modules/player/AntiVoid.java",
+      "explanation": "The module is two event handlers and one static flag. onEvent branches on the event type: the EventPacket pre branch runs the void sweep and resets fallDistance to 0 when an S08 arrives while the episode gate holds, and the EventUpdate pre branch runs the same sweep and performs the two-stage save. The ModeSetting registers a single mode, Hypixel, and the whole tick-side handler is gated on that mode plus the SpicyClient.config.fly disable check, so running Fly and AntiVoid at once disables the save while the S08 reset stays live.\n\nThe static bounced field is the save state machine: the first qualifying tick arms it, the second fires the C03(true) plus C04(y + 12) pair and pins fallDistance to -1, and the reset branch clears it only when the sweep finds a block and fall distance drops to 2 or below. The jumpFirst BooleanSetting switches the first stage between a pure flag arm and a motionY 2.2 launch, and the random jitter on the rescue is unused in the shipped path."
+    },
+    {
+      "label": "MovementUtils.java (ground probe)",
+      "rel": "info/spicyclient/util/MovementUtils.java",
+      "explanation": "The gate's ground test comes from MovementUtils.isOnGround(double), which offsets a copy of the player's bounding box down by the given height and checks getCollidingBoundingBoxes for any hit. The 0.001 probe used here is the vanilla near-ground epsilon: the player reads as airborne only when the box, dropped one thousandth of a block, touches nothing.\n\nThe same class carries setMotion, the yaw-blended velocity writer that Spicy's Bhop module reuses, plus getBlocksPerSecond which scales by the live ticksPerSecond and timerSpeed. For AntiVoid only the probe matters: it is the client-side twin of the block ray trace server checks run, which is exactly why the module's ground claims over void air are so easy for them to contradict."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the allowed vertical motion instead of trusting the packet. The vertical allowance comes from vDistRel, which seeds the permitted delta from the previous move's momentum (lastMove.yDistance) and accepts only named envelopes: a zero-y move on ground, a jump, a step-up and a riptide launch. Ground state comes from RichBoundsLocation.isOnGround, a scan of the block cache at minY minus the ground epsilon, never from the packet's onGround flag. The violation is (max(hDistanceAboveLimit, 0) plus max(yDistanceAboveLimit, 0)) times 100, applied with a set-back.\n\nThe module's rescue pair is a direct hit. The C04PacketPlayerPosition at posY plus 12 presents a 12-block vertical delta against a momentum seed of a fraction of a block per tick, so yDistanceAboveLimit lands near 11.9 and the violation is in the four-digit range on the first packet of the pair, with the set-back canceling the saved position. The accompanying C03PacketPlayer(true) claims ground over open air, and the block cache reports air, so the claim is ignored and the fall keeps accruing. The save therefore converts an imminent fall death into a flagged teleport-back, which is the honest outcome of every rescue the module attempts on an NCP server."
+    },
+    {
+      "label": "NoFall (server-side fall bookkeeping)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/NoFall.java",
+      "explanation": "NCP's movement NoFall keeps its own fall-height ledger: noFallMaxY tracks the highest point of the episode and noFallFallDistance accumulates the descent, and handleOnGround compares the pair to decide when to deal the damage itself. The client's fallDistance field is never trusted, so the module's fallDistance = 0 reset on the S08 and its fallDistance = -1 pin after the rescue change the packet, not NCP's counters.\n\nEvery save episode runs into this bookkeeping. The 20-block fall that arms the module has already accumulated 20 blocks in NCP's ledger, and the S08-triggered reset and the ground claim do not stop noFallMaxY from tracking the descent; when the episode crosses the damage threshold NCP applies the fall damage through its own path regardless of what the client claimed. The honest boundary: the module can prevent vanilla fall death client-side, but on NCP the fall is still counted and dealt, so the two disagree on the outcome of every save."
+    },
+    {
+      "label": "GroundSpoof (ground-truth cross-check)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/GroundSpoof.java",
+      "explanation": "Hawk's ground-truth check handles both packet shapes: position-bearing updates use the lag-compensated isOnGroundReally trace, and flag-only updates fall back to AdjacentBlocks.onGroundReally on the predicted position with a 0.001 velocity tolerance. On a claim-versus-trace mismatch it re-tests the pre-move position at the clipped Y, skips the step and web-phasing cases, then punishes and rubber-bands. With preventNoFall enabled it additionally rewrites the raw packet bytes to force onGround false on the wire.\n\nThe rescue pair is exactly the mismatch this check scores. The C03PacketPlayer(true) is a flag-only claim over void air: the trace at the predicted position reports no ground, the re-test fails, and the player is rubber-banded with a violation. The C04 lift with onGround false has no claim to contradict, but it hands the check the vertical outlier that its Fly simulation measures next. Claims within 0.02 of real terrain pass, which is the legitimate-landing band; the module's claims sit over open air, outside it."
+    },
+    {
+      "label": "Flight (vertical profile)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Flight.java",
+      "explanation": "Arc v2's Flight checks the vertical profile of every move. The ascension branch fires when the rising vertical speed exceeds getMaxJump, the jump-derived cap, with the flag text ascending_vertical; the descending branch compares the vertical change against a gravity polynomial and flags when the difference leaves the expected band. The checks compare per-move deltas, so a single outlier packet is enough.\n\nThe 12-block lift is a textbook ascension violation: vertical far above getMaxJump flags ascending_vertical on the first C04 of the pair, and the instant switch from a falling delta to a plus-12 delta trips the same profile from the glide side. The module's only legal vertical move is the jumpFirst launch's motionY 2.2, and even that exceeds the jump cap on a stock server. Arc fires on the rescue itself, so on Arc-protected servers the save is immediately punished."
+    }
+  ]
+}

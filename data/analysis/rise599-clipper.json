@@ -1,0 +1,57 @@
+{
+  "module": "Clipper",
+  "client": "Rise 5.99",
+  "category": "clipper",
+  "source_rel": "dev/rise/module/impl/movement/Clipper.java",
+  "overview": "Rise 5.99's Clipper scans the ten blocks below the player every pre-motion tick, and when it finds an air pocket with a solid floor while the player is grounded and sneaking, it snaps the player down into that pocket with setPosition. The module's packet machinery is, however, dead in the shipped tree: the amount field is never assigned and the clipping flag is never set to true anywhere in the file, so the per-tick event.setY descent and the S08PacketPlayerPosLook cancellation handler can never fire. The actual wire effect is a single vanilla movement packet reporting a position one to ten blocks lower than the previous tick, with whatever onGround value the client's stale collision state still carries, and the server's corrective teleport is accepted because the receive-side suppression never arms. The module is honest about its own shape: it is a client-side snap that survives only on servers that tolerate the resulting position packet.",
+  "sections": [
+    {
+      "h": "Pocket scan",
+      "p": "The scan probes one block past the pocket floor (the -i-1 check), so it only qualifies pockets with a solid landing, and it requires the block under the player's feet to be solid, which keeps the trigger grounded. The onRender2D handler draws a hint line whenever a pocket is available and the player is onGround. The clip depth is capped by the loop bound, so the maximum snap is ten blocks straight down."
+    },
+    {
+      "h": "Dead clip machinery",
+      "p": "The honest reading is that the packet-level half of the module was either never finished or was stripped before this build. What remains is the setPosition snap, which changes the client's local position without sending anything, and the vanilla packet builder emits the next C03 from the entity's new position. The server sees the drop as one movement packet with a y delta of one to ten blocks and no supporting physics, and its correction arrives as an S08 that the module would have eaten if clipping were armed. Because it is not, the correction lands and the player snaps back."
+    },
+    {
+      "h": "Wire shape",
+      "p": "For clips of a few blocks the packet claims a grounded stance over air, which is the classic faked-ground signature; for deeper clips the y delta itself is the signature. The receive side matters only in theory: the S08 suppression would keep a short correction from applying, but since it never arms, every anticheat set-back reaches the client. The module therefore works as intended only on servers with no position validation at all."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "Clipper.java",
+      "rel": "dev/rise/module/impl/movement/Clipper.java",
+      "explanation": "onPreMotion (lines 36-65) is the whole scan and trigger. The ten-deep loop with the lastAir state machine occupies lines 40-55, the qualification test at line 44 requires air above, solid below and a grounded player, and the trigger at line 46 snaps the player down i blocks when sneak is pressed and triggered is clear. The triggered latch releases only when sneak is released (line 63). The MoveButtonEvent handler at lines 74-77 cancels the sneak key while a pocket is available, and onRender2D draws the usage hint at lines 93-101.\n\nThe dead half of the module is explicit in the source: amount is never written after declaration (line 32), clipping is only ever assigned false (lines 48, 58, 85, 104), and the two consumers of clipping, the event.setY descent at lines 60-61 and the S08 suppression at lines 80-90, can therefore never execute. onPacketReceive does contain the intended logic: a teleport within amount minus 1 blocks or above the player ends the clip, anything else is cancelled, but with clipping false the whole handler is inert. The file is the complete module; there are no other references to these fields in the client tree."
+    },
+    {
+      "label": "PlayerUtil.java (getBlockRelativeToPlayer)",
+      "rel": "dev/rise/util/player/PlayerUtil.java",
+      "explanation": "getBlockRelativeToPlayer (lines 382-384) is the only helper the Clipper reads. It builds a BlockPos from the player's position plus the three offsets and returns mc.theWorld.getBlockState(...).getBlock(), with the BlockPos double constructor flooring the result onto the block grid. The Clipper calls it three times per loop iteration: once for the current depth, once for the depth below, and once for the block directly under the player, so a single pre-motion tick performs up to thirty world lookups during the scan.\n\nThe method is shared across the client, but the Clipper's use is distinctive: every call passes a negative y offset, so the lookups walk the column under the feet rather than probing forward. The same class provides findSword, findItem, isHoldingSword and the rest of the player utilities that other modules in this analysis set depend on, which is why the file appears as the supporting box for multiple modules."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (vertical drop envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly's vertical allowance comes from vDistRel, which seeds the allowed distance from the previous move's momentum and only accepts a narrow set of envelopes: zero-y moves on ground, jumps, step-ups and riptide launches. A grounded player has no downward momentum to carry, so the allowed descent is a few tenths of a block per move. The Clipper's single packet claims a y delta of one to ten blocks, so yDistanceAboveLimit is roughly the clip depth minus the allowance, and the violation (line 233) multiplies the excess by 100: a five-block clip scores around 400 to 500 on the first packet after the snap, before any further moves arrive. fromOnGround and toOnGround are taken from the block cache, so a stale onGround true claim over the pocket does not soften the envelope.\n\nThe set-back that results is the S08 the module was built to cancel, and because the clipping flag never arms, the packet reaches the client untouched and the player snaps back to the pre-clip position. The honest consequence is that on NCP the module does not clip at all: every activation produces a violation and a correction, and repeated use accumulates the violation level toward the configured cancel and kick actions."
+    },
+    {
+      "label": "FastFall (gravity fall envelope)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/FastFall.java",
+      "explanation": "Hawk's FastFall enforces the gravity profile for airborne descents. It returns early when the player is really grounded, accepting a server teleport, flying, under knockback, sleeping or swimming, then computes the expected y change as (velocity.y minus 0.08) times 0.98 and punishes with a rubberband when deltaY plus 0.02 falls below that expectation (FastFall.java lines 42-55). A legit fall loses at most a few tenths of a block per tick; the Clipper's snap changes y by one to ten blocks in a single move, so deltaY plus 0.02 is far below the gravity expectation and the check fires on the first packet after the clip.\n\nThe exemptions are all inapplicable to the snap: the player is not grounded at the claimed position (the pocket floor is one or more blocks below), the server did not teleport the player, there is no knockback pending, and the clip is not a swim. The rubberband pulls the player back to the pre-clip position, and because the module's S08 suppression is dead, the correction is applied. The honest boundary is a one-block clip into a pocket whose floor is within the player's own collision height, where the move can be absorbed by the next tick's grounding; every deeper snap trips the check."
+    },
+    {
+      "label": "NoFall (faked ground over the pocket)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/NoFall.java",
+      "explanation": "Arc v2's NoFall cross-checks the client's claimed onGround flag against the server-computed ground state. The moving listener derives ground from the world and stores the last grounded location, while the packet listener records the raw packet flag. The check fires when the vertical distance from the last grounded location is at least 3.0 blocks, the player is descending, Vrekt's own ground state reports air, and the client still claimed onGround while the server-side fall distance is zero, producing the 'Fall distance is 0 while not onGround. (Client faked)' violation with damage applied on cancel.\n\nThe Clipper's first packet after the snap carries exactly that contradiction for clips of three blocks or deeper: the last grounded location is the pre-clip floor, the claimed position is three or more blocks below it, the pocket column is air, and the stale onGround true flag survives because setPosition does not update collision state. Shallow clips of one or two blocks stay under the 3.0 threshold and pass, and clips that happen to land with a fresh false ground flag are invisible, but a deep clip while grounded is a direct hit. The same stale-flag pattern is what NCP's NoFall family would score if the movement envelope did not already catch the drop."
+    }
+  ]
+}

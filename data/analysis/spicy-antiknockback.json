@@ -1,0 +1,53 @@
+{
+  "module": "AntiKnockback",
+  "client": "Spicy",
+  "category": "antiknockback",
+  "source_rel": "info/spicyclient/modules/movement/AntiKnockback.java",
+  "overview": "Spicy's AntiKnockback is a two-setting packet filter for incoming knockback, driven entirely from the pre-phase of EventPacket. Two NumberSettings - Horizontal Knockback and Vertical Knockback, both 0-100 defaulting to 0 - scale the components of the self-entity S12PacketEntityVelocity in place using integer fixed-point arithmetic: setMotionX((int)((motionX / 100) * horizontal)), setMotionY((int)((motionY / 100) * vertical)), setMotionZ((int)((motionZ / 100) * horizontal)). When both settings are 0 the packet is cancelled outright instead of scaled, so the default configuration removes all entity knockback. The handler also cancels every S27PacketExplosion unconditionally, removing explosion knockback entirely regardless of the settings. EventUpdate only updates the module's suffix text ('H: x V: y') for the module list. The module never touches outgoing packets, has no state beyond the two settings, and its onEnable/onDisable are empty.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "onEvent branches on event type. EventUpdate pre only writes additionalInformation from the two settings' current values, purely cosmetic. EventPacket pre casts to the Spicy EventPacket and tests the packet type: an S12PacketEntityVelocity is scaled or cancelled, an S27PacketExplosion is always cancelled, and anything else passes through untouched. There is no entity-id check - the module assumes the only S12 a client sees for itself matters, and because Spicy's event system delivers packets before they reach the client's vanilla handler, the rewrite or cancel is the last word before the client applies the velocity. The two settings live in the settings list with resetSettings() restoring the 0/0 defaults, and the module registers under the MOVEMENT category with no default keybind."
+    },
+    {
+      "h": "Scale-or-cancel semantics",
+      "p": "The S12 branch rewrites the packet's fixed-point components with integer division: each component is divided by 100, multiplied by the corresponding percentage setting, and truncated back to int. At 100/100 the packet is rewritten to its own values (a no-op that still passes through), at 50/50 half knockback, and at 0/0 the module cancels the packet instead of sending a zeroed vector. Because the setting check uses equality with 0, partial configurations (e.g. 0 horizontal, 50 vertical) send a scaled packet rather than cancelling, which keeps the server's knockback bookkeeping from seeing a fully missing response. The S27 branch has no such subtlety: any explosion packet is dropped, so TNT, creeper and explosion-lag knockback never reach the client."
+    }
+  ],
+  "packets": [
+    "S12PacketEntityVelocity"
+  ],
+  "files": [
+    {
+      "label": "AntiKnockback.java (module)",
+      "rel": "info/spicyclient/modules/movement/AntiKnockback.java",
+      "explanation": "The whole module is this file: the two NumberSetting fields, the constructor wiring them into the settings list with resetSettings(), and the EventUpdate/EventPacket handlers. The EventPacket branch contains the S12 scale-or-cancel logic and the unconditional S27 cancel; there is no other interception point and no timer or state machine, which is the module's defining trait - it is a pure packet filter whose entire behavior is the two percentage settings. The integer arithmetic (motion / 100 * percentage) is the detail that matters to the countering checks below: partial settings produce truncated vectors that still differ from the server's recorded knockback."
+    }
+  ],
+  "countering": [
+    {
+      "label": "KnockbackHandler (required-velocity prediction)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/velocity/KnockbackHandler.java",
+      "explanation": "Grim's KnockbackHandler is a PacketSendListener on ENTITY_VELOCITY that wraps the packet in a transaction sandwich: a transaction is sent before the velocity packet and a second one after it. The vector is recorded into firstBreadMap keyed by the first transaction id, and once the client echoes a larger transaction id - proof the packet reached the client - it is promoted into lastKnockbackKnownTaken. From that moment the vector is required movement: the prediction engine must reproduce it in the player's motion. onPredictionComplete compares the prediction offset against offsetToFlag (default 0.001) and set-backs at an offset of 0.1 or more. Knockbacks that arrive while Grim itself is sending a setback are recorded with isSetback and treated leniently.\n\nBoth Spicy configurations fail the requirement. At 0/0 the S12 is cancelled client-side, but the sandwich already confirmed delivery, so the required vector simply never appears in the predicted motion and the offset is the full knockback. At partial percentages the client rewrites the vector, which cannot change the record Grim read off the wire, so any reduction below 100% produces an offset above the 0.001 floor. The S27 cancel fails the same way through Grim's ExplosionHandler, and the isSetback leniency does not apply because Grim is not the one teleporting the player."
+    },
+    {
+      "label": "ExplosionHandler (required explosion knockback)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/velocity/ExplosionHandler.java",
+      "explanation": "Grim's ExplosionHandler is the explosion twin of KnockbackHandler: it listens on the EXPLOSION packet send, stores the knockback vector in firstBreadMap (a deque of VelocityData), and once the client's transaction echo proves delivery it promotes the entry into lastExplosionsKnownTaken. The PostPredictionListener side then requires the predicted motion to consume that vector, flagging with the AntiExplosion check ('Did not take the expected explosion knockback', setback 10) when the offset exceeds the configured threshold. For versions below 1.21.2 it also derives knockback from the explosion's block-destruction changes.\n\nSpicy's unconditional S27 cancellation is the direct target: the server sent the explosion packet, the sandwich confirmed it, and the client dropped it - so the required explosion vector is never taken, and the offset accumulates exactly as if the player had ignored entity knockback. Because the module cancels the S27 before the client's vanilla handler applies it, there is no partial-consumption window to hide in; the only escape would be eating the transaction echo so the entry stays in the uncertain firstBreadMap, which is a network-level attack the module does not perform."
+    },
+    {
+      "label": "AntiVelocityBasic (pending knockback matching)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/AntiVelocityBasic.java",
+      "explanation": "Hawk's MoveEvent keeps a pending knockback list per player and matches every move's delta against it. handlePendingVelocities compares the Y component within 0.01 (unless the player collides, jumps, swims or steps) and X/Z within maxDiscrepancy, which scales with the player's speed, sprint state and the weirdConstant surface modifier (0.098 on ground, 0.2518462 jump-sprinting, 0.0196 swimming). A pending entry older than ping + 200ms with no matching move sets failedKnockback, and AntiVelocityBasic.check punishes that at VL 5 with 'may be using anti-velocity (basic)'; the class comment claims detection down to a 10% difference.\n\nAt 0/0 the cancelled S12 leaves the entry unmatched forever and it expires into a flag. At partial percentages the match window is the test: the scaled remainder must land inside maxDiscrepancy, and per the check's 10% claim a reduction beyond roughly 10% of the vector falls outside and flags; the integer truncation of the module's arithmetic pushes marginal percentages below the window. The module's own motion after the hit is vanilla (no extra input), so there is no compensating motion to satisfy the matcher - the entry ages out with failedKnockback set."
+    },
+    {
+      "label": "UnusedVelocity (unused knockback ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/UnusedVelocity.java",
+      "explanation": "NCP's movement model queues the vertical velocity the server applied and later consumes it to explain the player's actual movement. checkUnusedVelocity reads the pos and neg UnusedTracker instances of the SimpleAxisVelocity vertical tracker; UnusedTracker.addValue records a violation amount only when the direction has been blocked since the entry was added - i.e. the server pushed velocity in a direction the player never moved - and quickCheckDirection reports the violation count, accumulated amount and update count before resetting the results.\n\nIn this build the check is a debug ledger: quickCheckDirection logs through DebugUtil and returns false with a TODO for a real frequency or amount check, so the player cannot fail it yet - the honest framing is that NCP's velocity queue model is what would expose the module once the check is enabled. At 0/0 the cancelled S12 leaves the vertical push un-consumed (the client never moves along it), so the tracker accumulates; at partial settings the scaled vertical motion is a partial consumption and the horizontal rewrite leaves the horizontal component outside what the vertical tracker models. As shipped, an AntiKnockback user faces NCP's SurvivalFly envelope, not this check."
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "module": "Nuker",
+  "client": "Rise 5.99",
+  "category": "nuker",
+  "source_rel": "dev/rise/module/impl/other/Nuker.java",
+  "overview": "Rise 5.99's Nuker is an instant-dig block destroyer with three modes. Normal mode sweeps a cubic shell around the player every Tick setting ticks (default every tick) and, for every non-air block inside it, fires a C07PacketPlayerDigging START_DESTROY_BLOCK plus STOP_DESTROY_BLOCK pair with EnumFacing.UP hardcoded, so each block is reported as an instant harvest. Teleport and Area modes replace the sweep origin: they compute an A* path with MainPathFinder, stream C04 teleport packets along it to reach the target position, run the same dig pair spam there, and stream the reversed path back, all from a background thread through PacketUtil.sendPacketWithoutEvent. A receive-side handler cancels the S02 line 'You can't build outside the plot!', hiding plot-protection failures so the user keeps digging blind. At the default range 4 the sweep covers 216 blocks per pass; at the maximum range 7 it covers 1728, each block costing two C07 packets plus an optional swing.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module is one UpdateEvent handler plus a receive handler. Settings are Mode (Normal, Teleport, Area), Delay (0-5000ms), Range (1-7, step 0.5), Tick (1-20), Instant Only, Scatter and Swing. The effective sweep radius is range minus 1, and the Normal mode gate is ticksExisted modulo Tick with the default 1 meaning a full sweep every tick. A world-change guard toggles the module off within the first 5 ticks, and the GUI visibility wiring hides Delay unless Teleport or Area is active and Tick unless Normal is active. The single TimeUtil field acts as the Teleport and Area cycle clock through hasReached plus reset."
+    },
+    {
+      "h": "Instant dig stream",
+      "p": "nuke() runs three nested loops over x from -radius to radius - 1, y from radius down to -radius + 1, and z likewise, building a BlockPos per cell. Air blocks are skipped, and with Instant Only enabled any block with hardness above 0 is skipped too, so only instantly breakable blocks are attacked. For every surviving cell the module sends START_DESTROY_BLOCK followed immediately by STOP_DESTROY_BLOCK with EnumFacing.UP, the instant-dig pair that in vanilla reports a completed harvest without any progress phase, then optionally calls swingItem() on the local player (the Swing setting, default on). The Scatter setting skips alternating columns by testing the parity of ticksExisted against x and z, halving the packet rate at the cost of coverage. Every send goes through PacketUtil.sendPacketWithoutEvent, which dispatches straight into NetworkManager and bypasses Rise's own event bus."
+    },
+    {
+      "h": "Teleport and area modes",
+      "p": "Teleport mode arms on the use-item key and a Delay gate, ray-traces up to 999 blocks for the target block, and refuses to run when the traced block is air. Area mode picks a random point inside the bounding box recorded by the SetArea command. Both modes then compute a path with MainPathFinder.computePath from the player position (or from Freecam.startX/startY/startZ when Freecam is enabled), stream every waypoint as a C04 position packet with onGround true to reach the target, run nuke() there, reverse the path and stream it back, all on a fresh Thread per activation. The receive-side handler is the anti-detection tell: it cancels the S02 chat line 'You can't build outside the plot!' when the packet is not a normal chat message, so the server's rejection of out-of-bounds digs is never shown, while the dig packets themselves were already refused by the server."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging"
+  ],
+  "files": [
+    {
+      "label": "Nuker.java",
+      "rel": "dev/rise/module/impl/other/Nuker.java",
+      "explanation": "The full module: onUpdate drives the mode switch and the tick gate, nuke() emits the C07 START/STOP pairs from the three nested loops with the EnumFacing.UP constant, scatter parity and Instant Only filter, and onPacketReceive cancels the S02 plot message. The Teleport and Area branches contain the whole pathfinding flow, including the thread-per-activation pattern and the Freecam anchor read. The range-derived radius, the Delay timer reset and the world-change disable all live here."
+    },
+    {
+      "label": "PacketUtil.java (event-bus bypass sender)",
+      "rel": "dev/rise/util/player/PacketUtil.java",
+      "explanation": "sendPacketWithoutEvent wraps the raw NetworkManager dispatch so every C07 pair and every C04 waypoint bypasses Rise's outgoing event bus. The module never uses the event-visible send path, which is why no other Rise module can react to the stream and why the only observers are server-side. The same helper backs the Rise Blink flush and Disabler re-sends, so the bypass pattern here is the shared lineage rather than Nuker-specific code."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastBreak (dig-time check)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/FastBreak.java",
+      "explanation": "NCP FastBreak is the time-based dig check: expectedBreakingTime is round of the block's breaking duration times fastBreakModSurvival divided by 100, and the elapsed time is measured from the first damage timestamp (fastBreakfirstDamage, strict mode) or from the start. When elapsed plus fastBreakDelay (10ms) is still below the expected time, the missing time is scored into the fastBreakPenalties bucket, and once the bucket scores past fastBreakGrace (2000ms) the check fires. The module's instant START/STOP pair presents an elapsed time of a few milliseconds against a stone expectation around 750ms, so each real harvest adds most of the expected duration as missing time and a handful of blocks exhausts the grace.\n\nThe honest boundary is the invocation path: every NCP blockbreak check runs from BlockBreakListener.onBlockBreak, a Bukkit BlockBreakEvent handler, so it only sees digs that end in real harvests. On a server that accepts the instant dig (the module's own function) the sweep is fully visible here; on a server that rejects it, the whole C07 stream is invisible to this check and the packet-level counters are the real pressure."
+    },
+    {
+      "label": "Frequency (harvest rate limit)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/Frequency.java",
+      "explanation": "Frequency bounds how many blocks a player can break per time frame: two 1000ms buckets with a short-term limit of 7 harvests in 5 ticks, oriented upward by 45 in creative and 95 in survival. A single Normal-mode sweep at default range sends 216 instant pairs, and the maximum range sends 1728, so even the short-term window is crossed hundreds of times over in one tick whenever the server harvests the instant digs. The violation escalates quickly into the configured cancel or kick actions.\n\nLike the rest of the NCP blockbreak package, Frequency only counts Bukkit BlockBreakEvent harvests, so a server that ignores the instant STOP pair keeps the check silent; the module's scatter mode reduces the count by half but still blows the short-term limit on the first sweep. The check is content-blind: it never inspects the dig face or the block type, only the rate."
+    },
+    {
+      "label": "Direction (dig face versus view ray)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/Direction.java",
+      "explanation": "Direction scores the geometric plausibility of the dig face: the distance between the face's normal ray and the player's actual view ray is added into directionVL, and a legitimately aimed hit decays the accumulator by 0.9. The module hardcodes EnumFacing.UP for every block in the sweep, so only the blocks sitting directly above the eye produce a zero-distance face; every side, floor and corner block accumulates the face-to-ray distance instead. Over a 216 or 1728 block sweep the accumulator has no chance to decay back down.\n\nBecause the check is Bukkit harvest-gated like its siblings, the accumulation only happens on servers that accept the instant digs. The module never rotates toward the blocks either, which keeps the view ray fixed while the sweep attacks all around the player, exactly the configuration the face-to-ray distance is designed to expose."
+    },
+    {
+      "label": "FastBreak (packet-level instant-dig detector)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/breaking/FastBreak.java",
+      "explanation": "Grim's FastBreak operates directly on the digging packets rather than Bukkit events, which makes it the counter that still bites on servers rejecting instant harvests. A START_DIGGING arms startBreak and maintains blockDelayBalance, adding 300 minus the inter-break delay whenever a new dig starts under 275ms after the previous finish. A FINISHED_DIGGING computes predictedTime as ceil of 1 over the maximum block damage times 50ms and compares it against the real elapsed time; a difference of 25ms or more is added to blockBreakBalance, and once the balance passes 1000ms the check flags and cancels the break.\n\nThe module's instant pairs score on both accumulators: two pairs on a normal block add roughly 750ms each of missing time and cross the 1000ms balance in one or two blocks, and the sub-275ms spacing between consecutive finishes drives blockDelayBalance up at 300ms per pair. The start time is even backdated 50ms for the first dig (startBreak = now - 50), which does nothing to help a zero-elapsed instant pair. This is the check the NCP set cannot see on rejecting servers."
+    }
+  ]
+}

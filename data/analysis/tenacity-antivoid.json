@@ -1,0 +1,58 @@
+{
+  "module": "AntiVoid",
+  "client": "Tenacity 6.0",
+  "category": "antivoid",
+  "source_rel": "dev/tenacity/module/impl/player/AntiVoid.java",
+  "overview": "Tenacity 6.0's AntiVoid is a two-mode fall saver gated on a single client-side condition: mc.thePlayer.fallDistance greater than 3. The Vanilla mode cancels the pre-motion event outright, which suppresses the outgoing C03 movement packet for as long as the fall lasts, so the server-side entity freezes at its last accepted position and the fall never reaches the server's void damage check. The Negativity mode never touches the packet stream: it writes motionY to 0 once per tick, which stops the client-side descent and turns the fall into a hover, with a left-shift override that writes motionY to -100 when the player wants to drop instead. The module constructs no S08PacketPlayerPosLook of its own; the receive-side teleport is the server's reaction when the suppression window ends and the next C03 re-asserts a position the server never saw, which is why the S08 appears in the packet list.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The file is 42 lines: a ModeSetting holding the two modes, an unused TimerUtil field, and one MotionEvent consumer. The gate reads mc.thePlayer.fallDistance, which the client accumulates while falling, and the switch dispatches the two modes. MotionEvent fires once per tick before the client builds its movement packet and its cancel flag suppresses the C03 that tick, so the Vanilla branch removes the packet from the outgoing stream entirely; the Negativity branch writes client motion instead. The second constructor exists for the module framework and is never used by the module's own logic."
+    },
+    {
+      "h": "Vanilla suppression",
+      "p": "Cancelling the C03 while falling freezes the server-side entity at the last accepted position. The client keeps falling locally, so fallDistance stays above 3 and the suppression continues until the client touches ground, dies, or the module is toggled off. When the suppression ends, the next movement packet carries the real position, and the server's processPlayer sees a move from the frozen position that it cannot reconcile: vanilla's moved-too-quickly handler teleports the entity back to its last accepted location and sends S08PacketPlayerPosLook to the client, which snaps the player back to the ledge. The save is therefore the server's own snap-back, not a client-side teleport."
+    },
+    {
+      "h": "Negativity hover",
+      "p": "The Negativity mode writes motionY to 0 on every pre-motion pass while fallDistance exceeds 3. Zero vertical velocity means the client-side entity stops descending, so it never reaches the void and the fall never accrues further damage. The movement packets keep flowing at the normal rate with a zero-y delta, which is why this mode has no packet signature of its own. The left-shift override writes motionY to -100, an explicit drop that cancels the save on demand, for example to fall through the void intentionally once the danger has passed."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "AntiVoid.java (module)",
+      "rel": "dev/tenacity/module/impl/player/AntiVoid.java",
+      "explanation": "AntiVoid.java is the entire module. The MotionEvent consumer is the only logic: it reads mc.thePlayer.fallDistance, and when the value exceeds 3 it dispatches the active mode. The Vanilla branch calls event.cancel() on the pre-motion event, which suppresses the C03 movement packet for that tick, and the Negativity branch writes mc.thePlayer.motionY to 0 with the left-shift override to -100. The ModeSetting holds the two mode strings, and the unused TimerUtil field and the duplicate constructor are leftovers that never run.\n\nThe module never sends or receives packets itself. The S08PacketPlayerPosLook it is associated with arrives from the server when the suppression window ends: the client's next C03 claims a position far from the frozen server-side state, and the server's moved-too-quickly handler teleports the entity back and issues the S08 the module's save depends on."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the movement envelope from the world instead of trusting the packet. The vertical allowance comes from vDistRel (invoked around line 212, defined at line 1839), which seeds the allowed distance from the previous move's momentum and accepts only a short list of named envelopes: a zero-y move on ground, a jump, a step-up and a riptide launch. The violation is (max(hDistanceAboveLimit, 0.0) + max(yDistanceAboveLimit, 0.0)) * 100 with a set-back to the stored location.\n\nWhile the Vanilla mode suppresses C03s, NCP sees nothing, which is the honest gap: the freeze itself is invisible to a packet-driven check. The flag fires on the resume. The first C03 after the suppression window claims a position many blocks from the frozen server-side location, so hDistanceAboveLimit and yDistanceAboveLimit both land near the gap size and the violation reaches hundreds or thousands on a single move, followed by a set-back to NCP's tracked location. The Negativity hover writes zero-y moves over open air while the previous move carried falling momentum, which no named envelope accepts, so the same accumulation runs against the hover.\n\nThe set-back is the important difference from vanilla: the module's save relies on the server snapping the entity back, and NCP performs exactly that snap but as a flagged violation with a set-back, so the player is restored to the ledge while the violation ledger climbs."
+    },
+    {
+      "label": "NoFall (server-side fall bookkeeping)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/NoFall.java",
+      "explanation": "NCP's movement NoFall keeps its own fall-height bookkeeping server-side. noFallMaxY tracks the highest point of the fall episode and noFallFallDistance accumulates the descent, and handleOnGround compares the pair to decide when to deal the damage itself. The client's fallDistance field is never trusted, and the check does not care which packets carried the episode; it only needs the moves it actually processed.\n\nThe AntiVoid modes both aim to end the fall before it registers. The Negativity hover stops the client-side descent, but NCP's noFallMaxY still holds the highest point the player reached, and when the episode finally closes (the module toggles off, the player re-enables movement, or a set-back lands the entity) the tracked descent is measured against the damage threshold and NCP applies the fall damage through its own path. The Vanilla mode's suppression removes the intermediate C03s, but the resumed move completes the descent NCP had already started tracking, so the damage is dealt from the tracked heights rather than from the packets.\n\nThe honest boundary is that the module saves the player from vanilla fall death while NCP still counts the fall, so the two disagree on the outcome of every save attempt."
+    },
+    {
+      "label": "Flight (hover and vertical model)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Flight.java",
+      "explanation": "Vrekt's Flight check models the vertical axis from the movement stream. The hover sub-check fires when the vertical speed and the previous vertical speed are both exactly 0.0 while the player has been airborne for at least the configured max-hover-time ticks, producing the violation \"hovering off the ground, hover\". The vertical-move branch separately scores ascension (distance from the ground location, ascending-move count, speed against the max-jump config) and descent (the glide delta against an air-ticks-based gravity polynomial).\n\nThe Negativity mode is a literal hover: motionY 0 keeps the vertical speed at 0.0 for the whole fall, and once the air-tick counter passes the max-hover-time config the check fires and, on cancel, applies the previous location as the setback. The Vanilla mode's resumed move is scored by the same vertical model as a descent the gravity curve cannot explain, so the glide branch flags the snap-back move itself. The module's save still happens (the setback returns the player to the ledge), but it is a flagged violation with a setback rather than a free teleport."
+    },
+    {
+      "label": "OffsetHandler (prediction offset)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/prediction/OffsetHandler.java",
+      "explanation": "Grim simulates the player's tick server-side and compares each received move against the simulation. OffsetHandler runs after every prediction completes: the offset between the claimed position and the simulated position is checked against the Simulation.threshold default of 0.001, and offsets at or above the immediate-setback-threshold of 0.1 trigger a violation setback once the violation threshold is met, with the accumulated advantage capped at the max-ceiling of 4.\n\nThe suppression gap is the module's problem here. Grim keeps predicting through the gap, and the resumed C03 claims a position that no simulation step could have produced, so the offset is many blocks, far past the 0.1 immediate-setback threshold, and the first resumed packet flags with a setback. The honest limitation is identical to the other movement checks: while the client sends nothing, Grim has no packet to score, so the freeze itself is never the flagged event; the resume is."
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "module": "AutoWeapon",
+  "client": "LiquidSense Dev",
+  "category": "autoweapon",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/combat/AutoWeapon.kt",
+  "overview": "AutoWeapon swaps to the strongest sword or tool in the hotbar before every melee attack. An AttackEvent arms a gotIt flag; the outgoing C02PacketUseEntity ATTACK handler then scores every hotbar slot by its generic.attackDamage attribute plus 1.25 per sharpness level (read through ItemUtils.getEnchantment), and when a better weapon exists it cancels the C02 and either switches the client slot directly or hides the swap behind the packet stream. The silent mode, SpoofItem (default off), sends C09PacketHeldItemChange to the best slot, re-emits the cancelled C02 one tick later straight through the NetworkManager, then sends a second C09 restoring the original slot - the server processes the attack while it believes the better weapon is held, and the raw send bypasses the event bus so the replay cannot be re-cancelled.",
+  "sections": [
+    {
+      "h": "Attack interception and weapon scoring",
+      "p": "onAttack sets gotIt = true; onPacket consumes it: for a C02PacketUseEntity with Action.ATTACK and gotIt set, the module scans hotbar slots 0-8, keeps ItemSword and ItemTool entries, and computes damage = attributeModifiers[\"generic.attackDamage\"] amount + 1.25 * ItemUtils.getEnchantment(stack, Enchantment.sharpness). ItemUtils.getEnchantment walks the stack's enchantment tag list and returns the level of the first matching effect id, so the 1.25 multiplier is sharpness level only - a diamond sword with sharpness III scores 7 + 3.75. When the best slot differs from the current one, the module either queues C09PacketHeldItemChange(slot) and sets spoofedSlot (silent), or writes inventory.currentItem and calls updateController() (visible), then cancels the C02 event and stashes it with tick = 0."
+    },
+    {
+      "h": "The one-tick replay",
+      "p": "A MotionEvent handler with ignoreCondition = true drains the stash: the first pass increments tick to 1 and returns, the second sends the stashed C02 through mc.netHandler.networkManager.sendPacket(packet) - the raw NetworkManager path, which bypasses the client event bus and therefore cannot loop back into onPacket - and, when spoofedSlot is set, queues C09PacketHeldItemChange(currentItem) to restore the original slot. The whole swap-attack-restore sandwich spans two ticks, about 100ms. Because the C09 and the replayed C02 leave in order, the server's held-slot state shows the better weapon when the attack is processed, which is the entire point of the SpoofItem mode: the attack is credited with the sword's damage and the player never visibly switches weapons."
+    },
+    {
+      "h": "Client-side versus wire behavior",
+      "p": "The visible mode is wire-identical to a normal player: the vanilla updateController() syncs the held slot (a single C09 through the normal path) and the attack follows, so nothing about it is detectable beyond normal slot-change traffic. The silent mode is the wire signature: C09 to the best slot, C02 attack, C09 back, all within two ticks, with no swing-to-attack delay in between. The module never adds attacks - one C02 in, one C02 out - so its footprint is purely the item-switch sandwich around each attack."
+    }
+  ],
+  "packets": [
+    "C09PacketHeldItemChange",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "AutoWeapon.kt (module logic)",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/combat/AutoWeapon.kt",
+      "explanation": "The module is four state fields and three event handlers. gotIt, packetUseEntity, spoofedSlot and tick drive a small state machine: the AttackEvent arms it, the C02 packet handler decides and stashes, and the MotionEvent drains the stash exactly one tick later. The scoring loop in onPacket is the decision core - it iterates the hotbar, filters swords and tools, reads the generic.attackDamage attribute modifier and adds 1.25 per sharpness level through ItemUtils.getEnchantment. The send path matters: the replay uses networkManager.sendPacket directly instead of addToSendQueue, which is why the re-sent attack bypasses the client's packet event and cannot be re-intercepted; the restore C09 does use addToSendQueue because it must survive the event pipeline. Reading the file shows the silent path is fully packet-driven while the visible path is just two field writes plus the vanilla sync call."
+    },
+    {
+      "label": "ItemUtils.java (enchantment scoring)",
+      "rel": "net/ccbluex/liquidbounce/utils/item/ItemUtils.java",
+      "explanation": "getEnchantment is the helper AutoWeapon's damage formula depends on. It takes the stack and the Enchantment, returns 0 for a null stack or an empty enchantment list, otherwise iterates the NBTTagList and compares each entry's 'ench' or 'id' short against enchantment.effectId, returning the 'lvl' short of the first match. The damage score in AutoWeapon is the generic.attackDamage attribute amount (the base weapon damage) plus 1.25 times this result, so sharpness is the only enchantment that changes the ranking - a sharpness V sword outranks a plain one by 6.25 points. The same helper backs the client's item tooling elsewhere, but in AutoWeapon it is the entire difference between the visible and silent swap paths deciding which slot wins."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ItemSwitchSpeed (item-switch rate)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/item/ItemSwitchSpeed.java",
+      "explanation": "Hawk's ItemSwitchSpeed is the direct counter for the silent sandwich. The check keeps two per-player records: a usedSomething set, populated by every InteractItemEvent and InteractWorldEvent, and lastSwitchTicks, the tick of the previous C09. On an ItemSwitchEvent, when the player is in usedSomething it compares the current tick against lastSwitchTicks and punishes when the gap is under minSwitchTicks (default 1), then consumes the used marker.\\n\\nThe SpoofItem mode trips it on the first C09: the swap is queued in the same tick as the attack that armed gotIt, so the C09 lands in the same tick as the use event - gap 0, under the 1-tick minimum - and the player is punished. The restore C09 one tick later is not itself checked (the used marker was consumed), but it refreshes lastSwitchTicks, so any subsequent attack-plus-spoof within the same tick chain punishes again. The check is cancelless by design (the file's own comment warns that slot equality cannot be validated without false positives), so its value is the violation ledger and the pattern signal, not a cancel."
+    },
+    {
+      "label": "Reach (distance limit with dynamic reduction)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Reach.java",
+      "explanation": "NCP's fight.Reach validates every C02 attack against a server-side distance limit. check() measures the player-to-entity distance lenpRel, picks distanceLimit from reachSurvivalDistance (default 4.1, with a separate 6.5 creative limit), and flags when the distance exceeds it, optionally tightened by reachPrecision which compares the actual separation instead of the relaxed box margin. Repeated violations accumulate reachVL and drive a dynamic reduction: reachReduceDistance shrinks the effective limit stepwise (default 0.9) and reachPenalty applies an attack penalty when the module cancels.\\n\\nAutoWeapon does not extend reach - it only swaps weapons - so the check validates the replayed C02 rather than catching the module's signature. The one-tick replay does have a measurable effect: the attack is measured from the server position at the tick the C02 actually arrives, one tick after the swing that triggered it, so a player attacking while strafing or sprinting presents a slightly advanced position. That lag is small against the 4.1-block limit, but the sustained attack stream the module enables accumulates reachVL like any other fight stream, and the dynamic reduction is what turns a marginal stream into a cancelled one."
+    },
+    {
+      "label": "Angle (attack-stream consistency)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Angle.java",
+      "explanation": "fight.Angle scores the attack stream across a rolling window of AttackLocation entries: average movement between attacks (avgmove, flagged below 0.2 blocks), average time between attacks (avgtime, flagged under 150ms), average yaw delta (avgyaw, flagged above 50 degrees) and target-switch speed, accumulated into angleVL with cancel actions.\\n\\nThe module's observable effect on this stream is that it removes the human delay between deciding to attack and the weapon swap: a normal player swaps slots, takes a beat to re-aim or re-settle, and then attacks, while the module collapses swap and attack into one or two ticks. The result is an attack stream with tighter average timing (avgtime) and smaller movement between hits (avgmove) than a human produces, and the silent mode adds the two-C09 sandwich around each attack. The stock thresholds (move 100, time 150, yaw 60, switch 50) keep per-call scores well below trip level, so like most fight checks this one is only live on tuned servers; when it is live, the module's compressed swap-to-attack cadence is exactly the profile it scores."
+    },
+    {
+      "label": "KillAura (direction, multi, reach, speed)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/KillAura.java",
+      "explanation": "Arc v2's KillAura runs from the FightListener on every attack and combines four sub-checks. The direction check computes the angle between the player's look vector and the attacked entity and flags anything above max-direction-angle; the multi sub-check compares the angles to the last and current attacked entity and flags when they differ by more than maxAngle while both are in reach; the reach sub-check measures the player-to-entity distance minus the entity's velocity, so knockback does not mask an out-of-range hit; and the speed sub-check counts attacks and attack packets per second against max-attacks and max-attack-packets, resetting on a one-second boundary.\\n\\nFor AutoWeapon the check bounds the attack stream rather than catching the swap itself: the replayed C02 must still satisfy the direction angle and the reach bound, and the no-swing sub-check can fire because the module cancels and replays the attack - the swing animation the client shows belongs to the original event, while the C02 arrives one tick later. The speed sub-check is neutral here because the module emits exactly one C02 per attack; the value of the check is the combined stream when AutoWeapon runs alongside Aura, where the same listener scores the aura's attacks and the replay timing together."
+    }
+  ]
+}

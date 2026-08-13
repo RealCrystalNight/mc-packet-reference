@@ -1,0 +1,57 @@
+{
+  "module": "TargetStrafe",
+  "client": "Rise 6.1.30",
+  "category": "targetstrafe",
+  "source_rel": "com/alan/clients/module/impl/movement/TargetStrafe.java",
+  "overview": "Rise 6.1.30's TargetStrafe orbits the Kill Aura target by writing the movement yaw, the same steering channel the 5.99-era client used, but with a harder activation gate. The module only activates while KillAura is enabled, Scaffold is off, and the forward key is held together with an enabled Speed or Flight module; with the default holdJump setting the jump key must be held as well. When active, onPreUpdate derives the yaw to the target, offsets it by 135 degrees in the orbit direction, places a point at the configured range plus a small random jitter along that bearing, then re-derives the yaw from the player's own position to that point and writes it into mc.thePlayer.movementYaw. Every MoveUtil strafe helper reads that field, so the client steers toward the orbit point, and onStrafe and onJump stamp the same yaw onto the movement events so the orbit carries through strafing and jumps. Direction flips on horizontal collision or missing ground under a five-block probe.",
+  "sections": [
+    {
+      "h": "Activation gate",
+      "p": "onPreUpdate is a chain of requirements rather than a simple toggle: the module deactivates when Scaffold is enabled or KillAura is off, and it clears the target unless the forward key is down and either Speed or Flight is enabled. With holdJump set, releasing the jump key also drops the target. The net effect is that the orbit only ever runs while a speed module is driving the motion, which couples the module's wire profile to whatever velocity the Speed or Flight module produces."
+    },
+    {
+      "h": "Orbit geometry",
+      "p": "The steering is computed in two stages. First the yaw to the target is offset by plus or minus (90 + 45) degrees depending on the stored left flag, and a point is placed at the range setting plus a random jitter divided by 100 on that bearing around the target. Then the yaw is recomputed from the player's own position to that point, and it is this second angle that reaches movementYaw. The double atan2 matters for what the server sees: the motion direction is not 135 degrees off the target direction, it is the angle the player subtends on the orbit point. When the player holds the configured radius the divergence between the motion direction and the target direction is about 22.5 degrees (chord geometry), it shrinks toward zero as the player closes from far away, and it grows toward 45 degrees as the player hugs the target. The reported rotation meanwhile stays on the Kill Aura's smoothed aim yaw."
+    },
+    {
+      "h": "Steering and direction flips",
+      "p": "MoveUtil's strafe helpers read mc.thePlayer.movementYaw directly (lines 134, 341, 367, 393 and 422 of the 6.1.30 util), so the module's write is consumed unconditionally by the movement code. onStrafe and onJump forward the stored yaw into the motion and jump events, keeping the orbit direction through air time. The flip state machine runs in onPreUpdate: a horizontal collision or missing ground within five blocks below triggers MoveUtil.strafe() and toggles the left flag, with the colliding latch preventing retriggers every tick."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C0BPacketEntityAction"
+  ],
+  "files": [
+    {
+      "label": "TargetStrafe.java (orbit module)",
+      "rel": "com/alan/clients/module/impl/movement/TargetStrafe.java",
+      "explanation": "The module is one PreUpdate handler plus the two event stamps. The gate logic clears the target when Scaffold is up, KillAura is down, or the forward/jump requirements are unmet, then picks the nearest entity within range plus six blocks. The yaw pipeline is the double atan2: RotationUtil.calculate(target) gives the aim yaw, the plus-or-minus 135-degree offset picks the orbit side, a point is computed at range plus a jitter of Math.random()/100 on that bearing, and RotationUtil.calculate on the point gives the final steering yaw, which is stored and written to mc.thePlayer.movementYaw. onJump and onStrafe both forward the stored yaw into their events at HIGH priority, so the patched movement code uses it for the motion vector and the jump direction. The module never constructs a packet; its whole wire presence is the C03 stream and the sprint state produced by the surrounding movement."
+    },
+    {
+      "label": "MoveUtil.java (steering consumer)",
+      "rel": "com/alan/clients/util/player/MoveUtil.java",
+      "explanation": "MoveUtil is the consumer side of the steering channel. In the 6.1.30 client the strafe helpers read mc.thePlayer.movementYaw directly rather than substituting it conditionally: getMotion, the strafe overloads and the setSpeed helpers all start from that field (lines 134, 341, 367, 393, 422), apply the strafe-key offsets and the backward flip, and produce motionX and motionZ from the sine and cosine of the resulting angle. Because the field is consulted unconditionally, any module that writes movementYaw redirects the client's motion, and because the same field feeds the predictive movement copy used by other utilities, the orbit direction is consistent across the client's own physics. The wire effect is a C03 stream whose position deltas point along the orbit bearing while the rotation fields in the same packets carry the Kill Aura's aim yaw."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Strafe (45-degree motion angles)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Strafe.java",
+      "explanation": "Hawk's Strafe check takes the angle between the player's acceleration direction and the reported yaw, reduces it modulo 45 degrees, and requires the remainder to land within 0.5 degrees of a multiple of 45, the only angles a keyboard strafe can produce. The double-atan2 orbit defeats that model: at the configured radius the motion direction sits about 22.5 degrees off the reported aim yaw, and 22.5 degrees reduced modulo 45 is still 22.5, more than twenty degrees from the nearest multiple. The divergence sweeps as the player drifts in and out, passing through the 0 and 45 multiples only at the extremes of the wobble, so a sustained orbit spends almost all of its time outside the tolerance. The check requires grounded, two-consecutive-update motion and excludes teleports, knockback and liquids, which the orbit satisfies; the one configuration that passes is a client that does not report the aura rotation, which gives up the silent-aim property."
+    },
+    {
+      "label": "SurvivalFly (movement envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly validates every move against an envelope built from the world and the previous move's momentum. The horizontal allowance is the friction-decayed previous speed plus the input force the move implies, and it includes the sprint multiplier and the jump stage, so the check models the full range of legitimate ground and air motion. The orbit is only active while a Speed or Flight module drives it, which is exactly the case the envelope is built to bound: the circle inherits the speed module's velocity, and a sustained over-speed orbit keeps the per-move distance above the modeled allowance, accumulating hDistanceAboveLimit and ending in a set-back that snaps the player out of the circle. The jump legs run inside the jump-stage allowance, so it is the grounded sprint phase that binds; a legal-speed circle passes, while the module's intended pairing with a speed module does not."
+    },
+    {
+      "label": "Speed (base speed envelope)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Speed.java",
+      "explanation": "Arc v2's Speed check measures the horizontal distance of each move against a base of 0.2873 blocks per tick adjusted for speed potions, with allowances for ice, slime blocks, stairs and jump stages. On the ground it averages the move over the accumulated ground ticks and flags when the instantaneous move exceeds the base plus the average; in the air it compares against the base plus the stage constant. The orbit holds a roughly constant tangential speed, which is the profile the ground accumulator is designed to measure: a legal-speed circle passes, while a circle driven at the speed module's velocity keeps the average low and the instantaneous move high, tripping the expected branch with a set-back to the previous location. The check has no direction component, so it cannot identify the orbit as such; it bounds the speed the orbit can carry, which is the same role it plays against any movement module."
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "module": "ComboOneHit",
+  "client": "Rise 5.99",
+  "category": "comboonehit",
+  "source_rel": "dev/rise/module/impl/combat/ComboOneHit.java",
+  "overview": "Rise 5.99's ComboOneHit is a 27-line multiplier for the Combo duels gamemode: on every AttackEvent it re-sends the same C02PacketUseEntity ATTACK against the event's target a configurable number of times, 50 by default and up to 1000, all in the same tick. The packets go out through PacketUtil.sendPacketWithoutEvent, which bypasses the client's own PacketSendEvent bus, so no other Rise module sees or filters them, but they reach the wire like any other packet. The module has no aim logic, no range check and no target filtering of its own: it multiplies whatever attack produced the event, which is what makes it a one-tick burst of identical attack packets against a single entity id. The only setting is the packet count, and the wire fingerprint is the burst itself: dozens of C02 ATTACK packets with no swing packet, no rotation change and no intervening move between them.",
+  "sections": [
+    {
+      "h": "Burst multiplication",
+      "p": "sendPacketWithoutEvent is the deliberate detail: it pushes the packet straight to the net handler instead of firing the client's PacketSendEvent, so listeners that cancel or rewrite outgoing packets in other modules never see the burst. The server does see it, which is the point: in the Combo gamemode the module multiplies the hits a single swing yields. Because the loop runs inside the event handler, all 50 packets are queued before the client sends anything else, so the burst occupies the same tick as the swing that triggered it."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "There is no client-side bot filter anywhere in the module, and the countering checks below therefore do not need to argue around one: the server receives every packet in the burst and validates geometry and timing from its own world state, never from the client's entity list. The module inherits the target from the event, so the burst always names an entity the player actually attacked, which keeps reach and line-of-sight checks quiet while the rate checks fire."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "ComboOneHit.java",
+      "rel": "dev/rise/module/impl/combat/ComboOneHit.java",
+      "explanation": "The entire module is the NumberSetting at line 19 (Packets, default 50, range 1 to 1000, step 25) and the onAttackEvent handler at lines 22-26. The loop count is cast from the setting's double value to int, so fractional settings truncate toward the lower bound. Each iteration builds a new C02PacketUseEntity with the event's target and the ATTACK action and hands it to PacketUtil.sendPacketWithoutEvent, which queues it outside the client's own send event stream. There is no onEnable, no state, no other handler: the module exists only to inflate one attack event into N wire packets.\n\nThe absence of other traffic is part of the analysis: no C0A swing, no C02 INTERACT, no C03 movement, no rotation write. Everything the server can measure about the burst is in the C02 stream itself, which is why the countering checks below are all attack-rate and attack-shape checks rather than geometry checks. The file is self-contained and has no supporting utilities beyond PacketUtil."
+    }
+  ],
+  "countering": [
+    {
+      "label": "AttackFrequency (use-entity rate ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/AttackFrequency.java",
+      "explanation": "NCP feeds AttackFrequency from the ProtocolLib UseEntityAdapter, which is the file the C02 corpus mines for NCP, and every incoming C02 adds 1f to data.attackFrequencySeconds, an ActionFrequency covering half, one, two, four and eight second windows (AttackFrequency.java lines 44-89). The default limits are 8 attacks in a half second, 15 in one second, 30 in two, 60 in four and 95 in eight (DefaultConfig lines 548-552). The check takes the largest excess across the windows and raises a violation with that amount, feeding the Improbable tracker when configured.\n\nComboOneHit's default burst of 50 C02 packets in a single tick puts 50 in the half-second bucket against a limit of 8, an excess of 42 with the sec_half tag, and the same 50 keeps the one-second window at 50 against its 15 limit. The violation executes the configured actions, which by default cancel the packet stream once the level crosses the action thresholds. The check counts every packet, so even a setting of 9 trips the half-second window, and the maximum setting of 1000 saturates every window including the eight-second one. The burst cannot be hidden by spacing, because the loop is synchronous inside the event handler: all packets land in the same processing burst."
+    },
+    {
+      "label": "FightSpeed (attack interval envelope)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightSpeed.java",
+      "explanation": "Hawk's FightSpeed records the tick delta between consecutive attacks and only logs deltas of 4 ticks or less, then averages the last 10 samples into an estimated CPS and punishes when the average exceeds maxCps, default 16 (FightSpeed.java lines 40-77). The samples are taken per InteractEntityEvent with the ATTACK action, so each of ComboOneHit's 50 packets is its own event. The delta between consecutive packets in the burst is 0 ticks, the average of ten zeros is zero, and the CPS estimate becomes 1 divided by 0, which the check explicitly anticipates with the comment 'if someone manages to get an Infinity, they're dumb af' and punishes on the spot.\n\nThe punish is per-sample with a VL of 1 each, so the burst racks up violations faster than the configurable VL decay can drain them. The RECORD_SENSITIVITY guard that normally filters out slow clicking is irrelevant because every delta in the burst is zero. The check sees the burst exactly as the wire presents it: ten or more attacks with no time between them, which is mechanically impossible for a human and immediately distinguishable from even the fastest autoclicker, whose inter-click deltas are at least a few ticks."
+    },
+    {
+      "label": "KillAura (attack packet frequency and swing gate)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/KillAura.java",
+      "explanation": "Arc v2's KillAura check has two independent paths that both hit the burst. checkFrequency counts attack packets per second and flags when the count passes max-attack-packets, default 20 (config.yml killaura section), so the default 50-packet burst exceeds the ceiling two and a half times over, and the check's kick path applies at the configured violation level. The main check additionally enforces a swing deadline: time since the last arm swing must stay under max-swing-time, default 80ms (KillAura.java lines 58-63). ComboOneHit never swings, so once the player's last real swing ages past 80ms, every subsequent burst triggers the NoSwing violation as well as the Speed violation.\n\nThe direction and reach branches stay quiet, and that is the honest boundary: the burst always names the entity the player actually attacked, and the player's last movement packet aimed at it, so the angle and distance checks pass. The check still scores the module through the two rate and animation gates, which need none of the client's entity knowledge: the server counts packets and watches for swings from its own event stream. A setting of 20 or fewer packets per burst would slip under the attack-packet ceiling but still trip NoSwing the moment the swing deadline passes."
+    },
+    {
+      "label": "Direction (aim geometry, missed)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Direction.java",
+      "explanation": "NCP's fight Direction check measures the line of sight from the player's eye along the last reported look direction against the attacked entity's bounding box, using CollisionUtil.directionCheck with the entity's width, height and the configured precision (Direction.java lines 64-78). A player looking at the target passes with an off value of zero; a silent-aim attack that hits a target outside the view cone scores a violation. ComboOneHit inherits its target from the attack event, which by definition came from a real interaction with the entity, so the player's look is already on the target when the burst fires and Direction never sees an anomaly.\n\nThe entry is the honest boundary of the set: the burst's geometry is indistinguishable from a normal attack, and Direction is blind to rate, so it cannot contribute to scoring the module. The rate checks in this set are the ones that see the burst, and they see it because they count packets and watch swing timing rather than evaluating each attack's aim. This is also the pattern to remember for any client-side bot filter: a server check like Direction validates geometry from server state, while the client's entity filters decide who gets attacked, and the two never meet."
+    }
+  ]
+}

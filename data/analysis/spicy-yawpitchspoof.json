@@ -1,0 +1,62 @@
+{
+  "module": "YawAndPitchSpoof",
+  "client": "Spicy",
+  "category": "yawpitchspoof",
+  "source_rel": "info/spicyclient/modules/player/YawAndPitchSpoof.java",
+  "overview": "Spicy's YawAndPitchSpoof rewrites the look values of the client's C03 rotation packets before they are sent. On every outgoing EventSendPacket at the BEFOREPRE phase, the handler pins the pitch of C05PacketPlayerLook and C06PacketPlayerPosLook packets to 90 (Down mode), -90 (Up mode) or 0 (Middle mode), and optionally reverses the yaw by adding 180. The spoof is gated on the client's own killaura being disabled: while Spicy's killaura is enabled the handler does nothing, so combat modules keep the real look. The second half of the module injects a fresh C05PacketPlayerLook carrying the player's true rotation directly through NetworkManager.sendPacketNoEvent whenever a C08 placement, C02 use-entity, C0A swing, C07 digging or C0E window-click packet is sent, so interactions are still aimed with the real look even while the standing stream is spoofed.",
+  "sections": [
+    {
+      "h": "Look rewrite",
+      "p": "The handler listens on EventSendPacket and runs at isBeforePre(), the earliest phase of Spicy's event pipeline, before the module bus reaches PRE. Only C05PacketPlayerLook and C06PacketPlayerPosLook are touched: the pitch is set to 90 for Down, -90 for Up or 0 for Middle, and the yaw to mc.thePlayer.rotationYaw plus 180 for Reversed. Bare C03 and C04 position-only packets pass untouched, so the spoof only rides the ticks where the player actually changed look. The ModeSetting strings are matched with the is() helper against the registered values, and the No Spoof option is a registered value with an empty branch, so selecting it leaves the packet as-is."
+    },
+    {
+      "h": "Interaction injection",
+      "p": "The second branch watches for the interaction packet classes: C08PacketPlayerBlockPlacement, C02PacketUseEntity, C0APacketAnimation, C07PacketPlayerDigging and C0EPacketClickWindow. When any of them appears at BEFOREPRE, the module pushes a new C05PacketPlayerLook(mc.thePlayer.rotationYaw, mc.thePlayer.rotationPitch, mc.thePlayer.onGround) through sendQueue.getNetworkManager().sendPacketNoEvent, the fork's direct send that bypasses the event bus, so the injected packet never re-enters this handler. The effect is a look stream that alternates: spoofed pitch and yaw on normal rotation ticks, then a one-tick jump to the real look immediately before every swing, placement or attack, so server-side hit validation sees the real aiming direction at the moment it matters."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "Three signatures emerge. The pitch is frozen at an exact grid value (90, -90 or 0) on every rotation tick, so the look stream has a constant pitch delta of zero while the yaw follows the mouse. The Reversed mode flips the yaw by exactly 180 relative to the real facing, so the raw packet value jumps by about 180 between a spoofed tick and an injected real tick. And the injection itself is a one-tick snap: pitch and yaw both jump from the pinned values to the real values and back on the next spoofed tick, always within a tick or two of a swing or click. The killaura gate means the entire pattern disappears the moment Spicy's own killaura toggles on."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "YawAndPitchSpoof.java",
+      "rel": "info/spicyclient/modules/player/YawAndPitchSpoof.java",
+      "explanation": "The module is two settings and one onEvent handler. The pitchMode ModeSetting registers Down, Up, Middle and No Spoof with Down as default; the yawMode registers Forward, Reversed and No Spoof with Forward as default. The handler gates on EventSendPacket, isBeforePre() and the killaura-disabled condition, then rewrites the C05 and C06 branches separately because the two packet classes carry the same fields with different serialization. The interaction branch at the bottom matches five packet classes and injects the real-look C05 through sendPacketNoEvent. The module registers under Category.PLAYER with no default keybind, and resetSettings rebuilds the two settings."
+    },
+    {
+      "label": "Event.java (send-phase dispatch)",
+      "rel": "info/spicyclient/events/Event.java",
+      "explanation": "The base event class every Spicy event extends, and the carrier of the phase this module depends on. isBeforePre() returns true only when type is EventType.BEFOREPRE (lines 28-35), the earliest of the four phases; the module runs at that phase so the rewrite happens before any PRE handler and before the packet reaches the network layer. The class also carries the canceled flag and the INCOMING/OUTGOING direction used by Spicy's packet listeners. The C05PacketPlayerLook injected via sendPacketNoEvent is a packet, not an event, so it never passes through this class; the handler's own guard is the only thing that keeps the injection from being re-processed."
+    }
+  ],
+  "countering": [
+    {
+      "label": "PacketAnalysisAimStep (frozen-axis stepping)",
+      "ac": "Photon-GitHub-AntiCheatAddition",
+      "rel": "src/main/java/de/photon/anticheataddition/modules/checks/packetanalysis/PacketAnalysisAimStep.java",
+      "explanation": "Photon's AimStep listens on PlayerMoveEvent and computes yawDelta via MathUtil.yawDistance (the shortest angular distance, normalized) and pitchDelta as the absolute difference (lines 36-37). The step signature is one axis frozen while the other moves more than 1 degree: isAimStep returns true when deltaOne is under 0.00001 and deltaTwo exceeds 1 (lines 47-50), and the check fires when either axis order matches (line 42), adding 20 VL per flag with a 200ms decay. In any pitch-spoof mode the pitch delta is exactly 0 between consecutive spoofed rotation ticks (both are pinned to the same grid value) while the yaw delta follows the mouse, so every tick the player turns is a textbook frozen-axis step. The injected real-look tick breaks the pattern for that one tick (both axes move), but the surrounding ticks still trip the check, so the module cannot clear its own signature by injection."
+    },
+    {
+      "label": "PacketAnalysisPerfectRotation (exact-grid deltas)",
+      "ac": "Photon-GitHub-AntiCheatAddition",
+      "rel": "src/main/java/de/photon/anticheataddition/modules/checks/packetanalysis/PacketAnalysisPerfectRotation.java",
+      "explanation": "Photon's PerfectRotation flags rotation deltas that are exact integer multiples of 0.1 or 0.25 degrees (MULTIPLE_PATTERNS, lines 27, 78-83), with an epsilon of 1e-10 and a conditionallyIncDec consistency counter so an occasional match decays instead of flagging. The pinned pitch values are exactly 90.0, -90.0 and 0.0, which are 900, -900 and 0 multiples of 0.1, and in Reversed mode the jump between a spoofed yaw and the injected real yaw is exactly 180.0 when the mouse is still, which is 1800 multiples of 0.1 and 720 of 0.25. Every rotation tick carrying the pinned pitch and every interaction carrying the 180 flip increments the consistency counter, and the counter flags once the matches outpace the decay. Real mouse input almost never produces exact multiples repeatedly, which is the property the module's constant values violate."
+    },
+    {
+      "label": "AimbotHeuristic (raw-delta twitch while clicking)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotHeuristic.java",
+      "explanation": "Hawk's heuristic samples the last four to five raw yaw and pitch deltas, computed as plain subtraction without shortest-distance wrapping (line 73), and evaluates them only when a click or world interaction happened within the last two moves (clickedXMovesBefore, lines 83, 127-137). The twitching and zig-zag branch flags when both the current and previous speeds exceed 20 degrees and the angle between the move vectors exceeds 2.86 radians (line 107). The injected real-look C05 arrives immediately before the C0A or C02 that follows it, so the click gate is open exactly when the look snaps: in Reversed mode the raw yaw delta between the spoofed tick and the injected tick is about 180 degrees, and the pitch delta is the difference between the pinned 90 or -90 and the real pitch, typically 60 to 90 degrees, so both speeds exceed 20 and the angle is near pi, firing the twitch branch. The killaura gate is the honest bypass: while Spicy's own killaura is enabled the module stops spoofing entirely, and a user who never clicks never opens the check's evaluation window."
+    },
+    {
+      "label": "RotationSnapHeuristic (snap signature on the injection)",
+      "ac": "intave-intave",
+      "rel": "src/main/java/de/jpx3/intave/check/combat/heuristics/combatpatterns/rotation/RotationSnapHeuristic.java",
+      "explanation": "intave's snap heuristic subscribes to ARM_ANIMATION, ATTACK_ENTITY and USE_ENTITY, POSITION_LOOK, LOOK and FLYING (lines 49-93). The snap signature is a single-tick yaw jump between two near-static rotations: previousYawMotion under 9 degrees, the jump over 40, and the following motion under 9, gated on a swing or attack within 150ms, more than 10 rotation packets and more than 7 ticks since a teleport (lines 103-109, 167-175). The injection produces exactly that shape in combat: the spoofed stream's yaw motion is near zero while the mouse is still, the injected real-look tick jumps the yaw by roughly 180 in Reversed mode and the pitch by 60 to 90, and the next spoofed tick returns to the pinned values, all within a tick of the C0A swing the gate requires. With Forward yaw mode and No Spoof pitch the flip disappears and the snap is reduced to the pitch jump only, which weakens but does not remove the signature on servers running the check."
+    }
+  ]
+}

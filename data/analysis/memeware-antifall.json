@@ -1,0 +1,63 @@
+{
+  "module": "AntiFall",
+  "client": "Memeware 7.3",
+  "category": "antifall",
+  "source_rel": "me/memewaredevs/client/module/movement/AntiFall.java",
+  "overview": "Memeware 7.3's AntiFall is a single-shot fall saver built on an absurd-Y position packet. The UpdateEvent handler runs once per tick, and when the block-under sweep comes back empty and mc.thePlayer.fallDistance reaches the Distance setting (default 5, range 1 to 10), it sends a silent C03PacketPlayer.C04PacketPlayerPosition whose y coordinate is mc.thePlayer.ticksExisted minus 1.542E302, which evaluates to roughly negative 1.54 times 10 to the 302. The x and z stay at the real position and the onGround flag is the current client state. Vanilla accepts the packet because its illegal-position check bounds only x and z at 3.0E7 and never validates y, and the moved-too-quickly handler then takes its snap-back branch (the squared delta overflows the 100.0 threshold), teleporting the entity back to its last accepted position and issuing S08PacketPlayerPosLook, so the fall episode ends server-side without damage. The module never handles that S08 itself; the teleport is the server's own reaction.",
+  "sections": [
+    {
+      "h": "The absurd-Y payload",
+      "p": "The y expression is ticksExisted minus 1.542E302. ticksExisted is a small positive tick counter, so the result is a large negative finite double, roughly -1.542E302, far below the world floor. It is not NaN and not infinity: the value is exactly representable as a double, which matters because the server's moved-too-quickly check squares the per-axis deltas and compares the sum against 100.0, and the square of 1.5E302 overflows to infinity, so the comparison always trips. The vanilla illegal-position check that normally guards extreme coordinates tests only x and z at 3.0E7, so the packet is not kicked on arrival."
+    },
+    {
+      "h": "The snap-back path",
+      "p": "When the absurd packet is processed, the server's processPlayer finds a move it cannot reconcile and calls setPlayerLocation with the entity's last accepted position, which teleports the entity back and sends S08PacketPlayerPosLook to the client. The client accepts the teleport, and the fall episode that was about to end in damage is replaced by a snap back to the last safe location. The module fires once per fall because the send does not reset fallDistance, so the gate re-arms naturally when the next fall crosses the threshold; repeated fires just repeat the snap-back."
+    },
+    {
+      "h": "The block-under sweep",
+      "p": "isBlockUnder is a static helper that drops a copy of the player's bounding box from posY plus eye height in 2-block steps until getCollidingBoundingBoxes reports any collision. It returns true for any block anywhere in the column, so the module only fires over open air or the void. The same helper is shared with the NoFall module in the same client, whose Hypixel mode gates its ground-spoof packet on the same sweep, and PacketUtil.sendPacketSilent writes the C04 directly into the network manager, bypassing the client's outgoing event pipeline so the packet cannot be re-intercepted."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "AntiFall.java (module)",
+      "rel": "me/memewaredevs/client/module/movement/AntiFall.java",
+      "explanation": "AntiFall.java is the entire module: one settings registration (Distance, default 5) and one UpdateEvent consumer. The consumer calls isBlockUnder() and, when the sweep is empty and fallDistance passes the setting, builds a C04PacketPlayerPosition with the real x and z, the absurd y of ticksExisted minus 1.542E302, and the current onGround flag, and pushes it through PacketUtil.sendPacketSilent.\n\nThe companion isBlockUnder sweep is a genuine tolerance: the 2-block step can skip a thin ledge sitting between sample points, which is the honest gap in the void gate, and the shared helper means the NoFall module's Hypixel mode depends on this same file."
+    },
+    {
+      "label": "PacketUtil.java (silent send)",
+      "rel": "me/memewaredevs/client/util/packet/PacketUtil.java",
+      "explanation": "PacketUtil.sendPacketSilent writes a packet straight into the network manager, skipping the client's addToSendQueue path and therefore the outgoing event pipeline that modules hook. The AntiFall C04 travels this way so no other module can intercept or rewrite it before it reaches the wire. The plain sendPacket variant goes through the normal queue.\n\nThe distinction matters for the module's reliability: the silent path is what guarantees the absurd packet actually leaves the client unchanged, because a rewrite by a movement module would defeat the y payload before the server ever sees it."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Moving (extreme-move check)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/Moving.java",
+      "explanation": "NCP's net-level Moving check is the anticheat equivalent of the vanilla moved-too-quickly handler, and it closes the y gap the module exploits. On every position-bearing flying packet it compares the claimed location against the server's known location: when the absolute y distance exceeds 100 or the total distance exceeds 100, data.movingVL increments and the configured actions run (the default NET_MOVING_ACTIONS string cancels at vl above 17, with logging), and otherwise the violation level decays by 0.98 per move. The check comment names PlayerConnection's 100 threshold explicitly: NCP replaces the vanilla square-delta test with the same bound applied per axis and per total distance.\n\nThe C04's y of roughly -1.542E302 puts the y distance at 1.5E302, so the check fires on the very packet the module sends, before any snap-back can occur. The default cancel threshold of 17 means a single fire is logged, and a player who leans on the module across several falls accumulates the level until the cancel action kicks in, which removes the save attempt from the wire entirely."
+    },
+    {
+      "label": "SurvivalFly (vertical envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly's vertical allowance comes from vDistRel (invoked around line 212, defined at line 1839), which seeds the allowed distance from the previous move's momentum and accepts only a short list of named envelopes: a zero-y move on ground, a jump, a step-up and a riptide launch. The violation is (max(hDistanceAboveLimit, 0.0) + max(yDistanceAboveLimit, 0.0)) * 100 with a set-back to the stored location.\n\nThe absurd-y C04 is a per-move delta of 1.5E302 against an allowed descent of a few tenths of a block, so yDistanceAboveLimit is on the order of 1.5E302 and the violation value is astronomically large, an immediate flag with a set-back. The packet's onGround flag is irrelevant to the outcome because fromOnGround and toOnGround come from RichBoundsLocation.isOnGround, a block-cache scan, not from the packet bit."
+    },
+    {
+      "label": "NoFall (server-side fall bookkeeping)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/NoFall.java",
+      "explanation": "NCP's movement NoFall keeps its own fall-height bookkeeping server-side. noFallMaxY tracks the highest point of the fall episode and noFallFallDistance accumulates the descent, and handleOnGround compares the pair to decide when to deal the damage itself. The client's fallDistance field is never trusted.\n\nThe module's premise is that the absurd packet ends the fall before damage accrues. Under NCP the same packet ends the episode the other way: the tracked descent from noFallMaxY to the claimed y is the largest possible, so the damage threshold is exceeded by orders of magnitude and NCP deals the fall damage through its own path at the moment the episode closes, which the vanilla snap-back never gets to do. The honest boundary is that the module trades vanilla fall damage for an NCP-computed fall damage of at least the same size."
+    },
+    {
+      "label": "Flight (descent model)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Flight.java",
+      "explanation": "Vrekt's Flight check scores the vertical axis from the movement stream. For descents, once the fall is more than 1.6 blocks from the stored ground location with more than two consecutive descending moves, it computes an expected per-tick vertical delta from an air-ticks gravity polynomial (5.4246E-6 times airTicks squared minus 0.0011 times airTicks plus 0.0659 under 100 air ticks, a second polynomial above), and flags when the measured delta differs from the expectation by more than 0.02 or by less than 0.001, under the Flight (Glide) label, with the previous location as the setback.\n\nThe absurd-y C04 produces a vertical delta of about 1.5E302 against an expectation near 0.066, so the difference is astronomically beyond the 0.02 band and the check flags the move itself. The setback to the previous location performs the same snap-back the module wants from vanilla, but as a flagged violation, and the flag ledger accumulates across repeated uses."
+    }
+  ]
+}

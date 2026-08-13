@@ -1,0 +1,62 @@
+{
+  "module": "Blink",
+  "client": "Rise 6.1.30",
+  "category": "blink",
+  "source_rel": "com/alan/clients/module/impl/player/Blink.java",
+  "overview": "Rise 6.1.30's Blink is a thin wrapper over the shared PingSpoofComponent. Every PreMotionEvent while toggled calls PingSpoofComponent.blink(), which arms the component with spoof(9999999, true, false, false, false, true): outgoing packets matching the \"regular\" tuple (C0F, C00 keepalive, S1C metadata) or the \"blink\" tuple (C02, C0D, C0E, C0C, C0B, C08, C07, C09, C13, C15, C16, C17, C18, C19, the whole C03 family, C0A) are cancelled at PacketSendEvent and parked as timed entries. A PostMotion handler flushes the queue when mc.thePlayer.ticksExisted passes a randomly chosen next value in the 2-40 tick delay range and pulse mode is on, and dispatch() drops the enabled flag before re-sending so the flush is never re-captured. The component also drains on world change and from its own PostMotion about 100ms after the last arming call, which is how the buffer empties on disable. A vestigial blinkEntity field is never assigned anywhere in the module and only feeds a removal call in deSpawnEntity.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module wires three listeners: PreMotionEvent arms the buffer every tick, PostMotionEvent implements the pulse flush, and WorldChangeEvent re-seeds the random delay. onEnable calls getNext(), which stores ticksExisted plus a random draw between the two bounds of the delay setting (default 2-2, range 2-40). The pulse toggle defaults off, so the stock behavior is a single freeze that ends when the module is disabled and the component's own clock drains the queue. The blinkEntity field is created nowhere in the module source; deSpawnEntity only ever removes a null entity, so the local ghost-player half of the classic blink pattern is dead code in this build."
+    },
+    {
+      "h": "Buffer contents and flush",
+      "p": "PingSpoofComponent keeps six typed tuples and cancels any outgoing or incoming packet whose class matches an enabled tuple while the component is armed. blink() enables the regular tuple, which swallows keepalives and transactions, and the blink tuple, which swallows every combat, interaction and movement packet including the full C03 family. dispatch() sets enabled false, walks the queue with PacketUtil.queue (bypassing the event bus), clears it, and restores the flag, which is the re-entrancy guard that lets a flush from inside a send handler complete. The per-packet age flush inside the component never fires for this module because the armed amount is 9999999 milliseconds, and the enabledTimer reset on every blink() call keeps the 100ms fallback clock from tripping while the module is on."
+    },
+    {
+      "h": "Pulse and disable behavior",
+      "p": "In pulse mode the PostMotion handler waits until ticksExisted exceeds the random deadline, then re-seeds the delay, flushes the queue and calls deSpawnEntity. Because the whole C03 family is buffered, the server-side entity freezes at its last transmitted position while the client keeps simulating, and the flush replays the entire silent gap at once: a short pulse hides a brief movement burst, while a long freeze followed by disable replays the full accumulated motion in one tick. The keepalive buffering means the freeze also stalls the ping stream, which is what the PingSpoof module itself exploits with the same component."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Blink.java",
+      "rel": "com/alan/clients/module/impl/player/Blink.java",
+      "explanation": "The module is pure event wiring: PreMotion arms the shared component, PostMotion implements the pulse flush against a random tick deadline, and WorldChangeEvent re-seeds the delay so a world switch does not flush on the old clock. The delay BoundsNumberValue feeds getNext(), and the deSpawnEntity helper is the only other logic; it is vestigial because blinkEntity is never assigned. Every packet-level behavior described in the analysis lives in PingSpoofComponent, so this file is included to show the wiring and the dead-field finding."
+    },
+    {
+      "label": "PingSpoofComponent.java",
+      "rel": "com/alan/clients/component/impl/player/PingSpoofComponent.java",
+      "explanation": "This component is the module's entire mechanism: six class tuples, a PacketSendEvent handler that cancels and parks matching packets while armed, a dispatch() flush with an enabled-flag re-entrancy guard, and a PostMotion fallback clock that drains the buffer about 100ms after arming stops. The blink() helper arms it with spoof(9999999, regular, blink) so Blink swallows the C03 family plus keepalives and transactions, and the same component serves the PingSpoof exploit module, WatchdogNoFall and WatchdogAutoPhase, which is why the blink tuple is so broad. The per-packet age flush is the only path that never engages for Blink, since the armed amount is effectively infinite."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (flush burst and window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NoCheatPlus scores every processed move into data.morePacketsFreq, an ActionFrequency with half-second buckets over the configured window, and NetStatic.morePacketsCheck accumulates the window score against morePacketsEPSMax (default 22 per second, ideal 20) with a burst path on the newest half-second bucket (default 15 packets, direct-violation 10). The blink flush is the direct target: a long freeze followed by disable replays the entire buffer in one tick, so a 20-tick blink delivers a 20-packet pulse that trips the burst path immediately, and even a sustained 2-tick pulse mode averages near 20/s with instantaneous bursts of 10, which the burst path catches while the window accumulator stays under the ceiling. That split is the honest trade: the average rate hides in the window, the burst does not."
+    },
+    {
+      "label": "SurvivalFly (stale replay envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the movement envelope from the world: the horizontal allowance comes from prepareSpeedEstimation, the vertical allowance from vDistRel seeded by the previous move's momentum, and the violation is (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 with a set-back. The first flushed move after a blink is a delta equal to the whole silent gap from the last server-tracked position, which is exactly the divergence the envelope measures: a multi-block delta with no intermediate momentum lands far above the allowance and is reverted. A short pulse mode shrinks the gap so each replayed move stays small, trading the replay flag for the burst flag on MorePackets instead, which is the bypass surface to state honestly."
+    },
+    {
+      "label": "MovingListener (set-back teleports)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/MovingListener.java",
+      "explanation": "Every NCP movement violation is enforced here by teleporting the player back (SchedulerHelper.teleportEntity with a correction-of-position cause) and recording the target in the set-back bookkeeping; onPlayerTeleportLowest only accepts moves that reach the recorded teleported position. A set-back that lands mid-blink is itself buffered by the client, so the post-flush replay starts from the pre-correction position and the envelope re-flags the divergence on the next tick, which makes the two checks compound: the set-back teleport is a new origin the blink buffer cannot hide. The teleport is also an S08 the client receives, so the blink flush replays over it and the whole cycle repeats until the module stops buffering."
+    },
+    {
+      "label": "PlayerEventListener (teleport ledger)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/module/PlayerEventListener.java",
+      "explanation": "Hawk records every server teleport as a pending entry in HawkPlayer.pendingTeleports, drops MoveEvents while a pending teleport is unanswered, resyncs on any move more than 64 blocks squared from the last accepted position, and clears the ledger after ping plus 40 ticks with a source comment naming the cancelled-teleport case. For a blink module this ledger is the frame the flush must survive: the replayed multi-block jump either exceeds the 64-block squared resync bound, which snaps the player to the recorded position, or lands while a set-back teleport is still pending, in which case the move is discarded entirely and the server position never converges. The 40-tick ledger window also covers a full pulse cycle, so a pulse mode that flushes inside the window re-enters the drop path."
+    }
+  ]
+}

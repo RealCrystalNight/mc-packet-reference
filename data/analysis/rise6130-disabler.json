@@ -1,0 +1,57 @@
+{
+  "module": "Disabler",
+  "client": "Rise 6.1.30",
+  "category": "disabler",
+  "source_rel": "com/alan/clients/module/impl/exploit/Disabler.java",
+  "overview": "Rise 6.1.30's Disabler is a facade module: it declares over twenty BooleanValue toggles, each bound to a separate Mode<Disabler> class living in the exploit/disabler package, so the module is a settings menu over a library of independent packet-bypass strategies. The blanket switches cancel whole packet classes outright (KeepAliveDisabler kills every C00 echo, TransactionDisabler kills every C0F confirmation, SprintDisabler kills sprint entity actions, AbilitiesDisabler kills C13), while the server-specific modes run timed state machines over the outgoing stream: Verus2Disabler parks C00 keepalives and C0F transactions in concurrent queues and drips them back out on stopwatches, WatchdogDisabler collects negative-action-number S32 transactions, cancels them, and replays a shuffled batch a second later, and the Cubecraft, Vulcan, MineLand and UniversoCraft modes each target a server's particular transaction and movement handling. Because every strategy is a Mode bound to a BooleanValue, each one is independently toggleable and each one leaves its own trace on the wire.",
+  "sections": [
+    {
+      "h": "Facade architecture",
+      "p": "The module class only wires settings: each BooleanValue constructor takes the Mode instance that implements the strategy, and Rise's value system enables that mode's event listeners whenever the value turns on. Deprecated toggles (Hypixel Slime, MMC Partial Reach, Ghostly, Lunar) are hidden behind the Deprecated switch, and the constructor walks the value list to bind their visibility. The packet-handling logic itself never appears in the facade; it is spread across twenty-five mode classes that all hook the same event bus channels."
+    },
+    {
+      "h": "Keepalive and transaction buffering",
+      "p": "Verus2Disabler is the buffering mode and the one with the clearest wire profile. Its PacketSend handler intercepts C00PacketKeepAlive, rewrites the key field down by 30, parks the packet in a queue and cancels the original, and does the same for every C0F confirm transaction. The PreMotion handler is the drip clock: every 500ms one parked transaction is sent through sendNoEvent (bypassing the event bus so it is not re-intercepted), every 400ms one parked keepalive goes out, and a 300-entry cap flushes the oldest transaction when the queue grows past it. The movement sub-mode adds a triple C04 every 100 ticks (real position, then y minus 0.015625 with onGround false, then the real position again) and cancels the TeleportEvent that follows, so the server-side teleport correction never lands client-side. The sprint sub-mode alternates C0B STOP_SPRINTING and START_SPRINTING every tick while the player is moving."
+    },
+    {
+      "h": "Wire profile",
+      "p": "The buffering converts the client's steady keepalive cadence into a delayed drip: C00 echoes arrive 400ms late with ids the server never issued, C0F confirmations arrive 500ms late and out of order relative to the clicks that produced them, and every 100 ticks the movement stream carries three C04 packets in a single tick followed by a swallowed server teleport. The Watchdog mode's ping spoof is the same idea at a coarser granularity: incoming S32 transactions with negative action numbers are cancelled and collected for one second, then re-sent shuffled in a burst. Every mode is a timing or identity distortion of traffic the server treats as an ordered ledger."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive",
+    "C0FPacketConfirmTransaction"
+  ],
+  "files": [
+    {
+      "label": "Disabler.java (mode selector)",
+      "rel": "com/alan/clients/module/impl/exploit/Disabler.java",
+      "explanation": "The facade contains no packet logic; every strategy is a Mode instance bound to a BooleanValue. The cancellations are the simplest strategies: KeepAliveDisabler's PacketSend handler cancels any C00PacketKeepAlive it sees, TransactionDisabler cancels every C0F, SprintDisabler cancels C0B sprint actions, AbilitiesDisabler cancels C13. Those are one-line event handlers, and each is only usable against servers that tolerate the missing traffic class: no keepalive echoes means the server's own read-timeout eventually fires, no confirmations means the server's transaction ledger stays unconfirmed. The per-server modes are state machines layered on the same channels, and the deprecated aliases at the bottom of the value list show the module's lineage: hypixelSlime, mmcReachPartial and mmcKeepSprint each alias one of the generic strategies, which is why the mode classes are shared rather than duplicated."
+    },
+    {
+      "label": "Verus2Disabler.java (keepalive/transaction buffer)",
+      "rel": "com/alan/clients/module/impl/exploit/disabler/Verus2Disabler.java",
+      "explanation": "This mode is the wire fingerprint of the module. The PacketSend handler intercepts two packet classes: a C00 keepalive has its key field rewritten (c00.key -= 30) before being parked in the keepAlives queue and cancelled, and every C0F is parked in the transactions queue and cancelled. PreMotion is the flush clock: one transaction every 500ms, one keepalive every 400ms, both emitted through PacketUtil.sendNoEvent so they bypass the event bus and cannot be re-intercepted. The 300-entry cap forces the oldest transaction out when the queue overflows, which turns a sustained inventory interaction into a burst. The movement sub-mode sends three C04 packets in one tick every 100 ticks, the middle one at y minus 0.015625 with onGround false, then cancels the TeleportEvent that the server's S08 correction generates, so the client's own position never snaps while the server's view is converging on the re-asserted real position. The sprint sub-mode alternates C0B start and stop every tick while moving. The stopwatch drip is the important part: it deliberately delays the ledger-style packets (C00, C0F) while the movement stream flows at full rate, which is the profile the net-level checks measure."
+    }
+  ],
+  "countering": [
+    {
+      "label": "KeepAliveFrequency (keepalive ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java",
+      "explanation": "NoCheatPlus replaces vanilla's accept-any-echo keepalive model with an id-tracked ledger. The ProtocolLib KeepAliveAdapter records every outgoing S00 id in NetData.keepAliveRequests, pruned after KEEP_ALIVE_REQUEST_MAX_AGE_MS = 30000ms and capped at 40 pending; recordKeepAlivePacket matches each incoming C00 against that list, so a reply with no matching pending request, or a duplicate id, is counted. Every incoming C00 is also timestamped into keepAliveFreq, an ActionFrequency(20, 1000) that scores one-second buckets over a 20-second window, and the check flags when the newest bucket holds more than one reply, with the unexpected-reply path tightening that limit."
+    },
+    {
+      "label": "NegativeTimer (delayed-packet timeline)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/NegativeTimer.java",
+      "explanation": "NegativeTimer flags the client whose packet stream arrives slower than the expected 20-tick-per-second cadence. The Verus2 mode's stopwatch drip is precisely that profile: keepalives and transactions are held for 400-500ms while movement packets keep flowing at tick rate, so the ledger-class traffic stretches the client's effective timeline. The check compares the received packet timing against the server's own clock (timerBalanceRealTime seeded from clockDrift) and flags sustained delay with the '-{ulong}ms' verbose, and because the drip is steady-state rather than a one-off spike, it accumulates rather than decaying. The Watchdog mode's one-second transaction hold has the same effect on the subset of traffic it touches: the client appears to be processing its window slowly."
+    },
+    {
+      "label": "SurvivalFly (movement envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the client's physics from the world, so the movement sub-mode's tricks resolve against a real envelope. The y minus 0.015625 C04 is a sub-block move and passes the vertical allowance by itself; the detectable part is the cancelled TeleportEvent. When the server sends an S08 correction, the module cancels it client-side, so the client keeps reporting positions from its pre-teleport frame while the server has moved its entity to the teleport target; the next real movement packet then presents a jump the server never ordered, and the envelope's set-back snaps the player back to the stored location. The onGround claim on the middle C04 does not help, because the check derives ground from the block cache at the packet position rather than from the packet flag."
+    }
+  ]
+}

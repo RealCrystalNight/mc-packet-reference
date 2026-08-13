@@ -1,0 +1,62 @@
+{
+  "module": "AntiStuck",
+  "client": "Memeware 7.3",
+  "category": "antistuck",
+  "source_rel": "me/memewaredevs/client/module/exploit/AntiStuck.java",
+  "overview": "Memeware 7.3's AntiStuck is a five-second full-movement blink. onEnable resets the timer, the PacketOutEvent handler cancels every outgoing C03PacketPlayer in any of its variants while the module is on, and the UpdateEvent handler toggles the module off once timer.delay(5000) passes. For five seconds the client moves and attacks freely while the server-side entity freezes at its last accepted position; when the module disables, the next C03 carries the real position, and the server either accepts it (any gap under the moved-too-quickly threshold) or snaps the entity back with S08. The purpose is to break out of a stuck state: a rubber-band loop or a wedged position clears once the server-side entity stops receiving movement for a few seconds, because the server's position bookkeeping for the player resets around the frozen location.",
+  "sections": [
+    {
+      "h": "The five-second window",
+      "p": "The Timer field is the whole scheduler. delay(5000) returns true once getTime() minus the stored prevMS reaches 5000 milliseconds, where getTime is System.nanoTime divided by 1E6, so the window is real time, not ticks. onEnable resets the clock, and the UpdateEvent consumer checks the delay each tick and toggles the module off when the window expires. The window is hardcoded: there is no setting to adjust it."
+    },
+    {
+      "h": "Total C03 suppression",
+      "p": "The PacketOutEvent handler cancels every instance of C03PacketPlayer, which covers C03 (position and look), C04 (position only), C05 (rotation only), and C06 (position and rotation) because all four subclass the same packet class. No movement reaches the server for the whole window, which is a complete blink rather than the selective suppression a NoFall or AntiVoid uses. The client-side entity keeps simulating normally, so the player can reposition, open inventories, or just stand still while the server-side position state ages."
+    },
+    {
+      "h": "The resume",
+      "p": "When the window expires the module toggles off and the normal per-tick C03 stream resumes from the client's real position. The first resumed packet is a per-move claim spanning the whole desync distance, and the server's response depends on the gap: under the moved-too-quickly threshold the new position is simply accepted, which is the module's escape, and over it the server teleports the entity back and sends S08, which re-sticks the player. Anticheat movement checks see the resume as a single impossible move either way, which is where the counters below act."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "AntiStuck.java (module)",
+      "rel": "me/memewaredevs/client/module/exploit/AntiStuck.java",
+      "explanation": "AntiStuck.java is the entire module: a Timer field, an UpdateEvent consumer that expires the module after 5000 milliseconds, and a PacketOutEvent handler that cancels every C03PacketPlayer instance. The constructor takes name, key and category, and onEnable resets the timer. There are no settings.\n\nThe cancellation covers the whole C03 family because all four movement variants subclass C03PacketPlayer, so the instanceof check removes position, rotation, and combined packets alike for the full five-second window."
+    },
+    {
+      "label": "Timer.java (window clock)",
+      "rel": "me/memewaredevs/client/util/misc/Timer.java",
+      "explanation": "Timer is the delay primitive the module's window runs on. It stores prevMS as the last reset point, delay(milliSec) returns true when System.nanoTime divided by 1E6 minus prevMS reaches the requested milliseconds, and reset() re-anchors prevMS to the current time. The constructor calls reset, so a freshly built timer is armed immediately.\n\nThe five-second window is therefore measured in wall-clock time, not ticks, which means a lag spike or a paused client extends the effective suppression in tick terms: the window only expires after five real seconds of client uptime."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MicroBlink (blink detector)",
+      "ac": "intave-intave",
+      "rel": "src/main/java/de/jpx3/intave/check/movement/timer/MicroBlink.java",
+      "explanation": "intave's MicroBlink is the only dedicated blink detector in the corpus. It builds a histogram of movement gaps (10ms bins from 0 to 500ms over a 2400-second window) and, on each qualifying move (horizontal distance above 0.125 on both the current and the previous move), scores the gap against the histogram's normal probability, with the tolerance limit as 50ms plus the connection's feedback-delay standard deviation, floored at 70ms. It flags in two regimes: a direct branch for any gap above 70ms with probability below 1E-6 while the player is entity-aligned (the last position sat 2.7 to 3.8 blocks from a traced entity and the player moved closer), and a combat branch for gaps between 150 and 400ms with probability below 1E-6, an attack within the last 1250ms, and more than 5 ticks since the last teleport, plus a contingency chi2 test on lag-versus-near-entity alignment.\n\nThe module's 5000ms gap is outside the combat branch (capped at 400ms) and outside the histogram bins that feed the probability model, so the only live path is the entity-aligned branch: it scores a 5s gap while the frozen player sits 2.7 to 3.8 blocks from a traced entity and moves closer, accumulating 1.5 violation per occurrence and flagging past 5. Away from that exact geometry the check stays silent, which is the honest coverage gap: MicroBlink is built for micro-blinks in combat, and the module's full five-second freeze is mostly too long for it."
+    },
+    {
+      "label": "TickRate (clock-drift tick rate)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/tick/TickRate.java",
+      "explanation": "Hawk's TickRate enforces the client tick rate through a clock-drift accumulator. Each move adds (elapsed nanos minus 50ms) to the player's drift, and when the drift passes the clockDriftThresholdMillis of -50ms (the client clock is ahead, meaning packets arrive faster than 20 per second) the check punishes and rubber-bands. Positive drift, meaning the client clock is behind, is absorbed by MAX_CATCHUP_TIME of 2000ms, and after a large teleport the check warms up for 150 ticks.\n\nThe 5s gap produces a single +4950ms drift term, which is capped at the 2000ms catch-up limit and then decays back toward zero as normal-rate packets resume, so the suppression reads as a lag spike and never crosses the -50ms punish threshold. The check is one-directional by design: it exists to catch timer acceleration, and a total freeze is the opposite signal. That makes it the honest negative result for this module: the one rate check that could see the gap is structurally blind to it."
+    },
+    {
+      "label": "Moving (extreme-move check)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/Moving.java",
+      "explanation": "NCP's net-level Moving check compares every position-bearing flying packet against the server's known location and flags when the y distance or the total distance exceeds 100, incrementing data.movingVL and running the configured actions (the default NET_MOVING_ACTIONS string cancels at vl above 17, with logging), with the level decaying by 0.98 on clean moves. It is the anticheat replacement for vanilla's moved-too-quickly threshold, applied per axis.\n\nThe module's resume is exactly this check's input: the first C03 after the five-second freeze claims the client's real position, and the gap from the frozen known location is the whole desync distance. A player who repositions more than 100 blocks in the window trips the check on the first resumed packet; a player who stays within 100 blocks of the frozen spot is accepted, which is the honest tolerance, because a five-second sprint rarely exceeds the bound unless the escape is a long one."
+    },
+    {
+      "label": "SurvivalFly (movement envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly's horizontal allowance comes from prepareSpeedEstimation, which predicts the per-tick sprint distance and measures the reported move against it, and the violation is (max(hDistanceAboveLimit, 0.0) + max(yDistanceAboveLimit, 0.0)) * 100 with a set-back to the stored location. The check runs on every processed move, including the first one after the freeze.\n\nThat first resumed C03 is a single move spanning the entire desync distance, so hDistanceAboveLimit lands at the gap minus the predicted sprint step, producing a violation in the hundreds even for a modest 30-block escape, and the set-back returns the player to NCP's tracked location, which is the frozen position the module was trying to leave. The honest limitation is shared with every movement check: during the five seconds of silence NCP has no packets to score, so the freeze itself never flags; only the resume does."
+    }
+  ]
+}

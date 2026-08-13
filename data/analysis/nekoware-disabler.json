@@ -1,0 +1,57 @@
+{
+  "module": "Disabler",
+  "client": "Nekoware v1 private",
+  "category": "disabler",
+  "source_rel": "me/nekoWare/client/module/exploit/Disabler.java",
+  "overview": "Nekoware's Disabler registers two modes, Ghostly and Verus, and most of the file's logic is dead weight. The live surface is the Ghostly mode: every outgoing C0FPacketConfirmTransaction is cancelled from the packet-out event, and every time the inbound-packet counter passes 10 the module injects a C0CPacketInput with no vehicle state behind it. The Verus mode drains a packet queue on a 490ms timer but nothing in the file ever adds to that queue, and the nigerian counter that is supposed to clear the queue at 2 and reset it at 8 also never sees a populated queue, so both paths are inert.",
+  "sections": [
+    {
+      "h": "Ghostly mode",
+      "p": "The packet-out consumer increments a counter y on every outgoing packet, cancels each C0FPacketConfirmTransaction it sees, and resets a Timer object that no other branch reads. The packet-in consumer runs the injection: when y exceeds 10 it pushes a fresh C0CPacketInput onto the send queue and zeroes the counter, so roughly one C0C per ten inbound packets goes out while the mode is active. Cancelling the C0F stream removes the server's window-confirmation traffic, and the injected C0C claims vehicle steering input the player never performs."
+    },
+    {
+      "h": "Dead code and inert drains",
+      "p": "The Verus branch fires on a 490ms timer delay and, when the packetQueue is not empty, sends one queued packet through PacketUtil.sendPacketSilent and resets the timer. The queue is a ConcurrentLinkedQueue that onDisable clears, but no handler ever calls packetQueue.add, so the poll always sees an empty queue and the drain never transmits anything. The nigerian counter in the Ghostly branch clears the queue at 2 and resets at 8, which is the same empty-queue loop; the unused imports (S08PacketPlayerPosLook, S2APacketParticles, PlayerCapabilities, RandomUtils) and the VERUS_DISABLE_ constants reinforce that the file is a partial port with the buffering half left out."
+    },
+    {
+      "h": "Wire footprint",
+      "p": "The observable traffic is a cancelled C0F stream plus a periodic C0C injection. The module never touches C00 keepalives, so the keepalive ledger stays intact; the attack targets the transaction side of the connection's ping accounting and the input side that anticheats use to track vehicle and movement state. The sendPacketSilent path in PacketUtil writes straight to the network manager, bypassing the client's own event bus, which is why the Verus drain would not re-enter the cancel handler if the queue were ever populated."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive",
+    "C0FPacketConfirmTransaction"
+  ],
+  "files": [
+    {
+      "label": "Disabler.java",
+      "rel": "me/nekoWare/client/module/exploit/Disabler.java",
+      "explanation": "The module file holds both modes. The Ghostly branch is live: it cancels every C0FPacketConfirmTransaction from the packet-out event and injects one C0CPacketInput per ten inbound packets from the packet-in event. The Verus branch and the nigerian counter both drain a ConcurrentLinkedQueue that no code in the file ever populates, so they are inert; the unused S08/S2A/PlayerCapabilities/RandomUtils imports and the VERUS_DISABLE_ constants confirm the file is a partial port."
+    },
+    {
+      "label": "PacketUtil.java (sendPacketSilent)",
+      "rel": "me/nekoWare/client/util/packet/PacketUtil.java",
+      "explanation": "sendPacketSilent is the direct-to-netty path: it calls getNetworkManager().sendPacket(packet), bypassing addToSendQueue and the client's event bus. The Verus drain is written to use it so a replayed packet would not loop back into the packet-out cancel handler, and the same helper is the standard silent-send utility across the client's modules."
+    }
+  ],
+  "countering": [
+    {
+      "label": "PingSpoofA (ledger divergence)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofA.java",
+      "explanation": "PingSpoofA cross-checks the two ping ledgers the connection maintains. On each movement packet it compares transactionPing against keepAlivePing and fails when the transaction value is larger and the gap exceeds 50ms, unless the player is exempt for lag, teleport, TPS or chunk reasons and has been connected for more than 10 ticks. The transaction ping is fed by the C0F round trips, so cancelling every confirmation starves that ledger while the C00 keepalive ledger keeps updating, and the two pings diverge on exactly the axis the check measures.\n\nThis is a direct hit on the Ghostly mode's core technique. The 50ms threshold absorbs ordinary jitter, but a sustained cancel makes the divergence grow without bound, and the exemption list does not cover a client that simply stops confirming transactions. The module would need to spoof C0F echoes instead of cancelling them to stay under this check, which is the standard escalation for this technique family."
+    },
+    {
+      "label": "BadPacketsK (C0C outside a vehicle)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/badpackets/BadPacketsK.java",
+      "explanation": "BadPacketsK validates the vehicle-steering packet against the player's actual state: when a WrappedPlayInSteerVehicle (the C0C input packet) arrives and the player is not exempt as being in a vehicle, the check fails. The exemption is applied per vehicle-riding state, so a land-bound player emitting C0C input packets has no legitimate reason for the packet to exist.\n\nThe Ghostly injection trips this check on every emit: the module pushes a C0CPacketInput roughly once per ten inbound packets while the player walks on foot, which is precisely the no-vehicle C0C pattern the check exists to flag. Because the injection cadence is tied to inbound traffic rather than to any vehicle interaction, the player cannot ride into an exemption without abandoning the mode's effect."
+    },
+    {
+      "label": "InventoryMove (input-state pairing)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/InventoryMove.java",
+      "explanation": "InventoryMove punishes rotation, sprint and sneak movement while the player's inventory-open state is non-zero, where that state is driven by the packets Hawk observes: window interactions, the C0B open-inventory action, and the input stream the client reports. The injected C0CPacketInput is part of that input stream, so the module's periodic C0C changes the input picture Hawk uses for the check.\n\nFramed honestly, the check bites when the player actually moves while a window is open; the C0C injection alone does not open an inventory. The entry matters because it is the C0C-side consumer that pairs the module's injected input with its movement: on servers where Ghostly runs alongside a movement module, the combined stream is exactly what the check scores."
+    }
+  ]
+}

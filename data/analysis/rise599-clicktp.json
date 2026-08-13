@@ -1,0 +1,63 @@
+{
+  "module": "ClickTP",
+  "client": "Rise 5.99",
+  "category": "clicktp",
+  "source_rel": "dev/rise/module/impl/movement/ClickTP.java",
+  "overview": "Rise 5.99's ClickTP teleports the player to the block under the crosshair when the use-item key is held, gated by a 500ms timer. The four reachable modes shape the movement traffic differently: Normal computes an A* path in a background thread and fires one C04 per path point with onGround true, Vulcan climbs one block per tick through the pre-motion event, eats the anticheat's S08 lagback when it lands within 2 blocks, then fires the path packets and holds the teleport position in the event, and the Karhu and Purple Prison modes spam C04 packets to the target and back to abuse lagback handling. A fifth mode, Hypixel Fireball, compiles C09 slot switches and a C08 fireball use but is commented out of the mode list, so its branch is dead in the shipped build. The module sends no packets of its own in Normal and Karhu beyond the C04 burst; the Vulcan mode's entire signature is the packet-driven climb and the S08 cancellation.",
+  "sections": [
+    {
+      "h": "Mode dispatch",
+      "p": "The Karhu and Purple Prison comments state the intent directly: abuse lagbacks by spamming positions the anticheat cannot reconcile. Karhu's ten packets per trigger (five out and five back) arrive in a single tick from the main thread, while Purple Prison relies on the single outbound C04 being processed before the server notices the player never moved there. Neither mode waits for a server teleport or confirmation; they assert the destination and let the client-side setPosition hide the divergence from the local renderer."
+    },
+    {
+      "h": "Vulcan lagback dance",
+      "p": "The design assumes the anticheat reacts to the climb with a short-range teleport correction, which the module eats before the vanilla handler applies it. The two 0.1-offset packets bracket the final position to force the server's own position tracking to accept the destination on the next move. The climb itself is pure packet assertion: the pre-motion event carries the position, and in Rise 5.99 the injected vanilla packet builder emits the C03 from that event, so no extra packets are needed to move up."
+    },
+    {
+      "h": "Pathfinder burst",
+      "p": "Because the pathfinder only admits passable cells, the burst never steps through a solid block: every claimed position is inside open space the client's own world view confirms. That makes the teleport invisible to collision-based geometry checks and puts the burden on rate and movement-envelope checks instead, which is where the countering section below lands."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "ClickTP.java",
+      "rel": "dev/rise/module/impl/movement/ClickTP.java",
+      "explanation": "onPreMotion (lines 38-181) holds the entire mode machine. The use-item gate and 500ms timer are at lines 40 and 112, the ray trace and air checks at lines 42-47, and the switch at line 50 dispatches the four live modes plus the dead Fireball branch. Normal (lines 51-66) spawns the background thread that walks the path and sends C04 packets with onGround true, then calls setPosition. Karhu (lines 75-85) and Purple Prison (lines 87-94) send their C04 pairs and singles with onGround false and setPosition after. Vulcan (lines 68-73 and 115-137) stores the destination, raises the event y by one every tick, and fires the path at countTicks and ticks equal to 1, with the two 0.1-offset packets bracketing the final z.\n\nThe S08 handler at lines 190-204 is the Vulcan-specific receive side: it cancels teleports within 2 blocks and arms countTicks, and resets the whole state machine when the lagback is far away. The Fireball branch (lines 96-108 and 139-177) switches to the fire-charge slot with C09, sends a C08 use at tick 2, switches back, cancels MoveEvent while counting, and only teleports after hurtTime turns positive, but the mode string is commented out of the ModeSetting at line 29, so none of that code runs from the GUI. onEnable (lines 206-215) re-anchors tpX, tpY, tpZ to the current position and clears the tick counters, so a stale destination never survives a re-enable."
+    },
+    {
+      "label": "MainPathFinder.java (path for the C04 burst)",
+      "rel": "dev/rise/util/pathfinding/MainPathFinder.java",
+      "explanation": "The constructor floors both endpoints onto the block grid, and compute() runs compute(1000, 4): up to 1000 expansion loops with at most 4 hubs expanded per loop. Each hub tries the four cardinal neighbors plus a one-block rise and a one-block drop, and isValid gates every candidate. isNotPassable rejects every full or partial solid the client can name, from slabs and stairs to fences, glass, pistons, trapdoors and webs, and canWalkOn rejects fence and wall floors, so the path is confined to walkable air. The final path is the winning hub's accumulated pathway, a Vec3 per block step.\n\nClickTP consumes getPath() via the static computePath helper: every returned point becomes a C04PacketPlayerPosition with onGround true, sent back to back in the same tick. The air-only constraint is what keeps the burst clear of block-collision checks, and it is also why the module needs a ray trace first: the pathfinder cannot route through the wall the player is looking at, so the destination must be a reachable air pocket. The class is shared with other Rise 5.99 modules; ClickTP is the only consumer that fires the whole path as packets in one tick."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (C04 burst rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NCP's MorePackets scores every processed move packet into data.morePacketsFreq, an ActionFrequency with 500ms buckets, and NetStatic.morePacketsCheck compares the window against morePacketsEPSMax 22 with 20 ideal (DefaultConfig lines 458-459). The burst path adds a second ledger: more than 15 packets in a half-second bucket counts as one burst event, 10 in a bucket counts as a direct burst, and 95 burst events per minute are allowed before the check escalates (lines 460-462). A violation returns the morePacketsSetBack location, seeded from the SurvivalFly set-back when one exists.\n\nClickTP's Normal and Vulcan bursts are the direct target: a path of N blocks becomes N C04 packets in a single tick, so a 20-block teleport lands 20 packets in one half-second bucket, over the 15-packet burst threshold and double the 10-packet direct threshold, and the whole-path send recurs every 500ms the player holds the key. Karhu's ten packets per trigger land in the same bucket as the baseline ten, crossing 15 and generating a burst event on every activation. The check is content-blind, so the onGround true flag and the plausible one-block spacing of the path steps buy nothing; the ledger only sees the count. The one mode that sits under the burst ceiling is Purple Prison's single C04, which adds one packet per trigger and stays inside the 22/s window by itself, but sustained activation still accumulates window score."
+    },
+    {
+      "label": "SurvivalFly (per-step movement envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the physics envelope from the world. The horizontal allowance comes from prepareSpeedEstimation, roughly the sprint-jump force budget of a few tenths of a block per move, and the vertical allowance from vDistRel, which only accepts momentum-based descents, jumps and step-ups (SurvivalFly lines 181-215). The violation is (max(hDistanceAboveLimit, 0) plus max(yDistanceAboveLimit, 0)) times 100 (line 233), with handleViolation applying the set-back location. fromOnGround and toOnGround come from the block cache via RichBoundsLocation, not from the packet flag, so claiming onGround never relaxes the envelope.\n\nEvery path step in the Normal and Vulcan bursts is a roughly one-block horizontal move with onGround true: hDistanceAboveLimit lands around 0.6 per step against an allowance of a few tenths, so each C04 in the chain scores a violation of roughly 60 before the next one arrives, and the chain never resets the ledger. Path segments that ascend or descend violate vDistRel the same way, since a sustained one-block vertical step per packet is not a jump or a step-up. The Vulcan climb itself is caught by the vertical envelope before the burst: one block per tick upward is far beyond the jump allowance, so the mode starts accumulating violations from the first raised event. NCP answers with an S08 set-back, which is exactly the packet the Vulcan mode cancels when it lands within 2 blocks, so the snap-back is suppressed for a while; the violation level is not, and the configured action chain escalates to cancel and kick once the ledger crosses its thresholds."
+    },
+    {
+      "label": "Speed (large-move cancel and step envelope)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Speed.java",
+      "explanation": "Arc v2's Speed check opens with an unconditional guard: if the horizontal distance of the move exceeds 8 blocks, the check returns true and the move is cancelled (Speed.java line 54). That single rule kills the Karhu and Purple Prison modes outright when the destination is more than 8 blocks away, because their C04 packets assert the full jump in one move instead of stepping. For the stepped path of Normal and Vulcan, the per-move logic applies: the ground branch expects thisMove divided by groundTime (capped at 8) plus the base speed 0.2873 potion-adjusted (lines 102, 129-147), and the air branch expects baseMove plus a stage constant of 0.049, 0.08 or 0.3261 depending on vertical speed (lines 185-207). A one-block path step exceeds both budgets, so every step scores a violation and the check's setback (data.setSetback(from) on success, line 213) drags the player back along the path.\n\nThe check uses its own ground state (data.isOnGround, fed by the moving listener's world-based calculation), so the path's onGround true claims do not route the steps into the friendlier branch. The honest boundary is a short-range Purple Prison teleport under 8 blocks: the single C04 is under the large-move guard, and one step is not enough for the ground or air envelope to accumulate a decisive score on its own, though the one-step move still exceeds the expected speed and flags."
+    },
+    {
+      "label": "Speed (discrepancy accumulation)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed check builds an expected speed from the previous move: expected equals friction times lastSpeed times multipliers plus maxForce plus adders plus epsilon (Speed.java line 163), where maxForce is the client's implied input force with the sprint multiplier baked in, around 0.28 to 0.36 for a sprinting player. The discrepancy between expected and the actual move accumulates in a per-player ledger, and once the total passes DISCREPANCY_THRESHOLD 0.1 with a positive discrepancy, the check punishes with punishAndTryRubberband scaled by VL_FAIL_DISCREPANCY_FACTOR 10 (lines 198-215). Pending knockback moves are exempted at line 124, but a ClickTP burst has no knockback to point at.\n\nEach one-block path step is a horizontal speed of about 1.0 against an expected budget of a few tenths, so a single step contributes roughly 0.6 to 0.7 of positive discrepancy, six times the threshold on the first packet alone, and the punish fires with a rubberband on top of the NCP-style setback. The Karhu mode is even more direct: the out-and-back C04 pairs produce two full-speed moves in the same tick, and the return move back to the origin is a second full-speed step with no deceleration between them. The check's move-time bookkeeping (isUpdatePos) treats each C04 as its own move, so none of the burst packets are folded together. The honest limit is the same as everywhere else: a Purple Prison single C04 to a target within about a third of a block produces a discrepancy under the threshold and passes, which is the mode's only safe use."
+    }
+  ]
+}

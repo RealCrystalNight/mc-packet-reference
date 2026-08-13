@@ -1,0 +1,64 @@
+{
+  "module": "FightBot",
+  "client": "Rise 5.99",
+  "category": "fightbot",
+  "source_rel": "dev/rise/module/impl/combat/FightBot.java",
+  "overview": "Rise 5.99's FightBot is a full PvP bot with three target streams, silent smoothed rotations, key-injection movement, randomized 8 to 9 CPS attacking, optional auto-block, and gamemode automation for Hypixel Sumo, Classic and Pit plus Minemenclub Sumo. It builds three entity lists per render frame (target, walkTarget and swingTarget), writes the aim straight into rotationYaw and rotationPitch in onPreMotion so the server-visible movement packet carries it, drives approach and strafing by pressing the client's own key binds, and attacks through mc.playerController.attackEntity, the vanilla path, at a CPS randomized between the Min and Max settings. The auto-block path sends a C02 INTERACT, an item-use C08 at the (-1,-1,-1) sentinel, and a C07 release per cycle. Chat parsing in onPacketReceive drives the match state machine, including auto-queue, auto-GG and the anti-fall modes that reverse motion or assert a bogus (-1, y, -1) position to force a lagback.",
+  "sections": [
+    {
+      "h": "Target pipeline",
+      "p": "The client-side filters (invisibility, [npc] names, line of sight) decide who the bot attacks, but the server never sees them: the wire carries only C02 attacks and the movement stream, and every server check below validates geometry and timing from server state. The [npc] name check is worth calling out because it is purely a client-side string test; a server-side anticheat has no equivalent notion."
+    },
+    {
+      "h": "Movement and combat loop",
+      "p": "The attack gate runs in onUpdate: a TimeUtil armed with the cps field (randomized between (20 minus maxCps) times 10 and (20 minus minCps) times 10 milliseconds, 110 to 120ms for the defaults) fires the swing and the vanilla attackEntity call. autoBlock wraps each attack cycle in a block and unblock pair: block() sends a C02 INTERACT, sets the item in use with 5647 ticks, and queues C08 at the sentinel position with direction 255, and unblock() sends C07 RELEASE_USE_ITEM. The hitTicks gate is effectively always open because the delay value is -1."
+    },
+    {
+      "h": "Sumo automation and anti-fall",
+      "p": "The anti-fall gate, active only in Hypixel Sumo, fires when hurtTime is positive and a probe five blocks ahead of the motion is air: the Lagback mode sets the pre-motion event position to (-1, y, -1) and reverses the motion, deliberately asserting a position that forces the server to correct the player back onto the platform, and the Reverse mode only mirrors the motion. Both are server-visible signatures, and the Lagback position assert is the one the countering section can score directly."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging",
+    "C08PacketPlayerBlockPlacement",
+    "S02PacketChat"
+  ],
+  "files": [
+    {
+      "label": "FightBot.java",
+      "rel": "dev/rise/module/impl/combat/FightBot.java",
+      "explanation": "The bot lives entirely in this 823-line file. The target pipeline is at lines 622-740, three near-identical stream filters with the shared entity predicates and the 0.5657 girth constant. The aim math is getRotations at lines 540-605, with the prediction constants, head-speed blending, jitter and the getFixedRotation pass, and updateRotations at lines 517-538 applies it. The combat loop is onUpdate at lines 235-399: per-mode key injection, the CPS randomization at lines 363-372, the swing and attackEntity calls at lines 378-397. The silent aim write happens in onPreMotion at lines 139-232 alongside the anti-fall logic at lines 203-225, and the S02 state machine is onPacketReceive at lines 418-497. The auto-block pair is block() and unblock() at lines 813-823.\n\nNotable details for the countering section: the attack goes through mc.playerController.attackEntity, so the C02 it produces is vanilla-shaped; the C08 block is the (-1,-1,-1) sentinel with direction 255; the unblock C07 targets BlockPos.ORIGIN with DOWN; and the Lagback anti-fall writes -1 into the event x and z, which the tick's C03 then claims. The randomized CPS window of 110 to 120ms at defaults is the direct answer to the Hawk consistency check discussed below."
+    },
+    {
+      "label": "PlayerUtil.java (sword and block helpers)",
+      "rel": "dev/rise/util/player/PlayerUtil.java",
+      "explanation": "FightBot reads three helpers from this file. findSword (lines 115-143) scans hotbar slots 0 to 7 and returns the slot of the highest-damage sword, adding 1.25 per sharpness level to the base damage and breaking ties toward the lower durability, or -1 when no sword exists; the Classic, Pit and Normal modes assign the result straight into inventory.currentItem every tick. isHoldingSword (lines 41-43) checks that the equipped item is an ItemSword with a ticksExisted guard, gating the auto-block cycle. getBlockRelativeToPlayer (lines 382-384) returns the block at the player's position plus an offset, which the bot uses for the sumo edge probes (the -1 and -3 probes under the motion) and for the walk-direction block check that decides whether to strafe or reverse.\n\nOnly these three methods matter to the bot; the rest of the class serves other modules. The file is the same one that backs the Clipper analysis, which is why it appears as the supporting box for both. The sword selection is notable because it writes the hotbar slot directly, so the bot never sends C09 to switch: the next C08 and C02 traffic carries the new slot implicitly."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (anti-fall position assert)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly's horizontal allowance is derived by prepareSpeedEstimation from the implied input force, a few tenths of a block per move, and the violation is the excess times 100 (SurvivalFly lines 181-233). The Lagback anti-fall mode feeds it a move unlike anything else in this analysis set: it writes -1 into the pre-motion event x and z, so the tick's C03 claims position (-1, y, -1). From any real arena coordinate, that is a horizontal delta of tens of blocks in a single packet, against an allowance of a few tenths, so hDistanceAboveLimit is roughly the full delta and the violation is in the thousands on the first packet. The set-back fires immediately and the player is corrected back to the platform, which is the mode's stated purpose: the module names the lagback it is asking for.\n\nThe check scores only this mode. The bot's normal movement is vanilla key-driven motion (forward, back, strafe) produced by the client's own movement code, so it sits inside the envelope, and the silent rotations do not affect SurvivalFly at all. The honest boundary is that the anti-fall trick trades a guaranteed violation for survival: NCP's ledger accumulates and the action chain escalates, so repeated edge saves push the player toward cancel and kick, and the Reverse mode, which only mirrors the motion, stays inside the envelope."
+    },
+    {
+      "label": "AimbotConvergence (stable aim point)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotConvergence.java",
+      "explanation": "Hawk's AimbotConvergence computes the closest-point midpoint between the look rays of two consecutive moves and punishes when the midpoint stays within 1e-8 squared distance across ticks (AimbotConvergence.java lines 44-77). Two rays that both pass through the target intersect near it, so an aim locked on a stationary entity produces a convergence point that does not move, and the check punishes, with the class comment spelling out the design: turn off the aimbot when the opponent is standing still. Teleport-accept moves are excluded, and the check only runs after tick 100.\n\nFightBot is precisely the target pattern: the head-speed blending and getFixedRotation pass make the per-tick rotation change small and directed at the walk target, so the convergence midpoint parks on the target while it stands still. The module's defenses shrink the window without closing it: the plus/minus 0.5 jitter while swinging and the 6x head speed during combat move the midpoint by a few thousandths of a block per tick, which stays under the 1e-4 block threshold for a still opponent, and only the prediction jump (predictValue 15 against a running target) moves the rays enough to reset the midpoint. The check is cancelless, so it contributes VL and notifications rather than stopping the bot, but the accumulating level is exactly what a staff alert is built on."
+    },
+    {
+      "label": "Direction (aim geometry, missed)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Direction.java",
+      "explanation": "NCP's fight Direction check casts from the player's eye along the last server-observed look direction against the attacked entity's box and scores the miss distance (Direction.java lines 64-78). The bot defeats it by construction: the aim is written into rotationYaw and rotationPitch during onPreMotion, before the injected vanilla builder emits the C03, so the server sees the attack arrive with a look direction already centered on the target. The vanilla attackEntity call then produces a C02 whose entity is the one the look is pointing at, and directionCheck returns an off value of zero. This is the module's design goal, and the check is the honest boundary of the countering set: no look-based check can see an aim that is legitimate on the wire.\n\nThe distinction matters for the bot-filter question: the client's entity filters decide who the bot attacks, but Direction evaluates the geometry of each attack from server state and never consults the client's list. The scoreable surface of the bot is therefore not the aim but the timing and the position asserts, which is why the other entries in this set target the rotation convergence and the anti-fall lagback instead."
+    },
+    {
+      "label": "FightSpeedConsistency (click variance floor, missed)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightSpeedConsistency.java",
+      "explanation": "Hawk's FightSpeedConsistency averages inter-click deltas over a 20-sample window and punishes when the CPS estimate exceeds checkAboveCPS, default 10, and the standard deviation of the last 5 estimates drops below 0.05 (FightSpeedConsistency.java lines 47-107). The module's CPS randomization is built to sit under both conditions: minCps and maxCps default to 8 and 9, and the delay is drawn uniformly from (20 minus maxCps) times 10 to (20 minus minCps) times 10 milliseconds, 110 to 120ms, which is 8.3 to 9.1 attacks per second. The average stays under the 10 CPS evaluation floor, so the standard deviation test never runs, and the check rewards instead of punishing.\n\nThe companion FightSpeed check has the same outcome for the same reason: its maxCps ceiling of 16 is untouched by a 8.3 to 9.1 average. The honest reading is that the bot's click timing is the best-defended part of the module: it randomizes across a band wide enough to defeat consistency detection while staying under the rate ceilings that would trip NCP's AttackFrequency and Arc v2's KillAura speed path. The module trades that safety for the signatures the other entries score, the rotation convergence and the anti-fall position assert."
+    }
+  ]
+}

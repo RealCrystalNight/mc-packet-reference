@@ -1,0 +1,63 @@
+{
+  "module": "BowAimbot",
+  "client": "LiquidSense Dev",
+  "category": "bowaimbot",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/combat/BowAimbot.kt",
+  "overview": "BowAimbot aims every bow draw at a live target. While the player is using a bow, each UpdateEvent re-selects a target among the loaded living entities - filtered through the client's enemy checks and a sight ray trace unless ThroughWalls is set - by Health, Distance or Direction priority, and feeds it to RotationUtils.faceBow, which solves the full arrow-ballistics angle and applies it silently by default through the silent-rotation pipeline, so the server sees the aimed look in the C03 stream while the camera never moves. Predict (default on) offsets the aim by the target's velocity times PredictSize (0.1-5.0), the rotation is refreshed every tick so the aim tracks until the draw ends, and a Mark toggle paints a platform under the target on Render3D. The module sends no packets of its own; it only shapes the look fields of the movement packets.",
+  "sections": [
+    {
+      "h": "Target selection",
+      "p": "onUpdate nulls the target, then checks that mc.thePlayer.itemInUse?.item is an ItemBow. getTarget filters the loaded entity list for EntityLivingBase instances passing EntityUtils.isSelected(entity, true) - the shared client filter composing AntiBot, NoHurt, NoFriends, spectator and Teams checks plus the global targetPlayer/targetMobs/targetAnimals toggles - and then canEntityBeSeen unless ThroughWalls is on. The survivors are reduced by the priority value: Distance picks minBy getDistanceToEntity, Direction picks minBy RotationUtils.getRotationDifference (the angle to the current look), Health picks minBy the entity's health; the selected entity becomes the target and is passed to faceBow. If nothing survives, the target stays null and no aim is applied."
+    },
+    {
+      "h": "faceBow ballistics",
+      "p": "RotationUtils.faceBow computes the aim at the target's predicted position: each axis is the target position plus (target.pos - target.prevPos) * predictSize when Predict is on, minus the player's own position plus its velocity, and the yaw is atan2 of the horizontal delta. The pitch is the closed-form arrow-trajectory solution: it inverts the projectile equation for the given range and the charge factor velocity, where velocity = (v*v + 2v) / 3 with v = itemInUseDuration / 20 (or 1.0 while FastBow is active), capped at 1.0. When silent is true the result goes to setTargetRotation, the silent-rotation pipeline that rewrites yaw and pitch into the outgoing movement packets; otherwise limitAngleChange clamps the change to 10-15 degrees per tick and applies it visibly to the player. The re-aim runs every tick while the draw is held, so the delivered look converges on the target and tracks it."
+    },
+    {
+      "h": "Wire behavior and module pairing",
+      "p": "The aimed rotation reaches the server in the next C03PacketPlayer look fields - C05PacketPlayerLook or C06PacketPlayerPosLook depending on whether the player also moves - and the module emits nothing else. Because the rotation is refreshed each update, the C03 stream shows a smooth per-tick convergence toward the target rather than a single snap, with the convergence rate set by the faceBow formula. The pairing matters: AutoBow's WaitForBowAimbot gate (default on) holds releases until this module reports a visible target, and FastBow copies the pending targetRotation into its C05 burst, so the same computed rotation rides both the normal draw and the machine-gun cycle."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "BowAimbot.kt (module logic)",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/combat/BowAimbot.kt",
+      "explanation": "The module is two event handlers and one selector. onUpdate re-selects the target every tick while a bow is in use and hands it to RotationUtils.faceBow with the Silent, Predict and PredictSize values; onRender3D draws the target platform when Mark is on; getTarget implements the filter and priority reduction; hasTarget() is the predicate the AutoBow module polls. The value declarations at the top are the whole configuration surface: Silent, Predict, ThroughWalls, PredictSize, Priority and Mark. The file's only external dependency beyond the client utilities is RotationUtils, and the only state is the nullable target field that is cleared on disable."
+    },
+    {
+      "label": "RotationUtils.java (faceBow and silent application)",
+      "rel": "net/ccbluex/liquidbounce/utils/RotationUtils.java",
+      "explanation": "faceBow is the aim source: it derives the yaw from atan2 over the horizontal delta and the pitch from the closed-form ballistic solution, with the charge factor velocity (itemInUseDuration / 20 folded through (v*v + 2v) / 3, or 1.0 while FastBow is on) and the optional velocity prediction scaled by PredictSize. Silent application runs through setTargetRotation, which feeds the silent-rotation pipeline: the target rotation is stored in the static targetRotation field and the next movement packet's yaw and pitch are rewritten from it without moving the camera - which is why FastBow can copy targetRotation directly into its C05 burst. The non-silent path goes through limitAngleChange, which clamps the per-tick rotation change to 10-15 degrees and writes it into the player. The class is shared with the client's other combat modules, so the rotation profile it produces is the same one the killaura family produces."
+    }
+  ],
+  "countering": [
+    {
+      "label": "AimbotConvergence (fixed convergence point)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotConvergence.java",
+      "explanation": "AimbotConvergence intersects the look rays of consecutive movement updates and punishes a convergence point that stays fixed. On every MoveEvent with a position delta it builds the pre-move ray (from position minus velocity, plus eye height) and the post-move ray, finds the closest points between the two lines, and compares the midpoint against the previous midpoint; a squared distance under 1e-8 means the aim converges on the same world point again and the player is punished. Teleports are excluded and the check only arms after tick 100.\\n\\nBowAimbot's per-tick faceBow re-aim reproduces exactly this signature: while the shooter strafes during a draw, the rays from successive positions to the target all intersect at the target point, so the convergence distance stays at zero - the check's own comment targets this class ('You better turn off your aimbot when your opponent is standing still!'). A stationary shooter sends no position deltas and the check never arms, and a moving target moves the convergence point with it, which is why the check catches locked-on draws against still targets rather than tracking shots."
+    },
+    {
+      "label": "AimbotPrecision (pitch-delta GCD)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotPrecision.java",
+      "explanation": "AimbotPrecision collects the pitch deltas of consecutive moves and solves their greatest common divisor. Human pitch changes are quantized by the in-game mouse sensitivity, so every delta shares a GCD; a computed aim produces continuous arbitrary deltas whose GCD is unsolvable, and the check fails the player when the GCD drops below 1e-5. It skips zero deltas, deltas above the 0.96 pitch-rate limit, and pitches at +/-90.\\n\\nfaceBow's pitch is the output of the atan-based ballistic formula, so each per-tick delta while tracking a moving target is an arbitrary floating-point difference of that formula - the unsolvable-GCD profile the check was built for. The check has the same blind spots as the convergence check from the module's perspective: a still target yields a zero delta that is skipped, and the module's silent application does not hide the stream because the check reads the rotations that reach the server."
+    },
+    {
+      "label": "AimbotHeuristic (rotation pattern analysis)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotHeuristic.java",
+      "explanation": "AimbotHeuristic records every look delta as a Vector(yawChange, pitchChange) and walks the recent history after a click, scoring speed and the angle between consecutive moves. It fires on three signatures: a run of moves sharing one speed and direction (maxSpeed - minSpeed > 4 with minSpeed below 0.01, maxAngle below 0.1, and a preceding move faster than 1), a pair of consecutive high-speed rotations with a sharp turn between them, and a sudden deceleration of more than 30 with an angle over 0.8.\\n\\nThe load-bearing detail is which events arm it: processClick only registers InteractEntityEvent and InteractWorldEvent, not item interactions, so a pure bow session never triggers the check - the C03 look stream during a draw is not scored. Its relevance for BowAimbot is the melee follow-up: when the bow user switches to a sword and attacks, the look window around that C02 is scored, and the faceBow rotation still being applied produces the scripted signatures (snap, lock, stutter) against a human baseline. The module's aim is therefore invisible to this check while only bowing, and fully visible the moment the same aim feeds an entity attack."
+    },
+    {
+      "label": "Angle (attack-stream rotation deltas)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Angle.java",
+      "explanation": "NCP's fight.Angle maintains a rolling list of AttackLocation entries - position, yaw, timestamp, target id - per C02 attack and scores four averages over the window: movement between attacks (avgmove, flagged below 0.2 blocks), time between attacks (avgtime, flagged under 150ms), yaw change (avgyaw, flagged above 50 degrees) and target-switch speed, accumulated into angleVL with cancel actions.\\n\\nBowAimbot shapes the rotation stream that feeds those attacks when the user mixes melee in around bow shots: the faceBow angles are still being applied as the follow-up C02 leaves, and the switch from bow aim to melee aim is a scripted rotation rather than a mouse motion. The avgtime component is the sharpest signal - the module family removes the human re-aim pause between a shot and a sword hit, tightening the inter-attack gap. As with every fight check in this family, the stock thresholds (move 100, time 150, yaw 60, switch 50) leave per-call scores below trip level, so the check is a tuned-server counter rather than an out-of-the-box one."
+    }
+  ]
+}

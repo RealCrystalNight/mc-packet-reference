@@ -1,0 +1,57 @@
+{
+  "module": "AntiBot",
+  "client": "Rise 6.1.30",
+  "category": "antibot",
+  "source_rel": "com/alan/clients/module/impl/combat/AntiBot.java",
+  "overview": "Rise 6.1.30's AntiBot is not a mode-switch module: it registers eight independent entity-classification checks as the fourth argument of BooleanValue toggles, so each check runs only while its own toggle is on. Every check is a pure client-side observer that walks mc.theWorld.playerEntities on a motion event and writes its verdict into the shared BotManager, a HashMap keyed by the check instance that maps to ArrayLists of entity ids. TargetComponent consumes that registry when it rebuilds the KillAura target list, hard-filtering with !getBotManager().contains(entity), so the module's only observable effect on the wire is a narrowed C02 attack stream; the entity list itself is also forwarded to the Rise backend as C2SPacketFilterEntities. The checks cover display-name color codes (Funcraft), movement state, duplicate names and ids, negative entity ids, tab-list ping, visibility ticks, and a manual middle-click toggle.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "Each check is a Mode<AntiBot> instance passed as the fourth constructor argument of a BooleanValue, so flipping the toggle both stores the setting and activates the check. All eight write into Client.INSTANCE.getBotManager(): add() and remove() call TargetComponent.forceUpdate() so the aura's cached target list rebuilds on the next query, and a WorldChangeEvent listener clears the whole registry on world join. AntiBot.onDisable calls botManager.clear() outright, while each mode's own onDisable clears only the list it owns, so partially configured check sets survive mode-level toggles but never a module disable."
+    },
+    {
+      "h": "Bot detection heuristics",
+      "p": "FuncraftAntiBot runs on PreUpdateEvent and treats the display name as the oracle: a name containing the section-sign color code removes the entity from the bot list, a name without one adds it, which marks every uncolored name as a bot. NPCAntiBot adds entities whose moved flag is false, the signature of a static server NPC. DuplicateNameCheck and DuplicateIDCheck stream anyMatch over playerEntities and add every participant of a duplicate display name or duplicate entity id, which can also fold in the real player when a bot copies their name. PingCheck adds tab-listed players whose NetworkPlayerInfo response time is negative, NegativeIDCheck adds players with a negative entity id, and TicksVisibleCheck adds players visible for fewer than 160 ticks, removing them again at exactly 160. MiddleClickBot is the manual override: middle-click or ctrl+attack toggles the looked-at entity in and out of the registry."
+    },
+    {
+      "h": "Interaction with KillAura targeting",
+      "p": "TargetComponent.getTargets streams mc.theWorld.loadedEntityList and excludes every entity the BotManager contains before serializing the survivors into C2SPacketFilterEntities for the backend and caching the returned list for 5 seconds (forceUpdate bypasses the cache). A check that over-classifies removes a real player from every aura target list for the cache lifetime; a check that under-classifies lets a server bot into the attack stream. Because the heuristics only inspect playerEntities, mob-shaped bait never reaches them, which decides which server-side bot checks can see the module's behavior."
+    }
+  ],
+  "packets": [
+    "S0CPacketSpawnPlayer",
+    "S13PacketDestroyEntities"
+  ],
+  "files": [
+    {
+      "label": "AntiBot.java",
+      "rel": "com/alan/clients/module/impl/combat/AntiBot.java",
+      "explanation": "The dispatcher carries eight BooleanValue fields, each constructed with a check mode as its fourth argument, which is what makes the toggles self-registering. The module itself has no event handlers: every classification lives in the mode classes, and the module's only logic is the onDisable handler that clears the entire BotManager. The entity stream those modes observe is the client-side player list maintained by the S0C spawn and S13 destroy packets, which is why the analysis lists those packets even though the module never sends anything."
+    },
+    {
+      "label": "BotManager.java",
+      "rel": "com/alan/clients/bots/BotManager.java",
+      "explanation": "The registry is a HashMap<Object, ArrayList<Integer>> where the key is the check instance that classified the entity. contains(Entity) scans every list for the id, and every add/remove calls TargetComponent.forceUpdate() so the aura target cache is invalidated immediately; a WorldChangeEvent listener clears all entries on world join. This is the file every antibot check writes and the file TargetComponent reads when it filters KillAura targets, so it is the whole contract between the module and the combat pipeline. The id-only storage means the registry survives entity removal and re-spawn with the same id."
+    }
+  ],
+  "countering": [
+    {
+      "label": "AntiBotDetection (filter-state bot probe)",
+      "ac": "network-dev-MinecraftAntiCheat",
+      "rel": "src/main/java/me/sendpacket/anticheat/anticheat/Checks/KillAura/Modes/KillAura_AntiBotDetection.java",
+      "explanation": "MinecraftAntiCheat plants an invisible NPC named after the attacker one block behind him after the second hit on a real player, teleports it every tick, and arms a 10-tick BotTimer: a C02 targeting its id proves the client sees and attacks the probe, and the absence of one raises the violation \"KillAura AntiBotDetection.\" before re-arming. This is the direct counter to the filtered state: Rise's TicksVisibleCheck classifies the freshly spawned probe as a bot for its first 160 ticks, so the aura skips it and the check flags the skip. The honest bypass surface is the disagreement between Rise heuristics: NPCAntiBot sees the probe's moved flag flip every tick and removes it again, and PingCheck cannot classify it at all because an entity absent from the tab list yields a null NetworkPlayerInfo, so a check set without TicksVisibleCheck lets the aura attack the probe and escapes this check."
+    },
+    {
+      "label": "BotHit (unfiltered bot probe)",
+      "ac": "network-dev-MinecraftAntiCheat",
+      "rel": "src/main/java/me/sendpacket/anticheat/anticheat/Checks/KillAura/Modes/KillAura_BotHit.java",
+      "explanation": "The companion probe spawns an invisible NPC one block in front of the player on first damage and re-teleports it two blocks forward every tick; each C02 on its id increments NPCHits, and every 20 ticks more than 2 hits raise \"KillAura BotHit N hits.\" This covers the opposite failure mode: when Rise's checks fail to filter the probe, the aura's C02 stream at the attacker's normal range clips the decoy standing one block away and the counter accumulates. The two network-dev checks together bracket the module, so a working Rise configuration must push the probe through its filter (trip AntiBotDetection) or the aura must miss it (trip BotHit), with no middle ground."
+    },
+    {
+      "label": "KABot (fake-mob attack ledger)",
+      "ac": "funkemunky-KauriV3",
+      "rel": "Anticheat/src/main/java/dev/brighten/ac/check/impl/combat/killaura/KABot.java",
+      "explanation": "Kauri's bot ledger has two buffers. Buffer A scores a C02 on a tracked entity while its fake mob cluster is present (swing decays 0.05) and flags \"Attacked player without attacking bot!\" past 3, the filtered-state tell; buffer B scores a C02 on the per-player mob id (swing decays 0.25) and flags \"Player attacked bot\" past 3. The bait is not player-shaped: EntityTrackHandler spawns three invisible size-10 magma cubes around the tracked entity plus a size-5 slime on a ray 0.4 blocks ahead of the eye, with ids in the 1.5-2e9 range, so every Rise heuristic misses it by construction, because the antibot modes only iterate playerEntities. The slime rides the aim line and is re-aimed as the player turns, so aura swings aimed at the real player clip it and buffer B accumulates, while buffer A accumulates on every real-player attack the moment the cluster exists, which puts sustained pressure on any target the module is active against."
+    }
+  ]
+}

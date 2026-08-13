@@ -1,0 +1,56 @@
+{
+  "module": "Phase",
+  "client": "November Recode 2.0",
+  "category": "phase",
+  "source_rel": "feature/module/impl/exploit/PhaseModule.java",
+  "overview": "November's Phase module is a cage-phase cheat with a single mode, CAGE_PHASE, and a server selector for GENERIC, BLOCKS_MC and HYPIXEL. While armed it edits the client's own world to remove the glass block under the player's feet, then suppresses every outgoing packet except chat for as long as the phase lasts, freezing the server-side position while the local player walks through the empty cell. An S08 setback resets the arming timer, BlocksMC cage messages arm and disarm the phase window, and disabling the module flushes the entire suppressed queue in one tick and restores the glass block.",
+  "sections": [
+    {
+      "h": "Client-side world edit",
+      "p": "The update handler bails for the first five ticks, then increments ticksSinceLastSetback. When at least 20 ticks have passed without a setback, the player is on the ground, and the module is allowed to phase, it reads the block state directly under the feet; if that block is BlockGlass it sets cagePhasing true, calls setBlockToAir on the cell, and records the position and state for later restoration. The edit is purely local: the server never learns the glass was removed, so server-side collision still treats the cell as solid."
+    },
+    {
+      "h": "Blink-style suppression",
+      "p": "While cagePhasing is true, the packet-out listener cancels every outgoing packet except C01PacketChatMessage and queues the rest in a ConcurrentLinkedQueue. The client therefore sends no movement packets during the phase, and the server sees a frozen player at the pre-phase position while the local player walks through the glass cell. The packet-in listener resets ticksSinceLastSetback on every S08PacketPlayerPosLook, so a server teleport delays the next arming window, and on BLOCKS_MC the chat string 'Cages open in: 2 seconds!' arms canPhase while 'Cages opened! FIGHT!' disarms it."
+    },
+    {
+      "h": "Disable-time flush",
+      "p": "disable() walks the queue and re-sends every suppressed packet through addToSendQueueSilent in a single tick, so a phase that lasted several seconds replays its entire movement history at once, then restores the glass via setBlockState and resets the state fields. The flush is the module's most visible wire signature: the server receives a burst of every movement packet that was withheld during the phase instead of the steady stream it expected."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "PhaseModule.java",
+      "rel": "feature/module/impl/exploit/PhaseModule.java",
+      "explanation": "The module file is the complete mechanism: the update listener performs the client-side setBlockToAir on the glass cell under the feet, the packet-out listener cancels and queues everything except chat while phasing, the packet-in listener resets the setback timer on S08 and gates the phase window on BlocksMC chat strings, and disable() flushes the whole queue and restores the block. The Setting constructor is the November (name, value, scale, min, max) layout; the mode Setting pins CAGE_PHASE and the server Setting defaults to BLOCKS_MC."
+    },
+    {
+      "label": "EventPacket.java (cancel carrier)",
+      "rel": "listener/event/net/EventPacket.java",
+      "explanation": "EventPacket is the In/Out cancelable wrapper that the packet listeners receive. The Out variant carries the outgoing packet and supports setCanceled(true), which is what the phase suppression uses to stop packets reaching the wire, and the In variant wraps received packets for the S08 and S02 handling. November Recode 2.0's snapshot lays out its tree without the lol/november package prefix and ships no net/minecraft sources, so this wrapper is the only packet plumbing available to cite."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Passable (swept-box ray trace)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/Passable.java",
+      "explanation": "Passable ray-traces the player's swept collision volume between consecutive positions against the server's block cache and flags any transit whose box intersects a solid block's collision box, retrying alternate axis orders (YXZ, then YZX or XZY/ZXY) before giving up; a hit raises passableVL by 1 with 0.99 decay per clean move and returns a set-back location. The server's cache still contains the glass the client removed locally, so the phase move into that cell is a swept box crossing a solid face, which the ray trace collides on.\n\nThe initial-inside-block position is ignored (setIgnoreInitiallyColliding), so standing still inside the cell at rest is not flagged; the transit is what trips the check, which matches the module's behavior of walking through the removed cell. Every phase step that crosses the glass face accrues a violation until the set-back moves the player back out."
+    },
+    {
+      "label": "Phase (tesseract swept AABB)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Phase.java",
+      "explanation": "Hawk's Phase check builds the swept volume between the previous and current player boxes, shrunk by side 0.1, bottom 0.4 and top 0.1 epsilons to cut false positives, tests it as a tesseract against every nearby solid block's collision boxes from the server's world, and on a three-axis hit calls punish with a rubber-band. Walking into the glass cell that the client un-rendered is a direct hit: the server world still has the solid glass, and the swept box intersects it on every move.\n\nThe whitelist carve-outs (blocks updated within the player AABB, openable blocks) do not cover a block the client merely removed locally, because no update ever reached the server. The module's setBlockToAir only changes local rendering and collision, which is exactly the discrepancy the check is built to measure."
+    },
+    {
+      "label": "MorePackets (flush burst)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts every serverbound move packet into an ActionFrequency with 500ms buckets and scores the window against cc.morePacketsEPSMax (22 per second, 20 ideal), with a burst path on the newest half-second bucket (15 packets, 10 direct-violation). The disable-time flush replays every queued C03 in one tick: a phase held for two to three seconds withholds 40 to 60 movement packets, and the flush lands them all in a single burst that exceeds the direct-violation threshold immediately.\n\nThe suppression itself is the other half of the exposure: while phasing, the server sees a player who stops sending movement packets entirely, a blink-like signature that the burst check then punctuates when the queue drains. The flush cannot be spread out because disable() runs synchronously in one tick."
+    }
+  ]
+}

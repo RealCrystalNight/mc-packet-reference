@@ -1,0 +1,51 @@
+{
+  "module": "FastEat",
+  "client": "Rise 5.99",
+  "category": "fasteat",
+  "source_rel": "dev/rise/module/impl/player/FastEat.java",
+  "overview": "Rise 5.99's FastEat speeds up eating by flooding the server with C03-family movement packets while the player is using an edible item. While isEating() is true and Scaffold is off, onPreMotion runs speed divided by 2 iterations per tick; the Normal mode sends a plain C03PacketPlayer plus a same-position C04PacketPlayerPosition in each iteration, and the Ghostly mode sends a C06PacketPlayerPosLook with the y coordinate nudged by 1E-9. At the default speed of 20 that is 20 packets per tick, roughly 400 per second, and at the maximum of 100 it is 100 packets per tick. The mechanism matches the client's own AutoGap pattern: servers that advance item-use duration per received packet complete the 32-tick eat window almost instantly, while on vanilla the burst is redundant because the eat timer is client-fixed. The module's GUI even hides the speed slider for a Hypixel mode that does not exist in the mode list, a dead branch that shipped with the build.",
+  "sections": [
+    {
+      "h": "Spam loop",
+      "p": "The packets are plain sends through PacketUtil.sendPacket, so they ride the normal outbound queue. Because the loop runs inside onPreMotion, all packets of a tick are queued together, producing the burst the rate checks below measure. The onGround argument is forwarded from the player's live state, so the burst does not spoof ground: the exploit is purely the volume and cadence of the movement traffic during the eat window."
+    },
+    {
+      "h": "Why packets shorten eating",
+      "p": "The Ghostly variant adds a position component to every packet with a 1E-9 y offset, which keeps the packets distinct from pure look updates for servers that only count position-bearing moves, while the offset is far too small for any movement check to care about. The yaw and pitch are forwarded from the player, so the look stream is untouched. Whatever the server model, the flood is the fingerprint."
+    },
+    {
+      "h": "Dead GUI branch",
+      "p": "onUpdateAlwaysInGui hides the speed slider whenever the mode is set to Hypixel, but the ModeSetting at line 20 only ships Normal and Ghostly. The Hypixel string appears nowhere in the mode list, so the hiding branch can never run from the GUI, and the slider is always visible. The module's settings otherwise behave normally: the speed range is 1 to 100 with a default of 20, and there are no per-mode toggles beyond the two modes."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "FastEat.java",
+      "rel": "dev/rise/module/impl/player/FastEat.java",
+      "explanation": "The file is 45 lines and contains the whole module. The mode and speed settings are at lines 20-21, the dead GUI branch at lines 24-26, and the eat gate plus spam loop at lines 29-44. The gate requires isEating() and a disabled Scaffold; the loop bound truncates speed divided by 2 to an int, so odd speeds round down. Normal mode (lines 33-35) sends the parameterless C03 then the C04 position packet per iteration; Ghostly (lines 38-40) sends one C06 with the 1E-9 y offset and onGround false. Every send goes through PacketUtil.sendPacket into the normal queue, and all iterations of a tick are queued before the tick's own movement packet is built.\n\nThe module never touches C08 or C07 itself: the use that starts the eat and the release that finishes it come from the vanilla interaction path. That is why the countering section is built entirely on movement-packet rate checks: FastEat's only original traffic is the C03 flood, and the flood is what every rate ledger measures. The Scaffold guard exists because scaffold also spams movement traffic, and the two bursts would compound each other's packet counts."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (C03 flood rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NCP's MorePackets counts every processed move packet into data.morePacketsFreq with 500ms buckets, and NetStatic.morePacketsCheck scores the window against morePacketsEPSMax 22 with 20 ideal. The commented-out 'just look' exclusion in the check shows that even position-less C03 packets are counted; the TODO notes the exclusion was considered and not applied, so FastEat's plain C03 packets are full participants in the ledger. The burst path adds a second gate: more than 15 packets in a half-second bucket is a burst event, 10 is a direct burst, and the window accumulator flags when sustained throughput passes the ceiling.\n\nAt the default speed of 20, FastEat queues 20 C03-family packets per tick, roughly 400 per second against a 22 per second ceiling: the window accumulator saturates on the first eat and the half-second bucket passes the 15-packet burst threshold within a single tick. The check returns the morePacketsSetBack location on violation, which drags the player back mid-eat and cancels the move, and repeated eats keep the violation level climbing. The Ghostly mode's C06 packets count the same way, so neither mode reduces the ledger's exposure; only lowering the speed setting toward 1 (one packet per two ticks, under the ceiling) keeps the module under the rate limits, which defeats the purpose."
+    },
+    {
+      "label": "FlyingFrequency (C03 family PPS)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/FlyingFrequency.java",
+      "explanation": "NCP's FlyingFrequency is a content-blind ledger over the whole C03 family. Every flying packet adds 1f to data.flyingFrequencyAll, and the check computes the per-second rate over the full window and compares it to flyingFrequencyPPS, default 60 packets per second over 5 seconds, scaling by the lag factor before the final comparison (FlyingFrequency.java lines 52-65). The check's javadoc states its scope directly: frequency of pos, look and plain flying packets, disregarding packet content.\n\nFastEat's default 400 packets per second is nearly seven times the 60 PPS ceiling, so the violation amount is around 340 per second, and the default action chain cancels once the violation level passes its thresholds. The 5-second window means the flood must be sustained to score, which the module guarantees: every tick while eating contributes, and the window only starts draining after the eat ends. Even a single eat of one second leaves a score of roughly 340 in the window. The Ghostly mode's 1E-9 y offsets are irrelevant to this check, since it never inspects packet contents; the count is the entire test."
+    },
+    {
+      "label": "MorePackets (per-second cap and kick)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/MorePackets.java",
+      "explanation": "Arc v2's MorePackets keeps two rolling per-second counters fed from the packet listener: every C03 without a position increments flyingPackets, and every position-bearing C03 (C04 or C06) increments positionPackets. Once a second has elapsed since the last update, updateAndCheck runs the check, which flags when either counter passes max-packets, default 30, and kicks outright when either passes max-packets-kick, default 70 (config.yml morepackets section, PacketListener.java lines 195-206). A violation sets cancelMovingPackets so subsequent moves in the second are rejected.\n\nFastEat's Normal mode feeds both counters: the plain C03s raise flyingPackets and the C04s raise positionPackets, 10 of each per tick at the default speed, so both counters cross the 70 kick threshold in under a second of eating. Ghostly feeds only positionPackets, 10 per tick, which still crosses the kick threshold in about a second and the flag threshold in a third of a second. Because the counters reset once per second, the module's sustained flood cannot hide in a quiet window: every eat is a full second of exposure. The check's kick path is asynchronous but unconditional once the counter passes 70, so the module's effective lifespan on an Arc v2 server is one eat cycle."
+    }
+  ]
+}

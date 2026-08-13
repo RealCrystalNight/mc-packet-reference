@@ -1,0 +1,63 @@
+{
+  "module": "AutoBow",
+  "client": "LiquidSense Dev",
+  "category": "autobow",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/combat/AutoBow.kt",
+  "overview": "LiquidSense's AutoBow fires the bow the instant the draw reaches full charge. The single UpdateEvent handler checks that the player is using an item, that the held item is a bow, and that itemInUseDuration has crossed the 20-tick full-charge mark; when all three hold it calls stopUsingItem() and sends C07PacketPlayerDigging RELEASE_USE_ITEM at BlockPos.ORIGIN facing DOWN, which makes the server release the charge and launch the arrow along the player's current look. One BoolValue, WaitForBowAimbot (default on), couples the module to the BowAimbot sibling: while that module is enabled the release is additionally gated on bowAimbot.hasTarget(), so shots only leave while the aimbot reports a visible locked target. The module has no timing jitter and emits no C02PacketUseEntity of its own; its entire wire footprint is one C07 release per draw.",
+  "sections": [
+    {
+      "h": "Release logic",
+      "p": "onUpdate is the whole module. The guard is mc.thePlayer.isUsingItem, the held item being Items.bow, and itemInUseDuration > 20. itemInUseDuration counts the ticks the draw has been running, and 20 ticks is exactly where the vanilla charge factor (j = duration, folded through (f*f + 2f) / 3 capped at 1.0) reaches full power, so the release always fires a maximum-charge arrow. stopUsingItem() runs the client-side onPlayerStoppedUsing, and the wire trigger is the C07PacketPlayerDigging with Action.RELEASE_USE_ITEM at BlockPos.ORIGIN with EnumFacing.DOWN; the server clears the use state on that packet and launches the arrow along the look it last received, which is why the module only needs the one packet. Nothing randomizes the release: every draw that satisfies the guard ends on the exact tick the charge completes."
+    },
+    {
+      "h": "WaitForBowAimbot coupling",
+      "p": "The gate is (!waitForBowAimbot || !bowAimbot.state || bowAimbot.hasTarget()). With the default settings (WaitForBowAimbot true, BowAimbot enabled) the release is deferred until bowAimbot.hasTarget() is true, which is the aimbot's own last-aimed-entity check: target != null plus a fresh canEntityBeSeen ray trace against the client's world. The module therefore inherits the aimbot's target selection and sight filter: it only fires while a visible, client-side-valid enemy is locked. With BowAimbot disabled or the wait switch off it fires on the plain 20-tick condition. Either way, every shot that leaves under the default configuration coincides with an actively aimed draw."
+    },
+    {
+      "h": "Wire footprint",
+      "p": "Per draw the module sends exactly one packet, the C07 release; the arrow damage arrives later as server-side projectile hits, not as C02PacketUseEntity. The only other traffic it participates in is the C03 family: while BowAimbot is active the movement packets carry the faceBow rotations computed each tick, and when FastBow is active the same release path is fed by FastBow's per-tick re-arm cycle. On its own the module adds nothing to the movement stream, which is what makes it the least visible of the bow modules: a server sees a release at minimum charge, which is a fast but legal draw."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "AutoBow.kt (module logic)",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/combat/AutoBow.kt",
+      "explanation": "The file is a single @EventTarget onUpdate handler plus the WaitForBowAimbot BoolValue. Reading it from the value declaration down shows the full surface: one switch that decides whether the release waits for the aimbot, and one guard expression that combines the using-item state, the bow check, the 20-tick charge check and the aimbot gate. The module reaches into the module manager once per update to fetch the BowAimbot instance, which is the only cross-module dependency; everything else is vanilla player state (isUsingItem, heldItem, itemInUseDuration) and one packet send. There is no enable/disable logic, no timer, and no configuration beyond the single value, so the entire module is the guard plus the C07 send."
+    },
+    {
+      "label": "BowAimbot.kt (WaitForBowAimbot gate)",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/combat/BowAimbot.kt",
+      "explanation": "The coupling target of AutoBow's default configuration. hasTarget() is the method AutoBow polls before releasing: it returns true only while the aimbot holds a target reference from its last UpdateEvent pass and that entity is still visible through a fresh client-side ray trace. The file also shows where the target comes from: getTarget filters the loaded entity list through EntityUtils.isSelected(entity, true), which composes the client's AntiBot, NoHurt, NoFriends, spectator and Teams filters, and then picks the priority winner (Health, Distance or Direction). AutoBow's release therefore fires only when this module has a client-side-valid enemy locked, and the rotations that accompany the shot are the faceBow angles this module computed."
+    }
+  ],
+  "countering": [
+    {
+      "label": "AimbotConvergence (fixed convergence point)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotConvergence.java",
+      "explanation": "AimbotConvergence intersects the look rays of consecutive movement updates and punishes a convergence point that does not move. On every MoveEvent with a position delta it builds the pre-move ray (from position minus velocity, plus eye height) and the post-move ray, finds the closest points between the two lines, and compares the midpoint against the previous midpoint; when the squared distance is under 1e-8 the aim is treated as locked on a fixed world point and the player is punished. Teleports are excluded and the check only arms after tick 100.\\n\\nThis is a direct hit on the default AutoBow configuration, where every release is gated on BowAimbot. faceBow re-aims the target every tick while the draw runs, so while the shooter strafes during the draw the rays from successive positions all converge on the same target point and the convergence distance stays at zero. The check's own comment warns exactly about this class: 'You better turn off your aimbot when your opponent is standing still'. Standing-still draws emit no position deltas, so the check never arms against a stationary shooter, and a moving target shifts the convergence point with it and passes; the deterministic minimum-charge release itself is not what this check sees."
+    },
+    {
+      "label": "AimbotPrecision (pitch-delta GCD)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotPrecision.java",
+      "explanation": "AimbotPrecision collects the pitch deltas of consecutive moves and solves their greatest common divisor. A human's pitch changes are quantized by the in-game mouse sensitivity, so all deltas share a GCD; a computed aim produces continuous arbitrary deltas whose GCD is unsolvable, and the check fails the player when the GCD drops below 1e-5. It ignores zero deltas, deltas above the 0.96 pitch-rate limit, and pitches at exactly +/-90.\\n\\nfaceBow's pitch comes from the closed-form arrow-trajectory solution (atan of the ballistic equation with the charge-velocity factor), so while a target moves or the shooter strafes, the per-tick pitch deltas are floating-point derivatives of that formula - exactly the unsolvable-GCD profile. The same caveats apply as with the convergence check: a perfectly still target produces a zero pitch delta that the check skips, and the module's own 20-tick release timing contributes nothing to the look stream. The check is what catches the aim the release depends on, not the release itself."
+    },
+    {
+      "label": "Angle (attack-stream rotation deltas)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Angle.java",
+      "explanation": "NCP's fight.Angle keeps a rolling list of AttackLocation entries - position, yaw, timestamp, target id - for every C02 attack and scores four averages across the window: movement between attacks (avgmove, flagged below 0.2 blocks), time between attacks (avgtime, flagged under 150ms), yaw change (avgyaw, flagged above 50 degrees) and target-switch speed (switchspeed, any switch with a yaw jump over 30 degrees), each folded through the configured thresholds and accumulated into angleVL with cancel actions.\\n\\nAutoBow never emits a C02, so the check cannot fire on the shot itself; its relevance is the attack stream around the shots. The LiquidSense play pattern the module enables is a bow shot at minimum charge followed by a melee attack, and when the paired BowAimbot is active the same scripted rotation that aimed the arrow is still being applied when the follow-up C02 leaves - the low-movement, tightly-timed attack cadence scores avgmove and avgtime. The honest caveat is the stock configuration: the per-call scores stay far below the default move/time/yaw/switch thresholds (100, 150, 60, 50), so the check is dormant until an admin tunes it down - the same caveat that applies to every fight check against this module family."
+    },
+    {
+      "label": "UseItemAdapter (release-item rate gate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "The adapter is NCP's surface on the item-use packet stream. handleDiggingPacket stamps releaseItemTime on every C07 RELEASE_USE_ITEM and sets the isHackingRI flag when a second release arrives within timeBetweenRL of the first, with the threshold defaulting to 70ms; the javadoc states outright that this is a minimum-time-between-releases gate for the rapid-release exploit class. handleBlockPlacePacket tracks the C08 use-item sentinel so the use-state model stays consistent.\\n\\nAutoBow's own releases are one per full draw - roughly a second apart - so they sit far outside the 70ms window and the gate never trips on the module alone, and no anticheat in the pool carries a bow-charge timer that would see the deterministic 20-tick release. The check matters as the family boundary: the moment AutoBow's release path is combined with FastBow's per-tick re-arm cycle, the same C07 stream starts arriving every 50ms and isHackingRI is set from the second shot onward. That combination is exactly what the WaitForBowAimbot default encourages - an aimed minimum-charge shot every tick - so on an NCP-protected server the module family as configured runs into this gate."
+    }
+  ]
+}

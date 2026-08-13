@@ -1,0 +1,64 @@
+{
+  "module": "BackTrack",
+  "client": "Rise 5.99",
+  "category": "backtrack",
+  "source_rel": "dev/rise/module/impl/combat/BackTrack.java",
+  "overview": "Rise 5.99's BackTrack is a lag-compensation aid that aims and attacks the target at its previous - and extrapolated future - locations. While a target is locked (set by onAttackEvent), onPreMotion records the target's position every tick into pastPositions, capped at the Amount setting, extrapolates forwardPositions by doubling the target's per-tick delta up to the Forward count, and merges both lists into the positions that onRender3D draws as breadcrumbs. The module's packet-replay half, a deque that would cancel outgoing packets and flush them once the position history is long enough, is commented out in this build, so the wire technique the module represents - delaying C02 and C03 so the server's lag compensation measures the player at older positions - is inert; what remains active is a target tracker and aiming aid. The S08 teleport is the counterweight to the technique: every server teleport resets the position history that compensation is built from.",
+  "sections": [
+    {
+      "h": "Position history",
+      "p": "onPreMotion appends the target's current position to pastPositions once per tick and trims the list to the Amount setting (default 20, up to 100). The forward list is rebuilt every tick by extrapolating the target's velocity: deltaX and deltaZ are twice the difference between the current and last-tick positions, and Forward entries are placed at multiples of that delta ahead of the target. The merged positions list then holds a window of where the target has been and a short extrapolation of where it is going, which onRender3D renders as breadcrumbs. The target itself is only ever set from an AttackEvent on a player entity, and a tick counter resets on each attack."
+    },
+    {
+      "h": "Dead packet-replay code",
+      "p": "onPacketSend contains the commented-out skeleton of the real backtrack technique: every outgoing packet is added to a deque and cancelled, and once the accumulated position history reaches the Amount threshold the buffered packets are flushed through sendPacketNoEvent and the lists are cleared. That is the mechanism that makes the module's name accurate - attacking the server's lag-compensated snapshot of the target rather than the live position - and it is disabled in this build, so the deque never fills and no packet is ever delayed. The same pattern is implemented live in the sibling Blink module, which cancels every packet (or just C03) into a queue and flushes it on disable or on a pulse interval."
+    },
+    {
+      "h": "Teleport interaction",
+      "p": "The technique's vulnerability is the S08 teleport: when the server teleports the player or the target, the position history the server's lag compensation uses is rebuilt from the new location, so a client attacking a pre-teleport position suddenly faces a large distance to the compensated entity. The module's tick guard (onDisable when the local ticksExisted is under 5) only protects the client's own spawn-in, not the target's history; a kill aura driving attacks through the backtrack target inherits whatever position the server currently compensates."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity",
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "BackTrack.java (position tracker)",
+      "rel": "dev/rise/module/impl/combat/BackTrack.java",
+      "explanation": "The active logic is the history builder. onPreMotion pushes the target's position into pastPositions, trims to Amount, extrapolates forwardPositions at twice the per-tick delta up to Forward, and merges the two into the positions list that onRender3D draws with RenderUtil.renderBreadCrumbs. onAttackEvent sets the target from the attacked player and resets the tick counter; onDisable clears every list and the deque. The commented-out onPacketSend block is the module's original wire behavior: queue every outgoing packet, cancel it, and flush the queue once the position history is long enough - the actual packet-delay backtrack. Its absence means the shipped module changes no traffic: the C02 attacks it enables are ordinary attacks whose rotation happens to be chosen while tracking a client-side history, and the countering checks below are evaluated against the technique the code represents rather than a packet the build emits."
+    },
+    {
+      "label": "Blink.java (live packet buffer)",
+      "rel": "dev/rise/module/impl/player/Blink.java",
+      "explanation": "Blink is the sibling module where the buffering pattern BackTrack's commented code describes is actually wired: onPacketSend adds every outgoing packet (or only C03, per the allPackets toggle) to a ConcurrentLinkedQueue and cancels it, and the queue is flushed with PacketUtil.sendPacketWithoutEvent on disable or on a pulse interval that re-sends the buffer every delayPulse ticks with a randomness gate. It is the canonical fake-lag implementation in the same client, and it shows what BackTrack's deque would do if enabled: the delayed C03 flood that arrives when the buffer flushes is what the server-side rate and envelope checks measure, and the pulse mode is the bounded variant that keeps the flush inside a predictable window."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Reach (lag-compensated hitbox)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/combat/Reach.java",
+      "explanation": "Grim's Reach is the direct arbiter of the backtrack technique: it builds the victim's hitbox from the server's own compensated position history (the PacketEntity position ledger RewindEntity uses) and ray-casts the attack against it. The whole premise of backtracking is that the client can attack where the target was before the server's compensation caught up; Grim's history is precisely the set of past positions that compensation considers, so an attack at an older client-side position either intersects the compensated hitbox (legitimate) or misses it entirely, and a miss at normal reach raises the reach violation with a set-back. The check therefore neutralizes the position-history edge the technique exists to exploit: the server and the client are reasoning about the same snapshot window, and the client's older snapshot is inside it."
+    },
+    {
+      "label": "Reach (survival distance)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Reach.java",
+      "explanation": "NCP's fight.Reach measures the attack distance from the player's location to the victim's server-side location, with the survival limit plus a per-victim modifier, a center-to-edge inset for precision, and a dynamic range that scales the violation with how far past the limit the attack landed. It does not lag-compensate the victim position the way Grim and Hawk do; it measures against the server's current view. That is exactly what makes it the backtrack counter on the other axis: a client aiming at a position from its own history attacks a point the server has already moved past, so the measured distance is the distance to where the victim is now, not where the client aimed, and a history offset of a few ticks at sprint speed pushes the measurement past the limit. The check also feeds the Improbable feed on large over-distance attacks, so the backtrack pattern contributes to the attack-consistency score rather than just a single violation."
+    },
+    {
+      "label": "FightHitbox (server-side ray trace)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightHitbox.java",
+      "explanation": "Hawk's FightHitbox performs the server-side ray trace against the lag-compensated hitbox that the technique tries to outrun: the check walks the victim's history from the lag compensator and tests the attack direction against the box at the compensated position. An attack aimed at the client's older snapshot intersects the box only when the server's compensation window reaches that same snapshot; when the client's history lags further back than the server's window, the ray misses and the check punishes. Alongside Grim's Reach it forms the lag-compensation axis of the defense: both checks grant the client the same history the technique wants to use, and both flag when the client reaches further back than the server does."
+    },
+    {
+      "label": "Angle (attack-stream analysis)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Angle.java",
+      "explanation": "fight.Angle analyzes the C02 stream around the backtrack target: the average movement between hits, the average time between hits (a violation component under 150ms), the average yaw change (a component above 50 degrees), and the yaw difference on target switches (above 30 degrees). A kill aura driving attacks through BackTrack's target produces exactly the stream the check scores: sustained hits at high cadence against one entity while the attacker holds position, and the yaw difference accumulator when the target switches. The check does not know about position history; it constrains the attack cadence and rotation behavior that a backtrack-assisted fight exhibits, which is the dimension the reach checks do not cover."
+    }
+  ]
+}

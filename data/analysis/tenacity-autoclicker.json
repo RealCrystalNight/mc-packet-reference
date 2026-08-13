@@ -1,0 +1,62 @@
+{
+  "module": "AutoClicker",
+  "client": "Tenacity 6.0",
+  "category": "autoclicker",
+  "source_rel": "dev/tenacity/module/impl/combat/AutoClicker.java",
+  "overview": "Tenacity 6.0's AutoClicker is a two-mode ghost module that drives the vanilla click path once per delay interval while the attack key is held. The Normal mode computes a delay from the Min and Max CPS settings and calls mc.clickMouse(), which sends the C0A arm-swing packet alongside the C02 attack in one press, after resetting mc.leftClickCounter to 0 so every click is treated as a fresh press. The Drag mode runs a 1200ms click burst followed by a 300ms pause while the key is held. The delay math is the notable detail: the settings are labelled 9 to 11 CPS, but the formula (20 minus cps) times 20 produces a uniform random delay between 180 and 220 milliseconds, so the module actually clicks at 4.5 to 5.5 CPS, roughly half the labelled rate, and that low rate is what keeps it under the statistical gates of the autoclicker checks below.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module is a ModeSetting plus four settings and three TimerUtil fields. The MotionEvent consumer runs on the pre-motion pass only, so the click decision happens once per client tick before the movement packet is built. The Normal branch checks that the attack key is held, then fires when the click timer passes the random delay; the Drag branch gates the same click timer inside a 1200ms drag window that resets after a 300ms delay. Every click path sets mc.leftClickCounter to 0 before calling mc.clickMouse(), which resets the vanilla click-rate limiter so the synthetic presses are treated as fresh mouse-downs."
+    },
+    {
+      "h": "The delay math",
+      "p": "The delay is computed once per tick: maxValue is (20 minus maxCPS) times 20 and minValue is (20 minus minCPS) times 20, and MathUtil.nextInt(minValue, maxValue) picks a uniform integer between them. With the defaults of 9 and 11 that is a delay between 180 and 220 milliseconds, which is 4.5 to 5.5 clicks per second, not the 9 to 11 the labels promise, and the formula is inverted: the Min CPS setting produces the longer delay. The second click check at cps minus 2 milliseconds is effectively dead code, because its 2ms window between the two thresholds is never sampled at the client's roughly 50ms tick granularity, so each cycle emits exactly one click."
+    },
+    {
+      "h": "Click path and drag cycle",
+      "p": "mc.clickMouse() runs the full vanilla click: against an entity it calls attackEntity (C02 use-entity with the attack action plus the swing), against a block it starts a dig, and against air it swings the arm, and every path sends C0APacketAnimation, which is the wire surface the server-side autoclicker checks read. The Drag mode clicks at the same delay inside a 1200ms window, then idles for 300ms before the next burst, so the C0A stream becomes periodic bursts of about six clicks followed by silence, a cadence a periodicity detector can lock onto if the click rate crosses the detector's gates."
+    }
+  ],
+  "packets": [
+    "C0APacketAnimation"
+  ],
+  "files": [
+    {
+      "label": "AutoClicker.java (module)",
+      "rel": "dev/tenacity/module/impl/combat/AutoClicker.java",
+      "explanation": "The module holds the entire click decision. The MotionEvent consumer computes the random delay, checks the attack key, resets mc.leftClickCounter, and calls mc.clickMouse() through the vanilla click path, which emits the C0A swing alongside the C02 attack. The Drag branch wraps the same click in the burst-and-pause cycle driven by three timers. The setting guards (min clamped to max and back) run every tick and keep the delay range sane.\n\nThe second click check at cps minus 2ms is the honest dead-code detail: after the first check resets the click timer, the second check can only fire inside a 2ms window that a 50ms tick loop never samples, so it never produces a click in practice."
+    },
+    {
+      "label": "MathUtil.java (random delay source)",
+      "rel": "dev/tenacity/util/misc/MathUtil.java",
+      "explanation": "MathUtil.nextInt is the random source behind the click timing. It casts Math.random() times (max minus min) plus min to an int, so the delay is uniformly distributed on the interval from minValue to maxValue with max exclusive, which is what gives the click train its constant 180 to 220ms inter-click interval. The uniform spread is the statistical tell: a human click train has a skewed, high-variance interval distribution, while this one has a hard 40ms spread with no long-tail outliers.\n\nThe same utility serves the rest of the Tenacity module set with its random helpers, gaussian sampler and interpolation methods, so the file is shared infrastructure rather than click-specific code; the nextInt method is the only part the AutoClicker uses."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ClickACF (click autocorrelation)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/ClickACF.java",
+      "explanation": "Hawk's ClickACF runs an autocorrelation over the per-tick click count. Every MoveEvent appends the current tick's click count to a 30-sample window, and every arm swing increments the count for the current tick. When the window fills, the check computes the autocorrelation at lags 1 to 30 and flags when a lag between 1 and the ACF_PERIOD_THRESHOLD of 9 exceeds 0.87 times the zero-lag value, which is the signature of a periodic click train. Before the periodicity scan it enforces a minimum click rate: the normalized zero-lag value must reach MIN_ACF_0_NORM of 13, which requires roughly 13 sustained clicks per second.\n\nThe module's real rate of 4.5 to 5.5 CPS sits far below that gate, so the check prints the \"CPS not high enough\" bail and never evaluates the periodicity of the train. The honest tolerance is the low rate itself: a human-range click speed with a small uniform jitter is exactly the profile this check is tuned not to evaluate. If the user raised the settings to 13 CPS or higher, the uniform 180 to 220ms cadence would produce a strong autocorrelation peak at a period of 4 to 5 ticks and the check would flag."
+    },
+    {
+      "label": "ClickStats (inter-click interval histogram)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/ClickStats.java",
+      "explanation": "ClickStats is a histogram of inter-click intervals measured in ticks. Each arm swing computes the gap since the previous swing, and gaps up to MAX_PERIOD of 4 ticks are tallied into per-gap buckets until SAMPLES of 80 accumulate, then the histogram resets. The module's 200ms inter-click gap is exactly 4 ticks at 20 TPS, so every interval lands in the same bucket, which is the degenerate single-column histogram the check was written to expose. The cloned file is honest about its own state: the histogram print and the punish call are commented out, so in this build the check only collects and never acts.\n\nThe takeaway is that the module's interval distribution is detectably non-human (a constant 4-tick gap with at most one tick of jitter), but the shipped copy of the check has no active flag path, so on a server running this build the histogram is observational only."
+    },
+    {
+      "label": "AutoClickerA (movement-sample statistics)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/autoclicker/AutoClickerA.java",
+      "explanation": "Frequency's AutoClickerA measures movements between swings. Each C0A (WrappedPlayInArmAnimation) samples the number of C03 movements since the previous swing, but only when the gate passes: measured CPS above 6.5, fewer than 4 movements since the last swing, and the player not digging or placing. When 20 samples accumulate, the check computes the standard deviation and the outlier count, and a deviation below 2 with fewer than 2 outliers fails.\n\nThe gate is the module's escape hatch: at 4.5 to 5.5 real CPS, the measured click rate stays under the 6.5 CPS requirement, so no samples are ever added and the check never accumulates a window. The bypass surface is narrow: push the settings toward 13 to 14 CPS and the gate opens, and then the uniform 180 to 220ms delay produces a deviation of a few milliseconds and zero outliers, which fails the deviation and outlier test on the first full window."
+    },
+    {
+      "label": "AutoClickerA (no-drops counter)",
+      "ac": "AimbotPvP-azure-anticheat",
+      "rel": "src/main/java/us/skidrevenant/azure/check/checks/combat/autoclicker/AutoClickerA.java",
+      "explanation": "Azure's AutoClickerA is a no-drops counter. PlayerStats accumulates swingDelay by adding 50ms for every C03 movement and resetting it to 0 on each swing, so the value at any moment is the time since the last click. On every C03 the check tests that delay: while it stays at or under 100 milliseconds, a threshold increments, and once it passes 100 consecutive no-drop movements the check fires with a 60-second cooldown. Any swing gap above 100ms divides the threshold by 4, and digging divides it by 4 as well.\n\nThe module's 180 to 220ms inter-click gap is comfortably above the 100ms no-drop window, so the threshold decays on every cycle and the counter never approaches 100. This is the same tolerance story as the other statistical checks: the check is tuned for 10-plus-CPS autoclickers with millisecond-stable intervals, and the module's half-rate uniform jitter keeps its counter at zero."
+    }
+  ]
+}
