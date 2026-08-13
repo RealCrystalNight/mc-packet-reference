@@ -1,0 +1,62 @@
+{
+  "module": "Sprint",
+  "client": "Tenacity 6.0",
+  "category": "sprint",
+  "source_rel": "dev/tenacity/module/impl/player/SprintModule.java",
+  "overview": "Tenacity's Sprint is a one-line key-forcer: every pre-motion tick it sets the vanilla sprint key binding's pressed state to true — except while the Scaffold module is enabled — which walks the client's own sprint state machine into sprinting whenever its gates pass (forward input at 0.8 or above, food above 6, not blinded, not using an item), and the vanilla transition code emits the C0B START_SPRINTING entity action on the state change. onDisable releases the key and clears the sprinting state directly. The module builds no packets and changes no server-side state by itself; its entire wire footprint is the C0B stream the vanilla client produces for a permanently held sprint key.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module registers one IEventListener on MotionEvent with no settings. The handler's only guard is a module-repository lookup: if ScaffoldModule is enabled, the listener returns, so the key is never forced while scaffolding. onDisable releases the key binding and calls setSprinting(false) on the player, undoing both the binding state and the entity flag so the sprint state cannot linger after a manual toggle-off."
+    },
+    {
+      "h": "Key-forcing mechanics",
+      "p": "keyBindSprint.pressed = true every tick feeds the vanilla sprint logic in EntityPlayerSP.onLivingUpdate: sprint starts when forward input is at 0.8 or above, food is above 6 (or the player may fly), the player is not blinded and not using an item (Tenacity's NoSlow module can override the item gate), and sprint stops when forward input drops below 0.8, the player collides horizontally, or food drops to 6 or below. The C0B entity action fires only on state transitions — the client compares isSprinting() against serverSprintState and sends START or STOP on change — so the module's permanent key press yields one START per transition, never a packet flood."
+    },
+    {
+      "h": "Wire footprint and limits",
+      "p": "Functionally the module is indistinguishable from a player physically holding the sprint key: same state machine, same gates, same single C0B per transition. Its abuse surface is therefore not a packet anomaly but the sprint-state contract itself — sprinting kept alive through the strafes, item uses (with NoSlow) and boundary conditions that vanilla's forward gate alone cannot police once the state is on. Detection targets that contract: direction-vs-state consistency, redundant status packets, and the hunger window."
+    }
+  ],
+  "packets": [
+    "C0BPacketEntityAction"
+  ],
+  "files": [
+    {
+      "label": "SprintModule.java",
+      "rel": "dev/tenacity/module/impl/player/SprintModule.java",
+      "explanation": "The whole module: the MotionEvent listener that forces keyBindSprint.pressed true every tick unless ScaffoldModule is enabled, and the onDisable that releases the key and clears the sprinting state. The module repository lookup makes the Scaffold guard a live dependency on another module's toggle state. No packet is constructed anywhere; the C0B stream is produced entirely by the vanilla sprint transition code downstream of the forced key."
+    },
+    {
+      "label": "MotionEvent.java (pre-motion carrier)",
+      "rel": "dev/tenacity/event/impl/player/MotionEvent.java",
+      "explanation": "The pre-motion event the module hooks. Its constructor is invoked by the client's movement pipeline once per tick — the exact cadence of the key-forcing — and its x, y, z, yaw, pitch and onGround fields mirror the values that serialize into the next C03PacketPlayer, the packet that precedes the sprint-state transition check in the vanilla update order. The event's cancel flag and player reference go unused here; the module only needs the dispatch to run."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SprintDirection (sprint-state direction cone)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/SprintDirection.java",
+      "explanation": "Hawk's SprintDirection polices the contract between sprint state and movement direction. It records the last tick the player was not sprinting and only evaluates once sprint has been active for at least two ticks, then reconstructs the expected move from the tracked velocity (adjusting for soul sand, webs, hit slowdown, friction and the 0.2 forward component of a jump) and compares the actual horizontal move against the yaw vector: an angle beyond pi/4 + 0.3 radians (~62 degrees) punishes with a rubber-band. Teleport-accepted moves, knockback, swimming, wall collisions and ladder/vine contact are exempted.\\n\\nThe forced key keeps sprint state alive through the strafes and velocity changes that a physically held key would also survive, so the check's cone is the boundary of the module's reach: straight runs and W-A diagonals sit inside the tolerance, while any sprinting move pushed beyond the cone — hard strafes into knockback, or direction changes the forward gate alone cannot police — rubber-bands. The 2-tick grace and the exemptions are the check's honest tolerance; within them, vanilla-compliant sprinting passes."
+    },
+    {
+      "label": "BadPacketsF (duplicate sprint status)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/badpackets/BadPacketsF.java",
+      "explanation": "Grim's BadPacketsF validates the C0B state machine itself: a START_SPRINTING while the server already tracks sprinting, or a STOP while it does not, is a redundant status packet and is flagged and cancelled (one transition is exempt to support 1.14+ clients whose initial sprint state is unknown). The check runs as a PreViaPacketReceiveListener, so the duplicate packet is cancelled before ViaVersion or the server processes it.\\n\\nThe re-asserted key press is what produces the redundant status: the client's own stop conditions (horizontal collision or the food boundary at line 858 of the bundled EntityPlayerSP) can drop sprint state and re-start it within the same tick window, before the transition sender records the change, yielding two STARTs with no STOP between them. Each such duplicate is cancelled and flagged. The single exempt transition is the tolerance; beyond it, every repeated status packet is evidence."
+    },
+    {
+      "label": "SprintA (hunger gate window)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/sprint/SprintA.java",
+      "explanation": "Grim's SprintA runs after each prediction and flags whenever the server-tracked food level is at or below 6.0 while the player is sprinting, with exemptions for fly-capable players and camel riders. The check is stable (non-experimental) and carries no setback of its own.\\n\\nThe client-side gate is strictly food above 6, so the module cannot start sprint at the boundary — but the check's window is the drop: when food falls to 6 or below while sprint is already on, the client's stop transition fires on the next tick, and in the window where the server still tracks sprint state with food at the boundary, the check flags. Clients that bypass the hunger gate entirely are caught directly on every sprinting tick; the module itself only ever reaches the check's window at the boundary, which is the honest scope of this counter. The reward-on-legit path keeps the check quiet during normal full-hunger sprinting."
+    },
+    {
+      "label": "ToggleFrequency (C0B toggle ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/ToggleFrequency.java",
+      "explanation": "NoCheatPlus's ToggleFrequency counts toggle actions — every sprint or sneak start-or-stop scored into data.playerActionFreq — over the full window, divides by the lag factor, and flags when the sustained toggle rate exceeds cc.toggleActionLimit, accumulating toggleFrequencyVL and running the configured cancel actions; the VL decays by 0.9 on clean ticks.\\n\\nAlways-sprint setups feed this check through the toggle patterns they enable: sprint-state flicker at the boundary conditions (wall collisions, hunger drops, item uses) turns the module's re-asserted key into rapid START/STOP cycles, and any WTap-style macro layered on top of the forced key pushes the ledger past the limit on a sustained basis. The honest scope is the same as the module's wire footprint: a clean always-on sprint emits a single START and never trips the ledger — the check catches the toggling abuse that sprint automation enables, not the steady state itself."
+    }
+  ]
+}

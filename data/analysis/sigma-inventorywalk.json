@@ -1,0 +1,57 @@
+{
+  "module": "InventoryWalk",
+  "client": "Sigma 4.11",
+  "category": "inventorywalk",
+  "source_rel": "info/sigmaclient/module/impl/player/InventoryWalk.java",
+  "overview": "Sigma's InventoryWalk keeps the player moving while any GUI is open by re-asserting the five movement KeyBindings from the raw keyboard state every tick, so the vanilla movement code runs and the C03 stream continues through the window. Arrow keys rotate the view in addition (pitch 1, yaw 3 per key tick). The three modes differ in how they treat the open-window state: Basic just walks, AACP suppresses sprint while the window is open (one STOP_SPRINTING on open, START_SPRINTING on close, and every START_SPRINTING cancelled in between), and Cubecraft cancels the C0B OPEN_INVENTORY and C16 OPEN_INVENTORY_ACHIEVEMENT packets so the server never opens the vanilla inventory window at all. A separate CARRY toggle cancels outgoing C0D close-window packets, keeping the server-side window alive after the client GUI closes.",
+  "sections": [
+    {
+      "h": "Key re-assertion",
+      "p": "EventTick runs while mc.currentScreen is non-null and calls KeyBinding.setKeyBindState for forward, back, left, right and jump using Keyboard.isKeyDown, which makes the vanilla EntityPlayerSP movement code believe the keys are pressed even though the GUI owns the input. The arrow-key block mutates rotationPitch and rotationYaw directly (1 degree pitch, 3 degrees yaw per event) unless the open screen is Sigma's own GuiInvManager, and the mutated angles ride the next C03 look packet. The module bails entirely when the screen is a GuiChat, so chat typing never walks the player."
+    },
+    {
+      "h": "Mode-specific packet games",
+      "p": "The inInventory flag tracks whether the module has seen the window open transition. On the first tick with a screen open, AACP sends one C0BPacketEntityAction STOP_SPRINTING; while inInventory it cancels every outgoing START_SPRINTING, so the server-side sprint flag never turns back on during the walk; on close it sends START_SPRINTING to restore the state it found. The Cubecraft mode cancels C0B OPEN_INVENTORY and C16 OPEN_INVENTORY_ACHIEVEMENT, which removes the client's announcement of the vanilla inventory open, so the server-side window bookkeeping never registers the screen the client is actually showing. The CARRY toggle cancels every outgoing C0D close-window packet, which is the classic carry exploit: the client closes the GUI, the server believes the window is still open, and items held in the cursor or crafting slots survive the close."
+    },
+    {
+      "h": "Detection surface",
+      "p": "The wire signature is a normal C03 stream that simply continues while a window is open, plus mode-specific extras: the AACP C0B sprint toggle at each GUI boundary, the Cubecraft C0B/C16 cancellations, and the CARRY C0D cancellations. The open-state checks (NCP Open, Hawk InventoryMove) target the Basic behavior directly, the toggle-rate checks (NCP ToggleFrequency, Hawk ActionToggleSpeed) see the AACP C0B games, and the arrow-key look produces rotation updates while the window flag is set, which is precisely what Hawk InventoryMove flags."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "InventoryWalk.java",
+      "rel": "info/sigmaclient/module/impl/player/InventoryWalk.java",
+      "explanation": "The module is three event handlers. EventTick owns the key re-assertion and the mode transitions: the move-key loop runs whenever a screen is open, the AACP STOP_SPRINTING/START_SPRINTING pair brackets the inInventory flag flip, and the arrow-key rotation runs for every screen except GuiInvManager. EventPacket handles the packet games: the CARRY toggle cancels outgoing C0D close-window packets, the AACP branch cancels START_SPRINTING while inInventory, and the Cubecraft branch cancels C0B OPEN_INVENTORY and C16 OPEN_INVENTORY_ACHIEVEMENT. EventUpdate is registered but its body is empty, a leftover shell from an earlier revision.\n\nThe GuiChat early return and the mode string suffix are the only UX details; the rest is pure packet manipulation. Note that the C0D cancel in the CARRY branch is gated on the CARRY setting only, so it applies to every window including chests, not just the crafting inventory the setting name implies."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Open (inventory close on movement)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/Open.java",
+      "explanation": "NCP's Open check enforces a closed inventory while the player moves. checkOnMove (lines 123-170) skips duplicate packets, vehicles, creative quickbar cases, merchants and vertical-velocity moves, then decides on impulse: on 1.21.1+ Bukkit it reads the player's actual input flags, otherwise it falls back to the movement model's hasImpulse.decide() (line 163), which infers a deliberate move from the motion pattern. An impulse while InventoryUtil.hasInventoryOpen(player) is true feeds Improbable and the caller force-closes the window, resetting inventoryOpenTime and containerInteractTime.\n\nThe Basic mode is the direct target: the whole point of the module is to produce movement impulses while the window is open, and each WASD-driven move trips the decision. The AACP mode's sprint suppression does not help, because the check keys on the move impulse, not the sprint flag. The Cubecraft mode is the honest evasion: by cancelling C16 OPEN_INVENTORY_ACHIEVEMENT and C0B OPEN_INVENTORY it stops the server from ever opening the vanilla inventory window, so hasInventoryOpen stays false and there is no open state for the check to close. The evasion only covers the client inventory, not server-opened containers, and it relies on the server tolerating the missing open announcement."
+    },
+    {
+      "label": "ToggleFrequency (C0B toggle ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/ToggleFrequency.java",
+      "explanation": "ToggleFrequency limits how often a player toggles actions. The EntityActionAdapter (NCPCompatProtocolLib, checks/net/protocollib/EntityActionAdapter.java) counts every C0B entity action, sprint and sneak toggles included, into data.playerActionFreq (line 86) and runs toggleFrequency.check on each one: the full-window score of the ActionFrequency is compared against cc.toggleActionLimit, and the excess accumulates in toggleFrequencyVL until the configured actions cancel (ToggleFrequency lines 46-60).\n\nThe AACP mode feeds this ledger with a STOP_SPRINTING on every inventory open and a START_SPRINTING on every close, on top of the player's own sprint toggling. A single open/close cycle is harmless, but the mode is used exactly where the ledger matters: opening the inventory repeatedly during a fight (the classic inventory-walk pattern) adds two toggles per cycle to whatever sprint toggling the fight already generates, and sustained open/close spamming pushes the window score past the action limit. The check counts action types indiscriminately, so the module's extra C0Bs are indistinguishable from ordinary sprint toggles."
+    },
+    {
+      "label": "InventoryMove (rotation and state while open)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/InventoryMove.java",
+      "explanation": "Hawk's InventoryMove punishes rotation updates, sprinting and sneaking while an inventory window is open, excluding only teleport-accept moves, and rubberbands the player on violation (InventoryMove.java line 45). The check keys on the client's movement state as reported in the move stream, so it sees the exact states the module produces: the arrow-key look mutates rotationPitch and rotationYaw, and the next C03 look packet is an isUpdateRot move while pp.hasInventoryOpen() is non-zero, which is punished immediately. Sprinting and sneaking while the window is open take the same branch.\n\nThe AACP mode's sprint suppression is an evasion of only the sprint leg of this check: it cancels START_SPRINTING at the client so Hawk's server-side state never turns the sprint flag on, but the rotation leg has no such mitigation, and the module's own look keys guarantee rotation updates whenever they are pressed. A player who only walks (no look keys, no sprint, no sneak) stays under this check, which is the narrow safe envelope the module's Basic mode offers against Hawk."
+    },
+    {
+      "label": "ActionToggleSpeed (sprint/sneak toggle rate)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/ActionToggleSpeed.java",
+      "explanation": "Hawk's ActionToggleSpeed limits sprint and sneak toggle rates to prevent exploitation of the speed check and combat mechanics. For each PlayerActionEvent carrying SNEAK_START, SNEAK_STOP, SPRINT_START or SPRINT_STOP, the check compares the current tick against the last toggle of the same action and punishes when the gap is under one tick (ActionToggleSpeed lines 54-72), then records the new toggle time.\n\nThe AACP mode's open/close cycle emits STOP_SPRINTING on open and START_SPRINTING on close, and when a player taps the inventory open and shut in quick succession (or the client's own sprint logic and the module's close-time START_SPRINTING collide in the same tick), two same-direction toggles land within a tick and punish. The check is tick-grained, so it catches the pathological case rather than the ordinary cycle; the honest reading is that a single open/close cycle per few seconds stays inside the one-tick gap, and the check exists to stop the rapid toggle spam that inventory-walk sessions produce."
+    }
+  ]
+}

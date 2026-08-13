@@ -1,0 +1,63 @@
+{
+  "module": "PingSpoof",
+  "client": "Sigma 4.11",
+  "category": "pingspoof",
+  "source_rel": "info/sigmaclient/module/impl/other/PingSpoof.java",
+  "overview": "Sigma's PingSpoof is a keepalive buffer-and-flush cycle with no thread of its own. The outgoing-packet handler intercepts every C00PacketKeepAlive the vanilla client emits while the player is alive, cancels it and parks the original object in a CopyOnWriteArrayList. A timer gated on the WAIT setting (default 15 seconds, range 5-30) then flushes a randomly sized prefix of the buffer through sendPacketNoEvent, which bypasses the event bus so a flushed echo is never re-intercepted, and caps every flush with a fabricated C00PacketKeepAlive carrying the fixed key 10000.",
+  "sections": [
+    {
+      "h": "Buffer and flush cycle",
+      "p": "The park branch fires for every outgoing C00 while the player is alive: the packet object itself is appended to packetList and the event is cancelled, so the vanilla echo never reaches the wire at its natural time. The flush branch is a true period, not a latch: timer.delay(1000 * WAIT) with timer.reset() at the end of the branch, so the cycle repeats every WAIT seconds. The flush sends a random 0-10 of the parked echoes (MathUtils.getIncremental rounds a uniform 0-10 value to a whole number) before the fixed fake keepalive, and sendPacketNoEvent routes each replay straight to the network manager, keeping it out of the module's own event stream. CopyOnWriteArrayList makes the remove-during-iteration safe."
+    },
+    {
+      "h": "Server-side ping accounting",
+      "p": "The fork's vanilla NetHandlerPlayServer.processKeepAlive (line 1044) only updates the player's ping when the echoed key equals the single stored key field_147378_h, folding the elapsed time as ping = (ping * 3 + elapsed) / 4; any other key is silently dropped with no kick. The server issues a fresh S00PacketKeepAlive every 40 network ticks (update() line 150, key = the send-time millis) and overwrites the stored key, so at the default 15-second WAIT only echoes still holding the current key can update the ping when the flush lands. The older parked echoes and the fabricated key-10000 packet are inert on a stock server; the module's real effect is inflating the measured round trip for the surviving echo, and the fake packet exists purely as noise for servers that count keepalives instead of matching keys."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "Every flush concentrates up to 11 C00 packets in a single tick after a 5-30 second silence, the opposite of the vanilla one-echo-per-2-seconds pattern. The fabricated key 10000 repeats on every flush, so an id-tracking server sees a duplicate unexpected reply at a fixed cadence, and a ledger server sees replies arriving seconds after their requests. The module never touches the C0F transaction stream, so the transaction round-trip ledger stays fast while the keepalive ledger is inflated; that divergence between the two ping estimates is the tell the dedicated ping checks are built around."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive",
+    "C0FPacketConfirmTransaction"
+  ],
+  "files": [
+    {
+      "label": "PingSpoof.java",
+      "rel": "info/sigmaclient/module/impl/other/PingSpoof.java",
+      "explanation": "The module is the whole mechanism: the EventPacket handler parks every outgoing C00 while the player is alive and cancels it, the timer period decides when the flush runs, and the flush drains a random prefix of the buffer through sendPacketNoEvent before injecting C00PacketKeepAlive(10000). The WAIT setting is the only configuration, converted to milliseconds inside timer.delay. The fake packet is constructed with the hardcoded key 10000, which never matches a server-issued key (the server's keys are send-time millis values), so on vanilla it is dropped at the key comparison while on NCP it registers as an unexpected reply.\n\nThe CopyOnWriteArrayList is the carrier for the parked echoes: each entry is the original C00 object, so its key survives unchanged and a server that still tracks that request accepts the late reply and measures the inflated round trip. The random 0-10 flush count keeps the pattern from being perfectly periodic, and timer.reset() at the end of the branch makes the gate a true repeating period rather than the one-shot latch seen in the sibling AutoSoup."
+    },
+    {
+      "label": "EventPacket.java (direction guard)",
+      "rel": "info/sigmaclient/event/impl/EventPacket.java",
+      "explanation": "EventPacket is the wrapper the module hooks: NetworkManager.sendPacket fires fire(packet, true) for every serverbound packet and the channel read path fires fire(packet, false), so isOutgoing() distinguishes the two directions. PingSpoof gates its park branch on isOutgoing() and instanceof C00PacketKeepAlive, which is what keeps the flush from re-parking: the replay goes through sendPacketNoEvent straight to the network manager, never through the event dispatch, so the buffer drains without re-entering the handler.\n\nThe class also shows the pre/post split (fire(packet, outgoing) sets pre true, the single-argument overload sets it false), the mechanism that lets other Sigma modules mutate packets in the pre phase before serialization. For PingSpoof the relevant surface is the outgoing flag and the cancelable event, since the module cancels instead of mutating."
+    }
+  ],
+  "countering": [
+    {
+      "label": "PingSpoofB (keepalive vs transaction divergence)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofB.java",
+      "explanation": "PingSpoofB compares the two ping estimates Frequency maintains. keepAlivePing is the S00-to-C00 round trip: ConnectionManager.onKeepAlive looks up the echoed identification in the map of outstanding keepalive send times and stores now minus that timestamp. transactionPing is the C0F round trip measured the same way. The check runs on every C03 movement packet and fails when keepAlivePing exceeds transactionPing by more than 50ms, with the standard exemptions (lag, teleport, TPS, chunk) and a 10-tick post-join grace absent.\n\nSigma's PingSpoof inflates exactly the number this check keys on. The parked echoes keep their original keys, so the id lookup still succeeds when a replay lands, and the measured keepAlivePing becomes the 5-30 second delay instead of tens of milliseconds. transactionPing is untouched because the module never delays C0F transactions, which stay at their normal sub-100ms round trip. The divergence is seconds, orders of magnitude beyond the 50ms threshold, so the check fails on the first movement packet after a flush and on every flush thereafter. This is the direct counter to the module's core mechanism."
+    },
+    {
+      "label": "KeepAliveFrequency (keepalive id ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java",
+      "explanation": "NoCheatPlus replaces vanilla's accept-any-echo keepalive model with an id-tracked ledger. The ProtocolLib KeepAliveAdapter records every outgoing S00 id into NetData.keepAliveRequests with a 30-second age limit and a 40-entry cap, and recordKeepAlivePacket matches each incoming C00 against it. A reply that matches a still-pending request sets keepAliveExpectedResponse and the check bails, which means the module's delayed echoes pass as long as their ids are still live in the ledger. A reply with no pending request is counted into keepAliveFreq, a 1-second-bucket ActionFrequency, and the newest bucket scoring above 1f (2f without the duplicate-id path) triggers a violation with cancel actions from vl>10.\n\nThe fabricated key-10000 packet is the module's self-inflicted wound on this ledger: id 10000 never matches a server-issued request, so every flush counts an unexpected reply, and because the same key repeats on every flush the duplicate-id flag tightens the newest-bucket limit to 1f. Any flush that delivers a second counted reply in the same second trips the violation: an echo whose request aged past 30 seconds at the maximum WAIT setting, a request cleared by a world change or rejoin, or an overflow past the 40-entry cap. The default 15-second single-echo pattern sits inside the ledger's tolerance, so this check scores the burst and maximum-delay configurations rather than the benign default."
+    },
+    {
+      "label": "PingSpoofA (transaction vs keepalive divergence)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofA.java",
+      "explanation": "PingSpoofA is the mirror check in the same pair: it fails when transactionPing exceeds keepAlivePing by more than 50ms under the same exemptions. That direction is the signature of the C0F-delay family, clients that cancel or park transaction confirmations so the transaction round trip inflates while keepalives stay honest, which is how transaction-buffering disabler modes on other clients present. Sigma's PingSpoof moves the keepalive side instead, so the inequality runs the wrong way and this check never fires against it.\n\nThe entry is included as the honest boundary of the pair: the two checks together cover both directions of ping divergence, and a server running the pair catches a client that delays either ledger. Against this specific module PingSpoofB is the live half and PingSpoofA is the dormant sibling, which is the detail an admin needs to know when reading a flag report."
+    },
+    {
+      "label": "NegativeTimer (movement clock, slow direction)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/NegativeTimer.java",
+      "explanation": "Grim's NegativeTimer punishes a client whose movement packets arrive slower than the expected tick rate: it seeds a real-time balance from the clock-drift allowance (default 1200ms) and, on each prediction completion, flags when the player's movement clock falls more than the drift behind real time, then re-seeds the balance. The ledger is driven entirely by the movement and transaction stream, not by keepalives. Sigma's PingSpoof never touches C0F and never pauses the movement stream, so the player's movement clock advances normally and the balance never goes negative; the delayed C00 echoes are outside the check's accounting entirely.\n\nThe honest conclusion is that no Grim check in the corpus scores C00 ping spoofing: the timer family guards the transaction side of the protocol, which is exactly the side this module leaves alone. The entry documents that boundary so the countering picture is complete: the module's surface is the keepalive stream, and the checks that live there are the Frequency pair and the NCP ledger."
+    }
+  ]
+}

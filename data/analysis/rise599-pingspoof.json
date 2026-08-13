@@ -1,0 +1,63 @@
+{
+  "module": "PingSpoof",
+  "client": "Rise 5.99",
+  "category": "pingspoof",
+  "source_rel": "dev/rise/module/impl/other/PingSpoof.java",
+  "overview": "PingSpoof is a park-and-release buffer for the two reply packets the server uses to measure latency: onPacketSend intercepts every C00 keepalive echo and every C0F transaction confirmation, stores the packet in a ConcurrentHashMap with an absolute release deadline (the Delay setting, 10 to 30000 ms, default 1000), and cancels the original send. onPreMotion walks the map and pushes expired entries back through PacketUtil.sendPacket. The buffer is cleared on disable and on world change, and an S08 receive handler resets a TimeUtil that is never read, so that branch is dead code. The critical detail is the release path: the flush goes through the evented send queue, and on this fork the send event fires inside the network dispatch before the write, with a cancelled event suppressing the write. The client's own convention (Blink, Speed Timer Bypass) is to flush with sendPacketWithoutEvent precisely to avoid re-buffering; PingSpoof does not, so each released C00 or C0F re-enters onPacketSend, is re-parked with a fresh deadline and cancelled, and never reaches the wire while the module stays enabled.",
+  "sections": [
+    {
+      "h": "Park-and-release design",
+      "p": "Every C0F or C00 that the vanilla code produces is intercepted once: the packet object becomes the map key, the deadline is System.currentTimeMillis plus the delay setting, and the event is cancelled so nothing is written. The flush in onPreMotion iterates the map, sends every entry whose deadline has passed and removes it. Because the map is keyed on the packet instance, a given reply is parked at most once per vanilla emission. onDisable and onWorldChanged both clear the map outright, which drops any still-parked replies, and the S08 branch merely resets the timer field that nothing ever reads, so the intended teleport-sync logic is inert."
+    },
+    {
+      "h": "Release path re-entry",
+      "p": "The flush calls PacketUtil.sendPacket, which routes through addToSendQueue and the network dispatch, the same path every other send takes. The sibling Rise 6.1.30 fork shows the seam: NetworkManager.dispatchPacket constructs the send event, runs the module bus, and returns without writing when the event is cancelled. Rise 5.99 modules that buffer packets all flush through sendPacketWithoutEvent for exactly this reason, and PingSpoof is the exception. The consequence is a self-defeating cycle: the released C00 or C0F is re-intercepted in onPacketSend, gets a fresh deadline of now plus delay, and is cancelled again, so no delayed reply is ever actually sent. The server simply stops receiving keepalive echoes and transaction confirmations for as long as the module is enabled, and a stock server eventually times out a client that never answers keepalives."
+    },
+    {
+      "h": "Server-side footprint",
+      "p": "With the module enabled the observable is silence on two channels: no C00 replies and no C0F replies arrive, so the server's measured ping never inflates (there is no late reply to measure), pending keepalive requests age out, and any anticheat transaction bookkeeping stays open. Toggling the module off clears the buffer and the next vanilla replies flow normally, which is why the footprint is a gap rather than a stream. The intended design, had the flush bypassed the event bus, would be a uniform delay applied to both reply classes, with the S08 reset marking teleport boundaries; the re-entry defect turns that design into a canceller."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive",
+    "C0FPacketConfirmTransaction"
+  ],
+  "files": [
+    {
+      "label": "PingSpoof.java",
+      "rel": "dev/rise/module/impl/other/PingSpoof.java",
+      "explanation": "The module holds the entire mechanism: a ConcurrentHashMap of parked replies with deadlines, a cancel branch for C00 and C0F in onPacketSend, a deadline sweep in onPreMotion, and clears on disable and world change. The Delay setting (10 to 30000 ms) sets the park time, and the same delay applies to both reply classes. The S08 handler and its TimeUtil reset are the dead part of the file: timer is written but never queried, so the teleport-sync intent has no effect. The sweep re-sends through PacketUtil.sendPacket, the evented path, which is the module's defining flaw: the released packet re-enters the cancel branch on this fork's send dispatch and is re-parked, so the delayed replies never leave the client."
+    },
+    {
+      "label": "PacketUtil.java (flush path)",
+      "rel": "dev/rise/util/player/PacketUtil.java",
+      "explanation": "The utility the flush depends on. sendPacket calls addToSendQueue, the normal evented path that runs the module bus before the packet is written, which is why a flushed C00 or C0F can be re-intercepted by PingSpoof's own onPacketSend. sendPacketWithoutEvent is the sibling that bypasses the bus, the one every other Rise 5.99 buffer-and-flush module (Blink, Speed Timer Bypass) uses to avoid exactly this re-entry. The class also carries receive helpers used by other modules and a TimedPacket holder that mirrors the park-and-deadline idea, but PingSpoof does not use it; the choice of sendPacket over sendPacketWithoutEvent is the whole difference between a working ping delay and a permanent reply canceller."
+    }
+  ],
+  "countering": [
+    {
+      "label": "KeepAliveFrequency (keepalive reply ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java",
+      "explanation": "NoCheatPlus replaces accept-any-echo keepalive handling with an id ledger: the ProtocolLib adapter stores every outgoing S00 id in NetData.keepAliveRequests (pruned after 30000 ms, capped at 40 pending), and each incoming C00 is matched against it. A reply with a pending request sets the expected-response flag and is not counted; a reply with no pending request or a duplicate id is counted, and every reply is timestamped into an ActionFrequency(20, 1000) bucket window, with the newest-second bucket flagging above 1f. The module's actual behavior sends no replies at all, so the accumulator scores zero and the requests simply age out: the ledger is silent against pure suppression, which is its honest limit. Any reply that does leak through (a flush racing a disable, a C00 queued before the module toggled on) arrives after its request aged out and is counted as unexpected, which is the failure mode the check was built for."
+    },
+    {
+      "label": "PingSpoofA (transaction ping above keepalive ping)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofA.java",
+      "explanation": "Frequency's transaction-ping diverge check: on every flying packet, if transactionPing exceeds keepAlivePing by more than 50 ms the player fails, with exemptions for lag, teleporting, low TPS and chunk loading, and a 10-tick grace after join. The check is aimed at clients that delay transaction replies more than keepalive replies, which inflates the transaction measurement. PingSpoof parks both reply classes with the same delay, and in the working design the two measurements would inflate together, leaving only the tick-quantized flush skew (roughly one 50 ms client tick) at the threshold edge. With the re-entry defect both streams are suppressed, so transactionPing and keepAlivePing freeze at their pre-enable values and the divergence never appears. Either way the check stays silent; its value is the boundary it draws for asymmetric spoofs."
+    },
+    {
+      "label": "PingSpoofB (keepalive ping above transaction ping)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/pingspoof/PingSpoofB.java",
+      "explanation": "The mirror of PingSpoofA: it fails when keepAlivePing exceeds transactionPing by more than 50 ms, covering clients that inflate only the keepalive side. The module's symmetric park keeps both measurements equal in theory and frozen in practice, so the check never sees the divergence it exists to catch. It still matters as the second half of the pair: a one-sided implementation (delay only C00, or only C0F) would trip exactly one of the two, and an anticheat admin reading both flags gets a fingerprint of which reply class a spoof touches. Against Rise's module the honest outcome is a pass, and the 50 ms threshold is the exact size of the client-tick skew the flush would introduce if it worked."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "The movement-rate check invoked from MovingListener on every processed C03-family move, scoring each move into an ActionFrequency window against the 22 packets per second ceiling plus a half-second burst path. It is content-blind to C00 and C0F by construction: only flying packets feed the accumulator, so a module that delays or suppresses keepalives and transactions adds no movement traffic and the check never fires. The brief-pinned relevance is indirect: the module neither increases nor bursts the C03 stream, so MorePackets is an honest non-counter whose mechanism still bounds what a ping spoof can do on the side, and any future variant that also parks movement packets would face the window and burst paths directly."
+    }
+  ]
+}

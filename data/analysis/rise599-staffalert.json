@@ -1,0 +1,63 @@
+{
+  "module": "StaffAlert",
+  "client": "Rise 5.99",
+  "category": "staffalert",
+  "source_rel": "dev/rise/module/impl/other/StaffAlert.java",
+  "overview": "StaffAlert polls the Hypixel public punishment-stats API and notifies the user how many players were staff-banned since the previous poll. It needs an API key, which it bootstraps over the game connection: onPacketReceive watches S02 chat for the exact prefix \"Your new API key is \", and while apikey is still null the update handler re-issues C01 /api new on every tenth tick (a 2 per second command stream gated on Hypixel, 40 ticks after join, client tick counter modulo 10). Once a key is captured the poll runs on a worker thread: an HttpURLConnection GET to the punishmentstats endpoint, a line-by-line parse gated on the substring \"true\", a staff_total diff against the previous sample, and a warning notification when the diff is positive. The module hides itself off Hypixel and auto-toggles with a notification when it finds itself off the server. The S02 observation and the HTTP request are both invisible to the game server; the only wire presence is the C01 command stream.",
+  "sections": [
+    {
+      "h": "API key bootstrap",
+      "p": "The key-grab loop is the module's only serverbound traffic. Every tenth client tick, with ticksExisted at least 40, on a Hypixel server, while apikey is null, the handler resets the timer and sends C01PacketChatMessage(\"/api new\"). The key is then captured from the first S02 whose unformatted text starts with the exact prefix \"Your new API key is \", with the remainder stored into the static apikey field and a client-side confirmation message printed. The capture depends on the server replying with that exact prefix; if the reply differs (localization, a chat prefix) the loop keeps running at 2 per second indefinitely."
+    },
+    {
+      "h": "Polling and diff logic",
+      "p": "The poll fires when the TimeUtil gate hasReached(delay seconds) or on the first update (lastTimeAmountOfBans is -1), and runs on a fresh thread so the game tick never blocks. The request sets a Firefox user agent, reads the response line by line, and only parses lines containing the substring \"true\" (a sloppy gate that survives because the JSON payload is usually a single line), pulling staff_total from the parsed object. The diff against the previous sample drives the notification, which pluralizes player vs players and formats the window as seconds. A failed request prints a stack trace and, when a key exists, a failure notification. onEnable resets the sample and the timer so a re-enable always polls immediately."
+    },
+    {
+      "h": "Wire footprint",
+      "p": "Everything except the key bootstrap happens off the game connection: the S02 watch consumes an existing chat packet, and the API poll is a plain HTTPS request from the client's JVM. The server therefore only ever sees the /api new command stream, which stops the moment the key lands, plus the module's own chat output if the user has the notifications mirrored. The practical exposure is the command rate during the bootstrap window and the fact that the module announces its presence to anyone reading chat logs when the key is fetched."
+    }
+  ],
+  "packets": [
+    "S02PacketChat",
+    "C01PacketChatMessage"
+  ],
+  "files": [
+    {
+      "label": "StaffAlert.java",
+      "rel": "dev/rise/module/impl/other/StaffAlert.java",
+      "explanation": "The module is one file and the analysis surface is complete in it. onPacketReceive captures the API key from S02 chat; onUpdate runs the key-bootstrap loop, the Hypixel gating with auto-toggle, and the timer-gated poll that spawns the HTTP thread; the thread performs the GET, the \"true\" substring gate, the staff_total diff and the notification. The JSON parsing is inline (JsonParser over the response line), the delay setting is a NumberSetting in seconds (1 to 120, default 60), and the hidden flag is maintained per-GUI-update so the module only shows on Hypixel. The class is a self-contained poller with one packet-emitting branch, the C01 command loop."
+    },
+    {
+      "label": "TimeUtil.java (poll gate)",
+      "rel": "dev/rise/util/math/TimeUtil.java",
+      "explanation": "The wall-clock helper that gates the polling cadence: timer.hasReached(delay * 1000) turns the module's Delay seconds setting into the interval between API polls, and timer.reset() in onEnable, in the key-bootstrap branch and after each poll keeps the gate aligned. The class is the standard Rise time helper with lastMS state, convertToMS, getCurrentMS and hasReached style methods, and notably carries HWID and HTTP imports, a leftover of the client's licensing path, unrelated to the poll logic. It matters here because the module's two clocks are different animals: the poll uses this real-time gate, while the key-bootstrap loop counts client ticks with ticksExisted modulo 10, which is why the bootstrap can fire at 2 per second while the poll respects the seconds setting."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Commands (command rate check)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/chat/Commands.java",
+      "explanation": "NoCheatPlus scores '/'-prefixed chat on PlayerCommandPreprocessEvent: each command adds weight 1.0 to a 5-bucket ActionFrequency(5, 1000) window and to a short-term weight inside a tick window, and the violation is the larger of (window score minus commandsLevel, short-term weight minus commandsShortTermLevel) with stock levels 10 and 3 over 18 ticks. The module's bootstrap loop emits exactly one command per 10 client ticks, which is 2 per second, so the 5-second window scores exactly 10 and the short-term weight stays at 2: the loop runs precisely at the stock boundary and passes by default. It becomes a real counter the moment the cadence tips over, which happens when the key never lands and any additional command traffic (or an admin-lowered level) pushes the window score past 10, or when server lag resets the short-term window mid-burst and re-accumulation crosses 3."
+    },
+    {
+      "label": "Captcha (chat gate, auto-armed)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/chat/Captcha.java",
+      "explanation": "The captcha gate activates automatically from the Commands path: with captchaSkipCommands off, a commands violation arms shouldCheckCaptcha and the next command must match the generated captcha string exactly, with wrong answers incrementing captchaVL toward the configured actions. The module's bootstrap loop is a perfect feeding machine once armed: it keeps sending /api new on its tick cadence, the client has no captcha-reply logic anywhere, so every answer is wrong and the violation climbs. The honest caveat is the same as the Commands boundary: at stock levels the loop scores exactly at the threshold, so captcha arms only in the failure mode where the key never arrives or the level is lowered."
+    },
+    {
+      "label": "Text (chat content and frequency)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/chat/Text.java",
+      "explanation": "The content-scoring check runs on AsyncPlayerChatEvent, which Bukkit never fires for '/'-prefixed messages, so the module's only serverbound traffic (the /api new stream) is invisible to Text by construction. The S02 side is receive-only: the module consumes an existing chat packet and sends nothing, so no content check can observe the key capture either. Text is therefore an honest boundary that defines what the module does not expose: had the bootstrap sent bare chat instead of a command, the upper-case and letter-ratio scores, the 8000 ms repeat-similarity test and the frequency accumulators would all apply to it."
+    },
+    {
+      "label": "ChatEvent (Spartan dispatch shim)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/ai/idealistic/spartan/listeners/bukkit/standalone/ChatEvent.java",
+      "explanation": "Spartan's only chat hook in the corpus is a Bukkit dispatch shim: ChatEvent listens to AsyncPlayerChatEvent at HIGHEST priority and routes the event into the check runner, with no chat-content or command-rate analysis in the clone. The '/'-prefixed /api new traffic does not even reach it, since commands fire PlayerCommandPreprocessEvent. Its value is the exposure surface it points to: the Bukkit event chain is where moderation plugins and server-side command logging see the key bootstrap, which is the only part of the module a server can ever observe."
+    }
+  ]
+}

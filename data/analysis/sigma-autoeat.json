@@ -1,0 +1,63 @@
+{
+  "module": "AutoEat",
+  "client": "Sigma 4.11",
+  "category": "autoeat",
+  "source_rel": "info/sigmaclient/module/impl/player/AutoEat.java",
+  "overview": "Sigma's AutoEat is a one-shot eater that routes through the hotbar instead of the inventory window. On every EventUpdate, when a hotbar slot holds an ItemFood, the player's food level is below twice the LEVEL setting (default 8.5, so an integer threshold of 16 out of 20), and the player is collided vertically, it queues C09PacketHeldItemChange to the food slot, C08PacketPlayerBlockPlacement with the food stack (the use-item constructor), 32 positionless C03PacketPlayer(false) packets, then calls stopUsingItem() locally and queues C09 back to the previously held slot. There is no timer gate: the whole sequence re-fires every tick while the condition holds, so the packet flood is the module's true fingerprint.",
+  "sections": [
+    {
+      "h": "The eat sequence",
+      "p": "The C08 uses the single-argument ItemStack constructor, which serializes the use-item form (origin position, face 255) so the server starts an item use with the food in hand; the two C09 packets bracket it, switching to the food slot and back inside the same tick. The 32 C03s are positionless with onGround false, so they only flip the ground flag. stopUsingItem() is called directly on the entity, bypassing PlayerControllerMP.onStoppedUsingItem, so no C07 release packet is emitted: the server-side use simply runs its fixed 32-tick timer and completes the eat on its own schedule."
+    },
+    {
+      "h": "Routing family",
+      "p": "AutoEat is the C09-routed member of Sigma's eater family. The sibling AutoSoup routes through the inventory window instead: its swap() calls playerController.windowClick(0, slot, 6, 2), the mode-2 swap-with-hotbar click that emits one C0EPacketClickWindow, then C09(6), C08(current item) and C09(restore). AutoEat drops the window click entirely and addresses the food slot directly with C09, which changes the countering surface completely: no window clicks means the window-click rate checks never see it, and the same-tick C09 pair becomes the tell."
+    },
+    {
+      "h": "Cadence and server-side reality",
+      "p": "The gate re-arms every tick because nothing in the handler records a fire time: as long as the food level sits below 16 and the player stands on ground, each EventUpdate queues the full C09, C08, 32x C03, C09 sequence, so a single eat episode sustains roughly 32 C03s per tick for the duration of the server-side 32-tick use. The server-side eat cannot actually be accelerated: the use completes on the fixed 32-tick item-in-use timer regardless of the client's packets, so the module's observable effect is the flood and the slot pair, not a faster heal."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoEat.java",
+      "rel": "info/sigmaclient/module/impl/player/AutoEat.java",
+      "explanation": "The module file is the full sequence: getFoodSlotInHotbar scans slots 0-8 for the first ItemFood, the gate combines the food level threshold (twice the LEVEL setting, integer-truncated) with isCollidedVertically, and the body queues C09(food), C08(stack), 32x C03(false), stopUsingItem() and C09(restore) in one EventUpdate. The C08 uses the ItemStack constructor, the use-item form that starts a server-side item use without a block target.\n\nThe absence of any Timer or cooldown field is the key fact: the handler re-fires every tick while the gate holds, so the 32-packet flood repeats per tick rather than per eat. The LEVEL setting is the only configuration, and the intValue() truncation turns the 8.5 default into the 16-of-20 threshold."
+    },
+    {
+      "label": "AutoSoup.java (sibling routing contrast)",
+      "rel": "info/sigmaclient/module/impl/combat/AutoSoup.java",
+      "explanation": "AutoSoup is the sibling eater that chose the other routing mechanism: swap() calls playerController.windowClick(0, slot, 6, 2), which emits one C0EPacketClickWindow per cycle to move the soup into hotbar slot 6, then C09(6), C08(current item) and C09(restore). The contrast is the whole point of the file for this analysis: AutoEat and AutoSoup do the same job, but the C0E window click versus the direct C09 switch changes which anticheat checks can see them.\n\nThe file also carries the family's dead pieces: the Timer is delay-gated but never reset, so after construction-time milliseconds elapse the gate returns true every tick and the module cycles at roughly 20/s regardless of the 350ms DELAY default, and the DROP setting is registered but never read. AutoEat's handler has no such latch, but the same dead-setting pattern appears as the CLICKSPEED constant in the sibling FastPlace."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ItemSwitchSpeed (same-tick switch-back)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/item/ItemSwitchSpeed.java",
+      "explanation": "ItemSwitchSpeed punishes a held-slot change that follows an item-use interaction too closely: after an InteractWorldEvent or InteractItemEvent arms the usedSomething flag, a C09 arriving with currentTick minus lastSwitchTick below minSwitchTicks (default 1) is punished. Hawk's own packet listener raises those interaction events from the serverbound C08 stream, so the module's direct C08 send arms the check regardless of the client-side call path.\n\nAutoEat sends both C09s in the same tick as the C08: the switch to the food slot and the restore both land at a delta of 0 ticks from the interaction, below the 1-tick minimum, so every cycle is punished. This is the same verdict the C09-routed eaters get on Hawk: same-tick restore is the losing pattern, while a one-tick-delayed restore would scrape by at the default threshold. The module's choice to restore in the same EventUpdate is what makes the check decisive."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets scores every processed movement packet into 500ms buckets against a 22-per-second window with a half-second burst path at 15 packets and a direct-violation threshold of 10. AutoEat's 32 positionless C03s arrive in a single tick, so the newest bucket scores 32 against a direct threshold of 10: the violation fires on the first eat tick, and because the sequence re-fires every tick while the food level is low, the window accumulator stays pinned at several times the ceiling for the whole episode.\n\nPositionless packets count identically to position-bearing ones, so the flood cannot hide by omitting coordinates. On any server running the check with its default actions this is a self-kick configuration: the module produces more packet rate in one tick than the burst path allows, independent of the movement it claims."
+    },
+    {
+      "label": "FastConsume (consume duration, conditional)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/inventory/FastConsume.java",
+      "explanation": "FastConsume is Arc v2's consume-duration ledger: it stamps consumeTime on the right-click use of an edible item and fails when the PlayerItemConsumeEvent arrives within consume-time (1280ms), the signature of an instant-consumption client. On a vanilla 1.8 server the eat completes on the fixed 32-tick use timer, about 1600ms, so the consume event lands after the 1280ms window and the check stays silent; the module's local stopUsingItem() changes nothing server-side because it emits no packet.\n\nThe gap is conditional by design: the check bites exactly on the instant-consumption server model, which is the environment these eaters are built for, and stays silent on vanilla pacing. For AutoEat the honest reading is that FastConsume cannot score the module on a stock server, and the module's real exposure is the packet flood the other two checks read."
+    },
+    {
+      "label": "FastClick (window click rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "FastClick is NCP's window-click rate check: it scores C0E click traffic through ActionFrequency windows (a 15-per-second normal window and tighter short-term buckets) and is invoked from the inventory listener on every click packet. AutoEat never sends a C0E: the food slot is addressed with C09 held-slot changes, so no window click ever reaches the ledger and the check is structurally blind to the module.\n\nThe miss is a documented property of the C09-routed eater family, the same reason the C0E-swapping sibling AutoSoup trips FastClick while AutoEat does not. The distinction belongs in the countering picture because it decides which of the two Sigma eaters a given server setup actually catches: window-click rate for AutoSoup, slot-switch timing and packet flood for AutoEat."
+    }
+  ]
+}

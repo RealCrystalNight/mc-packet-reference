@@ -1,0 +1,52 @@
+{
+  "module": "Disabler",
+  "client": "Spicy",
+  "category": "disabler",
+  "source_rel": "info/spicyclient/modules/player/Disabler.java",
+  "overview": "Spicy's Disabler is a Hypixel-targeted packet cocktail with three live ingredients and one dead one. Every update tick it builds a PlayerCapabilities with isFlying, allowFlying and isCreativeMode all true and a fly speed drawn randomly from 0.1 to 9.0 (vanilla's cap is 0.05), sends it as C13PacketPlayerAbilities through sendPacketNoEvent so the module's own send interception cannot see it, and doubles the send while Spicy's Fly module is enabled. Every outgoing C0FPacketConfirmTransaction is buffered and cancelled, then replayed one per update once a 500-1250ms timer fires, so confirmations arrive late with their original window and uid. Every C0CPacketInput is cancelled outright. The keepalive branch, which would cancel C00PacketKeepAlive echoes, is entirely commented out, and the buffer is flushed at once on disable and cleared on C00 handshake and S00 disconnect.",
+  "sections": [
+    {
+      "h": "Abilities spam",
+      "p": "The EventUpdate pre handler fabricates a PlayerCapabilities each tick: isFlying and allowFlying true, isCreativeMode true, and a fly speed from Math.random() scaled to 0.1-9.0, far beyond the 0.05 the protocol permits. It is sent via NetworkManager.sendPacketNoEvent, which pushes the packet straight to the wire without firing the module's own EventSendPacket, so the spam never re-enters the interception logic. Vanilla NMS only honors the isFlying claim when the player is already in creative mode, so on a survival server the per-tick C13s are inert; the module's purpose is Hypixel's custom flying detection, where the constant re-assertion of flight and the absurd fly speed are meant to desynchronize the anticheat's ability state."
+    },
+    {
+      "h": "Transaction delay",
+      "p": "Every C0F is captured in the static C0FPackets list and cancelled, and the EventUpdate handler drains it at a rate of one packet per 500-1250ms (ping.hasTimeElapsed(500 + random(750), true) then sendPacketNoEvent(C0FPackets.remove(0))). The replays keep the original window id and uid, so the server's processConfirmTransaction matches them against its ledger and accepts the confirmations late, which inflates the round-trip measurements servers use for ping- and timer-based tolerance. onDisable flushes the entire backlog in one sendPacketNoEvent loop, and the buffer is cleared on S00PacketDisconnect and on C00Handshake, so a fresh connection starts empty."
+    },
+    {
+      "h": "Input and keepalive handling",
+      "p": "Every C0CPacketInput is cancelled in the send handler, so the server never receives the client's per-tick input state (strafe, forward, jump, sneak); vanilla ignores C0C for players not riding, which is why the cancel is safe on foot. The C00PacketKeepAlive branch is fully commented out, including a buffered keepalive-cancel variant: in the shipped build keepalives pass through untouched, and the import plus the dead code are the only reason C00 appears anywhere in the module. onEnable posts a 'Relog for the disabler to take effect' notification and resets the watchdog flag, signalling that the module's state only becomes coherent on a fresh connection."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive",
+    "C0FPacketConfirmTransaction"
+  ],
+  "files": [
+    {
+      "label": "Disabler.java",
+      "rel": "info/spicyclient/modules/player/Disabler.java",
+      "explanation": "Three static fields carry the module's state: the watchdog flag, the C0FPackets buffer, and the ping Timer. onEnable arms the notification and clears watchdog; onDisable replays every buffered C0F through sendPacketNoEvent and clears the list, which is the one place the backlog becomes a burst. EventUpdate pre is the abilities spam and the C0F drain, EventPacket pre clears the buffer on S00 disconnect, and EventSendPacket pre owns the C0F capture, the C0C cancellation, and the buffer clear on C00Handshake.\n\nThe commented-out lines are the interesting archaeology: the C0F branch has experimental rewrites (window id Short.MAX_VALUE, random accepted flag, Integer.MIN_VALUE window) all disabled in favor of the plain buffer-and-replay, and the keepalive branch has a cancelled-echo variant commented out, leaving C00 untouched in the live build. The double-C13 send when SpicyClient.config.fly.isEnabled() is the module's only coupling to another module, and it exists because the disabler's whole job is to make the Fly module's server-side state believable."
+    }
+  ],
+  "countering": [
+    {
+      "label": "KeepAliveFrequency (keepalive ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java",
+      "explanation": "NoCheatPlus replaces vanilla's accept-any-echo keepalive model with an id-tracked ledger. The ProtocolLib KeepAliveAdapter records every outgoing S00 id into NetData.keepAliveRequests and matches each incoming C00 against it (KeepAliveAdapter lines 73-104, NetData lines 290-341), and KeepAliveFrequency checks every reply: data.keepAliveFreq, an ActionFrequency(20, 1000) (NetData line 150), scores one point per reply, the newest second's bucket is compared against a first-bucket limit (2f normally, tightened to 1f for duplicate ids, lines 85-96), and the full 20-second window score is compared against the bucket count (lines 50-58), with a modeled-boundary-burst exemption for tiny monotonic id runs (lines 63-83).\n\nThis is the check that governs the technique the module's commented-out keepalive branch implements: were the cancelled-echo variant re-enabled, every suppressed echo would be an unexpected reply or a duplicate id once the request aged out or the replay lagged, feeding the frequency counters and tripping the duplicate-id path, which forgives nothing. The shipped build sends its keepalives untouched and replays no echoes, so it sails past this check; the ledger still matters to the module's design because the C00Handshake buffer clear and the relog requirement exist precisely because the C0F delay scheme must not survive across connections."
+    },
+    {
+      "label": "AbilitiesEvent and HawkPlayer.setFlying (server-state gate)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/HawkPlayer.java",
+      "explanation": "Hawk gates the client's flying claim on server-granted state. PacketConverter7 and PacketConverter8 convert every C13 into an AbilitiesEvent whose flying field is packet.isFlying() AND p.getAllowFlight() (PacketConverter7 line 277, PacketConverter8 line 306), so a flying claim is only recorded when the server has already granted allow flight. HawkPlayer.setFlying adds a second guard: if the player is not allowed to fly, the flying state is refused outright (HawkPlayer lines 1092-1096), and the server-side abilities handler keeps allowedToFly and inCreative synced from the S39 the server actually sent (HawkPlayer lines 171-173).\n\nThe module's per-tick C13 spam with isFlying true is therefore inert against Hawk: on a survival player the server never granted allow flight, so the claim never reaches Hawk's flying state, and every movement check that keys off pp.isFlying() (Fly, Speed, FastFall and the rest) keeps judging the player as a grounded survival player. The random 0.1-9.0 fly speed never factors in either, because Hawk's expected-speed math reads the server-side fly speed from the Bukkit player, not from the client's C13. The spoof cannot change what the server measured, so the disabler's only server-visible effect against Hawk is the extra C13 traffic itself."
+    },
+    {
+      "label": "PacketFrequency (global client-packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/PacketFrequency.java",
+      "explanation": "NCP's CatchAllAdapter (NCPCompatProtocolLib, checks/net/protocollib/CatchAllAdapter.java) subscribes to every Play.Client packet type at LOWEST priority and runs packetFrequency.check on each one, scoring every incoming client packet into data.packetFrequency and comparing the per-second rate against packetFrequencyPacketsPerSecond, default 300 (DefaultConfig line 569, with the comment noting legit 1.8 clients can reach 200). A violation cancels the packet (PacketFrequency lines 47-63, CatchAllAdapter lines 70-92).\n\nThis is the only ledger among NCP, Arc v2 and Hawk that counts the module's traffic at all: none of the three parse C0F content, so the delayed-confirmation technique itself is unopposed by this pool. What the ledger does see is the volume. The on-disable flush replays the entire C0F backlog in one tick, and with the Fly module enabled the abilities spam doubles to two C13s per tick; a long session with heavy window interaction can accumulate a backlog large enough that the flush registers as a multi-hundred-packet second, approaching the 300/s ceiling that is otherwise only reached by crash-flood clients. The default actions escalate to a kick, which turns the module's own clean-up routine into its most detectable moment."
+    }
+  ]
+}

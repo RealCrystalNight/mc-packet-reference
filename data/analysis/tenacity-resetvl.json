@@ -1,0 +1,66 @@
+{
+  "module": "ResetVL",
+  "client": "Tenacity 6.0",
+  "category": "resetvl",
+  "source_rel": "dev/tenacity/module/impl/exploit/ResetVL.java",
+  "overview": "Tenacity's ResetVL is a bounded hop-and-timer burst that runs for exactly 25 ground hops and switches itself off. While the counter is under 25, every on-ground tick sets motionY to 0.11, re-pins the client's Y to the position captured at enable, and drives the vanilla tick multiplier to 2.25, so the client executes 2.25 ticks per real tick and every tick-driven outgoing cadence compresses to 2.25 times its real-time rate. The server sees rapid, small vertical moves at an accelerated rate — the movement stream it integrates runs faster than real time, and the keepalive echo (C00) and its latency measurement ride the same accelerated clock. After 25 hops the multiplier returns to 1 and the module toggles itself off; onDisable restores the static Timer.timerSpeed regardless of where the burst stopped.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module keeps two fields: jumped, the hop counter, and y, the altitude captured in onEnable. The single MotionEvent listener runs the whole loop, and the module toggles itself off from inside its own listener after the 25th hop — an unusual self-disable pattern. onEnable resets the counter and captures the current Y; onDisable restores the static Timer.timerSpeed to 1 so a manual toggle-off never leaves the multiplier applied."
+    },
+    {
+      "h": "Hop-and-pin loop",
+      "p": "While on the ground with jumped at or below 25, each tick sets motionY = 0.11 (a small hop impulse), increments the counter, and re-pins posY to the enable-time Y. The net client-side motion is a vertical oscillation around a fixed altitude: hop up 0.11 velocity, get pulled back to the pin, hop again. The server sees the corresponding stream of small vertical moves — legible, plausible movement, but arriving at an accelerated cadence."
+    },
+    {
+      "h": "Timer acceleration",
+      "p": "The loop drives mc.timer.timerSpeed to 2.25. The vanilla Timer.updateTimer accumulates elapsedPartialTicks += d2 * timerSpeed * ticksPerSecond (capped at 10 elapsed ticks), so 2.25 means the client runs 2.25 game ticks per real tick: every tick-driven send compresses to 2.25 times its real-time rate, and the movement packets the server integrates arrive faster than real time. The keepalive echo is the protocol's timing anchor: the C00 round trip is what server latency ledgers are keyed to, so the accelerated client clock shows up in the timing model even though the module itself never constructs a packet. Note that the module writes the instance field through mc.timer in the loop and the static Timer.timerSpeed in onDisable — the same static field in vanilla 1.8.9."
+    },
+    {
+      "h": "Teardown",
+      "p": "After 25 hops the branch sets timerSpeed back to 1 and calls toggle(), turning the module off from within its own event handler. onDisable then runs as part of that toggle and re-asserts timerSpeed = 1 through the static reference, so the multiplier is restored exactly once per burst. The bounded design is deliberate: 25 hops at 2.25x is roughly eleven real seconds of accelerated movement, after which the client returns to a normal clock and the server's rate windows see the burst as a bounded anomaly rather than a sustained one."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive"
+  ],
+  "files": [
+    {
+      "label": "ResetVL.java",
+      "rel": "dev/tenacity/module/impl/exploit/ResetVL.java",
+      "explanation": "The whole module: the jumped counter and captured y, the onEnable capture, and the MotionEvent listener that runs the hop-and-pin loop, drives timerSpeed to 2.25, and toggles itself off after 25 hops. The onDisable override restores the static Timer.timerSpeed to 1. The module constructs no packets of its own; its entire effect is the accelerated client clock and the vertical oscillation the movement path then serializes."
+    },
+    {
+      "label": "Timer.java (vanilla tick multiplier)",
+      "rel": "net/minecraft/util/Timer.java",
+      "explanation": "The vanilla timer the module drives. updateTimer folds the real-time delta d2 through the static timerSpeed and ticksPerSecond into elapsedPartialTicks, then elapsedTicks = (int) elapsedPartialTicks — so timerSpeed 2.25 makes the client run 2.25 game ticks per real tick, capped at 10 elapsed ticks per frame. Every tick-driven send (the movement C03 stream, and the keepalive path) inherits that cadence, which is why the module needs no packet code: the multiplier does the work. The field is static in 1.8.9, which is why ResetVL's onDisable can write Timer.timerSpeed directly."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NoCheatPlus's MorePackets scores every serverbound move packet into morePacketsFreq and compares the window against cc.morePacketsEPSMax, default 22 packets per second (ideal 20), with a half-second burst path (default 15 packets) and lag adaption, returning the morePacketsSetBack location on violation.\\n\\nAt 2.25x the moving client emits ~45 move packets per second — twice the ceiling — and because the hop loop keeps the player moving, the elevated rate holds for the entire ~11-second burst, so the window accumulator stays positive and the set-back fires mid-burst. The check is content-blind, so the small hop deltas and the pinned Y contribute nothing toward leniency; the only relief is the bounded design, which ends the burst before a long run of flagged windows accumulates — the set-back itself is what the 25-hop limit is racing."
+    },
+    {
+      "label": "MorePackets (per-second packet rate)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/MorePackets.java",
+      "explanation": "Vrekt's MorePackets counts flying and position packets per second against max-packets 30 and max-packets-kick 70. Exceeding 30/s triggers a violation and cancels movement packets; exceeding 70/s schedules a broadcast and a kick.\\n\\nAt 2.25x the accelerated client sits at roughly 45 move packets per second — inside the kick threshold but above the violation threshold — so the check flags and starts cancelling movement packets for the whole burst, which quietly removes the hop stream the module needs to look legitimate. The 30/s line is the real counter: the module's own hop cadence at 2.25x cannot stay under it. The kick line is the safety margin the bounded 25-hop design stays below, which is why the check cancels rather than bans the burst."
+    },
+    {
+      "label": "TickRate (inter-move clock drift)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/tick/TickRate.java",
+      "explanation": "Hawk's TickRate measures real time between MoveEvents. Each move adds (timeElapsed - 50ms) to a per-player clock-drift accumulator; drift below the -50ms threshold (clockDriftThresholdMillis) punishes with a rubber-band, and per-move MIN_RATE/MAX_RATE clamps (50/0.999 and 50/1.005 millisecond adjustments) keep the accumulator from unbounded growth. A 2000ms catch-up cap absorbs lag spikes, and a 150-tick warm-up after big teleports prevents post-teleport falses.\\n\\nAt 2.25x, moves arrive every ~22ms instead of 50ms, so each move subtracts ~28ms from the drift; after two or three hops the accumulator crosses the -50ms threshold and the check punishes with a rubber-band, which resets the client position mid-burst. The catch-up and warm-up windows are the module's only cover: a lag spike that stretches inter-move gaps can repay the drift, and the burst after a teleport is ignored — but a sustained 2.25x hop loop in open ground has no such cover."
+    },
+    {
+      "label": "Timer (player-clock balance)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java",
+      "explanation": "Grim's Timer adds 50ms of player-clock balance per counted tick packet and flags whenever the balance outruns System.nanoTime, anchored to the player's ping through C0F transactions and PONG so ping fluctuation cannot false it. The check's own notes state it flags a 1.01 multiplier almost immediately on low ping.\\n\\nAt 2.25x the client emits 2.25 tick packets per 50ms of real time, so the balance gains 112.5ms per 50ms tick — the clock leads by ~62.5ms per tick and the check flags within the first few ticks of the burst, cancelling the offending packets and executing a non-simulating setback. The 25-hop cap means the burst is over before a long violation string accumulates, but the setback itself lands mid-burst and the cancelled packets already broke the hop rhythm the module needs."
+    }
+  ]
+}

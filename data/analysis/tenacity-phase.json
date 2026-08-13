@@ -1,0 +1,56 @@
+{
+  "module": "Phase",
+  "client": "Tenacity 6.0",
+  "category": "phase",
+  "source_rel": "dev/tenacity/module/impl/player/PhaseModule.java",
+  "overview": "Tenacity's Phase is a no-move desync module with no settings and no packet construction of its own. While enabled it cancels every MotionEvent, so the vanilla movement path emits no C03 for the tick and the server's copy of the player freezes at the last reported position while the local player keeps moving — the client-side position drifts out of sync with the server entity, which is what lets the player pass through blocks on the server's model. Each tick also writes the truncated client x into the server-position tracker. A TimerUtil field and a player field are allocated but never used. The desynced position only reaches the server when the module is toggled off and the next movement packet reports it.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module registers a single IEventListener on MotionEvent and nothing else: no settings, no enable-time setup, no disable-time cleanup. The handler cancels the event and writes serverPosX, and the constructor allocates a TimerUtil and a player field that no code path ever touches — leftovers from an earlier revision. Because the class carries no state, toggling is stateless; the entire behavior is the per-tick cancellation."
+    },
+    {
+      "h": "Cancellation mechanics",
+      "p": "MotionEvent is the pre-motion event whose x, y, z, yaw, pitch and onGround fields serialize into the outgoing C03. setCanceled(true) makes the vanilla send path skip that packet for the tick, so the server never learns the player's new position and keeps the entity at the last reported location. The serverPosX = (int) posX line writes the truncated client x into the client's server-position tracker, keeping that tracker aligned with the client while no packets flow — a one-line bookkeeping tweak that has no wire effect of its own."
+    },
+    {
+      "h": "Desync consequence",
+      "p": "The gap between the client-side position and the server-tracked position grows for as long as the module stays on: the local player walks freely while the server entity stands still, so server-side collision and anticheat checks evaluate against a stale location. When the module is toggled off, the next tick's movement packet reports the phased position as a single move from the stale server location, and the server's own validation — or any anticheat positioned in between — sees a move that crossed solid geometry. The module itself never sends a packet; its entire fingerprint is the absence of movement traffic followed by one reconciling move."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "PhaseModule.java",
+      "rel": "dev/tenacity/module/impl/player/PhaseModule.java",
+      "explanation": "The whole module: the single MotionEvent listener that cancels every pre-motion event and re-aligns the server-position tracker, plus two dead fields (TimerUtil and an EntityPlayer) that are allocated and never referenced. The event listener is registered in the field initializer, so the behavior is active from construction. There is no settings object, no onEnable/onDisable logic and no packet construction anywhere in the class."
+    },
+    {
+      "label": "MotionEvent.java (pre-motion carrier)",
+      "rel": "dev/tenacity/event/impl/player/MotionEvent.java",
+      "explanation": "The pre-motion event the module cancels. Its x, y, z, yaw, pitch and onGround fields mirror the values the vanilla movement send path writes into the next C03PacketPlayer, and the cancel flag is the module's entire lever: a canceled event means no C03 leaves the client for that tick. The event also carries the player reference that PhaseModule's dead field mirrors, and its constructor is invoked by the client's movement pipeline once per tick, which is the cadence of the cancellation."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Passable (swept-path ray trace)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/Passable.java",
+      "explanation": "NoCheatPlus's Passable is the block-intersection check for movement. On every accepted move it ray-traces from the previous location to the new one with PassableAxisTracing, using margins derived from the player's box (box margin vertical times passableVerticalMargins, half the width times passableHorizontalMargins), and when the trace reports a collision it increments passableVL and returns a set-back location — the stored set-back if one exists, otherwise the from location — so the player is snapped back to the last valid position with the new rotation preserved. The optional BlockChangeTracker widens the path so recently changed blocks are considered.\\n\\nWhile the module is on, no moves arrive and nothing is checked; the check engages the moment the module is toggled off and the reconciling C03 reports the phased position. The ray from the stale server location to the reported one sweeps through whatever solid geometry the player crossed, the trace collides, and the player is set back to the pre-phase position. The margin configuration is the tolerance: small genuine clips into non-solid edges pass, but a wall crossed while the server entity stood still is a full collision."
+    },
+    {
+      "label": "Phase (swept-AABB geometry)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Phase.java",
+      "explanation": "Hawk's Phase check is pure geometry: it inscribes the previous and current player AABBs inside a bounding box and cuts the swept volume into a tesseract of collision planes, then tests every nearby block's collision box against it. The player box is shrunk by epsilon (0.1 sides, 0.4 bottom, 0.1 top) to avoid false positives, blocks below the sweep are included for fences, and the check bails on moves whose squared distance exceeds 65 (teleport-scale moves) or equals zero, on piston moving pieces, and on openable blocks when the move is small. Any solid block intersecting the swept volume punishes and rubber-bands the player.\\n\\nThe desync re-sync move is the trigger: when the module toggles off and the next move spans the wall the player crossed, the swept volume between the two AABB positions intersects the wall's collision box and the check punishes. The 65-block bail is the honest gap — a phase that drifts far enough that the reconciling move looks like a teleport is skipped, so the check reliably catches short phases through adjacent geometry and the module's own freeze-then-report pattern is exactly what feeds it."
+    },
+    {
+      "label": "Phase (post-prediction intersection)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/prediction/Phase.java",
+      "explanation": "Grim's Phase runs as a PostPredictionListener after the movement prediction engine has simulated the tick. It keeps the previous tick's bounding box and, for every checked, non-teleport prediction, gathers the collision boxes under the new box and flags when the new box intersects one the old box did not — with a 1.8-only exemption for anvils, chests and trapped chests, whose glitchy collision in that version is known to false-positive. Flags carry a setback of 1 and a decay of 0.005, so the violation drains slowly.\\n\\nThe reconciling move after disable reports a position inside the geometry the client crossed; the prediction simulates that move, the new bounding box intersects a collision box the pre-move box did not, and the check flags with a setback. The exemption list is the tolerance: on 1.8.9 the check deliberately ignores the glitchy-block set, so phasing through an anvil or chest row passes where any other solid flags. Teleport-scale reconciles are skipped by the isTeleport guard, mirroring the same gap Hawk's 65-block bail leaves."
+    }
+  ]
+}

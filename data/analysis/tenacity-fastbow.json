@@ -1,0 +1,67 @@
+{
+  "module": "FastBow",
+  "client": "Tenacity 6.0",
+  "category": "fastbow",
+  "source_rel": "dev/tenacity/module/impl/combat/FastBow.java",
+  "overview": "Tenacity's FastBow is a two-mode bow-spam module driven by the pre-motion event. While right-click is held with a bow equipped, the Vanilla mode pushes forty C03-family packets per tick — twenty C05 look packets and twenty C06 position-look packets, all claiming onGround — resets the right-click delay timer to zero so the bow re-charges instantly, closes the flood with a flag-only C03(true), and walks the vanilla release path, so the server fires an arrow every tick. The Ghostly mode drops the position pairs and spams twenty flag-only C03(true) packets before the same release call. The module constructs C03 subclasses exclusively; C02PacketUseEntity is the attack-registration companion of the instant-fire flow. onDisable restores the right-click delay to its vanilla value of 4.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module registers one IEventListener on MotionEvent, the pre-motion event that fires once per client tick, and switches on a two-option ModeSetting with Vanilla as the default and Ghostly as the only alternative. The handler early-returns when nothing is equipped, then checks Mouse.isButtonDown(1) and ItemBow instanceof against the equipped item, so the spam only runs while the player is actually holding right-click with a bow. The constructor registers only the mode setting, and onDisable writes rightClickDelayTimer = 4, restoring the vanilla four-tick gate between item uses that the flood had been zeroing."
+    },
+    {
+      "h": "The Vanilla flood",
+      "p": "The Vanilla branch runs a 20-iteration loop, and each iteration pushes two packets: C05PacketPlayerLook with the current yaw and pitch and onGround true, then C06PacketPlayerPosLook with the player's real posX, the bounding-box minY (feet level), posZ, yaw, pitch and onGround true, followed by rightClickDelayTimer = 0. After the loop it pushes a plain flag-only C03(true) and calls onStoppedUsingItem. That is 41 C03-family packets per motion tick, roughly 820 per second at 20 TPS. Because every C06 re-asserts the true position, the server's tracked location never drifts, while the onGround-true claims on all 41 packets reset the server-side fall-distance accounting and keep the movement validators lenient across the burst."
+    },
+    {
+      "h": "The release chain",
+      "p": "The zeroed rightClickDelayTimer lets the next right-click begin charging the bow immediately, and onStoppedUsingItem walks the vanilla release path — stopUsingItem plus the release packet through the send queue — so each tick starts a charge and instantly releases it. The server fires one arrow per tick with whatever charge the client reports, which is the entire point of the flood: the position and ground noise keeps the rapid release inside the server's movement validation while the bow cycles at 20 shots per second. The Ghostly branch is the same cycle without the position noise: twenty flag-only C03(true) packets per tick, then the release. Both modes therefore produce a flat, featureless C03 rate far above what the movement path alone can generate."
+    },
+    {
+      "h": "Wire shape",
+      "p": "Every packet the module builds is a C03PacketPlayer subclass: C05 (look only), C06 (position and look) and the plain flag-only C03. The packets list also carries C02PacketUseEntity as the attack-path companion: the instant-release stream is what lets arrow hits land inside the spam window, and anticheats that count entity-attack rate see the bow burst and the C02 attacks that follow it as one combined combat spike."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity"
+  ],
+  "files": [
+    {
+      "label": "FastBow.java",
+      "rel": "dev/tenacity/module/impl/combat/FastBow.java",
+      "explanation": "The whole module: the two-option ModeSetting, the single MotionEvent listener, and the two spam loops. The Vanilla branch's 20-iteration C05/C06 pair loop plus the closing C03(true) and the release call is the full 41-packets-per-tick flood; the Ghostly branch drops to 20 flag-only C03(true) packets. Mouse.isButtonDown(1) is polled rather than listened to, so the burst starts the instant right-click is held. The onDisable override restores rightClickDelayTimer to 4, which is the vanilla item-use gate the flood had been suppressing."
+    },
+    {
+      "label": "MotionEvent.java (pre-motion carrier)",
+      "rel": "dev/tenacity/event/impl/player/MotionEvent.java",
+      "explanation": "The pre-motion event the flood hooks. Its x, y, z, yaw, pitch and onGround fields mirror the values the vanilla movement send path writes into the next C03PacketPlayer, and its constructor is invoked by the client's movement pipeline once per tick — the exact cadence the 41-packet burst follows. The event also carries a cancel flag and a player reference, though FastBow uses neither; the listener simply runs once per dispatch and pushes its packets straight into the send queue."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NoCheatPlus's MorePackets counts the raw rate of serverbound move packets, content-blind. MovingListener invokes it on every processed move, scoring each into data.morePacketsFreq, an ActionFrequency with 500ms buckets over the configured window, and NetStatic.morePacketsCheck accumulates the window against cc.morePacketsEPSMax (default 22 packets per second, ideal 20) with a separate half-second burst path (default 15 packets, direct-violation 10, 95 burst events per minute) and lag adaption. A violation returns the morePacketsSetBack location, seeded from the SurvivalFly set-back when one exists, so the player is snapped back on top of the movement check.\\n\\nThe flood is the direct target: 41 C03-family packets per motion tick is roughly 820/s sustained, thirty-seven times the 22/s ceiling, so vEPSAcc stays positive for the whole window and the set-back fires immediately. The half-second burst path also trips on the very first tick's 41 packets. Because the check scores every C03 subclass the module sends — including the C06 packets that re-assert the true position — the flood cannot shed its rate by keeping the position stable, and because the check never inspects position, the onGround-true noise buys nothing."
+    },
+    {
+      "label": "InstantBow (bow pull duration)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/InstantBow.java",
+      "explanation": "NoCheatPlus's InstantBow is the archetypal bow-rapidity check. It estimates the expected pull duration from the released arrow's force with the parabola maxTime - maxTime * (1 - force)^2 minus the configured delay (maxTime 800ms), and compares it against the measured time between the previous shot (or, in strict mode, the item interact) and the current one. A pull that finishes before the expected duration adds (expected - pull) / 100 to instantBowVL and runs the configured actions; a pull at or above the expectation decays the VL by 0.9. Server lag is folded in through TickTask, and a debug message reports force and pull time.\\n\\nThe per-tick release cycle is exactly the shape the check measures: each onStoppedUsingItem arrives a few tens of milliseconds after the previous one, far under the 800ms parabola even for near-zero force, so every shot adds to instantBowVL. The honest caveat is the class's own comment: the check is legacy and disabled on 1.8 and later, so on 1.8.9 servers the pull-timing path is off and the flood falls entirely to the rate checks (MorePackets) — which is why those are the primary counters and InstantBow remains the reference design every modern bow check descends from."
+    },
+    {
+      "label": "MorePackets (per-second packet rate)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/MorePackets.java",
+      "explanation": "Vrekt's MorePackets counts flying packets and position packets per second separately against two thresholds read from config: max-packets 30 and max-packets-kick 70. When either counter exceeds maxPackets it calls checkViolation(\"sending too many packets\"), cancels incoming movement packets via setCancelMovingPackets(true), and returns; when either exceeds the kick threshold it schedules a broadcast and a kick through the Bukkit scheduler instead.\\n\\nThe fastbow burst presents 41 flying packets (the C05 look packets and the flag-only C03) and 20 position packets (the C06 poslook packets) in a single tick, so both counters blow past the 30/s violation threshold on the first tick and past the 70/s kick threshold within two. The check is per-second and content-blind, so the onGround-true noise and the stable re-asserted position are irrelevant; the only mitigation would be spreading the burst, which is exactly what the module's per-tick loop cannot do."
+    },
+    {
+      "label": "Timer (player-clock balance)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java",
+      "explanation": "Grim's Timer check builds a per-player clock from the packets themselves. Every counted tick packet (all flying packets) adds 50 milliseconds of balance to timerBalanceRealTime, and the check flags whenever that balance outruns System.nanoTime, which on a legitimate client can never happen because one tick packet arrives per 50ms of real time. The clock is anchored to the player's ping through transactions (C0F window confirmations) and PONG packets: the largest gap is always the transaction round-trip, so the smaller movement gap must never exceed it, and a 1.01 multiplier is flagged almost immediately on low ping. On flag the packet is cancelled and a non-simulating setback executes.\\n\\nThe 41-packet burst adds 41 * 50ms = 2050ms of balance in a single real tick, so the balance jumps roughly two seconds ahead of the clock on the first tick and the check flags, cancels and setbacks on the spot. The Ghostly branch's 20 flag-only C03s add a full second per tick, the same outcome. The content-blind accounting means the flood cannot hide by re-asserting stable positions or claiming ground; the only safe stream is the vanilla one-packet-per-tick cadence the module exists to break."
+    }
+  ]
+}

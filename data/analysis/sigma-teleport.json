@@ -1,0 +1,62 @@
+{
+  "module": "Teleport",
+  "client": "Sigma 4.11",
+  "category": "teleport",
+  "source_rel": "info/sigmaclient/module/impl/player/Teleport.java",
+  "overview": "Sigma's Teleport is a right-click instant teleport to the block under the crosshair, gated by a render-frame validity check and a 5-tick delay. The Basic mode interpolates the jump as a burst of C04 position packets with onGround true fired in a single tick through PlayerUtil.teleport, then snaps the local player with setPosition; the Hypixel mode is a premium-only variant that delegates the actual movement to a paid addon hook and refuses to run in the free build. The module suppresses nothing on the wire in the end: it cancels and immediately un-cancels its own update event, so the tick's vanilla movement packet still fires alongside the burst, and the server is left reconciling a multi-block jump the client initiated without any server confirmation.",
+  "sections": [
+    {
+      "h": "Mode dispatch and gates",
+      "p": "The mode setting switches between Basic and Hypixel. The Hypixel branch is walled behind premiumAddon: when the addon is null the module posts a 'Premium Bypass' warning every 400ms and toggles itself off, so the shipped free build can only ever run Basic. Both modes share the same input gate: right mouse held, not sneaking, no held food or block item, inGameHasFocus, a ray trace to 70 blocks that hits no entity and no chest, and delay equal to zero. The render-3D handler computes canTP from the looked-at block region: the block at the target must be solid (the code reads block1.getMaterial().isSolid() for the level and above checks too, so only the below and level checks actually discriminate) and the target must not be a chest, which both limits the destination to walkable faces and silently drops sign targets through the BlockSign exclusions."
+    },
+    {
+      "h": "The teleport burst",
+      "p": "PlayerUtil.teleport(startPos, endPos) interpolates the jump. nbPackets is round(dist / 5 + 0.49999999999) minus 1, and the loop runs i from 1 to nbPackets exclusive, so a 10-15 block jump emits one C04 at the midpoint, a 30 block jump emits four, and any jump under about 10 blocks emits none at all: the code falls through to setPosition and the server learns of the move only from the next vanilla movement packet. Each emitted C04 carries onGround true and lands 6-7.5 blocks from its predecessor; the final packet stops one step short of the destination and setPosition(endPos.x + 0.5, endPos.y, endPos.z + 0.5) covers the rest locally. delay is set to 5 after each teleport and decremented once per pre-update, so the burst is followed by a 5-tick silence before movement traffic resumes from the destination. The event.setCancelled(true) that brackets the call is reverted immediately, so the current tick's vanilla C03 still goes out; the 'ClickBlink method' label in the setting description overstates what the shipped code does."
+    },
+    {
+      "h": "Wire signature",
+      "p": "A teleport is one tick carrying 0-4 C04 packets (all with onGround true over open air), then five ticks of silence, then the resumed C03 stream from the destination. The server sees a client-initiated multi-block displacement with no S08 teleport behind it: either a single large step (the sub-10 block case), a chain of 6-7.5 block steps in one tick, or a full-distance step after the burst. None of the packets announce a teleport, so every move is scored as ordinary movement."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Teleport.java",
+      "rel": "info/sigmaclient/module/impl/player/Teleport.java",
+      "explanation": "onEvent handles both event types. EventRender3D computes canTP from the looked-at block's solidity and draws the target box, which is where the target region is validated before any teleport is allowed. EventUpdate pre runs the input gate (held item, right mouse, sneak, focus, entity and chest exclusions), picks the mode branch, and in Basic calls PlayerUtil.teleport with endPos set to the look block plus one block up; the Hypixel branch adds a 500ms cooldown timer and flattens endPos to the player's own y before handing the event to premiumAddon.onEvent. The canTP flag is only set while the renderer keeps agreeing the target is solid, so releasing the view or looking at invalid terrain disarms the teleport.\n\nThe mode setting's description says 'ClickBlink method' and the branch cancels the update event, but the cancel is undone on the next line, so the module never actually blinks the vanilla movement packet: the burst simply rides along with the normal per-tick C03. The 5-tick delay and the 500ms Hypixel cooldown are the only pacing the module applies."
+    },
+    {
+      "label": "PlayerUtil.java (teleport helper)",
+      "rel": "info/sigmaclient/util/PlayerUtil.java",
+      "explanation": "The teleport(double[], BlockPos) method at line 184 is the whole movement implementation. It computes dist from the player to the endPos block, derives nbPackets from the nominal 5-block spacing, and fires nbPackets minus one interpolated C04PacketPlayerPosition packets with onGround true, all through addToSendQueue in the same call stack, i.e. the same tick. The loop deliberately skips the endpoints, so the last packet lands one step short of the target and setPosition closes the gap locally. For distances at or under about 10 blocks the packet count rounds to one or zero and no packet is sent at all.\n\nThe neighboring move(double[], BlockPos, double) overload (lines 145-183) is the variant the module does not use: it applies a 2E-8 y jitter on the first two packets when the step is not over a solid full cube and carries onGround false, a separate anti-detection pattern for walking-style movement. Keeping the two overloads side by side makes the teleport variant's onGround true and missing jitter visible as the deliberate choice it is."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets scores every processed move packet into data.morePacketsFreq, an ActionFrequency with 500ms buckets (MovingData line 321), and NetStatic.morePacketsCheck compares the window score against morePacketsEPSMax 22 with 20 ideal (DefaultConfig lines 458-459). The burst path adds a second ledger: more than 15 packets in a half-second bucket counts as one burst event, 10 in a bucket counts as a direct burst, and 95 burst events per minute are allowed before escalation. A violation returns the morePacketsSetBack location, seeded from the SurvivalFly set-back when one exists.\n\nEvery teleport concentrates its C04s into one 500ms bucket on top of the baseline 20/s, so a single 30-block jump adds 4 packets to the newest bucket and a player teleporting as fast as the 5-tick delay allows sustains roughly 16 extra packets per second, pushing the window accumulator past the 22/s ceiling with every jump. The sub-10 block teleports add nothing to the rate ledger, but they are exactly the case the movement-envelope checks below cover. The check is content-blind, so the onGround true flag and the plausible step spacing buy nothing; the ledger only counts."
+    },
+    {
+      "label": "SurvivalFly (per-step movement envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the physics envelope from the world instead of trusting the packet. In check() (line 114) the horizontal allowance comes from prepareSpeedEstimation and the vertical allowance from vDistRel (line 1839, invoked at line 212), and the violation is (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 (line 233), with handleViolation applying the set-back. Critically, fromOnGround and toOnGround come from the block cache via RichBoundsLocation, not from the packet's onGround flag, so claiming onGround never relaxes the envelope.\n\nEach teleport step is a 6-7.5 block horizontal move with onGround true fired over open air: hDistanceAboveLimit lands around 5.5-7 against an allowance of a few tenths of a block, so every C04 in the burst scores a violation of roughly 550-700 before the next one arrives, and the burst never resets the ledger. Steps that drop below the player's starting y (the Basic mode aims one block above the look block, so descents are common) violate vDistRel the same way. The sub-10 block teleports concentrate the whole displacement in the first resumed C03 after the 5-tick silence, a single move far beyond any momentum-based allowance. NCP answers with an S08 set-back, which is exactly the packet the module never asked for, so the client snaps back to the last legitimately scored position."
+    },
+    {
+      "label": "Speed (large-move cancel and step envelope)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Speed.java",
+      "explanation": "Arc v2's Speed check opens with an unconditional guard: if the horizontal distance of the move exceeds 8 blocks, the check returns true and the move is cancelled (Speed.java line 54). That rule kills the sub-10 block teleport outright whenever the distance lands between 8 and 10, because the resumed C03 after the 5-tick silence asserts the entire jump in one move. For the stepped bursts, the per-move logic applies: the ground branch expects thisMove divided by groundTime (capped at 8) plus baseMove (line 102, enforced at lines 129-147), and the air branch expects baseMove plus a stage constant of 0.049, 0.08 or 0.3261 depending on vertical speed (lines 185-207). A 6-7.5 block step exceeds both budgets by an order of magnitude, so every interpolated C04 scores a violation and the check's stored setback (data.setSetback(from)) drags the player back along the path.\n\nThe check uses its own ground state (data.isOnGround, fed by the moving listener's world-based calculation), so the burst's onGround true claims do not route the steps into the friendlier branch; positions over open air are treated as air. The honest boundary is a teleport under 8 blocks whose resumed C03 is a single sub-8 move: the guard does not fire, and one step alone is not enough for the envelope to accumulate a decisive score, though the move still exceeds expected speed and flags."
+    },
+    {
+      "label": "Speed (discrepancy accumulation)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed check builds an expected speed from the previous move: expected equals friction times lastSpeed times multipliers plus maxForce plus adders plus epsilon (Speed.java line 163), where maxForce is the client's implied input force with the sprint multiplier baked in, around 0.28-0.36 for a sprinting player. The discrepancy between expected and the actual move accumulates in a per-player ledger, and once the total passes DISCREPANCY_THRESHOLD 0.1 with a positive discrepancy the check punishes with punishAndTryRubberband scaled by VL_FAIL_DISCREPANCY_FACTOR 10 (lines 198-215). Pending knockback moves are exempted at line 124, but a teleport burst has no knockback to point at.\n\nEach 6-7.5 block step is a horizontal speed of roughly 6-7.5 against an expected budget of a few tenths, so a single step contributes around 6 of positive discrepancy, sixty times the threshold, and the punish fires with a rubberband on the first packet of the burst. The sub-10 block case is even more direct: the resumed C03 after the silence is a full-speed move from the server's stale position with no intermediate packets, the largest possible single discrepancy. The check's move-time bookkeeping treats each C04 as its own move, so none of the burst packets are folded together."
+    }
+  ]
+}

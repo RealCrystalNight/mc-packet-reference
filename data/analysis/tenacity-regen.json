@@ -1,0 +1,66 @@
+{
+  "module": "Regen",
+  "client": "Tenacity 6.0",
+  "category": "regen",
+  "source_rel": "dev/tenacity/module/impl/exploit/Regen.java",
+  "overview": "Tenacity's Regen is a two-mode health-regeneration exploit that only fires while food is above 3 and health is at or below a configurable threshold. The Vanilla mode pushes five flag-only C03(true) packets per tick through PacketUtils.sendPacketNoEvent; the Vifa mode first teleports the local player to y = -999, waits for the client's ground flag to go false, then floods twenty C04 position packets re-asserting the pre-teleport position with onGround false and snaps back with setPositionAndUpdate. Both modes lean on the same server-side fact: the 1.8.9 natural-regeneration timers are gated on the player's onGround flag, so re-asserting ground keeps the regen timers running. A 'teleported' latch gates the Vifa sequence and resets on disable.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "The module carries a two-option ModeSetting (Vanilla default, Vifa), a NumberSetting health (1-20, default 1) that sets the health ceiling, and a boolean teleported latch. The single MotionEvent listener switches on the mode and gates both branches on foodLevel above 3 and health at or below the threshold, so the exploit only runs while the player is hungry-viable and hurt. onDisable clears the latch; the listener resets it whenever the gate fails, so the Vifa sequence always restarts from the teleport step."
+    },
+    {
+      "h": "Vanilla mode",
+      "p": "While the gate holds, the Vanilla branch loops five times calling PacketUtils.sendPacketNoEvent(new C03PacketPlayer(true)) — five flag-only C03 packets per tick that claim ground and change nothing else. sendPacketNoEvent routes through the packet event bus silently, so the sends bypass any module that listens for outgoing packets. One accuracy note: in this source snapshot the utility's send body is stubbed empty (only an mc.thePlayer null check), so the Vanilla branch is inert in the dump; the send-queue path the Vifa branch uses is live. The branch as written intends 5 ground-claim packets per tick, roughly 100/s at 20 TPS."
+    },
+    {
+      "h": "Vifa mode",
+      "p": "The Vifa branch runs a two-step sequence. Step one, on the first tick the gate holds: setPosition(posX, -999, posZ) teleports the local player into the void, and once the client's onGround flag goes false the latch flips. Step two, while latched: twenty C04PacketPlayerPosition packets re-assert the pre-teleport lastTickPos with onGround false, then setPositionAndUpdate snaps the client back to its real position. The server-visible fingerprint is a massive Y excursion to -999, a twenty-packet burst re-asserting the stale position, and a snap-back — the classic teleport-down-and-flood shape used to break the server's fall-distance and movement accounting."
+    },
+    {
+      "h": "Server-side regen link",
+      "p": "The 1.8.9 server's FoodStats.onUpdate runs both natural-regeneration paths off the server entity's onGround flag: the saturation path (food level at 20 with saturation above zero) heals every 10 ticks, and the food path (food at 18 or above) heals every 80 ticks, each adding exhaustion — and any tick where the flag reads false resets the timer. The C03 flood's onGround-true claims keep that flag asserted even while the client moves or jumps, so the regen timers never reset mid-flight. That is the module's entire lever: uninterrupted regeneration while mobile, with the saturation path delivering the fast 10-tick heal cadence whenever food and saturation allow."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Regen.java",
+      "rel": "dev/tenacity/module/impl/exploit/Regen.java",
+      "explanation": "The whole module: the ModeSetting and health NumberSetting, the teleported latch, and the two-mode MotionEvent listener. The Vanilla branch's five sendPacketNoEvent calls and the Vifa branch's -999 teleport, twenty C04 flood and setPositionAndUpdate snap-back are the complete exploit; the latch state machine and its reset on disable are the only bookkeeping. The switch has no break statements, but the branches are mutually exclusive modes, so the fall-through is harmless here."
+    },
+    {
+      "label": "PacketUtils.java (silent send path)",
+      "rel": "dev/tenacity/util/network/PacketUtils.java",
+      "explanation": "The utility the Vanilla branch calls. sendPacketNoEvent delegates to sendPacket(packet, true), the silent flag that routes the send outside the outgoing-packet event bus so no module sees it. In this source snapshot the send body is stubbed — it only null-checks mc.thePlayer — so the Vanilla branch's sends are inert in this dump; the send-queue path the Vifa branch uses is the live one. The file shows the intended architecture: one silent send entry point for exploit traffic."
+    }
+  ],
+  "countering": [
+    {
+      "label": "Regeneration (heal-interval check)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/Regeneration.java",
+      "explanation": "Vrekt's Regeneration check measures the time between health events. FightData records the timestamp of the last health event, and check() computes timeSince = now - lastHealthEvent, flagging \"regeneration time too fast\" whenever that interval falls below the configured regenerationTime, default 3400ms. The check is deliberately simple: vanilla natural regen has a hard 80-tick (4 second) floor on the food path, so any health gain arriving inside the 3.4 second window is impossible without help.\\n\\nThe module feeds exactly that window. With food at 20 and saturation available, the saturation path heals every 10 ticks — a 500ms interval, seven times faster than the check's limit — and because the module keeps the ground flag asserted, those heals keep arriving while the player moves, which vanilla would otherwise interrupt. Every such heal registers as a health event inside the 3400ms window and accumulates violations. The check's tolerance is the window itself: pure natural regen on the 80-tick path (4000ms) sits just outside it, so the check only engages when the regen cadence is actually compressed."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NoCheatPlus's MorePackets counts serverbound move packets against cc.morePacketsEPSMax, default 22 packets per second with an ideal of 20, plus a half-second burst path (default 15 packets, direct-violation 10) with lag adaption, and returns the morePacketsSetBack location on violation.\\n\\nThe Vanilla branch's five flag-only C03s per tick land at roughly 100/s sustained — more than four times the ceiling — so the window accumulator stays positive and the set-back fires on the first sustained burst. The Vifa branch's twenty C04s in a single tick blow through the burst path on that one tick and sustain ~400/s during the flood. Because every packet counts regardless of content, the ground claims and the stale re-asserted positions are invisible to the check; the only way under the ceiling is to stop flooding, which is the module's whole function."
+    },
+    {
+      "label": "Timer (player-clock balance)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java",
+      "explanation": "Grim's Timer adds 50ms of balance to the player clock for every counted tick packet and flags whenever that balance outruns System.nanoTime, anchoring the clock to the player's ping via C0F transactions and PONG. A legitimate client emits exactly one tick packet per 50ms, so the balance can never lead the real clock.\\n\\nThe Vanilla branch's five C03s per tick add 250ms of balance per real 50ms tick, so the clock leads by ~200ms per tick and the check flags, cancels and setbacks within a tick or two. The Vifa branch's twenty-packet burst adds a full second of balance in a single tick and flags instantly. The check never inspects the packet contents, so neither the onGround-true claims of the Vanilla branch nor the onGround-false C04s of the Vifa branch change the arithmetic: packet count alone is the evidence."
+    },
+    {
+      "label": "FastFall (vertical-speed envelope)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/FastFall.java",
+      "explanation": "Hawk's FastFall bounds vertical speed. On each MoveEvent it skips players Hawk considers grounded, teleport-accepted moves, flying, knockback, sleeping and swimming, then computes the expected deltaY from the tracked velocity ((velocityY - 0.08) * 0.98 — the vanilla gravity-and-drag descent) and punishes with a rubber-band when deltaY + 0.02 falls below it, as long as no solid block sits within 2.5 blocks above the origin.\\n\\nThe Vifa branch's y = -999 teleport produces exactly one massive deltaY move when the client's next C04 reports it: -999 against an expected descent of at most a few blocks per tick, with nothing solid overhead, so the check rubber-bands on the spot. The exemption list is the honest scope — a server-accepted teleport is skipped, so a teleport that the server explicitly acknowledges passes; the module's client-initiated -999 drop is not acknowledged, which is precisely why the check sees it as a radical fall. The Vanilla branch's flag-only C03s never change Y and never reach this check."
+    }
+  ]
+}

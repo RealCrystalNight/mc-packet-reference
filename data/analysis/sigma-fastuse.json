@@ -1,0 +1,63 @@
+{
+  "module": "FastUse",
+  "client": "Sigma 4.11",
+  "category": "fastuse",
+  "source_rel": "info/sigmaclient/module/impl/player/FastUse.java",
+  "overview": "Sigma's FastUse is a two-mode item-use accelerator built on the vanilla getItemInUseDuration counter. Packet mode waits until the held item has been in use for exactly TICKS ticks (default 12), then fires 30 positionless C03PacketPlayer(true) packets through the send queue, a C07PacketPlayerDigging RELEASE_USE_ITEM against the origin block via sendPacketNoEvent, and a local stopUsingItem() to end the use client-side. Timer mode skips the packets and instead raises mc.timer.timerSpeed to 1.3555 while the use duration sits at or above TICKS, then restores 1.0. Both modes gate on canUseItem, which rejects ItemSword and ItemBow, and onEnable and onDisable always restore the timer to 1. The module never constructs the C08 use-item packet itself: the eat is armed by the vanilla PlayerControllerMP.sendUseItem path when the player right-clicks the food.",
+  "sections": [
+    {
+      "h": "Packet mode",
+      "p": "When getItemInUseDuration() equals TICKS and the held item passes canUseItem, the handler pushes 30 copies of new C03PacketPlayer(true) through addToSendQueue in a single tick, then sends the C07 release with BlockPos.ORIGIN and EnumFacing.DOWN through sendPacketNoEvent so it bypasses the client event bus, then calls stopUsingItem() locally. The C03s are positionless: only the onGround flag travels, so the server sees a burst of ground-flag toggles with no position change, and the release tells the server's item-use state machine to end the use early. The 30-packet burst is the module's whole wire fingerprint, the same eat-accelerator archetype that appears across the 1.8 client family."
+    },
+    {
+      "h": "Timer mode",
+      "p": "Timer mode never sends a packet of its own. While the use duration is at least TICKS and the item qualifies, it writes mc.timer.timerSpeed = 1.3555; the fork's net.minecraft.util.Timer consumes the scalar in updateTimer (elapsedPartialTicks += var13 * timerSpeed * ticksPerSecond), so the client ticks about 27 times per real second during the eat instead of 20, and the C03 stream the vanilla movement path emits per tick rides along at the inflated rate. The mode restores 1.0 as soon as the duration drops below TICKS or the item stops qualifying, and both onEnable and onDisable reset the scalar so a toggle cannot leave the game sped up."
+    },
+    {
+      "h": "Item gating and cadence",
+      "p": "canUseItem is a two-line predicate: any item that is not an ItemSword and not an ItemBow qualifies, so food, potions, golden apples and ender pearls all work while swords and bows are excluded, keeping the burst away from melee and arrow-charging flows. The TICKS setting spans 1-20 with a default of 12, so the module fires at roughly 60 percent of the vanilla 32-tick use window. Because the gate is an equality in Packet mode, the burst fires on exactly one tick per use and does not repeat until the next use, which keeps the flood bounded per cycle."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement",
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "FastUse.java",
+      "rel": "info/sigmaclient/module/impl/player/FastUse.java",
+      "explanation": "The module file holds both modes and the shared item gate. Packet mode is the interesting half: the equality check on getItemInUseDuration() picks the burst tick, the 30-packet C03 loop floods the queue, and the C07 release plus stopUsingItem() end the use. The release goes through sendPacketNoEvent while the C03s go through addToSendQueue, a split that matters because the release never re-enters the client's packet hooks while the C03s do. Timer mode is the scalar alternative: timerSpeed 1.3555 is written and restored from the same handler, with onEnable and onDisable guaranteeing the restore.\n\ncanUseItem is the gate that keeps the burst off swords and bows. The C08 chip in the packet list is the vanilla sendUseItem arm that starts the use; the module's own sends are the C03 burst and the C07 release."
+    },
+    {
+      "label": "C03PacketPlayer.java (wire format)",
+      "rel": "net/minecraft/network/play/client/C03PacketPlayer.java",
+      "explanation": "The vanilla C03PacketPlayer shows what the 30-packet burst actually puts on the wire. The single-boolean constructor sets only the onGround field, so new C03PacketPlayer(true) serializes as a flag byte with no position: the server reads a ground-flag toggle and keeps the existing position. That is why the burst is invisible to position-delta checks and why the rate ledgers are the checks that matter.\n\nThe class also documents the family constructors the sibling modules use: the no-argument form leaves onGround false, which is what AutoEat's 32-packet flood sends, and the C04/C05/C06 subclasses carry positions and looks. For FastUse the relevant fact is the boolean constructor's wire shape: 30 identical flag-only packets in one tick."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts the raw serverbound movement rate, content-blind, and it is the direct counter to Packet mode. Every processed move scores into data.morePacketsFreq, an ActionFrequency with 500ms buckets over the configured window, against a ceiling of 22 packets per second (ideal 20, NetStatic line 63), with a burst path on the newest half-second bucket at 15 packets and a direct-violation threshold of 10. The module's 30 C03s in one tick triple the burst threshold on the first use tick, so the violation fires immediately and the cancel action (vl>2 under the default actions) applies; positionless packets count exactly the same as position-bearing ones.\n\nTimer mode trips the same window by a different route: 1.3555 timerSpeed sustains roughly 27 movement packets per real second while the use lasts, which holds the window accumulator above the 22/s ceiling for the whole eat instead of bursting. Either mode breaches the rate envelope, which is what makes MorePackets the primary counter for both branches."
+    },
+    {
+      "label": "Timer (per-packet time balance)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java",
+      "explanation": "Grim's Timer check converts the movement stream into a time budget: each movement packet grants 50ms of balance and real elapsed time consumes it, with a clockDrift tolerance of 120ms, and the ledger is anchored to the C0F transaction stream so the client cannot resync by replaying moves. Packet mode's 30-packet burst grants 1500ms of balance inside one tick while real time consumes roughly 50ms, overshooting the drift tolerance by an order of magnitude; the check flags within one or two ticks of the burst. The one-directional leniency that lets slow clients pass does not apply to a burst in the fast direction.\n\nTimer mode presents a sustained 1.3555x rate: about 27 packets per real second grant 1350ms while only 1000ms elapses, a positive drift of roughly 350ms per second that exceeds the 120ms tolerance within half a second of the use starting. The transaction anchoring matters here because the module leaves the C0F stream untouched, so Grim's clock reference stays honest and the drift is fully attributable to the movement stream."
+    },
+    {
+      "label": "SurvivalFly (silent envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the client's physics envelope from the server block cache and it is an honest gap for this module: the C03 flood is positionless, so every packet carries a zero position delta and the envelope's h/y allowance math never engages. The onGround true flag on the burst packets is read against the block-cache ground truth (RichBoundsLocation.isOnGround), and a standing player claiming ground is legitimate, so the flag toggle is not itself a violation. The use window changes no positions, which is why the module reads to the movement layer as a stationary player sending noise.\n\nThe gap is structural: rate is the only signal the module emits, so the physics envelope cannot be its counter. That is why the effective checks are the two rate ledgers (MorePackets, Grim Timer) and the release ledger (UseItemAdapter) rather than anything in SurvivalFly."
+    },
+    {
+      "label": "UseItemAdapter (release-gap ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "UseItemAdapter is NCPCompatProtocolLib's item-use classification and release gate: it timestamps every C07 RELEASE_USE_ITEM and sets CombinedData.isHackingRI when a release lands within timeBetweenRL (default 70ms) of the previous one, which SurvivalFly then consumes as the noslowpacket penalty on horizontal distance. Sigma's Packet mode emits exactly one release per use cycle at roughly one-second cadence, so the 70ms window never arms and the ledger never sees the module.\n\nThe gap is honest in both directions: the check exists for the per-tick release streams of the noslow family, and this module's single release is far outside its window. The release itself does end the server-side use state early, but the check's ledger is built around release spacing, not release presence, so a single spaced release passes by design. A fastuse variant that released every tick would trip it, which is the boundary worth stating."
+    }
+  ]
+}

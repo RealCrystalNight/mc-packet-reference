@@ -1,0 +1,62 @@
+{
+  "module": "Breaker",
+  "client": "Rise 5.99",
+  "category": "breaker",
+  "source_rel": "dev/rise/module/impl/other/Breaker.java",
+  "overview": "Rise 5.99's Breaker is a C07 bed destroyer: every PreMotionEvent it scans an 11 by 11 by 11 cube around the player for bed blocks, optionally verifies line of sight with a 4.5-block ray trace, rotates the outgoing C03 look onto the target, and destroys the block. The Instant toggle (default on) collapses the dig into a same-tick START_DESTROY_BLOCK plus STOP_DESTROY_BLOCK pair with the facing hardcoded to up, followed by a direct onPlayerDestroyBlock call, with no swing; the non-instant path swings, accumulates the block's hardness across ticks, and only sends STOP once the client-side damage passes 1. The Teleport handler remembers any teleport farther than 40 blocks as 'home', and the whitelist toggle refuses to break beds within 55 blocks of it.",
+  "sections": [
+    {
+      "h": "Scan and target selection",
+      "p": "The triple loop walks x, y and z from -5 to 5 relative to the player's position, reads each cell through PlayerUtil.getBlockRelativeToPlayer, and keeps only BlockBed cells while the Bed toggle is on. With Through Walls disabled, the module computes BlockUtil.getRotations toward the candidate, fires a 4.5-block rayTraceCustom along that look, and requires the hit block to equal the candidate by floor coordinates; with the toggle on (default), the ray trace is skipped entirely. The own-bed whitelist runs first: onTeleportEvent stamps 'home' whenever a teleport exceeds 40 blocks, and any candidate within 55 blocks of that point is rejected while Whitelist Own Bed is on. The first matching cell in scan order wins, so the target is a function of scan order, not of distance or direction."
+    },
+    {
+      "h": "Break mechanics",
+      "p": "Instant mode sends C07PacketPlayerDigging with action START_DESTROY_BLOCK and then STOP_DESTROY_BLOCK, both against the same block position with EnumFacing.UP, and immediately calls mc.playerController.onPlayerDestroyBlock with EnumFacing.DOWN; the whole sequence happens inside one PreMotionEvent and no swingItem call precedes it. The non-instant path swings once, sends START on the first tick, reads the hardness via getPlayerRelativeBlockHardness, and accumulates it into the damage field; updateDamage also pushes the client-side crack through sendBlockBreakProgress with (int)(damage * 10 - 1). When damage passes 1 the module sends STOP and destroys the block through the controller. The damage counter resets whenever the target cell changes, which the three equals() overloads decide by comparing floored coordinates."
+    },
+    {
+      "h": "Rotation and packet order",
+      "p": "rotate() writes BlockUtil.getRotations yaw and pitch into the PreMotionEvent, so the tick's C03PacketPlayer carries a look aimed at the bed before the C07 pair leaves the queue; with the Rotate toggle off, the dig goes out with the player's natural look. The wire order is therefore C03 with the aimed look followed by the two C07 packets, which is what makes the server accept the dig as an ordinary, faced interaction. Because the scan covers the whole cube, the module breaks beds behind and beside the player, and every dig claims the up face regardless of the block's real geometry relative to the player."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging"
+  ],
+  "files": [
+    {
+      "label": "Breaker.java",
+      "rel": "dev/rise/module/impl/other/Breaker.java",
+      "explanation": "The module file is the entire mechanism. onPreMotion chains block() (the cube scan, the ray-trace gate, the own-bed whitelist), rotate() (writes the aim into the pending C03), and destroy() (the same-tick C07 pair or the damage-accumulating path). The three equals() overloads compare floored coordinates so the damage counter resets only when the target cell changes, and updateDamage drives the client-side break progress. onTeleportEvent seeds 'home' from any teleport beyond 40 blocks, which the Whitelist Own Bed toggle then uses to spare the player's own bed within 55 blocks."
+    },
+    {
+      "label": "PacketUtil.java (send path)",
+      "rel": "dev/rise/util/player/PacketUtil.java",
+      "explanation": "PacketUtil is the send wrapper every dig goes through. sendPacket calls addToSendQueue on the net handler, the same queue vanilla uses, so the C07 pair is delivered in order behind the tick's C03 look and is visible to the client's own outgoing-packet events; sendPacketWithoutEvent is the silent sibling that writes through addToSendQueueWithoutEvent and skips the event bus. The distinction matters for Breaker because the module relies on the normal path so its rotation and dig stay ordered on the wire, while other Rise modules that must hide traffic from their own hooks use the silent variant."
+    }
+  ],
+  "countering": [
+    {
+      "label": "NoCheatPlus blockbreak FastBreak (zero-duration digs)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/FastBreak.java",
+      "explanation": "FastBreak runs from BlockBreakListener.onBlockBreak, so it only scores digs that end in a real harvest, which is the module's function. The check computes the expected breaking time from the block hardness and compares it with the elapsed time since the first damage packet; the Instant mode's same-tick START plus STOP pair presents an elapsed time of a few milliseconds against the bed's expected hand-dig time of roughly 300ms (hardness 0.2, no tool), so every harvested bed adds almost the full expected duration to the fastBreakPenalties bucket.\n\nThe bucket tolerates 2000ms of accumulated missing time (fastBreakGrace default) before violations start; a room with several beds in the cube exhausts the grace within a couple of ticks, and every later harvest pushes the level and its configured actions. The honest caveat is the event path: a server that rejects the instant dig never fires BlockBreakEvent, and then this check and the other Bukkit-gated blockbreak checks stay silent while the C07 stream is only visible to packet-level checks."
+    },
+    {
+      "label": "NoCheatPlus blockbreak NoSwing (digs without arm movement)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/NoSwing.java",
+      "explanation": "NCP requires one arm swing between breaks. NoSwing increments a per-player counter on every break check and decrements it when a C0A animation arrives, and a counter above 1 at break time is a violation. The Instant mode never calls swingItem, so the counter climbs on every consecutive harvest and the check flags from the second break onward, adding 1 to noSwingVL per pair; a single bed that takes several START/STOP pairs before the server harvests it accumulates the same way.\n\nThe non-instant path swings once per block, which keeps this check quiet, so the Instant toggle is the exposure. The check runs from the same Bukkit harvest event as FastBreak, so on servers that reject the instant dig it shares the same silence, and the packet-level counter for the stream is Hawk's dig-speed check."
+    },
+    {
+      "label": "Hawk BlockBreakSpeedSurvival (same-tick dig completion)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/terrain/BlockBreakSpeedSurvival.java",
+      "explanation": "Hawk tracks the dig lifecycle per player. On START it records the target block and the current tick and resets the accumulated damage; on every subsequent MoveEvent while digging it adds the expected per-tick damage computed from the held item's dig speed against the block strength; on COMPLETE it punishes when the accumulated total is below 1 or when the complete lands on the same tick as the start (PREVENT_SAME_TICK default true), with a violation of min((1/totalDamage - 1) * 10, 10) and a resync.\n\nThe Instant mode sends START and STOP in the same tick and no move event ever elapses, so both conditions hold at once: totalDamage is 0 and the tick stamps match, and the player is resynced on every bed. The check is packet-level, so it works on servers that reject instant digs where the NCP Bukkit path is silent, which makes it the decisive counter for the Instant configuration."
+    },
+    {
+      "label": "Hawk BlockBreakDirection (dig against the look ray)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/terrain/BlockBreakDirection.java",
+      "explanation": "BlockBreakDirection validates the dig against the player's look on COMPLETE (checkDigComplete default true; START is only checked in creative). It builds the target block's AABB and requires the ray from the head position along the current yaw and pitch (plus the tick's delta) to intersect it, punishing and resyncing otherwise.\n\nBreaker's Rotate toggle is the deciding factor: with Rotate on, the tick's C03 look is aimed at the bed before the C07, so the ray lands and the check passes; with Rotate off, or when the last C03 look does not face the bed the scan picked, the dig misses the ray and is punished. Because the module breaks exactly one block per tick but the cube scan is 11 blocks wide, any bed chosen outside the view cone while Rotate is off produces a clean flag, which makes the honest framing a conditional counter: direction checks are defeated by the built-in rotation and bite when it is disabled."
+    }
+  ]
+}

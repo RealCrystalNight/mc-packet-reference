@@ -1,0 +1,58 @@
+{
+  "module": "FastPlace",
+  "client": "Spicy",
+  "category": "fastplace",
+  "source_rel": "info/spicyclient/modules/world/FastPlace.java",
+  "overview": "Spicy's FastPlace is a two-line timer kill. Its entire logic runs in the EventUpdate pre phase of every tick: it writes 0 into mc.rightClickDelayTimer, the field that Minecraft's right-click handler re-arms to 4 after every processed right click and that the main loop decrements once per tick. Vanilla uses the timer to enforce a minimum four-tick gap between right-click actions, so blocks place at most once every five ticks; with the timer pinned at 0, every click is processed immediately and the placement rate rises to the click-processing ceiling of one C08PacketPlayerBlockPlacement per tick, roughly 20 per second against vanilla's 4 per second. The module touches nothing else: no rotation rewrite, no packet injection, no reach change. Every placement it produces is an ordinary C08, which is what makes the module's only observable the rate of its own C08 stream.",
+  "sections": [
+    {
+      "h": "The timer kill",
+      "p": "Three sites in Minecraft.java give the timer its lifecycle. The main loop decrements rightClickDelayTimer once per tick while it is above zero (line 1743). The use-item handler is only entered while the timer reads exactly 0 (line 2166: keyBindUseItem down, rightClickDelayTimer == 0, not already using an item), and rightClickMouse() ends by resetting the timer to 4 (line 1577). The module's pre-tick write of 0 therefore collapses the cooldown to zero for every tick the mouse button is held, and because the click handler runs at most once per game tick, the module's ceiling is one placement per tick — 20 per second — against vanilla's one per five ticks."
+    },
+    {
+      "h": "Wire effect and limits",
+      "p": "Each placement is a stock C08PacketPlayerBlockPlacement carrying the vanilla payload: the targeted position, face, held item and the four float offsets. Nothing about the packet's geometry changes, so geometry-based checks see nothing. The gain is purely rate: a sustained 20/s C08 stream instead of 4/s. The same delay gate also throttles right-click item use, so the timer kill accelerates item interactions as well, but the module's purpose and its name are block placement. The C08 rate is the entire detectable surface."
+    }
+  ],
+  "packets": [
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "FastPlace.java (module)",
+      "rel": "info/spicyclient/modules/world/FastPlace.java",
+      "explanation": "The whole module is the single EventUpdate pre branch; onEnable and onDisable are empty stubs. The one statement, mc.rightClickDelayTimer = 0, is the full exploit: the field is public on Minecraft, the main loop decrements it once per tick, and the use-item handler at Minecraft.java line 2166 only proceeds while it is exactly 0. Writing 0 from a pre-tick event therefore removes the four-tick cooldown before every click check.\n\nThe pre-tick placement is deliberate: Spicy's onUpdateWalkingPlayer dispatches EventUpdate with EventType.PRE at the very start of the movement tick, before any input processing, so the zeroed timer is in place before the game loop's click handling reads it."
+    },
+    {
+      "label": "Minecraft.java (timer lifecycle)",
+      "rel": "net/minecraft/client/Minecraft.java",
+      "explanation": "The timer is born and consumed in three spots. Line 292 declares the public int rightClickDelayTimer. The main loop decrements it once per tick while positive (line 1743), and the use-item branch (line 2166) is gated on rightClickDelayTimer == 0, with rightClickMouse() re-arming the timer to 4 (line 1577) at the end of every processed click.\n\nZeroing the field from an event hook defeats the gate without touching the rest of the click path, so every subsequent right click in the same tick passes. Because the click handler itself runs once per tick, the module cannot exceed one C08 per tick no matter how fast the mouse is clicked — the 20/s ceiling is structural, not configurable."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastPlace (placement-rate ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/FastPlace.java",
+      "explanation": "NCP's FastPlace check scores every processed block placement into data.fastPlaceBuckets, an ActionFrequency with 2 buckets of 1000ms each (BlockPlaceData line 53), giving a two-second window. check() computes a full-window score against cc.fastPlaceLimit and, in parallel, a short-term counter (fastPlaceShortTermCount within cc.fastPlaceShortTermTicks) against cc.fastPlaceShortTermLimit; the violation is the larger of the two, lag-adjusted through TickTask, and executeActions decides cancellation. A vanilla click-spammer reaches about 8 places per two-second window (4/s); the module's zeroed timer sustains 20/s, roughly five times that rate, so the full-window score crosses the default limit and the short-term counter trips within the first second of sustained placing.\n\nThe check is content-blind — it reads no geometry, no rotation, no item — which is exactly right for this module: the timer kill leaves every other C08 field vanilla, so the rate ledger is the only check in the blockplace battery that actually fires on it."
+    },
+    {
+      "label": "Direction (placement line-of-sight)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Direction.java",
+      "explanation": "Direction extends AbstractBlockDirectionCheck, which validates the geometry of every placement. check() casts a ray from the eye position along the player's yaw and pitch (checkBoulder against a CollideRayVsAABB) and requires it to intersect the placed block's AABB; isInteractable then verifies the clicked face is a face the player can actually reach from their position, using the block-relative coordinates and the block flags (getInteractableFaces, isDirectionBlocked). The violation distance feeds directionVL with a 0.9 cooldown decay.\n\nFastPlace never touches rotations, so an honest player's placements stay on the look ray and pass. The check is the companion in the battery that catches clients whose placement rate outpaces their aim — edge-of-view placements, look-ahead placement streams — which is precisely the behavior a pure timer kill does not produce. As a counter to this module it is the geometry half of the battery, present to keep the rate ledger honest rather than to fire on it."
+    },
+    {
+      "label": "Reach (placement distance)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Reach.java",
+      "explanation": "Reach measures the eye-to-block-center distance of every placement against SURVIVAL_DISTANCE = 5.2 or CREATIVE_DISTANCE = 5.6 depending on the player's game mode; a distance above the limit accumulates reachVL and cancels through cc.reachActions, otherwise the VL decays by 0.9.\n\nThe module does not extend reach in any way — the timer kill leaves the click target exactly where the crosshair points — so every placement stays inside the survival envelope and the check passes. It rounds out the blockplace battery and only becomes relevant if a FastPlace user pairs the timer kill with a reach extension, in which case the same C08s that trip the rate ledger also trip this distance check."
+    },
+    {
+      "label": "BlockInteractSpeed (same-tick double-place)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/terrain/BlockInteractSpeed.java",
+      "explanation": "Hawk's BlockInteractSpeed is the tightest placement-rate check in the corpus. check() compares the current server tick against the per-player lastPlaceTick: if two block interactions land in the same tick, punishAndTryCancelAndBlockRespawn fires with VL 1; any other outcome rewards, and the tick is recorded for the next comparison.\n\nFor this module it is a documented boundary: the timer kill's ceiling is one C08 per tick because the client's click handler itself runs once per tick, so the module can never produce two placements in one tick and the check never fires on it. Its purpose is the class of clients that emit multiple C08s per tick by bypassing the click path entirely — a single-tick timer kill cannot reach that rate, which is exactly why it is the right boundary check to pair with NCP's windowed ledger."
+    }
+  ]
+}

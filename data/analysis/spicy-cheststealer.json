@@ -1,0 +1,63 @@
+{
+  "module": "ChestStealer",
+  "client": "Spicy",
+  "category": "cheststealer",
+  "source_rel": "info/spicyclient/modules/world/ChestStealer.java",
+  "overview": "Spicy's ChestStealer drains chests from a background thread. The client's custom GuiChest fires EventOpenChest PRE in initGui and POST in onGuiClosed; on PRE the module stops whatever previous thread is still alive and starts a fresh one that walks the chest's inventoryRows times 9 slots, sleeps the configured delay plus 0-40ms of random jitter before every non-null slot, and shift-clicks it through spicyHandleMouseInput, which is a one-line pass-through to GuiContainer.handleMouseClick and the source of every C0E mode-1 click. The thread is only ever stopped by the next chest opening, never by the GUI closing, so a drain can keep clicking a stale GuiChest after the window is gone; a C16 re-open trick sits in the source fully commented out.",
+  "sections": [
+    {
+      "h": "Thread-per-chest steal loop",
+      "p": "chestStealerThread is a static field, so exactly one drain can exist process-wide. EventOpenChest PRE calls thread.stop() on the previous worker (the deprecated API, which terminates the thread mid-sleep) and starts the replacement. The worker iterates the chest's own slots only (inventoryRows times 9, never the player's bottom rows), and for each non-null stack sleeps delay plus a fresh Random().nextInt(40) before clicking. The delay setting spans 0-2000ms with a 250ms default, so the cadence is one shift-click per delay-plus-jitter interval; the jitter is the module's only attempt at humanization and it is a fixed 40ms band on top of a constant delay, which leaves the near-uniform inter-click spacing intact."
+    },
+    {
+      "h": "The click path",
+      "p": "The click is chest.spicyHandleMouseInput(slot, slotNumber, 0, 1): the Spicy GuiChest wrapper exposes GuiContainer.handleMouseClick, and click type 1 is the shift-click that moves the stack to the player inventory, emitted as C0EPacketClickWindow mode 1 against the chest's window id. The module never inspects item values or filters stacks; every non-null slot is drained. A commented-out C16PacketClientStatus(OPEN_INVENTORY_ACHIEVEMENT) inside the loop shows a re-open trick that was removed from the active code, leaving the drain dependent on the chest GUI staying open."
+    },
+    {
+      "h": "Lifecycle races",
+      "p": "The thread starts only on the PRE event. When the player closes the chest, the vanilla GUI path sends C0D close-window and the custom GuiChest fires EventOpenChest POST, which the module ignores: the worker keeps running, sleeping and clicking the stale GuiChest object until its slot loop completes or the next chest opens and thread.stop() kills it. Every click in that window is an interaction against a window the server has already closed, which is the race the Hawk InventoryActions check below punishes."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C0DPacketCloseWindow"
+  ],
+  "files": [
+    {
+      "label": "ChestStealer.java",
+      "rel": "info/spicyclient/modules/world/ChestStealer.java",
+      "explanation": "The whole module is the EventOpenChest handler and the anonymous worker. onEvent receives the chest event from the custom GuiChest, tears down any previous thread with Thread.stop(), and builds a Runnable that walks chest.inventoryRows times 9 slots, sleeping delay plus a random 0-40ms before each non-null slot and shift-clicking through spicyHandleMouseInput. The static thread field means the drain survives module toggles until the next chest opening replaces it, and the try/catch around the loop swallows ThreadDeath, the exception Thread.stop() throws, which is why a stopped worker leaves no trace.\n\nThe disabled C16 re-open inside the loop (commented out) is the only other packet logic: were it active it would re-send OPEN_INVENTORY_ACHIEVEMENT to keep the server-side window alive mid-drain. The onEnable and onDisable overrides are empty, and the Delay NumberSetting is the only setting the module carries."
+    },
+    {
+      "label": "GuiChest.java (event hooks and click pass-through)",
+      "rel": "net/minecraft/client/gui/inventory/GuiChest.java",
+      "explanation": "This Spicy-patched GuiChest is the module's trigger and click conduit. initGui fires EventOpenChest with type PRE after the vanilla chest layout is built, and onGuiClosed fires POST after the GUI tears down, so the module sees both ends of the window lifecycle. spicyHandleMouseInput is a direct pass-through to GuiContainer.handleMouseClick, which is the method that validates the click against the client-side container and emits C0EPacketClickWindow; the module calls it from the worker thread with clickType 1, the shift-click mode.\n\nThe file is small because it only adds the two event hooks and the alias; everything else is inherited vanilla container logic. The asymmetry that matters is in the event flow: the PRE event starts the drain, and the POST event is where the module could stop it but does not, which is what leaves the worker clicking a dead window."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastClick (window click rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "NoCheatPlus FastClick counts inventory clicks into data.fastClickFreq, an ActionFrequency with five 200ms buckets (InventoryData line 58), against a short-term limit of 4 for the newest bucket and a one-second window limit of 15 (DefaultConfig lines 389-390). Each shift-click with an empty cursor scores 1.0; the stack-size weighting in detectTweaks1_5 only applies when the cursor already holds an item, which never happens here because every click is a shift-click with an empty cursor. checkContainerInteraction adds a second path: when the first click lands within chestOpenLimit (155ms) of the container open, it scores (chestOpenLimit / duration) * 100 (lines 165-179).\n\nAt the stock 250ms delay plus 0-40ms jitter the module lands roughly one click per 200ms bucket (score 1-2 against the short-term limit of 4) and about 3.4-4 clicks per second against the window limit of 15, and the first click arrives at 250-290ms, after the 155ms interact-time window, so the default configuration passes. Dropping the delay flips it: at 0ms the clicks land every 0-40ms, the newest bucket carries 5-10 clicks against the limit of 4 and the window score clears 15 within a second, and the first click lands inside the interact-time window for an immediate (155 / duration) * 100 violation, so a low-delay drain trips the cancel action within the first chest."
+    },
+    {
+      "label": "Open (inventory close on movement)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/Open.java",
+      "explanation": "NCP's Open check closes the inventory when the player moves while a window is open. checkOnMove skips duplicate packets, vehicles, creative quickbar cases, merchants and vertical-velocity moves, then decides on impulse via direct WASD input where available or the movement model's hasImpulse.decide(); an impulse while InventoryUtil.hasInventoryOpen(player) is true feeds Improbable and the caller force-closes the window, resetting inventoryOpenTime and containerInteractTime (Open.java lines 123-170).\n\nChestStealer never touches the player's motion: the worker only clicks the container, so any WASD input or step while the chest is open is visible to the check, and a single impulse move aborts the drain by closing the window. The module offers no protection for this: it has no movement-cancelling logic and no anti-close guard beyond the disabled C16 re-open, so on NCP the steal is only safe while the player stands perfectly still. The check also resets the open-time baseline that FastClick's interact_time path compares against, so a player caught moving mid-steal loses the click-timing advantage on the next attempt."
+    },
+    {
+      "label": "InventoryActions (window state mismatch)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/inventory/InventoryActions.java",
+      "explanation": "Hawk's InventoryActions punishes ClickInventoryEvent packets when HawkPlayer.hasInventoryOpen() is zero, and world interaction (InteractEntity, BlockDig, ArmSwing, InteractWorld) when it is non-zero, with a resync on every punish (InventoryActions.java lines 43-55). Hawk tracks the window lifecycle from the S2D open, C16 inventory-command and close packets, so its open state mirrors the server's window bookkeeping rather than the client's screen.\n\nThe module's lifecycle race is the exposure here. The worker thread is only stopped by the next chest opening, never by the GUI close, so after the player closes the chest (C0D goes out and Hawk's open state returns to zero) the thread keeps sleeping and shift-clicking the stale GuiChest. Every C0E that lands after the close is a ClickInventoryEvent against a window Hawk considers closed, punished and resynced, which forces a container-state refresh and interrupts whatever slots remain. The world-interaction branch stays quiet, since the drain never swings, digs or interacts with the world while the chest is up, but the click-after-close race is inherent to the thread lifecycle."
+    },
+    {
+      "label": "InventoryMove (rotation and state while open)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/InventoryMove.java",
+      "explanation": "Hawk's InventoryMove punishes rotation updates, sprinting and sneaking while an inventory window is open, excluding only teleport-accept moves, and rubberbands the player on violation (InventoryMove.java line 45). The check keys on the client's movement state as reported in the move stream, so it catches players who open a chest mid-motion or look around while the window flag is set.\n\nChestStealer does nothing to hide these states: it never cancels movement packets and never suppresses rotation, so a player who opens the chest while holding W or sneaking, or who turns to check surroundings mid-drain, trips the check immediately. The vanilla chest GUI normally grabs the mouse and blocks look, which is the main reason rotation-while-open is rare in legit play, but the module offers no protection for the sprint and sneak flags, which persist from the moment of opening. The randomized steal delays are irrelevant to this check, which scores movement state, not click cadence."
+    }
+  ]
+}

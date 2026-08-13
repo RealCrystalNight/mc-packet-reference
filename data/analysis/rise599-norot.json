@@ -1,0 +1,63 @@
+{
+  "module": "NoRot",
+  "client": "Rise 5.99",
+  "category": "norot",
+  "source_rel": "dev/rise/module/impl/other/NoRot.java",
+  "overview": "NoRot intercepts S08PacketPlayerPosLook and rewrites or delays the forced rotation so the camera never snaps to what the server orders. The Mode setting registers six values but only three have switch cases: Vanilla overwrites the S08 yaw and pitch fields with the client's current rotation before the vanilla handler runs, so the teleport applies position-only and the C06 ack the client sends immediately after carries the client's own look; Delay lets the S08 snap and restores the pre-teleport rotation on the next PreMotion; Legit rewrites the S08 like Vanilla, saves both the server rotation and the player's starting rotation, then reports the saved server rotation on every subsequent PreMotion while the player's view is unchanged, gated on the event yaw still matching the starting yaw. Packet, Edit and Hypixel have no case branches and are dead modes. The vanilla handler that consumes the modified packet (handlePlayerPosLook) sets position and rotation and immediately emits a C06 ack with the same position and look, which is why the module's field rewrite changes what the server measures.",
+  "sections": [
+    {
+      "h": "Mode matrix",
+      "p": "The switch in onPacketReceive runs before the vanilla handler, so field writes change what the client applies and acks. Vanilla stores the server's yaw and pitch into the module fields and overwrites the packet fields with mc.thePlayer.rotationYaw and rotationPitch; the stored values are never read again, making Vanilla a pure drop of the forced rotation. Delay does not touch the packet at all: it saves the client's current rotation and restores it in onPreMotion one tick later, so the snap exists for exactly one tick. Legit rewrites the packet like Vanilla, saves the server rotation and the player's starting rotation, and on later PreMotions reports the server rotation via event.setYaw and event.setPitch, but only while the event yaw still equals the starting yaw, so the first mouse movement clears the pin. Packet, Edit and Hypixel register no case and execute nothing."
+    },
+    {
+      "h": "Vanilla teleport contract",
+      "p": "The fork's vanilla handler defines the wire effect. handlePlayerPosLook applies the packet's position and rotation to the player and immediately sends C06PacketPlayerPosLook with that same position, yaw and pitch, which the server treats as the teleport acknowledgement. NoRot's rewrite therefore does not just spare the camera: it changes the ack. In Vanilla and Legit the ack reports the client's pre-teleport rotation instead of the server's forced one, while the position part matches exactly. In Delay the ack reports the forced rotation (the packet was untouched) and the restore appears only on the next regular C03, one tick later."
+    },
+    {
+      "h": "Legit pin behavior",
+      "p": "Legit is the mode with a persistent signature. Because the camera never snapped and the equality gate requires the event yaw and pitch to match the starting values, the pin survives until the mouse moves: every PreMotion in between reports the saved server rotation verbatim, so the C03 stream carries one constant yaw and pitch pair for potentially many ticks. The moment the player moves the view, the gate fails and all four saved fields are nulled, releasing the pin. The mode is a rotation desync rather than a freeze: the local camera stays at the player's rotation while the packets claim the server's."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "NoRot.java",
+      "rel": "dev/rise/module/impl/other/NoRot.java",
+      "explanation": "The module is the complete technique: the ModeSetting with six registered values, the three live switch cases in onPacketReceive (Vanilla, Delay, Legit), and the two live onPreMotion restore paths (Delay and Legit). The yaw, pitch, startingYaw and startingPitch fields carry the state between the receive handler and the motion handler, and the null-out logic in the Legit gate is what releases the pin on mouse movement. The dead modes (Packet, Edit, Hypixel) are visible as registered strings with no case, a decompiled-client artifact worth stating rather than glossing over."
+    },
+    {
+      "label": "PreMotionEvent.java (rotation carrier)",
+      "rel": "dev/rise/event/impl/motion/PreMotionEvent.java",
+      "explanation": "The event that carries the client's per-tick rotation into the module layer, fired before the tick's C03 is built. NoRot's Delay restore writes mc.thePlayer.rotationYaw and rotationPitch directly, while the Legit pin works through the event itself: event.setYaw and event.setPitch overwrite the values that become the C03 look, and the getYaw and getPitch accessors feed the equality gate that decides whether the pin is still live. The class is a plain yaw, pitch, ground, x, y, z carrier, but it is the exact seam where a rotation-only module can change what the wire reports without moving the camera, which is the whole mechanism of the Legit mode."
+    }
+  ],
+  "countering": [
+    {
+      "label": "EqualRotation (duplicate rotation stream)",
+      "ac": "Photon-GitHub-AntiCheatAddition",
+      "rel": "src/main/java/de/photon/anticheataddition/modules/checks/packetanalysis/PacketAnalysisEqualRotation.java",
+      "explanation": "PacketAnalysisEqualRotation flags a C03 whose yaw and pitch exactly equal the previous packet's pair, with a battery of gates: out of vehicles, not within 5000 ms of a teleport, XZ movement within the last 100 ms, no recent interactions or right-clicks, and a sync sanity check. The Legit pin is precisely this signature: while the mouse is still, every reported rotation equals the server-forced pair, so once the 5-second post-teleport grace expires and the player is strafing, consecutive packets with identical yaw and pitch trip the flag. Vanilla and Delay never produce equal consecutive rotations (the live stream or the one-tick snap keeps deltas nonzero), so the check is a mode-specific counter: it punishes the desync mode that reports a constant rotation and is blind to the modes that drop or briefly restore it."
+    },
+    {
+      "label": "RotationSnapHeuristic (teleport-coupled snap detection)",
+      "ac": "intave-intave",
+      "rel": "src/main/java/de/jpx3/intave/check/combat/heuristics/combatpatterns/rotation/RotationSnapHeuristic.java",
+      "explanation": "intave's snap detector requires the yaw-motion triple (previous under 9 degrees, current over 40, next under 9) plus a swing or attack within 150 ms, more than 10 rotation packets processed and more than 7 ticks since the last teleport. Delay mode produces exactly a snap-and-restore: the S08 forces a rotation jump and the next PreMotion restores it, so the C03 stream shows a single over-40 spike between two quiet ticks. The check's own teleport grace defeats it: the spike lands one or two ticks after the S08, inside the 7-tick exemption window, so the snap is never evaluated. Vanilla and Legit produce no spike at all (the forced rotation never enters the stream, or enters as a constant), so the heuristic is an honest miss whose mechanism explains why: it is built for aimbot snaps that follow attacks, not for anti-correction restores that follow teleports."
+    },
+    {
+      "label": "TeleportQueue (teleport ack ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/model/TeleportQueue.java",
+      "explanation": "NoCheatPlus queues every outbound S08 teleport and matches the client's next position-and-look packet against it with exact equality via isSamePosAndLook, so the acknowledgement must reproduce the teleport's yaw and pitch as well as its position. Vanilla and Legit rewrite the S08 fields before the vanilla handler acks, which means the C06 reports the client's rotation and never matches the queued entry: the ledger stays WAITING until the entry ages out at 4000 ms. On 1.8 the WAITING branch does not cancel the move (the cancel path is gated on the 1.9-plus CONFIRM_TELEPORT packet type), so the practical effect is a stale queue entry and the ack being treated as an ordinary move. Delay mode sends the correct forced look in its ack and closes the ledger normally, so the check separates the modes exactly along the rewrite boundary."
+    },
+    {
+      "label": "AimbotHeuristic (rotation delta analysis)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotHeuristic.java",
+      "explanation": "Hawk's rotation-stream heuristic scores the delta pattern of C03 looks but arms only on entity interactions, so a NoRot session without combat never activates it, and the streams the module produces are not the pattern it hunts: Vanilla keeps the player's live rotation with human deltas, Delay shows one spike then continuity, and Legit shows a frozen pair with zero deltas, none of which is a snap-to-target signature. It is the honest boundary for the rotation family: the check catches aimbot-style rotation jumps toward entities, while NoRot is an anti-correction module whose whole point is that the server's rotation never appears as a client-side aim change."
+    }
+  ]
+}

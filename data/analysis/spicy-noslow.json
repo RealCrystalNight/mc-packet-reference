@@ -1,0 +1,59 @@
+{
+  "module": "NoSlow",
+  "client": "Spicy",
+  "category": "noslow",
+  "source_rel": "info/spicyclient/modules/movement/NoSlow.java",
+  "overview": "Spicy's NoSlow works on two layers. Client-side, the fork's EntityPlayerSP has been modified so the item-use movement damping — the moveForward/moveStrafe *= 0.2 applied while using an item — is gated on the NoSlow module being disabled, so turning the module on removes the local slowdown without touching the item-use state. Server-side, the module runs a release-spam cycle: on every pre-tick while the player is blocking, moving and grounded, with no killaura target, it sends a C07PacketPlayerDigging(RELEASE_USE_ITEM) whose BlockPos coordinates are drawn randomly from the full double range, with EnumFacing.DOWN. Each release clears the server's item-use state, so the server never observes a blocking player. The C08 re-place branch in the same handler is unreachable dead code: the outer guard already requires the pre phase, so the else that would re-arm the use-item placement is never taken.",
+  "sections": [
+    {
+      "h": "The client-side half",
+      "p": "EntityPlayerSP.onLivingUpdate (line 832) is a modified copy of vanilla's damping: if (isUsingItem() && !isRiding() && !SpicyClient.config.noSlow.isEnabled()) { moveStrafe *= 0.2F; moveForward *= 0.2F; sprintToggleTimer = 0; }. The 0.2 damping is preserved verbatim but conditioned on the module's toggle, so with NoSlow on the client keeps full input speed while still holding the sword up. This half is client-internal: the server only sees its consequence in the C03 stream, which shows full-speed movement while the player appears to block."
+    },
+    {
+      "h": "The wire cycle",
+      "p": "While isBlocking(), isMoving() and isOnGround(0.42) hold, with the killaura target null, every EventUpdate pre sends C07PacketPlayerDigging(RELEASE_USE_ITEM). The position is junk on purpose: each coordinate is RandomUtils.nextDouble(Double.MIN_VALUE, Double.MAX_VALUE), flooring to enormous integers far outside the world — RELEASE_USE_ITEM processing ignores the position anyway, so the payload is harmless noise. The server clears the player's item-use on each release, so its blocking state flaps to false every tick. The else branch that would send C08PacketPlayerBlockPlacement with BlockPos(-1, -1, -1) and face 255 (the vanilla use-item re-arm) is unreachable because the outer condition already requires e.isPre(), making the module release-only as shipped."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging",
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "NoSlow.java (module)",
+      "rel": "info/spicyclient/modules/movement/NoSlow.java",
+      "explanation": "The module is one pre-update handler gated on isBlocking, isMoving, the 0.42 ground probe and an empty killaura target. The active statement sends the C07 release with the randomly generated BlockPos and EnumFacing.DOWN; the inner else that would send the C08 re-arm is dead code because the outer condition already tests e.isPre(). The Killaura import shows the intended combat integration: NoSlow holds its releases while the aura has no target.\n\nThe random-position detail is the giveaway of the technique's age: the release's position is semantically irrelevant to RELEASE_USE_ITEM, so the module randomizes it to look less like a scripted payload, the same habit seen in other Spicy modules."
+    },
+    {
+      "label": "EntityPlayerSP.java (damping hook)",
+      "rel": "net/minecraft/client/entity/EntityPlayerSP.java",
+      "explanation": "Line 832 is the fork's modification of vanilla's item-use damping: the move input is multiplied by 0.2 only while the NoSlow module is disabled, which is the entire client-side effect of the module. The same method also carries the vanilla sprint gates (the foodLevel > 6 flag3 check, the double-tap timer, the key-hold path) that the sibling Sprint module overrides.\n\nReading the file also shows the emission path the module's C07 rides: onUpdateWalkingPlayer dispatches EventUpdate PRE at the top of every movement tick, so the release lands before the tick's C03, and the C03 itself is sent unconditionally. That ordering is what makes the release-then-move cycle deterministic: the server always processes the release before the move it is meant to legitimize."
+    }
+  ],
+  "countering": [
+    {
+      "label": "UseItemAdapter (release-interval ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "NCP's ProtocolLib adapter tracks the item-use lifecycle at the packet level. handleDiggingPacket, on RELEASE_USE_ITEM, clears the player's item-in-use and compares the release timestamp against the previous one: if the gap is under timeBetweenRL = 70ms, CombinedData.isHackingRI is set true (line 421). The comment documents the threshold intent: minimum time between release packets, 51-100ms, higher meaning more protection.\n\nThe module's cycle sends exactly one release per tick — 50ms apart — so every release after the first lands inside the 70ms window and isHackingRI stays armed. SurvivalFly consumes the flag at the top of its horizontal prediction (line 877): it tags the move 'noslowpacket', feeds Improbable with 'moving.survivalfly.noslow', resets the horizontal data and returns a violation — so the release spam converts directly into a movement violation on the very next C03. This is the one check in the set that fires deterministically on the module."
+    },
+    {
+      "label": "NoSlowCheck (1.9+ protocol state machine)",
+      "ac": "amnoah-BetterAnticheat",
+      "rel": "core/src/main/java/better/anticheat/core/check/broken/NoSlowCheck.java",
+      "explanation": "BetterAnticheat's NoSlowCheck arms a blocking flag on the 1.9+ USE_ITEM packet, arms sprinting on an ENTITY_ACTION START_SPRINTING, and fails when a RELEASE_USE_ITEM arrives while both are set — the signature of starting a sprint while using an item. The class comment notes it is 'intended to detect starting sprinting while using an item... however, this check has unexplainable falses.'\n\nAgainst this module it is a documented miss on protocol grounds: on a 1.8.9 client the blocking start arrives as a C08 BlockPlace packet, which the check does not track as USE_ITEM, and this module's C08 re-arm is dead code, so blocking is never armed and the release stream cannot fail the check. It is the modern-protocol counterpart of the same exploit — the check that the C07+C08 re-arm cycle of other clients is designed against."
+    },
+    {
+      "label": "RepeatedReleaseCheck (release-without-use)",
+      "ac": "amnoah-BetterAnticheat",
+      "rel": "core/src/main/java/better/anticheat/core/check/broken/RepeatedReleaseCheck.java",
+      "explanation": "RepeatedReleaseCheck encodes the 1.9+ item-use contract: a USE_ITEM packet must sit between every pair of RELEASE_USE_ITEM packets. It tracks useItem, sets it on USE_ITEM, and fails any RELEASE_USE_ITEM that arrives with useItem false, then clears the flag. The file's own header notes the check is not currently enabled due to false-flag issues.\n\nWhen enabled it is a direct hit on this module: the initial field value true lets the first release through, but no USE_ITEM ever follows (the C08 re-arm is dead code), so every release after the first arrives with useItem false and fails. The module's release-only cycle is exactly the stream the check was written to reject — the module simply predates the protocol change the check assumes."
+    },
+    {
+      "label": "Speed (item-use slowdown branch)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed computes two expected speeds per move: one with the item-use slowdown (maxForce) and one without (maxForceNoItemUse). While the server believes the player is blocking, consuming or pulling a bow, the item-use expectation is used unless the player is moving at full speed — in which case they are granted exactly one extra tick for the slot-switch quirk, then judged against the slowed expectation. A discrepancy over 0.1 at a position update triggers the rubberband, and at VL above RELEASE_ITEM_OVER_VL (default 4) the check force-releases the item via pp.releaseItem().\n\nFor this module the branch only bites in the window where the server still believes the player is blocking: the release spam clears the server-side item-use on the first packet, so after one tick Hawk treats the player as a normal non-blocking mover and the full-speed C03s pass. The check is the counter to the C08-re-arming NoSlow variants that keep the server-side blocking state alive — the behavior this module's dead re-arm deliberately avoids."
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "module": "FastBreak",
+  "client": "Spicy",
+  "category": "fastbreak",
+  "source_rel": "info/spicyclient/modules/world/FastBreak.java",
+  "overview": "Spicy's FastBreak accelerates block breaking by writing a fixed amount into the client-side damage accumulator every update tick: curBlockDamageMP gains speed/100 (speed 1-20, default 20), so at the default the accumulator climbs 0.2 per tick on top of vanilla's hardness-based contribution and any block crosses the 1.0 break threshold in about five ticks of holding, regardless of how hard it is. The handler clamps the accumulator at 1.0 and returns once the break threshold is reached. Unlike other clients it never touches blockHitDelay, so the 5-tick post-break pause stays vanilla and chained breaks keep their normal gap. An older EventAddBlockDamage approach that set the damage directly sits in the source commented out.",
+  "sections": [
+    {
+      "h": "Fixed-rate damage accumulation",
+      "p": "PlayerControllerMP.onPlayerDamageBlock adds the block's relative hardness to curBlockDamageMP on each damage tick and sends C07 STOP_DIGGING when the accumulator reaches 1.0 (Spicy PlayerControllerMP lines 289-330). The module runs on every EventUpdate: while the accumulator is below 1.0 it adds speed/100 (0.01 to 0.2), and once at or above 1.0 it pins the accumulator to exactly 1.0 and returns, letting the vanilla break path fire on the current damage tick. Because the added term dominates the hardness term for hard blocks, the effective break time converges to about five ticks at default speed for any block that would otherwise take longer; soft blocks that vanilla breaks in one or two ticks are barely affected, since their own hardness term already crosses the threshold."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The module sends no packets of its own; it changes the controller state that drives vanilla C07 emission. The per-block window shrinks from the hardness-based duration (stone by hand is about 45 ticks) to roughly five ticks at default speed, so the server sees START_DIGGING followed by STOP_DIGGING after a fraction of the expected time. blockHitDelay is untouched, so the 250ms inter-block pause remains, which distinguishes this implementation from the zero-delay variants and means the chained-break signature is weaker than in clients that also zero the delay."
+    },
+    {
+      "h": "Detection surface",
+      "p": "The counters split across the two effects. NCP blockbreak FastBreak and Hawk BlockBreakSpeedSurvival compare the measured break time against an expected time derived from the block's hardness and the player's tool, which is the direct counter to the collapsed window; NCP blockbreak Frequency caps breaks per time frame and bites in creative-mode chains. The Arc lineage offers nothing here: Vrekt-Arc's block-break check is creative-gated, and Vrekt-Arc v2 dropped the block package entirely, its PacketListener subscribing only to FLYING, POSITION, USE_ENTITY, ARM_ANIMATION, HELD_ITEM_SLOT and BLOCK_PLACE."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging"
+  ],
+  "files": [
+    {
+      "label": "FastBreak.java",
+      "rel": "info/spicyclient/modules/world/FastBreak.java",
+      "explanation": "The module is a single EventUpdate handler with one NumberSetting. The speed setting spans 1-20 with a 20 default, and each pre-update either adds speed/100 to mc.playerController.curBlockDamageMP or, once the accumulator has reached 1.0, pins it there and returns. The pin matters: without it the accumulator could ride above 1.0 while the vanilla break path waits for its own damage tick, and with it the break fires on the first damage tick after the threshold.\n\nThe commented-out EventAddBlockDamage block shows the previous design, which set the damage directly from the speed value inside the block-damage event; the shipped build moved the mutation to the update tick instead, which spreads the acceleration over the damage controller's own cadence. The class carries no other logic: no blockHitDelay manipulation, no packet interception, no onEnable/onDisable behavior."
+    },
+    {
+      "label": "PlayerControllerMP.java (damage controller)",
+      "rel": "net/minecraft/client/multiplayer/PlayerControllerMP.java",
+      "explanation": "This is the vanilla class the module mutates. The relevant state is curBlockDamageMP (line 47) and blockHitDelay (line 57). onPlayerDamageBlock decrements blockHitDelay and returns without damaging while it is positive, sets blockHitDelay to 5 when a new block is first targeted (line 234), resets the accumulator on a block change, adds getPlayerRelativeBlockHardness to curBlockDamageMP each damage tick (line 319), and when the accumulator reaches 1.0 sends the break and resets both fields (lines 289-330).\n\nEmbedding the controller makes the module's single write legible: the fixed speed/100 addition substitutes a constant per-tick term for the hardness-derived one, and the 1.0 clamp in the module lines up exactly with the line-330 break threshold. The file also shows what the module deliberately does not touch: blockHitDelay keeps its 5-tick assignment on every break, which is why chained blocks still carry the vanilla gap."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastBreak (break-time differential)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/FastBreak.java",
+      "explanation": "NCP's blockbreak FastBreak validates the measured break time against the block's expected breaking time. The expected value is round(getBreakingDuration(blockType, player) * fastBreakModSurvival / 100) (line 56; the survival modifier defaults to 100, DefaultConfig line 126), and the elapsed time is now minus the first damage time in strict mode (lines 61-63; strict defaults to true, DefaultConfig line 124). When elapsed plus the fastBreakDelay (default 10ms) falls short of the expected time, the missing time is added as a penalty to a bucket (lines 74-81) and a violation fires once the bucket score exceeds the grace (default 2000, DefaultConfig line 128), with the violation level scaled by the missing time in seconds (lines 85-87). Insta-break blocks are skipped (line 66).\n\nThe module's fixed five-tick window cuts every hard block's measured time short by most of its expected duration: stone by hand expects about 45 ticks and completes in five, so each stone block adds roughly 2 seconds of missing time to the penalty bucket, and the 2000ms grace is exhausted after a single block. Soft blocks that already break in one or two ticks add almost nothing, because the module's 0.2-per-tick term does not shorten their window, so the check punishes the module's hard-block use specifically and accumulates nothing on sand or gravel."
+    },
+    {
+      "label": "Frequency (break-rate cap)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/Frequency.java",
+      "explanation": "NCP's blockbreak Frequency limits breaks per time frame with two windows: a full-window bucket score (2 buckets of 1000ms each, BlockBreakConfig lines 81-82) where each break adds the interval modifier (45 in survival, 95 in creative, DefaultConfig lines 132-133) and a violation fires when the score passes the window duration, plus a short-term counter that flags when more than 7 breaks land inside 5 ticks (frequencyShortTermTicks 5, frequencyShortTermLimit 7, DefaultConfig lines 134-135; check lines 55-75). The default actions cancel at vl > 5.\n\nThe thresholds are tuned for instant-break chains. In survival, a block still takes about five ticks even with the module, so the chained rate of roughly 3.6 breaks per second stays far below the 7-in-5-ticks short-term limit, and the full-window score of 45 per break needs over 44 breaks in two seconds to exceed the 2000ms window, which the five-tick break time makes impossible. In creative mode the story flips: insta-breaks chained at one per tick flood both windows, and the 7-in-5-ticks limit trips within a few ticks. This check therefore only bites the module's creative-mode use, while survival hard-block mining is left to the FastBreak time differential."
+    },
+    {
+      "label": "BlockBreakSpeedSurvival (expected damage accumulation)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/terrain/BlockBreakSpeedSurvival.java",
+      "explanation": "Hawk's BlockBreakSpeedSurvival rebuilds the break server-side and compares expected damage against elapsed time. On START_DIGGING it records the target block and resets the accumulator (lines 85-91), on every MoveEvent while digging it adds the block's expected per-tick damage, computed from the block strength and the player's held item, potion and water state through a copy of the vanilla formula (lines 70-77, 126-202), and on COMPLETE_DIGGING it compares: if the accumulated expected damage is under 1.0, or the break landed in the same tick as the start (the flagSameTick setting), the check computes speedFactor as 1/totalDamage, scores vl as min((speedFactor - 1) * 10, 10), punishes with a resync, and resets (lines 93-108).\n\nFor any block that should take more than about five ticks, the module's actual break lands before the server-side accumulator reaches 1.0, so totalDamage is under 1 and every accelerated hard block is flagged with a speed-factor violation: stone by hand, which should accumulate 1.0 over roughly 45 ticks, has accumulated about 0.11 by the fifth tick, so speedFactor is around 9 and the violation is clamped at 10 with a resync that snaps the block back. The same-tick branch catches the pathological case of an insta-break arriving with the dig start. Soft blocks that genuinely break in one or two ticks accumulate their full expected damage and pass, so the check's honest boundary matches the module's own: only the hardness-collapsed breaks are punished."
+    }
+  ]
+}

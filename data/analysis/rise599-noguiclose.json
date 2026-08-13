@@ -1,0 +1,56 @@
+{
+  "module": "NoGuiClose",
+  "client": "Rise 5.99",
+  "category": "noguiclose",
+  "source_rel": "dev/rise/module/impl/other/NoGuiClose.java",
+  "overview": "NoGuiClose is a single-condition receive-side cancel: onPacketReceive drops every S2EPacketCloseWindow while the current screen is a chat window, or unconditionally when the Chat Only toggle is off. The vanilla handler the module intercepts (NetHandlerPlayClient.handleCloseWindow, which calls EntityPlayerSP.func_175159_q and then displayGuiScreen(null)) closes whatever screen is up, chat included, so a server that forces window closes mid-typing kills the player's message. Cancelling the packet keeps the screen alive. Two facts bound what the module can do on the wire: vanilla never echoes C0D in response to S2E (the close packet is only sent by EntityPlayerSP.closeScreen when the player closes a screen themselves), and chat is not a window at all, so the default Chat Only mode changes nothing on the C0D channel and the module is nearly wire-silent.",
+  "sections": [
+    {
+      "h": "Receive-side interception",
+      "p": "The whole module is one instanceof check in onPacketReceive: S2EPacketCloseWindow plus a screen test. With Chat Only at its default true, the cancel fires only while mc.currentScreen is a GuiChat, so a server-initiated window close that would yank the player out of typing is dropped and the chat stays open. With Chat Only off, every S2E is dropped regardless of screen, which also keeps containers open past the server's close. The setting is a BooleanSetting read directly in the condition, so there is no other state, no timer and no send path anywhere in the class."
+    },
+    {
+      "h": "Vanilla close contract",
+      "p": "The fork's vanilla tree defines what the cancel actually prevents. handleCloseWindow calls func_175159_q, which nulls the carried item stack, calls super.closeScreen and displayGuiScreen(null); it sends no packet. C0DPacketCloseWindow is emitted only from EntityPlayerSP.closeScreen with openContainer.windowId, which the client runs when the player closes a screen through the GUI. So the server's S2E never produces a C0D echo in vanilla, and NoGuiClose does not suppress one: the C0D traffic the server sees is unchanged in every mode. The only divergence the module creates is the client-side screen state, which stays open against a server that believes it closed the window."
+    },
+    {
+      "h": "Server-side footprint",
+      "p": "With the default Chat Only mode the wire effect is close to zero: chat is not an inventory window, the server tracks no window id for it, and the player simply keeps sending C01 chat messages that would otherwise have been interrupted. With Chat Only off the divergence is structural: the server closed the window (S2E) and the client keeps the container open, so subsequent C0E clicks reference a window the server has already discarded; vanilla processClickWindow ignores clicks for unknown window ids, but server-side window ledgers see clicks arriving against a closed-window state, and the C0D the player eventually sends on closing marks an already-closed window."
+    }
+  ],
+  "packets": [
+    "C0DPacketCloseWindow"
+  ],
+  "files": [
+    {
+      "label": "NoGuiClose.java",
+      "rel": "dev/rise/module/impl/other/NoGuiClose.java",
+      "explanation": "The module is the entire technique: a BooleanSetting chatOnly and one onPacketReceive handler that cancels S2EPacketCloseWindow when the screen test passes. The chat-only default restricts the cancel to GuiChat so a server-forced window close cannot interrupt typing; disabling the toggle extends the cancel to every S2E and thereby keeps containers open as well. Because the handler only ever cancels an inbound packet and never sends, the class is the complete wire surface of the module: there is no flush loop, no re-send and no state beyond the toggle. The event is received on the client's packet thread before the vanilla handler runs, so cancelling it prevents func_175159_q from closing the screen, and modifying it would equally change what the vanilla handler applies."
+    },
+    {
+      "label": "PacketReceiveEvent.java (cancel carrier)",
+      "rel": "dev/rise/event/impl/packet/PacketReceiveEvent.java",
+      "explanation": "The event object that carries every serverbound-bound packet into the module layer. It holds the raw Packet and the cancelled flag that NoGuiClose flips: EventHandler.handle dispatches it to every enabled module's onPacketReceive, and the fork's receive path checks isCancelled before handing the packet to NetHandlerPlayClient, so a cancelled event never reaches the vanilla S2E handler. The class is trivial (a Packet field plus the inherited cancel state) but it is the exact seam the module exploits: the cancel happens after ProtocolLib-style processing and before vanilla dispatch, which is why the client-side screen survives while the server believes its S2E was delivered."
+    }
+  ],
+  "countering": [
+    {
+      "label": "intave InventoryTracker (window-state ledger)",
+      "ac": "intave-intave",
+      "rel": "src/main/java/de/jpx3/intave/module/tracker/player/InventoryTracker.java",
+      "explanation": "InventoryTracker maintains the server's belief about which players have a window open: the outbound S2E (CLOSE_WINDOW) handler closes the state, the inbound C0D handler closes it again, the C16 OPEN_INVENTORY_ACHIEVEMENT command opens it, and S2F WINDOW_ITEMS for window 0 refreshes the item list, with a beacon-window exception because the vanilla client never closes beacons. Because the tracker keys on its own outbound S2E send, NoGuiClose's client-side cancel does not stop the ledger from marking the window closed. With Chat Only off the client then keeps clicking a container that intave considers closed, and every C0E click against that closed-window state feeds the inventory-analysis heuristics (the ChestStealer-style violations the intave command surface prints). With the default Chat Only mode the ledger is never involved: chat has no window id, so open and close events simply do not occur and the tracker records nothing."
+    },
+    {
+      "label": "azure InvTweaksA (close-window while sprinting)",
+      "ac": "AimbotPvP-azure-anticheat",
+      "rel": "src/main/java/us/skidrevenant/azure/check/checks/misc/invtweaks/InvTweaksA.java",
+      "explanation": "The only packet-level C0D consumer in the corpus: onPacketReceiving flags when PacketPlayInCloseWindow arrives while the Bukkit player is sprinting, a signature of inventory-tweak clients that close windows while moving. NoGuiClose never emits C0D itself, and the C0D that the player's own screen-close produces is timed by the player, not the module, so this check sees the same traffic with the module on or off. It is therefore an honest boundary rather than a counter: it targets the opposite abuse (closing windows to sprint-teleport) and is structurally blind to a module whose only action is suppressing an inbound S2E."
+    },
+    {
+      "label": "FlopAC InventoryC (click cadence)",
+      "ac": "JTXOfficial-FlopAC",
+      "rel": "src/main/java/me/jtx/flopac/checks/misc/inventory/InventoryC.java",
+      "explanation": "InventoryC scores the standard deviation of five consecutive left or shift C0E click delays, flags when the std-dev delta stays under 0.7 across batches, and prints a chest-stealer or refill suspicion at punishmentVL 9. It only ever sees C0E traffic, so it bites exclusively in the Chat Only off case, where the module keeps a container usable past the server's close and a player can farm it with regular-interval clicks. A default-mode NoGuiClose emits no C0E at all and is invisible to the check. The check is also a window-state dependent: a server that rejects clicks on its closed window produces no click events for it to score, so the realistic surface is servers that process late clicks and let the cadence accumulate."
+    }
+  ]
+}

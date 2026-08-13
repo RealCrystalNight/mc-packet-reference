@@ -1,0 +1,63 @@
+{
+  "module": "Timer",
+  "client": "Tenacity 6.0",
+  "category": "timer",
+  "source_rel": "dev/tenacity/module/impl/world/TimerModule.java",
+  "overview": "Timer is a scalar on the vanilla clock. A NumberSetting labeled \"Speed:\" spans 0.1 to 10 with default 1, and a MotionEvent pre handler writes Timer.timerSpeed on every tick. The write is (float)(int) value, so the fractional part is truncated: the setting behaves as an integer multiplier, and any sub-1 value (0.1 through 0.9) casts to 0.0, which freezes elapsedPartialTicks accumulation and halts the client tick loop instead of slowing it. onEnable writes the raw float once before the handler overwrites it, and onDisable restores 1.0F. A TimerUtil field is declared but never referenced. Timer.updateTimer folds the static timerSpeed into the per-frame tick budget, so the whole packet pipeline scales linearly with the setting.",
+  "sections": [
+    {
+      "h": "The clock mechanics",
+      "p": "net.minecraft.util.Timer holds a static timerSpeed field (1.0F default) and updateTimer() accumulates elapsedPartialTicks += clamp(realDelta, 0, 1) * timerSpeed * ticksPerSecond (line 97), then elapsedTicks is the integer part, capped at 10 ticks per frame. The module writes the static field from a pre-motion event every tick, so the multiplier applies to every frame while toggled and no other code path can override it. A 2x clock doubles the tick budget per real second, and with it the rate of every per-tick serverbound packet."
+    },
+    {
+      "h": "The truncation bug",
+      "p": "The write is Timer.timerSpeed = (float)(int) timer.getCurrentValue(), and the int cast is a first-class finding. Values 2.0 through 2.9 all become 2.0, 3.0 through 3.9 become 3.0, and 0.1 through 0.9 become 0.0. A zero timerSpeed means elapsedPartialTicks never accumulates, so elapsedTicks stays 0 and the game does not tick at all: the slider's slow range is a freeze, not a slow-motion. onEnable writes the raw float without the cast, so the first frame after enabling uses the exact setting before the pre-motion handler truncates it. The effective range after the first tick is therefore {0, 1..10}, not 0.1 to 10."
+    },
+    {
+      "h": "Wire picture",
+      "p": "The module sends nothing itself; it changes when the client emits what it would emit anyway. The C03 movement stream (one to three position packets per tick from func_175161_p) scales with the clock, the C00 keepalive replies and C0F transaction confirmations are emitted earlier relative to wall time because the network read loop runs more often, and those periodic streams are exactly the anchors the countering checks use: Frequency TimerA refuses to run without a recently accepted keepalive, and Grim Timer calibrates its movement clock against the C0F and PONG stream."
+    }
+  ],
+  "packets": [
+    "C00PacketKeepAlive",
+    "C0FPacketConfirmTransaction"
+  ],
+  "files": [
+    {
+      "label": "TimerModule.java (module)",
+      "rel": "dev/tenacity/module/impl/world/TimerModule.java",
+      "explanation": "The module is three small handlers: onMotionEvent writes the truncated timerSpeed every pre-motion, onEnable writes the raw float once, and onDisable restores 1.0F. The unused TimerUtil field and the commented-out initializeSettings(mode) line are leftovers. The truncating cast in the pre-motion write is the whole story of the module: it is the difference between the advertised 0.1 to 10 range and the real {0, 1..10} behavior after the first tick."
+    },
+    {
+      "label": "Timer.java (vanilla clock target)",
+      "rel": "net/minecraft/util/Timer.java",
+      "explanation": "Tenacity 6.0 ships the vanilla net/minecraft tree, and this file is the object the module abuses. updateTimer() accumulates elapsedPartialTicks from the wall-clock delta multiplied by the static timerSpeed and ticksPerSecond (line 97), caps elapsedTicks at 10 per frame, and feeds the result to the client tick loop. The static timerSpeed field (line 30) is the single global multiplier the module rewrites, which is why one write per tick is enough to scale the entire packet pipeline."
+    }
+  ],
+  "countering": [
+    {
+      "label": "NCP MorePackets (movement rate window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets scores every processed move into morePacketsFreq, an ActionFrequency with 500ms buckets over the configured window (MovingData line 321), against a 22 packets per second ceiling with 20 ideal, plus a burst path on the newest half-second bucket (15 packets, direct-violation 10, burst events 95 per minute). A 2x clock produces roughly 40 C03 packets per second sustained, so the window accumulator runs positive for the whole duration and the check cancels at vl above 2, with the set-back seeded from SurvivalFly. The detection floor is sustained use above about 1.1x because empty buckets burn excess; short spikes under the window ceiling are forgiven."
+    },
+    {
+      "label": "NCP KeepAliveFrequency (keepalive ledger gate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/KeepAliveFrequency.java",
+      "explanation": "KeepAliveFrequency replaces accept-any-echo keepalives with an id ledger: every outgoing S00 id is recorded (pruned after 30000ms, capped at 40 pending) and each incoming C00 is matched against it, with unexpected or duplicate replies counted into one-second buckets. Its structural role here is a gate: Frequency TimerA refuses to run unless a keepalive was recently accepted, so the ledger is what arms the timer check. It fires on the accelerated loop when a batched keepalive delivery drains into one second-bucket or when replies age out or duplicate."
+    },
+    {
+      "label": "Frequency TimerA (inter-packet delay)",
+      "ac": "ElevatedDev-Frequency",
+      "rel": "src/main/java/xyz/elevated/frequency/check/impl/timer/TimerA.java",
+      "explanation": "TimerA compares the delay between consecutive C03 packets against the 50ms tick expectation: each move adds 50 minus the observed delay to an allowance, and the check fails once the allowance exceeds the floor of 7.07, gated on a recently accepted keepalive and exemption flags for TPS, TELEPORT and LAG. A 2x clock compresses inter-packet gaps to roughly 25ms, so the allowance climbs past the threshold within two packets. Sub-1x speed drains the allowance instead, so slow timer passes by design; the truncation bug's 0.0 freeze is likewise invisible to this check because no packets arrive at all."
+    },
+    {
+      "label": "Grim Timer (transaction-anchored balance)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java",
+      "explanation": "Grim Timer grants 50ms of balance per movement packet against real time measured with System.nanoTime, with the baseline clock anchored to the C0F stream: knownPlayerClockTime is only refreshed after a movement followed by a PONG or WINDOW_CONFIRMATION, and clockDrift defaults to 120ms. Each accelerated packet spends 50ms of balance that only about 50ms of real time repays, so a 2x clock drives the balance deeply negative within a few ticks, and the burst path catches the 10-ticks-in-one-frame cap when the render loop stalls. The check is one-directional: sub-1x and the freeze both pass, since falling behind is absorbed by limitFallBehind."
+    }
+  ]
+}
