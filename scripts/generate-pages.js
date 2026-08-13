@@ -357,6 +357,7 @@ function main() {
       + '  <nav class="sidebar-nav" id="sidebarNav">' + sidebarHtml + '</nav>\n'
       + '</aside>\n'
       + '<main class="main" id="main">\n'
+      + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
       + '  <div class="content-detail" style="display:block;max-width:860px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
       + '    <div class="detail-header" id="detailHeader">\n'
       + '      <h1><span class="detail-hex">' + pkt.hex + '</span> ' + pkt.id + '</h1>\n'
@@ -379,7 +380,7 @@ function main() {
       + '  </div>\n'
       + '</main>\n'
       + '<script src="../../assets/highlight.min.js"></script>\n'
-      + '<script>\n(function() {\n  // highlight vanilla-source code boxes\n  document.querySelectorAll(\'.cv-table\').forEach(function(table) {\n    var rows = table.querySelectorAll(\'tr.cv-row\');\n    if (!rows.length) return;\n    var texts = [];\n    rows.forEach(function(r) { texts.push(r.querySelector(\'code\').textContent); });\n    var src = texts.join(\'\\n\');\n    var hl = hljs.highlight(src, {language: \'java\'}).value.split(\'\\n\');\n    rows.forEach(function(r, i) { r.querySelector(\'code\').innerHTML = hl[i] || \'\'; });\n    table.dataset.src = src;\n  });\n  document.querySelectorAll(\'.cv-copy\').forEach(function(btn) {\n    btn.addEventListener(\'click\', function() {\n      var t = document.createElement(\'textarea\');\n      t.value = btn.closest(\'.code-viewer\').querySelector(\'.cv-table\').dataset.src || \'\';\n      document.body.appendChild(t); t.select();\n      try { document.execCommand(\'copy\'); btn.textContent = \'Copied!\'; } catch (e) {}\n      document.body.removeChild(t);\n      var b = btn; setTimeout(function() { b.textContent = \'Copy\'; }, 1500);\n    });\n  });\n})();\n</script>\n'
+      + '<script>\n(function() {\n  var toggle = document.getElementById(\'sidebarToggle\');\n  if (toggle) toggle.addEventListener(\'click\', function() {\n    document.getElementById(\'sidebar\').classList.toggle(\'open\');\n  });\n  document.querySelectorAll(\'#sidebar a\').forEach(function(a) {\n    a.addEventListener(\'click\', function() { document.getElementById(\'sidebar\').classList.remove(\'open\'); });\n  });\n  // highlight vanilla-source code boxes\n  document.querySelectorAll(\'.cv-table\').forEach(function(table) {\n    var rows = table.querySelectorAll(\'tr.cv-row\');\n    if (!rows.length) return;\n    var texts = [];\n    rows.forEach(function(r) { texts.push(r.querySelector(\'code\').textContent); });\n    var src = texts.join(\'\\n\');\n    var hl = hljs.highlight(src, {language: \'java\'}).value.split(\'\\n\');\n    rows.forEach(function(r, i) { r.querySelector(\'code\').innerHTML = hl[i] || \'\'; });\n    table.dataset.src = src;\n  });\n  document.querySelectorAll(\'.cv-copy\').forEach(function(btn) {\n    btn.addEventListener(\'click\', function() {\n      var t = document.createElement(\'textarea\');\n      t.value = btn.closest(\'.code-viewer\').querySelector(\'.cv-table\').dataset.src || \'\';\n      document.body.appendChild(t); t.select();\n      try { document.execCommand(\'copy\'); btn.textContent = \'Copied!\'; } catch (e) {}\n      document.body.removeChild(t);\n      var b = btn; setTimeout(function() { b.textContent = \'Copy\'; }, 1500);\n    });\n  });\n})();\n</script>\n'
       + '</body>\n</html>';
 
     fs.writeFileSync(path.join(dir2, 'index.html'), html);
@@ -460,6 +461,7 @@ function main() {
     + '  </nav>\n'
     + '</aside>\n'
     + '<main class="main" id="main">\n'
+    + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
     + '  <div class="content-detail" style="display:block;max-width:960px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
     + '    <div class="detail-header">\n'
     + '      <h1>Module Index</h1>\n'
@@ -472,6 +474,7 @@ function main() {
     + '    </div>\n'
     + '  </div>\n'
     + '</main>\n'
+    + '<script>(function(){var t=document.getElementById(\'sidebarToggle\');if(t)t.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.toggle(\'open\');});document.querySelectorAll(\'#sidebar a\').forEach(function(a){a.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.remove(\'open\');});});})();</script>\n'
     + '</body>\n</html>';
   fs.writeFileSync(path.join(modDir, 'index.html'), modHtml);
 
@@ -518,7 +521,8 @@ function main() {
     + '  <nav class="sidebar-nav">' + sidebarHtml + '</nav>\n'
     + '</aside>\n'
     + '<main class="main" id="main">\n'
-    + '  <div class="content-detail" style="display:block;max-width:960px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
+    + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
+    + '  <div class="content-detail" style="display:block;max-width:900px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
     + '    <div class="detail-header">\n'
     + '      <h1>All Packets</h1>\n'
     + '      <p class="detail-desc">Every Minecraft 1.8.9 network packet, organized by protocol state and direction. Click through for fields, wire encoding, server-side handling, and real client implementation cases.</p>\n'
@@ -529,6 +533,7 @@ function main() {
     + '    </div>\n'
     + '  </div>\n'
     + '</main>\n'
+    + '<script>(function(){var t=document.getElementById(\'sidebarToggle\');if(t)t.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.toggle(\'open\');});document.querySelectorAll(\'#sidebar a\').forEach(function(a){a.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.remove(\'open\');});});})();</script>\n'
     + '</body>\n</html>';
   fs.writeFileSync(path.join(path.join(BASE, 'packets'), 'index.html'), packetsIndex);
 
@@ -551,9 +556,12 @@ function main() {
     home = home.replace('<!-- PACKET_LINKS -->', block);
   }
   // inline the site CSS into the home page (kills the render-blocking css/style.css request)
+  const css = fs.readFileSync(path.join(BASE, 'css', 'style.css'), 'utf8');
   if (home.indexOf('<!-- STYLE_CSS_INLINE -->') !== -1) {
-    const css = fs.readFileSync(path.join(BASE, 'css', 'style.css'), 'utf8');
     home = home.replace('<!-- STYLE_CSS_INLINE -->', '<style>\n' + css + '\n</style>');
+  } else {
+    // idempotent rebuilds: refresh the already-inlined style block
+    home = home.replace(/<style>\n[\s\S]*?\n<\/style>/, '<style>\n' + css + '\n</style>');
   }
   fs.writeFileSync(homePath, home);
 

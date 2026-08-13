@@ -70,6 +70,14 @@ function getGroupPackets(group) {
 // BUILD SIDEBAR — links to standalone packet pages
 // ============================================================
 function buildSidebarNav(visiblePackets) {
+  // mobile sidebar toggle (off-canvas drawer)
+  var t = document.getElementById('sidebarToggle');
+  if (t) t.addEventListener('click', function() {
+    document.getElementById('sidebar').classList.toggle('open');
+  });
+  document.querySelectorAll('#sidebar a').forEach(function(a) {
+    a.addEventListener('click', function() { document.getElementById('sidebar').classList.remove('open'); });
+  });
   var nav = document.getElementById('sidebarNav');
   var html = '';
 
