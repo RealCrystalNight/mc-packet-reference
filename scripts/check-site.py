@@ -80,6 +80,12 @@ for asset in ["assets/og-image.png", "assets/icon-192.png", "assets/icon-512.png
 robots = open(os.path.join(BASE, "robots.txt"), encoding="utf-8").read()
 if SITE + "/sitemap.xml" not in robots:
     errors.append("robots.txt sitemap URL is wrong")
+# the renamed twin (John Mueller fix) must exist and be byte-identical
+twin = os.path.join(BASE, "sitemap-index.xml")
+if not os.path.exists(twin):
+    errors.append("missing sitemap-index.xml (renamed twin for Google resubmission)")
+elif open(twin, encoding="utf-8").read() != open(os.path.join(BASE, "sitemap.xml"), encoding="utf-8").read():
+    errors.append("sitemap-index.xml differs from sitemap.xml")
 
 # analysis pages: hub + every registered analysis + assets
 an_data = os.path.join(BASE, "data", "analysis")

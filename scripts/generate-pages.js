@@ -401,6 +401,10 @@ function main() {
     + '</urlset>\n';
 
   fs.writeFileSync(path.join(BASE, 'sitemap.xml'), sitemap);
+  // John Mueller's fix for a valid-but-unread sitemap: serve the same content
+  // under a fresh filename so Google treats it as a new submission
+  // (clears any cached "couldn't fetch" state from the old name).
+  fs.writeFileSync(path.join(BASE, 'sitemap-index.xml'), sitemap);
 
   // ============================================================
   // Modules index — every module name across all packets
