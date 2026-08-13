@@ -1,0 +1,56 @@
+{
+  "module": "KeepSprint",
+  "client": "Sigma 4.11",
+  "category": "keepsprint",
+  "source_rel": "info/sigmaclient/module/impl/movement/KeepSprint.java",
+  "overview": "Sigma 4.11's KeepSprint is a one-branch packet filter that tries to cancel every C0B STOP_SPRINTING entity-action so the sprint state survives hits. The intended mechanism is standard for 1.8 keep-sprint modules, but this port is doubly inert. First, the guard is e.isIncoming() && packet instanceof C0BPacketEntityAction: EventPacket.isIncoming() returns the negation of the outgoing flag, which NetworkManager sets true only on the receive path (channelRead0) and false on the send path (sendPacket), and C0B is a serverbound-only class, so no packet can ever satisfy both halves of the guard and the cancel branch is unreachable code. Second, the fork has already removed the vanilla sprint-stop-on-hit: EntityPlayer.attackTargetEntityWithCurrentItem carries the commented-out //this.setSprinting(false); inside its knockback block, so the client never emits the STOP this module exists to suppress. The module's wire footprint is zero: it sends nothing, cancels nothing, and leaves the fork's sprint-state diff in motionUpdates() untouched.",
+  "sections": [
+    {
+      "h": "The inverted event guard",
+      "p": "EventPacket is the fork's single packet event, fired from NetworkManager.sendPacket with the outgoing flag true and from channelRead0 with false; isIncoming() returns !outgoing. KeepSprint's guard therefore only admits packets the client received, but C0BPacketEntityAction is a client-to-server class that the server never sends, so the instanceof can never be true on the receive path. The branch that would cancel STOP_SPRINTING is unreachable in exactly the same way as FakeHacker's REACH and FLY branches, which are gated on the same isIncoming() predicate. The try/catch around the handler swallows nothing relevant; the ClassCastException guard is defensive noise."
+    },
+    {
+      "h": "The fork already removed the sprint-stop-on-hit",
+      "p": "In vanilla 1.8.9, landing a hit while sprinting stops the sprint: EntityPlayer.attackTargetEntityWithCurrentItem calls setSprinting(false) inside the knockback block after a successful attack, which the fork's motionUpdates() state diff would turn into a C0B STOP_SPRINTING packet. In this fork those lines are commented out: //this.motionX *= 0.6D, //this.motionZ *= 0.6D and //this.setSprinting(false) sit dead inside the hasDamaged branch. The client therefore keeps sprinting through hits on its own, and the sprint-state diff in motionUpdates() (lines 185-193) never sees the false transition that would produce the STOP. The module's intended function is already performed by the fork itself."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "There is no fingerprint because there is no behavior. The C0B stream is the vanilla one produced by motionUpdates(): one START_SPRINTING when the flag rises, one STOP_SPRINTING when it falls, exactly as an unmodified client emits them. The module consumes EventPacket instances and cancels nothing; the only trace of its existence is the empty handler in the bytecode. As with FakeHacker, the honest conclusion is that the module's effect is nil and every anticheat observation of the module is an observation of nothing."
+    }
+  ],
+  "packets": [
+    "C0BPacketEntityAction"
+  ],
+  "files": [
+    {
+      "label": "KeepSprint.java",
+      "rel": "info/sigmaclient/module/impl/movement/KeepSprint.java",
+      "explanation": "The module is this file alone, authored by Arithmo in the same 2017 batch as WorldTime. The single handler registers for EventPacket, casts the event, and in a try/catch checks e.isIncoming() with the packet being a C0BPacketEntityAction whose action is STOP_SPRINTING, cancelling the event if so. The class never touches the player, never writes motion, and never constructs a packet; its entire surface is the one cancel. The isIncoming() predicate is the fatal flaw: NetworkManager fires the event for outgoing packets with the outgoing flag true (sendPacket) and for received packets with false (channelRead0), and isIncoming() returns the negation of that flag, so the guard admits only received packets, while C0B is a packet class that only travels client-to-server. The conjunction is unsatisfiable and the cancel is dead code. A working port would either drop the direction check or use isOutgoing()."
+    },
+    {
+      "label": "EntityPlayer.java (fork attack path)",
+      "rel": "net/minecraft/entity/player/EntityPlayer.java",
+      "explanation": "This file proves the fork needs no KeepSprint at all. Inside attackTargetEntityWithCurrentItem, in the block that runs after hasDamaged, vanilla applies the hit penalties: it dampens the attacker's own motion and stops the sprint. The fork ships those three statements commented out: //this.motionX *= 0.6D; //this.motionZ *= 0.6D; and //this.setSprinting(false);. With setSprinting never called on a successful hit, the isSprinting() state the fork's motionUpdates() diffs stays true, so no STOP_SPRINTING C0B is ever emitted from the attack path and the entity-action stream carries only the ordinary START/STOP toggles of manual sprinting. The file also documents the vanilla baseline the module was written against: the commented-out call is exactly the transition a working KeepSprint would have to intercept."
+    }
+  ],
+  "countering": [
+    {
+      "label": "ToggleFrequency (entity-action rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/ToggleFrequency.java",
+      "explanation": "NCP handles the C0B stream through the ProtocolLib EntityActionAdapter, which adds one point to data.playerActionFreq per entity-action packet and runs ToggleFrequency.check on the window, scoring the full window against cc.toggleActionLimit, default 25 actions per second, with the configured actions cancelling at vl above 10. It does not distinguish action types, so sprint, sneak and bed-leave toggles share one bucket.\n\nFor KeepSprint the check is doubly moot. The check can only flag an excess of toggles, while the module's intended effect is the absence of one: suppressing a STOP_SPRINTING removes an action from the ledger, which can only push the player further from the limit. And because the shipped module never fires at all, the C0B stream stays the vanilla START/STOP toggles, one or two actions per toggle cycle, far under the 25-per-second ceiling. This entry is the honest baseline: the only NCP check on the module's target packet class cannot observe either the module or its intended behavior."
+    },
+    {
+      "label": "SprintDirection (sprint state vs move force)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/SprintDirection.java",
+      "explanation": "Hawk's SprintDirection validates that a sprinting player's horizontal move force agrees with the facing. For each move while pp.isSprinting(), it reconstructs the force by removing friction, the prior velocity (damped for soul sand and webs), the hit-slowdown factor and the jump impulse, then measures the angle between that force and the yaw vector, punishing when the angle exceeds PI/4 + 0.3. Exemptions cover swimming, teleports, accepted knockback, horizontal collision, moves within two ticks of a sprint toggle, near-zero horizontal distance, and ladder/vine contact.\n\nThe check is the closest thing in Hawk to a sprint-state validator, and it is also one the module cannot reach. A player whose sprint is kept alive through hits still has to move in the yaw quadrant for SprintDirection to pass, which has nothing to do with the C0B stream; and since the shipped module never suppresses the STOP, the sprint state Hawk tracks is whatever the vanilla stream says. The entry documents the check that would constrain a working keep-sprint player on the movement axis, and why the module's dead branch means it never interacts with it."
+    },
+    {
+      "label": "ActionToggleSpeed (same-tick toggles)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/ActionToggleSpeed.java",
+      "explanation": "ActionToggleSpeed watches PlayerActionEvents for sneak and sprint toggles and punishes a toggle that lands on the same tick as the previous one of its kind: pp.getCurrentTick() - lastSprintToggle < 1 after a SPRINT_START or SPRINT_STOP, with the same rule for sneak. It exists to catch clients that rapidly re-assert sprint or sneak state, which generate action packets faster than a human or vanilla toggle cycle can.\n\nKeepSprint interacts with this check only by subtraction. The intended behavior suppresses STOP_SPRINTING entirely, which leaves the ledger with the single START from enabling and removes the pairs that rapid re-assertion would produce; a working module would make ActionToggleSpeed even quieter, and the dead shipped branch changes nothing at all. The C0B traffic on the wire stays at vanilla toggle frequency, so the check never sees a same-tick pair. This entry closes the sprint-domain coverage for Hawk: none of its sprint checks can flag a module whose observable output is zero."
+    }
+  ]
+}

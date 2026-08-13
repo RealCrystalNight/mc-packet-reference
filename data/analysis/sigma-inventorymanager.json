@@ -1,0 +1,57 @@
+{
+  "module": "InventoryManager",
+  "client": "Sigma 4.11",
+  "category": "inventorymanager",
+  "source_rel": "info/sigmaclient/module/impl/player/InventoryManager.java",
+  "overview": "Sigma 4.11's InventoryManager is a full inventory organizer driven from the EventUpdate pre phase: it keeps the best weapon, pickaxe, shovel and axe in hotbar slots 36-39, delegates armor to the AutoArmor module (shift-clicking upgrades and dropping worn pieces), and runs an inventory cleaner that drops junk under a whitelist/blacklist rule set with a BLOCKCAP (default 128) for blocks. Every action is a mc.playerController.windowClick - SHIFT_CLICK (mode 1) for armor, SWAP (mode 2) for tools, DROP (mode 4, button 1) for junk - so all of it travels as C0EPacketClickWindow bursts against the player's own window 0, gated by a shared DELAY timer (default 1, i.e. 50ms, up to 10) that caps the click rate at 20 clicks per second. The Basic mode operates with mc.currentScreen == null - clicking a window the client considers closed - while OpenInv mode requires the GuiInventory screen.",
+  "sections": [
+    {
+      "h": "Click pipeline",
+      "p": "The EventUpdate pre handler is a sequence of timer-gated passes: first the AutoArmor pass (getBestArmor, gated by AutoArmor's own DELAY/MODE settings and only when AutoArmor is enabled), then a consistency guard that bails while any armor slot holds a non-best piece or a matching piece exists in the inventory, then the four best-tool swaps into slots 36-39 (weapon 36, pickaxe 37, shovel 38, axe 39), and finally the INVCLEANER sweep over slots 9-44 calling shouldDrop on each stack and dropping one item at a time. Every pass shares the single timer: a click resets it, and when DELAY > 0 the pass breaks after one click per tick, so the sustained rate is 1000/(DELAY*50) clicks per second - 20/s at the default, 10/s at DELAY 2. The drop path uses windowClick(slot, 1, 4) - button 1, mode 4, the vanilla drop-one-slot action - which is what NCP weights at 0.6 when repeated on the same slot."
+    },
+    {
+      "h": "Item policy",
+      "p": "shouldDrop encodes the cleanup rules: display-name guards exempt '(right click)' and '§k||' items; the four hotbar tool slots are exempt while they hold their best item; armor is exempt while it is the best piece for its slot; blocks drop when the total block count exceeds BLOCKCAP or the block is on Scaffold's blacklist; bad potions (poison, harm, slowness, weakness - or any potion with no effects) drop; food drops when FOOD is on (golden apples exempt); hoes, tools, swords and armor always drop unless the SWORD setting keeps swords; bows and arrows drop when ARCHERY is on; and a long unlocalizedName blacklist (tnt, sticks, eggs, string, cake, mushroom, flint, compass, dyes, feathers, buckets, chests without 'collect', snow, fish, enchants, exp, shears, anvils, torches, seeds, leather, reeds, skulls, records, snowballs, glass bottles, pistons) covers the rest. Weapon and tool 'best' scoring is getDamage (tool damage + sword attack damage + sharpness*1.25 + fire aspect*0.01) and getToolEffect (str-vs-block with gold penalties and efficiency/unbreaking bonuses)."
+    },
+    {
+      "h": "Window-state assumption",
+      "p": "The module assumes it may click window 0 at any time: Basic mode runs when mc.currentScreen == null, GuiInventory or GuiChat is open, and OpenInv mode narrows that to GuiInventory only. With no screen open, the vanilla client still accepts window-0 clicks because the player inventory container is always conceptually open in 1.8 - the C0E packets carry windowId 0 and the server processes them against the crafting/player inventory. That is also the exact condition anticheats key on: Hawk's InventoryActions flags any ClickInventoryEvent while its per-player window state says nothing is open, which makes the default Basic mode visible to it on every click."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "InventoryManager.java (module)",
+      "rel": "info/sigmaclient/module/impl/player/InventoryManager.java",
+      "explanation": "The module is a 120-line policy engine over windowClick. The three click helpers are thin wrappers: shiftClick(slot) sends windowClick(windowId, slot, 0, 1) - SHIFT_CLICK, used only by getBestArmor; swap(slot1, hotbarSlot) sends windowClick(windowId, slot1, hotbarSlot, 2) - the SWAP action that moves an item into a hotbar slot; drop(slot) sends windowClick(windowId, slot, 1, 4) - DROP_ONE_SLOT. The windowId is always mc.thePlayer.inventoryContainer.windowId (0 for the player inventory), so no window-open packet is ever sent - the module never touches C16 or S2D and never relies on a server window. The weapon/tool passes run getBestWeapon/getBestPickaxe/getBestShovel/getBestAxe with per-type 'best' comparisons over slots 9-44, and the AutoArmor pass reads the other module's settings directly (armor.getSetting(AutoArmor.DELAY)). The C09PacketHeldItemChange import on line 28 is vestigial - no C09 is ever constructed; slot changes are expressed entirely through C0E swaps, which is the detail that keeps the module off C09-rate checks."
+    },
+    {
+      "label": "AutoArmor.java (armor pass dependency)",
+      "rel": "info/sigmaclient/module/impl/player/AutoArmor.java",
+      "explanation": "AutoArmor is the armor half of the pipeline and the module's only hard dependency. Its settings (DELAY, MODE) gate InventoryManager's armor pass: the pass reads armor.getSetting(AutoArmor.DELAY) and AutoArmor.MODE, waits for AutoArmor's timer, and only calls getBestArmor when AutoArmor is enabled and the screen rule matches. AutoArmor itself defers to InventoryManager when both are on (isEnabled(InventoryManager.class) returns early), so the two modules never double-click. getBestArmor - shared by both modules - iterates armor slots 4-8, drops a worn piece that is no longer best (drop(4 + type), a DROP_ONE_SLOT click) and shift-clicks the best piece from the inventory (shiftClick(i)); its FakeInv mode (not used by InventoryManager's pass) sends a C16PacketClientStatus OPEN_INVENTORY_ACHIEVEMENT to make the server think the inventory opened. The interplay matters for countering because every armor click is a full-weight C0E against the same 50ms timer as the tool swaps and drops."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastClick (click-rate ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "NCP's FastClick is the rate check for window clicks. Each click feeds data.fastClickFreq - an ActionFrequency(5, 200L), i.e. five 200ms buckets covering one second (InventoryData line 58) - with an amount weight: 1.0 for ordinary clicks, 0.6 for a repeated DROP_ONE_SLOT on the same slot in the CRAFTING inventory (the getAmountWithAction branch, which is exactly the module's drop-one-at-a-time pattern), and scaled weights for COLLECT_TO_CURSOR and shift-click stacks. The newest bucket is scored against cc.fastClickShortTermLimit (default 4, DefaultConfig line 389) and the full window against cc.fastClickNormalLimit (default 15, line 390), both lag-adapted, with violations accruing fastClickVL and cancelling from vl>150 under the default actions. At the module's default 50ms delay the sustained rate is 20 clicks per second: the full-window score of ~20 (or ~12 for a pure drop sequence at 0.6 weight) clears the 15/s normal limit whenever any full-weight shift-click or swap is in the mix, and the per-bucket score sits right at the 4-per-200ms boundary, so timer jitter that bunches five clicks into one bucket trips the short-term path. DELAY >= 2 (10/s) keeps the window score under 15 and passes the rate check entirely."
+    },
+    {
+      "label": "InventoryActions (closed-window click rejection)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/inventory/InventoryActions.java",
+      "explanation": "Hawk's InventoryActions is the window-state check. It tracks each player's open-window state (pp.hasInventoryOpen()) and punishes two inversions: interacting with entities/blocks while a window is open, and - the relevant branch - any ClickInventoryEvent while hasInventoryOpen() == 0, i.e. a window click with no window open. The punish path resyncs the client (e.resync()) to force the window state back in sync. Sigma's Basic mode clicks window 0 with mc.currentScreen == null, which on the server means no S2D window-open ever arrived, so Hawk's ledger records the inventory as closed and every one of the module's clicks is a punishable closed-window click, independent of rate. The OpenInv mode is the designed dodge: it only acts while the GuiInventory screen is open, which arrives with the window-open packet (C16 OPEN_INVENTORY_ACHIEVEMENT or the vanilla open), so Hawk's hasInventoryOpen() is nonzero and the clicks are legitimate. The module's own comment structure shows this was a deliberate mode split rather than an accident."
+    },
+    {
+      "label": "ItemSwitchSpeed (the C09 check the module avoids)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/item/ItemSwitchSpeed.java",
+      "explanation": "ItemSwitchSpeed is the held-item switch rate check and the counter that the module structurally avoids. It listens for ItemSwitchEvent (fired by C09PacketHeldItemChange) and, whenever the player used an item (InteractItemEvent or InteractWorldEvent) in the same tick window, punishes a switch fewer than MIN_SWITCH_TICKS (default 1) ticks after the previous switch - the signature of autotool-style instant switching. The check is cancelless and only feeds VL. InventoryManager never sends C09: its C09PacketHeldItemChange import is dead code, and every slot change is a C0E SWAP click against window 0, so the check never sees an ItemSwitchEvent from this module. That is the honest verdict for the C09 side of the packet surface: the module is invisible to C09 policing precisely because it routes its hotbar changes through the inventory window protocol instead of the held-item channel - which in turn is why the C0E rate and window-state checks above are the effective counters."
+    }
+  ]
+}

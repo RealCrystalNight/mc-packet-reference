@@ -1,0 +1,62 @@
+{
+  "module": "AutoClicker",
+  "client": "Rise 6.1.30",
+  "category": "autoclicker",
+  "source_rel": "com/alan/clients/module/impl/ghost/AutoClicker.java",
+  "overview": "Rise 6.1.30's AutoClicker is a ghost-category click injector built as a ModeValue shell over two modes, Normal (default) and Drag Click Simulations, plus a Jitter toggle. Instead of forging packets it drives the vanilla input path: PlayerUtil.sendClick sets the attack or use key bind state and fires KeyBinding.onTick, so the game's own tick loop consumes the press and runs clickMouse, which swings first and then attacks. Every module click is therefore a complete vanilla click: one C0A arm animation, and a C02 attack whenever the crosshair is over an entity. The shell also pins mc.leftClickCounter to -1 every render frame so the vanilla click gate never blocks the injected presses, and the Jitter mode writes mouse motion into EntityRenderer.mouseAddedX and mouseAddedY for 100ms after a real click.",
+  "sections": [
+    {
+      "h": "Click injection path",
+      "p": "PlayerUtil.sendClick(button, state) resolves the key bind for button 0 (attack) or 1 (use item), calls KeyBinding.setKeyBindState and, on the press edge, KeyBinding.onTick, which increments the bind's click counter. The next Minecraft.runTick consumes the counter through isPressed and enters clickMouse while leftClickCounter is at or below zero; the fork's clickMouse fires ClickEvent and AttackEvent through the client event bus, then AttackOrder.sendConditionalSwing (swing only when the target is not an entity) and AttackOrder.sendFixedAttack, which on 1.8 runs swingItem() and then playerController.attackEntity, emitting the C02. The module's own onRender3D sets mc.leftClickCounter = -1 every frame, so the 10-tick penalty vanilla applies when a click has no hit result never stalls the next injection. The Jitter toggle writes EntityRenderer.mouseAddedX and mouseAddedY inside the 100ms window after a real click, scaled by 400 divided by the debug FPS and the per-click direction vector captured in the ClickEvent listener."
+    },
+    {
+      "h": "Normal mode cadence",
+      "p": "NormalAutoClicker runs on TickEvent and computes the inter-click interval as 1000 divided by a per-click random draw: cps is a BoundsNumberValue defaulting to 8-14 with a 0.1 step, and the draw is multiplied by 1.5, so the interval bounces between roughly 47ms and 83ms, a 12-21 CPS stream. Clicks fire only while the attack key is held for at least two ticks, with no GUI open, and never while the use-item key is held. hitSelect suppresses clicks until attackTicks reaches 10 or the player is being hit (hurtTime above 0); breakBlocks skips clicks aimed at a block, or resets curBlockDamageMP when disabled so the injected swings never start a dig. The butterfly branch caps long intervals: whenever the pending interval is 100ms or more, the next one is drawn uniformly from 0-100ms, doubling the effective rate. Right-click mode sends sendClick(1, true) with a 10% chance of a second press."
+    },
+    {
+      "h": "Drag Click Simulations mode",
+      "p": "DragClickAutoClicker simulates a drag click as a run of one-press-per-tick clicks. With the attack key held, each tick decrements nextLength and, with 95% probability, sends sendClick(0, true), so a default drag of 17-18 clicks lands at roughly 20/s; when nextLength runs out, the mode counts down nextDelay ticks (default 6) before arming the next drag with fresh random draws from the length and delay bounds. The result is a burst-and-pause pattern that no single fixed-period model matches, which is why the statistical rate checks in the countering section are the deciding signal rather than any one interval."
+    }
+  ],
+  "packets": [
+    "C0APacketAnimation"
+  ],
+  "files": [
+    {
+      "label": "AutoClicker.java (mode shell)",
+      "rel": "com/alan/clients/module/impl/ghost/AutoClicker.java",
+      "explanation": "The shell is 48 lines and holds the injection policy: the ModeValue registers Normal and Drag Click Simulations with Normal as default; the Jitter BooleanValue gates the mouse-noise branch; the ClickEvent listener stamps the per-click direction and resets the StopWatch; onRender3D pins leftClickCounter to -1 and, inside the 100ms post-click window while use-item is held, writes randomized mouseAddedX and mouseAddedY scaled by 400 over the debug FPS. All actual clicking logic lives in the mode classes, which is the standard Rise 6.x ModeValue split."
+    },
+    {
+      "label": "NormalAutoClicker.java (default mode)",
+      "rel": "com/alan/clients/module/impl/ghost/autoclicker/NormalAutoClicker.java",
+      "explanation": "The default mode implements the cadence. A TickEvent gate checks the StopWatch against the computed interval, applies the hitSelect, breakBlocks and right-click conditions, and calls PlayerUtil.sendClick, which is a key-bind injection rather than a packet send. The interval is 1000 divided by cps.getRandomBetween() times 1.5, with the butterfly re-draw below 100ms; attackTicks is reset by AttackEvent so hitSelect can measure time since the last real hit. This file defines the wire fingerprint the countering checks see: one key-bind press per interval, each press becoming a vanilla clickMouse with its C0A swing and its C02 attack."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FightSpeed (attack-rate cap)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightSpeed.java",
+      "explanation": "Hawk's FightSpeed caps the C02 attack rate at 16 CPS (the maxCps setting). It records the tick delta between consecutive non-INTERACT InteractEntityEvents, logs a delta only when it is at most RECORD_SENSITIVITY 4 ticks, and after SAMPLES 10 deltas computes avgCps as 20 divided by the mean tick spacing: a 20 CPS stream with one-tick spacing reads exactly 20 and punishes, a 14 CPS stream reads 14 and stays under. Every sample window that exceeds the cap calls punish(1, true), which lifts the violation level; windows below it call reward().\n\nAgainst the Normal mode the readout is the deciding number: the per-click interval draw of 1000 over (cps times 1.5) with defaults 8-14 produces a 12-21 CPS stream, so the upper half of the range and every butterfly burst (intervals drawn from 0-100ms) sit above 16 and accumulate violations, while the lower half of the range stays under the cap. The Drag mode's one-per-tick run reads a flat 20 CPS and trips immediately, and the trailing 6-tick pause only resets the window. The honest boundary is the same as any rate check: a player who runs the module at the bottom of the range, below 16 CPS sustained, produces deltas the check never scores at the cap."
+    },
+    {
+      "label": "FightSpeedConsistency (cadence regularity)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightSpeedConsistency.java",
+      "explanation": "FightSpeedConsistency punishes cadence regularity instead of raw rate. It averages tick deltas in windows of SAMPLE_SIZE 20 clicks, converts each window to a CPS figure, and keeps SAMPLES 5 window averages; when the mean is above MIN_CPS 10 and the standard deviation of the five window averages is below STDEV_THRESHOLD 0.05, it punishes (Cancelless). The 0.05 stdev bound is the false-positive gate: human clicking is irregular enough that five 20-click window means wander more than 0.05 CPS, while a machine period stays flat.\n\nThe Rise module's interval is an iid random draw per click, and by the central limit theorem the 20-click window means converge: the per-click jitter averages out inside each window, so the five window averages sit nearly constant and the check fires whenever the window mean exceeds 10 CPS, which the default 8-14 range does on its upper half. The butterfly re-draw below 100ms skews the distribution but does not add window-to-window drift. The Drag mode is a textbook target: a fixed one-tick period produces a stdev near zero. The honest miss is the same CLT caveat: at the bottom of the range the window mean can sit under the 10 CPS gate and the check never arms."
+    },
+    {
+      "label": "KillAura (attack and swing windows)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/KillAura.java",
+      "explanation": "Arc v2's KillAura check runs two rolling-window rate tests on the C02 stream. PacketListener increments totalAttacks on every USE_ENTITY packet and attackPackets on every ATTACK action, and stamps lastArmSwing from every C0A. checkFrequency runs per ATTACK packet: once the rolling one-second window holds more than maxAttackPackets 20 attacks, the check cancels the packet outright; check() runs the same window against totalAttacks with maxAttacks 16 and flags Kill Aura (Speed). The same file holds the reach, direction and swing-time sub-checks, with max-swing-time 80ms: an attack whose last C0A is older than 80ms flags Kill Aura (NoSwing). All defaults come from config.yml (max-direction-angle 1.2, max-swing-time 80, max-reach 4.2, max-attacks 16, max-attack-packets 20).\n\nThe Normal mode feeds these windows directly: every injected click is a real clickMouse, so the swing ledger stays fresh and the NoSwing sub-check passes, while the attack counters see one C02 per click. Above roughly 16-20 CPS the window overflows and the check flags, then cancels the 21st attack packet of any second; below that the rate windows stay under the caps. The honest boundary is the swing path: the module always swings, so only the rate half of this check can fire, never the NoSwing half."
+    },
+    {
+      "label": "NoSwing (attack-without-swing ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/NoSwing.java",
+      "explanation": "NCP's fight NoSwing enforces the arm-movement rule. FightListener increments noSwingCount on every attack and decrements it on every PlayerAnimationEvent; check() rewards a single swingless attack (the count stays at one and the violation level decays by 0.9) and punishes the second consecutive swingless attack, resetting the count, adding one violation level and executing the configured actions, whose default is cancel at level 2.\n\nBecause the module swings on every injected click through the vanilla path, each C0A lands between the C02s and the ledger stays fed, so this check is an honest gap for AutoClicker: it is designed for killaura variants that attack without swinging, and a swing-always autoclicker never trips it. It belongs in the set as the negative result that separates swing-always clickers from swingless killaura, and it frames why the rate checks above are the real countering layer for this module."
+    }
+  ]
+}

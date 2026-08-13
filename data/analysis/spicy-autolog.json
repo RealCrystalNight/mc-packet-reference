@@ -1,0 +1,62 @@
+{
+  "module": "AutoLog",
+  "client": "Spicy",
+  "category": "autolog",
+  "source_rel": "info/spicyclient/modules/player/AutoLog.java",
+  "overview": "Spicy's AutoLog is a health-gated disconnect in two modes. The Vanilla mode closes the network channel directly with a formatted chat reason once health drops to the configured threshold, which is a clean logout that produces no farewell packet. The Packet mode instead floods the send queue with 1000 identical C04 position replays in a single tick, replaying the player's current position with the real onGround flag, which blows through the server's move-processing rate limits and gets the player disconnected by the anticheat or the connection itself. Both modes fire from EventUpdate pre, guard against health 0, and toggle the module off through notifyPlayer after firing. The module never emits a client-status packet; its traffic is the C03 position flood or nothing at all.",
+  "sections": [
+    {
+      "h": "Two disconnect modes",
+      "p": "The mode setting selects the exit. Vanilla mode calls sendQueue.getNetworkManager().closeChannel with a ChatComponentText carrying the client name and version and the notice that autolog disabled itself, which drops the connection the way a normal quit does: the server simply sees the socket close. Packet mode loops 1000 times pushing new C04PacketPlayerPosition objects with the player's current coordinates and the real onGround flag into addToSendQueue, all in the one EventUpdate pre tick, so the server processes a 1000-packet move burst at once."
+    },
+    {
+      "h": "The 1000-packet replay",
+      "p": "Every C04 in the flood carries the identical position and the genuine onGround flag, so the burst is zero-displacement and contains no spoofed state. Its purpose is volume: one server tick of 1000 move packets saturates the move processing path and rate ledgers, which on anticheat-protected servers means an instant kick from the packet-rate check, and on stock servers means the queued flood alone can sever the connection. The health guard is common to both modes: the trigger is getHealth() <= health setting with getHealth() != 0, so a post-death zero-health state never fires it, and the threshold defaults to 4 over a 1-20 range."
+    },
+    {
+      "h": "Wire shape and dead imports",
+      "p": "The observable traffic of Packet mode is purely C03: 1000 C04PacketPlayerPosition packets, a C03 subclass, in one tick. Vanilla mode has no packet at all. The class imports C00PacketKeepAlive but never constructs one, and the C16 client-status packet appears nowhere in the module, so the disconnect is either a channel close or a position flood. notifyPlayer() runs after either mode, pushing two notifications and calling toggle() so the module disarms itself and cannot re-fire on the next low-health tick."
+    }
+  ],
+  "packets": [
+    "C16PacketClientStatus"
+  ],
+  "files": [
+    {
+      "label": "AutoLog.java (module)",
+      "rel": "info/spicyclient/modules/player/AutoLog.java",
+      "explanation": "The module is one EventUpdate pre branch with the mode switch inside. The health setting is a NumberSetting with default 4 over the range 1-20, and the trigger condition is getHealth() <= health with a != 0 guard, so the module fires at four hearts or below and ignores the zero-health death state. Vanilla mode closes the channel directly through getNetworkManager().closeChannel with a formatted chat reason, and Packet mode loops 1000 C04PacketPlayerPosition constructions into addToSendQueue.\n\nThe notifyPlayer() helper pushes the two notifications and calls toggle() to disarm the module, so the firing is one-shot. The C00PacketKeepAlive import is dead code: no keepalive is ever built, which matters because a reader following the imports could otherwise assume a keepalive-based disconnect."
+    },
+    {
+      "label": "C03PacketPlayer.java (position replay carrier)",
+      "rel": "net/minecraft/network/play/client/C03PacketPlayer.java",
+      "explanation": "The fork's movement packet base defines the C04PacketPlayerPosition subclass that carries the flood. C04's constructor sets the moving flag and its writePacketData emits the three doubles followed by the inherited onGround byte, so each replay is a full position plus the true ground flag. The base class also exposes the setYaw, setPitch, setIsOnGround and setMoving mutators used across the client's movement modules, which is why the C03 family is the common rewrite target in Spicy.\n\nReading the subclass serialization makes the flood's shape concrete: 1000 wire-identical position packets, each roughly 25 bytes, emitted in one tick, which is the volume profile the countering checks below key on."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (move packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NoCheatPlus scores every processed move into data.morePacketsFreq, an ActionFrequency with 500ms buckets, against the 22-per-second window ceiling, with a burst path on the newest half-second bucket (default 15 packets, direct-violation 10) and a cancel at low vl once the accumulated excess passes. MovingListener invokes the check on every C03-family packet, so the C04 subclass is counted identically to a position move.\n\nThe Packet mode flood is the direct target: 1000 moves arrive in one tick, so the newest bucket scores 1000 against a 15-packet burst threshold and the window accumulator runs at roughly 45 times the ceiling. The violation fires on the first bucket and the default action cancels the player, which is exactly the disconnect the module wants, but on the anticheat's terms with a recorded flag rather than a clean logout. The replays are zero-displacement, so no motion check sees them; the rate ledger is the only surface."
+    },
+    {
+      "label": "MorePackets (per-second rate ledger)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/MorePackets.java",
+      "explanation": "Arc v2's MorePackets enforces a 30-packets-per-second flag threshold with a 70-per-second kick, counting serverbound movement packets through its packet listener. A 1000-packet single-tick flood is over 33 times the kick threshold, so the flag fires on the first packet batch and the kick follows immediately.\n\nThis is the second independent rate ledger the flood trips, which is the point of the entry: the module's own disconnect mechanism is indistinguishable from a rate-check flag to every ledger-based anticheat, so the Packet mode converts a deliberate exit into a recorded violation. A player who wants an unrecorded exit must use the Vanilla mode, which closes the channel without any packet for a ledger to count."
+    },
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the physics envelope from the block cache: horizontal allowance from prepareSpeedEstimation, vertical allowance from vDistRel, and a violation equal to the summed excess times 100 with a set-back. The onGround flag is ignored for ground purposes because the ground state comes from a ray trace of the actual block cache at minY minus yOnGround.\n\nThe flood's replays present zero displacement and the true onGround flag, so every replayed move scores as a no-move and the envelope passes them all. This is the honest boundary that keeps the countering set honest: the burst is a volume event, invisible to motion models by construction, and only the rate ledgers above can score it. The entry also covers why a NoFall-style ground check cannot help: the flag is never spoofed."
+    },
+    {
+      "label": "TickRate (move clock)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/tick/TickRate.java",
+      "explanation": "Hawk's TickRate measures the server tick rate from the timestamps of arriving movement events, punishing a sustained clock drift in either direction. The 1000-packet flood lands inside a single server tick, so every replay carries the same arrival timestamp and the inter-move intervals around the burst stay at one tick; no drift accumulates and the check never fires.\n\nThis is the timing twin of the rate story: a one-tick volume burst is exactly what a clock check cannot see, because the check keys on interval length rather than packet count. The entry documents the division of labor across the set: MorePackets ledgers catch the flood, TickRate and SurvivalFly pass it, and the Vanilla mode's channel close leaves no trace for any of them."
+    }
+  ]
+}

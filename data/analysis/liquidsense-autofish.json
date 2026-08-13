@@ -1,0 +1,63 @@
+{
+  "module": "AutoFish",
+  "client": "LiquidSense Dev",
+  "category": "autofish",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/player/AutoFish.kt",
+  "overview": "LiquidSense Dev's AutoFish automates the cast-and-reel cycle of a fishing rod from an UpdateEvent handler. It requires an ItemFishingRod in hand, casts whenever a 500ms rodOutTimer has elapsed and no bobber entity exists, and reels the instant the bobber enters the sink state that marks a bite (motionX and motionZ zero while motionY is non-zero). The action for both directions is a single mc.rightClickMouse() call, which routes through the vanilla PlayerControllerMP.sendUseItem path and reaches the wire as a C08 use-item packet with facing 255; the server-side ItemFishingRod.onItemRightClick handler then either spawns the bobber or retracts it. The module's wire fingerprint is at most one or two C08 packets per second with a fishing rod held, which is indistinguishable from a fast human angler, and it never touches C02 or any other packet class.",
+  "sections": [
+    {
+      "h": "Bite detection",
+      "p": "The condition that triggers a reel is the bobber's local motion state: mc.thePlayer.fishEntity.motionX == 0.0 and motionZ == 0.0 while motionY != 0.0. That is the client-side sink animation the server produces when a fish bites: the hook stops drifting horizontally and drops, and a human player reacts by right-clicking within a few hundred milliseconds. The module evaluates the same state on the next UpdateEvent, so its reaction latency is a single tick from the moment the sink is visible, versus the roughly 100-300ms plus human error of a manual reel. The casting half uses the complementary condition: no fishEntity at all, gated by rodOutTimer.hasTimePassed(500L), so after a catch or a broken line the rod is re-cast no sooner than 500ms later."
+    },
+    {
+      "h": "Cast and reel wire path",
+      "p": "Both the cast and the reel are plain right-clicks: the module calls mc.rightClickMouse(), the fork's MixinMinecraft injects into that method right after the vanilla rightClickDelayTimer field is set, and the vanilla body runs PlayerControllerMP.sendUseItem, which serializes a C08PacketPlayerBlockPlacement with a null-origin position and facing 255, the use-item form. On the server, ItemFishingRod.onItemRightClick branches on the player's fishEntity: with a bobber out it calls handleHookRetraction and damages the rod, otherwise it plays the cast sound and spawns a new EntityFishHook. The reel is therefore another C08 use, not a C07 RELEASE_USE_ITEM, and the bobber is never the target of a C02 use-entity packet; a fishing session produces zero entity-interaction traffic, which is why the brief's C02 chip is covered in prose only. The vanilla rightClickDelayTimer gate (set to 4 after each use) would cap programmatic re-casts even if the 500ms timer were removed."
+    },
+    {
+      "h": "Timing profile and detection surface",
+      "p": "The module's only observable difference from a manual angler is the same-tick reel response and the exact 500ms cast cadence, both of which live in the client's timing, not in any packet property. The server sees one C08 use-item with a fishing rod every few seconds, well inside every item-use rate window, and the rod itself is a legitimate held item, so no content-based check can separate the module from a fast human. The countering entries below are therefore honest gaps: each check has a mechanism that would catch item-use automation, and each one structurally cannot see this pattern, which is the accurate statement for a module whose entire advantage is reaction time."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity",
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "AutoFish.kt",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/player/AutoFish.kt",
+      "explanation": "The module file is the whole mechanism. onUpdate checks the held item, evaluates the 500ms rodOutTimer gate against the bobber state, and calls mc.rightClickMouse() plus rodOutTimer.reset() when a cast or a reel is due. The rodOutTimer is an MSTimer whose hasTimePassed compares System.currentTimeMillis() against the last reset plus the delay, and its initial time of -1 makes the first check pass immediately, so with a rod already held the module casts on the first tick after enable. The file imports only ItemFishingRod and MSTimer, which confirms the cast and reel are deliberately routed through the vanilla right-click path rather than raw packet sends."
+    },
+    {
+      "label": "MixinMinecraft.java (right-click injection point)",
+      "rel": "net/ccbluex/liquidbounce/injection/forge/mixins/client/MixinMinecraft.java",
+      "explanation": "The mixin defines the fork's relationship to the vanilla right-click path. The rightClickMouse injection fires after the rightClickDelayTimer field is written in the vanilla method, which is the hook the click-speed modules use to zero the delay; AutoFish does not use that hook, but every rightClickMouse() the module calls passes through this injected method, so the mixin is the fork-level context in which the module's C08 uses are emitted. The file also injects into clickMouse, sendClickBlockToController and runTick, giving the surrounding event dispatch context. The LiquidSense Dev snapshot has no net/minecraft tree, so this mixin is the closest verifiable carrier of the module's wire path."
+    }
+  ],
+  "countering": [
+    {
+      "label": "UseItemAdapter (use-item and release ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "NCP's ProtocolLib use-item adapter watches the C08 use form and the C07 release form. It marks mightUseItem for use packets with a face above 5, and its release ledger punishes C07 RELEASE_USE_ITEM packets arriving within the 70ms release interval, feeding the noslowpacket penalty in SurvivalFly. AutoFish's reels are C08 uses, not C07 releases, so the release ledger never arms, and the use packets themselves are tracked but trigger no rate penalty at one or two per second. The honest statement is both sides of the ledger: the check exists to catch item-use automation on the release side, and this module completes its entire cycle on the use side, which the check does not score."
+    },
+    {
+      "label": "blockplace FastPlace (placement-rate window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/FastPlace.java",
+      "explanation": "NCP's block-placement rate check runs from BlockPlaceListener.onBlockPlace, a Bukkit BlockPlaceEvent handler, and scores placements into an ActionFrequency(2, 1000) window plus a short-term tick counter. A fishing-rod cast serializes as a C08 with a null-origin position and facing 255, which is the use-item form, so no BlockPlaceEvent ever fires and the placement window never sees the casts. Even if the event did fire, the module's 500ms minimum spacing is far below the click-spam rates FastPlace is calibrated for. This entry is the honest gap on the placement side: the check that catches C08 spam is structurally blind to air-use packets, which is exactly the class AutoFish emits."
+    },
+    {
+      "label": "FastConsume (consume-completion ledger)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/inventory/FastConsume.java",
+      "explanation": "Arc v2's FastConsume stamps a consume start on the item-use packet and closes the ledger only when the consumption completes, punishing eat cycles that finish faster than the server's fixed use timer (1280ms default). A fishing-rod cast never fires PlayerItemConsumeEvent, so the completion half never engages and the ledger stays open, exactly the same structural miss documented for splash-potion throws. The module's cast cadence of at most two uses per second is also comfortably under any consume-rate window. The honest framing is that the check is the closest Arc v2 item-use counter in the C08 corpus, and it cannot see a rod because rods are not consumables."
+    },
+    {
+      "label": "BlockInteractSpeed (same-tick interaction bound)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/terrain/BlockInteractSpeed.java",
+      "explanation": "Hawk's BlockInteractSpeed punishes two interactions landing in the same server tick, the signature of click-speed and fast-place automation. AutoFish fires at most one right-click per UpdateEvent, gated by the 500ms rodOutTimer and further bounded by the vanilla rightClickDelayTimer, so the same-tick condition is unreachable by construction and the check stays clean even during a rapid catch streak. The entry is the honest boundary on the interaction side: the check's own detection threshold (two uses in one tick, about 40 interactions per second) is an order of magnitude above the module's peak rate of two per second, and no configuration change makes a rod user look like a fast-place spammer."
+    }
+  ]
+}

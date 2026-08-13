@@ -1,0 +1,58 @@
+{
+  "module": "DepthStrider",
+  "client": "Sigma 4.11",
+  "category": "depthstrider",
+  "source_rel": "info/sigmaclient/module/impl/movement/DepthStrider.java",
+  "overview": "Sigma 4.11's DepthStrider fakes the Depth Strider enchantment without the boots: while the player is in water it rewrites the outgoing EventMove's X and Z directly, pulsing a 0.4 blocks-per-tick horizontal speed on every fourth tick and a 0.3 speed on the fifth, then resetting its counter. The rewrite only touches the horizontal plane - Y motion is left to vanilla - and the direction math is a normalized forward/strafe decomposition: both inputs zero forces X/Z to zero, a nonzero forward folds strafe into the yaw (a 45-degree shift per strafe direction), and the result is projected with cos/sin(yaw + 90). The module never sends a packet of its own; it only changes the velocity value the movement hook writes into the next C03PacketPlayer, which makes it a pure speed-multiplier exploit against vanilla's water physics.",
+  "sections": [
+    {
+      "h": "Pulse cadence",
+      "p": "A single waitTicks counter gates the whole module. Every EventMove while mc.thePlayer.isInWater() increments it: ticks 1-3 pass vanilla water movement through untouched, tick 4 applies the 0.4000000059604645D multiplier, tick 5 applies 0.30000001192092896D and resets the counter to zero. The two written speeds are the float literals 0.4f and 0.3f widened to double, which is why the source shows the odd long decimals. Because the pulses are per-tick position deltas rather than a sustained velocity, the server sees alternating normal water moves and sudden 0.3-0.4 block horizontal jumps every five ticks - a per-move signature that content-aware movement envelopes catch even though the average speed stays low."
+    },
+    {
+      "h": "Direction handling",
+      "p": "The movement vector is built from movementInput.moveForward and moveStrafe plus rotationYaw. With no input the module pins X and Z to zero, which is itself an anomaly: vanilla water applies drag and flow, so a motionless player should drift toward the current, not stop dead. With forward input the strafe axis is folded into the yaw (yaw += -45 when strafing right and moving forward, +45 when strafing left, inverted for backward), strafe is zeroed and forward normalized to -1/0/1, and the final delta is forward * speed * cos(yaw+90) + strafe * speed * sin(yaw+90) on X and the mirrored expression on Z. The yaw offset of 90 degrees matches vanilla's own movement-space rotation, so the direction the server measures matches the direction the player faces - there is no rotation anomaly to exploit, only the speed itself."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "DepthStrider.java (module)",
+      "rel": "info/sigmaclient/module/impl/movement/DepthStrider.java",
+      "explanation": "The module is a single @RegisterEvent handler for EventMove with one int field (waitTicks) and no settings. The water gate is mc.thePlayer.isInWater(), which is true whenever the player's eyes are in a water block, so the module also triggers for partially submerged swimming. The two write blocks are structurally identical except for the speed constant (0.4 on the waitTicks == 4 branch, 0.3 on the waitTicks >= 5 branch which also resets the counter). The zero-input branch sets X and Z to exactly 0.0D, and the input branch re-derives the direction from the yaw each tick instead of reusing the player's current motion, so every pulse is a fresh heading. Because EventMove is fired before the movement packet is assembled, the rewritten values flow into the next C03PacketPlayer unchanged; the module itself never touches the network layer."
+    },
+    {
+      "label": "EventMove.java (rewrite carrier)",
+      "rel": "info/sigmaclient/event/impl/EventMove.java",
+      "explanation": "EventMove is the mutable carrier the module rewrites: it holds three plain doubles (x, y, z), fires them from the movement hook, and exposes setX/setZ for exactly this kind of override. The fire(double, double, double) signature shows the event is fired with the vanilla-computed motion values, and any listener that mutates the fields before the event returns changes what the client applies to its position and therefore what the next C03PacketPlayer reports. DepthStrider uses only setX and setZ; setY is left untouched, which is the module's deliberate choice to stay under vertical swim checks while exploiting the horizontal envelope."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (water inertia envelope + Depth Strider attribute)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "NCP's horizontal envelope models water physics explicitly instead of trusting the packet. In check(), when from.isInWater() the code sets data.nextInertia to Magic.WATER_HORIZONTAL_INERTIA (0.8f) and acceleration to Magic.LIQUID_ACCELERATION (0.02f), then reads the server-side Depth Strider attribute via attributeAccess.getHandle().getWaterMovementEfficiency(player) and scales both terms toward the 0.546 inertia and the player's walk speed by StriderLevel / 3.0 (halved off-ground via Magic.STRIDER_OFF_GROUND_MULTIPLIER). estimateNextSpeed then runs the recurrence allowed = inertia * previous + acceleration for each move, and the violation is hDistanceAboveLimit * 100 with a set-back. The steady-state envelope converges to 0.02 / (1 - 0.8) = 0.1 blocks per tick without the enchantment and to roughly 0.22 at Depth Strider III, so the module's 0.3/0.4 pulses exceed even the max-enchantment model on the very tick they are sent; the packet's own position claims are compared against this rebuilt trajectory, so the fake enchantment has no server-side counterpart to reference and every pulse contributes hDistanceAboveLimit around 0.2-0.3, an immediate violation and set-back."
+    },
+    {
+      "label": "Speed (swim discrepancy accumulation)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed check is a per-move 'your current speed must not exceed f(previous speed)' model. For swimming it sets swimming = pp.isInWater() and, in the water branch, adds the water-flow force projection to handleAdders, then compares speed against expected = friction * lastSpeedCompare * handleMultipliers + (maxForce + handleAdders + EPSILON) with the water friction of 0.8. Positive discrepancies accumulate in a per-player map, and once totalDiscrepancy exceeds the 0.1 threshold the move is punished and rubber-banded. A vanilla swimmer's steady-state horizontal speed is about 0.1 blocks per tick, so the module's 0.3 pulse produces a discrepancy near 0.2 and the 0.4 pulse near 0.3 on the first occurrence - both already double or triple the cumulative threshold, so the module cannot hide by pulsing every five ticks; the ledger never decays fast enough between pulses (the two 0.2+ entries land 100-200ms apart)."
+    },
+    {
+      "label": "SwimVertical (vertical liquid envelope - the gap the module uses)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/SwimVertical.java",
+      "explanation": "SwimVertical is the companion check that DepthStrider deliberately dodges. It fires while pp.isSwimming() with no teleport, no real ground, no flight and no accepted knockback, and whenever |currentDeltaY| >= 0.1 it compares the move against kineticPreservation * prevDeltaY +-(Physics.MOVE_LIQUID_FORCE + 1e-6 + flowForce), i.e. the 0.8 water-drag recurrence around a 0.02-per-tick liquid force. Because the module only ever rewrites X and Z and leaves EventMove's Y untouched, its vertical component stays inside the vanilla recurrence and the check never sees an anomalous deltaY. The pair of checks together define the exploit's boundary: horizontal swim speed is policed by Speed, vertical swim speed by SwimVertical, and a horizontal-only rewrite like this one is exactly the shape the two checks are meant to catch on the axis they share - Speed."
+    },
+    {
+      "label": "Speed (off-ground horizontal cap)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Speed.java",
+      "explanation": "Arc v2's Speed check has no water-specific model: while swimming the player reports not-on-ground, so the off-ground branch applies, with expected = baseMove (0.2873, scaled by speed potions) + stage (0.049 for a zero vertical move, 0.08 under 0.34, 0.3261 above). A hard cap also cancels any single move over 8 blocks. The module's 0.4 pulse therefore compares against 0.2873 + 0.049 = 0.3363 and flags as a bunny-hop-style off-ground move (0.4 > 0.3363), while the 0.3 pulse lands just under at 0.3 < 0.3363 and slips through. The practical verdict is threshold-sensitive: at the default 0.4 speed the check fires on every fourth tick, and a user dropping the MOTION-equivalent below 0.336 would pass Arc's horizontal model while still failing NCP's water envelope and Hawk's cumulative discrepancy, so Arc alone is the weakest of the four counters but the only one whose ceiling is close enough to tune against."
+    }
+  ]
+}

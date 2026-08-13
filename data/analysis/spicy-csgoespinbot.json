@@ -1,0 +1,62 @@
+{
+  "module": "CS:GO Spinbot",
+  "client": "Spicy",
+  "category": "csgospinbot",
+  "source_rel": "info/spicyclient/modules/memes/CsgoSpinbot.java",
+  "overview": "Spicy's CS:GO Spinbot is a meme look-spin that runs an unbounded yaw random walk of 45 plus a random value up to 1000 degrees per pre-update, renders the player model with the spun yaw and a 90-degree pitch through RenderUtils static flags consumed by RendererLivingEntity, and rewrites outbound C05 and C06 look packets with the spun rotation. Every C08, C02, C0A or C07 packet arms a 500ms timer and injects a fresh C05 with the real rotation before the action packet, so the server sees an honest look at the moment of each interaction, then up to half a second of honest rotation, then the spin resumes. The mode setting selects nothing: all three modes run the same random walk, and the whole module is inert while the client's killaura is enabled.",
+  "sections": [
+    {
+      "h": "The accumulator",
+      "p": "EventUpdate pre, gated on the killaura being off, adds 45 plus a random float scaled by 1000 to the lastYaw field every tick and never wraps the value, so the yaw drifts over thousands of degrees in a few seconds. The render side mirrors it: setCustomYaw(lastYaw) and, when lookDown is enabled, setCustomPitch(90) flip static flags that RendererLivingEntity reads for the player's own model, applying the custom pitch and writing the spun yaw into renderYawOffset, which is what makes the visible body spin."
+    },
+    {
+      "h": "The interaction window",
+      "p": "EventSendPacket pre handles the timing split. When the outgoing packet is a C08 placement, C02 use-entity, C0A swing or C07 digging, the handler resets the timer, sets skipRender, and pushes a C05PacketPlayerLook with the player's real yaw, real pitch and onGround through sendPacketNoEvent, so an honest look lands immediately before the action packet. While the timer reports less than 500ms since that arm, the render flags are reset and the handler returns without rewriting anything; past 500ms, C05 and C06 packets get their yaw overwritten with lastYaw and their pitch with 90 when lookDown is on. The C04 branch builds a C05 replacement whose send call is commented out, leaving the original position packet untouched, which is dead code: C04 carries no look fields anyway."
+    },
+    {
+      "h": "What the server sees",
+      "p": "The look stream alternates between two regimes. In the idle regime every C03 look packet carries a yaw step between 45 and roughly 1045 degrees and a pitch pinned to 90, which is a rotation signature no human produces. In the action regime, each C08, C02, C0A or C07 is preceded by a real-look C05, and the following half second of C03s carries honest rotation before the spin resumes. Position packets never carry the spoof. The mode setting is decorative: the handler never reads it, so Slow Smooth, Fast Smooth and Random are the same behavior."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "CsgoSpinbot.java (module)",
+      "rel": "info/spicyclient/modules/memes/CsgoSpinbot.java",
+      "explanation": "The module is two handlers. EventUpdate pre runs the accumulator: lastYaw plus 45 plus a random value up to 1000 per tick, then the render writes through setCustomYaw and setCustomPitch, with a skipRender latch that suppresses the spin for one tick after an action. EventSendPacket pre runs the interaction window: action packets arm the timer and inject the real-look C05, packets inside the 500ms window pass untouched, and C05 or C06 packets outside the window get the spun yaw and the optional 90-degree pitch.\n\nThe mode setting is declared but never read by either handler, so the three advertised modes collapse into one behavior, and the killaura gate makes the module fully inert while the client's own killaura holds a target. onDisable resets both render flags, so the model returns to the real rotation the moment the module turns off."
+    },
+    {
+      "label": "RenderUtils.java (model spin carrier)",
+      "rel": "info/spicyclient/util/RenderUtils.java",
+      "explanation": "This class carries the spin from the module to the renderer through static state: setCustomYaw and setCustomPitch store the value and set a flag, resetPlayerYaw and resetPlayerPitch clear them, and the getters feed the consumer. The consumer is RendererLivingEntity, which substitutes the custom pitch into the player's render pitch and writes the custom yaw into renderYawOffset, so the spinning body the player sees is the same static flag pair the module drives.\n\nThe class is the right supporting file because it separates the two surfaces of the module: the wire surface is the C05 and C06 rewrite in the module file, and the cosmetic surface is this flag pair. The reset calls on disable and in the interaction window are what keep the model honest during combat, which is the behavior the countering checks below measure against."
+    }
+  ],
+  "countering": [
+    {
+      "label": "PacketAnalysisAimStep (frozen-axis rotation)",
+      "ac": "Photon-GitHub-AntiCheatAddition",
+      "rel": "src/main/java/de/photon/anticheataddition/modules/checks/packetanalysis/PacketAnalysisAimStep.java",
+      "explanation": "Photon's PacketAnalysisAimStep flags rotation ticks where one axis moves by less than 0.00001 while the other moves by more than 1, the signature of a machine holding one axis still, with 20 VL per flag and a 200ms decay. The module's pitch pin makes the pitch delta exactly zero on every spun tick while the yaw steps between 45 and roughly 1045 degrees, so every idle rotation tick satisfies the frozen-axis test and the check accumulates VL as long as the spin runs.\n\nThe honest 500ms windows after each action break the pattern for a few ticks, since both axes then move with the mouse, but the spin resumes and the flags resume with it. This is the definitive counter for the module: no amount of randomization in the yaw step matters, because the pitch pin is what trips the frozen-axis test on every tick."
+    },
+    {
+      "label": "PacketAnalysisPerfectRotation (exact-grid deltas)",
+      "ac": "Photon-GitHub-AntiCheatAddition",
+      "rel": "src/main/java/de/photon/anticheataddition/modules/checks/packetanalysis/PacketAnalysisPerfectRotation.java",
+      "explanation": "Photon's PacketAnalysisPerfectRotation flags rotation deltas that are exact integer multiples of 0.1 or 0.25 within an epsilon of 1e-10, using a consistency counter that increments on each match and flags once matches outpace decay. The pinned pitch of 90 degrees is exactly 900 times 0.1, so every spun tick with lookDown enabled feeds the counter, and the injected real-look C05 before an action adds a full-scale rotation jump on top.\n\nThe yaw steps themselves, 45 plus a random value up to 1000, are rarely exact multiples, so the pitch pin is the reliable contributor; the honest framing is that the check scores the constant 90-degree value rather than the random yaw. This is the second Photon check that keys on the pitch pin, which is why the pin is the module's structural weakness rather than its random yaw."
+    },
+    {
+      "label": "AimbotHeuristic (click-gated rotation snap)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotHeuristic.java",
+      "explanation": "Hawk's AimbotHeuristic scores raw unwrapped yaw deltas and only evaluates while the click window is open, keyed on a swing or interaction having occurred recently. The module's injection opens exactly that window: a C02 use-entity or C0A swing arms the handler, which immediately sends a C05 with the real rotation, snapping the server-side look from the spun yaw (thousands of degrees off) back to the honest value in one packet. The raw delta of that snap far exceeds the twitch branch thresholds on both the yaw and pitch axes.\n\nThe honest boundary is the gate: a player who never swings or attacks never opens the click window, so the check only fires on the injection ticks, not on the spin itself. The 500ms honest rotation after the injection also decays the score, so the check is a burst detector on the snap rather than a continuous scorer."
+    },
+    {
+      "label": "RotationSnapHeuristic (snap signature)",
+      "ac": "intave-intave",
+      "rel": "src/main/java/de/jpx3/intave/check/combat/heuristics/combatpatterns/rotation/RotationSnapHeuristic.java",
+      "explanation": "intave's RotationSnapHeuristic looks for the shape prev delta below 9, then a jump above 40, then current delta back below 9, gated on a swing or attack within 150ms, more than 10 rotation packets and more than 7 ticks since the last teleport. The module's spin resume after an honest window has the first two elements, prev small and a jump of at least 45, but the spin continues at 45 to roughly 1045 degrees per tick, so the current delta never drops below 9 and the third gate never completes.\n\nThis is the honest miss of the set: a uniform continuous spin fails the snap signature by construction, which is why the module's random walk is still visible to the frozen-axis and exact-grid Photon checks but invisible to intave's snap detector. The entry documents the division: intave catches one-tick snaps into stillness, and this module never snaps into stillness."
+    }
+  ]
+}

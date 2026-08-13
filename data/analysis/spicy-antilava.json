@@ -1,0 +1,62 @@
+{
+  "module": "AntiLava",
+  "client": "Spicy",
+  "category": "antilava",
+  "source_rel": "info/spicyclient/modules/player/AntiLava.java",
+  "overview": "Spicy's AntiLava is a Hypixel-labeled lava escape that fires once per motion event while the player's entity is inside lava. It scans the hotbar range of the inventory container for an ItemBucket, then queues a pitch-90 look claim (C05), a held-item swap to the bucket's slot (C09) and two identical use-item placements (C08 carrying the bucket stack). The look is the mechanism: ItemBucket.onItemRightClick ray-traces from the player's eye through the server-side look, and because the C05 is processed first, the water bucket resolves onto the block under the player's feet and lifts them out of the lava. The double C08 is redundancy in case the first use is dropped or consumed without effect, and the loop returns after the first bucket found, so the burst fires at most once per tick.",
+  "sections": [
+    {
+      "h": "The in-lava trigger",
+      "p": "onEvent routes two event types. EventUpdate pre only stamps the module's additionalInformation to 'Hypixel'; the actual work sits in the EventMotion branch, gated on mc.thePlayer.isInLava(). The hotbar scan iterates container slots 36 through 44 (inventory slots 0-8), and the first slot whose stack item is an ItemBucket wins; the guard skips empty slots with getHasStack(). Because the branch returns immediately after the first bucket, a full lava bath produces exactly one packet burst per tick, not one per bucket slot."
+    },
+    {
+      "h": "The packet sequence",
+      "p": "The queued order matters. A C05PacketPlayerLook carries the current rotationYaw with pitch pinned to 90 and the real onGround flag, then a C09PacketHeldItemChange moves the server-side held slot to i-36, then two C08PacketPlayerBlockPlacement packets are queued with the single-argument ItemStack constructor, which serializes the sentinel BlockPos(-1,-1,-1) with face 255, the use-item form. On the server the C05 updates the player look before the C08s are processed, and ItemBucket.onItemRightClick performs a ray trace from the eye through that look, so a full water bucket places its fluid at the feet. An empty bucket is inert on this path: the fill action only lives in onItemUse, which requires a real block click."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "While the player is in lava the move stream doubles: the normal onUpdateWalkingPlayer C03 of the tick is joined by the extra C05 look, both being C03PacketPlayer subclasses, so roughly 40 move packets per second reach the server for the duration. The C09 and the two C08s ride the same tick on top of that, giving a three-packet interaction burst in a single tick. Outside lava the module is silent, which makes its detection story entirely a rate and interaction-timing story rather than a movement one."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "AntiLava.java (module)",
+      "rel": "info/spicyclient/modules/player/AntiLava.java",
+      "explanation": "The module is a single EventMotion branch. The isInLava() gate, the container slot scan from 36 to 44 and the first-bucket-found return define the cadence: at most one burst per tick, and only while the player stands in lava. The burst itself is the sequence C05 look with pitch 90, C09 slot swap to the bucket, then two C08 use-item packets, all through addToSendQueue so they leave in order. The EventUpdate branch only maintains the 'Hypixel' label; there are no settings and no other handlers.\n\nThe 90-degree pitch is not cosmetic. The C05 is queued ahead of the C08s precisely so the server-side player look points straight down when the bucket use resolves, steering the ray trace that ItemBucket.onItemRightClick runs to the cell under the player. Understanding the sentinel serialization is required to read the wire: the single-argument C08 constructor is what produces the BlockPos(-1,-1,-1) and face 255 in the packet."
+    },
+    {
+      "label": "C08PacketPlayerBlockPlacement.java (use-item serialization)",
+      "rel": "net/minecraft/network/play/client/C08PacketPlayerBlockPlacement.java",
+      "explanation": "The fork's placement packet defines the sentinel that makes AntiLava's C08s use-item packets instead of block placements. The static field_179726_a is BlockPos(-1,-1,-1), and the single-argument ItemStack constructor forwards that sentinel with placedBlockDirection 255 and zeroed facing floats; writePacketData then emits those bytes verbatim. On the server, processPlayerBlockPlacement sees direction 255 and routes the stack through the item's onItemRightClick rather than into a block-state change.\n\nThis is why the module's two C08s are invisible to placement-rate checks that hook the Bukkit BlockPlaceEvent: no block is ever placed, so the event never fires. The only server-side consumers are the ones that score interaction packets as traffic."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (move packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NoCheatPlus scores every serverbound move packet into data.morePacketsFreq, an ActionFrequency with 500ms buckets, and accumulates the window against the 22-per-second ceiling with a burst path on the newest half-second bucket (default 15 packets, direct-violation 10). The extra C05 look is a C03PacketPlayer subclass, so it counts as a move even though it carries no position.\n\nWhile the player is in lava the tick's normal C03 and the module's C05 double the stream to about 40 move packets per second, well past the window ceiling, so vEPSAcc stays positive and the violation cancels the move at low vl. The C09 and the two C08s are not move packets and never reach this ledger; the doubling that trips it is purely the C05. Outside lava the module emits nothing and the check sees a clean stream."
+    },
+    {
+      "label": "BlockInteractSpeed (same-tick interaction)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/terrain/BlockInteractSpeed.java",
+      "explanation": "Hawk's BlockInteractSpeed keeps a per-player lastPlaceTick map and punishes with vl 1 and cancel whenever an InteractWorldEvent arrives on the same server tick as the previous one, rewarding otherwise. The module queues two C08 use-item packets in a single tick, and Hawk wraps both into interaction events, so the second one lands on the same tick as the first and the punish branch fires immediately.\n\nThe use-item form does not save it: Hawk converts the packet on arrival regardless of the -1,-1,-1 sentinel or the 255 face, treating it as an interaction with the world. This is the same-tick double-interaction surface that a hypothetical one-C08-per-tick placement module would deliberately stay under, and AntiLava's redundancy copy is exactly what crosses it."
+    },
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the client's physics envelope from the block cache instead of trusting the packet: the horizontal allowance comes from prepareSpeedEstimation, the vertical allowance from vDistRel, and the violation is the summed excess times 100 with a set-back to the stored location. The onGround flag is ignored for ground purposes because fromOnGround and toOnGround come from a ray trace at minY minus yOnGround.\n\nThe pitch-90 C05 claim does not enter this model at all: it changes no coordinate, and the module sends the real onGround flag with it, so the envelope scores the tick as an ordinary zero-displacement look update and passes. This entry documents the boundary: AntiLava's detectable surface is the packet-rate and interaction-timing burst, not motion, and a physics envelope by construction cannot see it."
+    },
+    {
+      "label": "InvalidPitch (pitch bounds)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/InvalidPitch.java",
+      "explanation": "Hawk's InvalidPitch flags only out-of-bounds pitch, |pitch| greater than 90, and rewrites the offending value. The module pins pitch to exactly 90, which is the maximum legal value and sits precisely in bounds, so the check never fires on the look claim.\n\nThis is an honest miss rather than a counter: the module chose the legal boundary as its spoof target, and a bounds check keyed on the same boundary is structurally blind to it. Any pitch limit check from the pool (Hawk InvalidPitch, intave InvalidPitch, Photon IllegalPitch) behaves identically here, so the entry stands as the documented boundary for the whole family."
+    }
+  ]
+}

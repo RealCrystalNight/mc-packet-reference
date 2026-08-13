@@ -1,0 +1,62 @@
+{
+  "module": "NoRotate",
+  "client": "Sigma 4.11",
+  "category": "norotate",
+  "source_rel": "info/sigmaclient/module/impl/player/NoRotate.java",
+  "overview": "Sigma 4.11's NoRotate is a receive-side packet mutator that stops the server from rotating the player. It registers for EventPacket and, when an incoming S08PacketPlayerPosLook arrives, overwrites the packet's yaw and pitch with the client's current rotationYaw and rotationPitch before the packet is processed. The fork's NetworkManager fires the event in channelRead0 before packet.processPacket, so the mutation lands before NetHandlerPlayClient.handlePlayerPosLook runs: setPositionAndRotation then applies the server's position but the client's own angles, the camera never snaps, and the client's reply C06 echoes its own rotation unchanged. Position teleports still apply in full; only the rotation half of the S08 is discarded. The module sends no packets of its own and is invisible on the wire except for the C06 echo that disagrees with the S08 rotation the server just sent.",
+  "sections": [
+    {
+      "h": "Interception point",
+      "p": "NetworkManager.channelRead0 fires EventPacket with the outgoing flag false (line 151) before processPacket dispatches to the handler, and sendPacket fires it with true (line 207). NoRotate's isIncoming() guard therefore selects exactly the receive path, and the instanceof selects the S08. The rewrite happens in place on the single EventPacket instance, so when handlePlayerPosLook (NetHandlerPlayClient line 599) later reads packetIn.getYaw() and getPitch(), it reads the client's own angles, applies them via setPositionAndRotation (line 634), and echoes C06PacketPlayerPosLook with rotationYaw/rotationPitch (line 635) - which are the client's angles, because the rewrite already happened. The X_ROT/Y_ROT relative-flag accumulation (lines 626-632) is applied to the already-rewritten values, so relative teleports are handled consistently too."
+    },
+    {
+      "h": "What survives and what does not",
+      "p": "Only the rotation is discarded. The x, y, z fields (and the X/Y/Z relative flags that add onto the current position) pass through untouched, so teleport-based position corrections, anti-phase set-backs and server-side position resyncs all still take effect; the module only cancels the visual and reported rotation change. The client's own rotation is what the C06 echo carries, which is what makes the module visible to a server that compares the rotation in the S08 it sent against the rotation in the subsequent C06: vanilla clients echo the S08 angles, a NoRotate client echoes its own."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The module adds no packets. The observable is the C06 reply to each S08: the yaw and pitch fields carry the client's pre-teleport rotation instead of the teleport's angles, and the client's subsequent look updates continue from that rotation. Servers that enforce a teleport-rotation convergence window would see the gap; none of the anticheats in this reference set do, because none of them model S08 rotation compliance."
+    }
+  ],
+  "packets": [
+    "S08PacketPlayerPosLook"
+  ],
+  "files": [
+    {
+      "label": "NoRotate.java",
+      "rel": "info/sigmaclient/module/impl/player/NoRotate.java",
+      "explanation": "The module is this file alone. The handler registers for EventPacket, and on every incoming packet that is an S08PacketPlayerPosLook it assigns mc.thePlayer.rotationYaw to pac.yaw and mc.thePlayer.rotationPitch to pac.pitch. That is the entire mechanism: the packet object the event carries is the same object processPacket will hand to handlePlayerPosLook, so mutating its fields is equivalent to rewriting the packet before the handler reads it. The module never cancels the event, so the S08 continues to the handler and the position teleport is honored; only the rotation values are swapped. There is no setting, no onEnable/onDisable logic beyond the default, and no outgoing-packet access. The file's correctness depends entirely on the fork's channelRead0 firing the event before processPacket, which NetworkManager guarantees at line 151-152."
+    },
+    {
+      "label": "NetHandlerPlayClient.java (S08 application path)",
+      "rel": "net/minecraft/client/network/NetHandlerPlayClient.java",
+      "explanation": "handlePlayerPosLook (line 599) is the consumer that NoRotate pre-empts. It resolves the target position from packetIn.getX()/getY()/getZ(), honoring the relative X/Y/Z flags by adding them onto the current position (lines 608-624) and zeroing the matching motion components for absolute flags, then resolves the rotation the same way for X_ROT/Y_ROT (lines 626-632), calls setPositionAndRotation with the final values (line 634), and immediately replies with C06PacketPlayerPosLook carrying the client's own position, yaw, pitch and onGround false (line 635). Because NoRotate already replaced yaw and pitch before this method ran, the angles fed to setPositionAndRotation and echoed in the C06 are the client's own, while the position keeps the server's correction. The file also shows the intended vanilla behavior the module defeats: a stock client would apply the S08 angles and echo them back, closing the rotation loop."
+    }
+  ],
+  "countering": [
+    {
+      "label": "WrongTurn (pitch bounds)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/WrongTurn.java",
+      "explanation": "WrongTurn is NCP's entire rotation check, and its own doc comment admits the scope: 'Currently, only impossible pitch is detected, later, we might throw in actual pattern-based checks.' It fires only when the reported pitch is above 90 or below -90, incrementing wrongTurnVL and executing the configured actions. It never compares a reported rotation against a rotation the server previously sent, and it never inspects S08 packets at all.\n\nNoRotate is invisible to it by construction: the module rewrites the S08's angles to the client's own rotation, and a legitimate client's pitch is always inside [-90, 90], so the check's sole predicate can never be satisfied by anything the module produces. The C06 echo it would need to inspect travels through the movement listeners, not this check. This entry documents that NCP's rotation layer is pitch-bounds only, which is why the module survives NCP untouched."
+    },
+    {
+      "label": "InvalidPitch (pitch bounds)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/InvalidPitch.java",
+      "explanation": "Hawk's InvalidPitch is the same shape as NCP's WrongTurn: on any move that carries a rotation delta it punishes and rubber-bands a player whose absolute pitch exceeds 90, and rewards otherwise. The check's own comment calls it 'Not really an important check', noting it just stops players from abusing impossible look angles.\n\nNoRotate cannot trip it. The rewritten S08 is consumed locally and never re-reported as a pitch value; the client's own pitch is what flows into the move events, and that pitch is always within the legal range by construction. Like WrongTurn, this is a bounds check on reported rotation, not a compliance check against server-issued rotations, so the module's substitution leaves no trace in the data the check reads. The entry is the second half of the same observation: both major anticheats police only the pitch envelope, and neither models teleport-rotation convergence."
+    },
+    {
+      "label": "AimbotConvergence (look-target heuristic)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/look/AimbotConvergence.java",
+      "explanation": "AimbotConvergence is Hawk's closest thing to a rotation-pattern check, and it is aimed at a different target entirely. It tracks the point a player's look direction converges on over successive moves and punishes convergence that is too stable or too perfect, the signature of an aim-assist that snaps to a target and stays glued. The check runs on move events and compares computed convergence points across a window.\n\nNoRotate's mutation happens inside the S08 handler, before any move event, and the module does not touch the player's look at all: rotationYaw and rotationPitch are read, not written. The convergence heuristic therefore sees exactly the same input stream as it would from a vanilla client - the difference the module makes is that the client's rotation never receives the server's teleport angles, which is not a pattern AimbotConvergence looks for. The entry stands as the representative of Hawk's look suite: all of it targets aim behavior, none of it validates S08 rotation compliance."
+    },
+    {
+      "label": "Arc v2 (no clientbound consumer)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/listener/packet/PacketListener.java",
+      "explanation": "Arc v2's PacketListener is the complete list of packets the anticheat observes, and it is entirely serverbound. startListening registers ProtocolLib adapters for Play.Client.FLYING, POSITION and POSITION_LOOK (the movement layer), USE_ENTITY (fight data and KillAura), ARM_ANIMATION (swing timing), HELD_ITEM_SLOT (soup switching) and BLOCK_PLACE (the soup auto-heal branch). There is no Play.Server adapter of any kind: no S08, no teleport tracking, no rotation bookkeeping.\n\nThe consequence is total invisibility. Arc v2 never sees the S08 the module rewrites, never sees the C06 echo's rotation, and has no data structure that could hold a server-issued rotation to compare against. Its movement checks (Speed, Flight, MorePackets, NoFall) consume only the serverbound position stream, where the module's effect - an unchanged rotation echo - is indistinguishable from a vanilla client that happens to look the same way. This entry closes the gap: of the three anticheats, Arc v2 has the least surface for NoRotate, which is to say none."
+    }
+  ]
+}

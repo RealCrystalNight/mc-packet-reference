@@ -1,0 +1,63 @@
+{
+  "module": "InventoryCleaner",
+  "client": "LiquidSense Dev",
+  "category": "invcleaner",
+  "source_rel": "net/ccbluex/liquidbounce/features/module/modules/player/InventoryCleaner.kt",
+  "overview": "LiquidSense's InventoryCleaner (a LiquidBounce-lineage module) runs one inventory pass per UpdateEvent: it sorts the hotbar, then drops every stack its usefulness predicate rejects, one click per randomized delay. All clicks go through PlayerControllerMP.windowClick, which serializes them as C0EPacketClickWindow; because the sort and drop clicks can move a different item into the held slot, the controller's syncCurrentPlayItem emits C09PacketHeldItemChange alongside the stream. When the real inventory screen is not open, SimulateInventory wraps each click in C16PacketClientStatus(OPEN_INVENTORY_ACHIEVEMENT) plus C0DPacketCloseWindow so the server accepts clicks against a window it believes is open.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "Everything funnels through onUpdate. The early-return guard bails while flying, while the shared InventoryUtils.CLICK_TIMER has not passed the current delay, when InvOpen requires a real GuiInventory screen that is not open, when NoMove is set and the player is moving, or when the player's openContainer windowId is not 0. sortHotbar runs first and swaps the best item into each of the nine configured sort slots (SortSlot-1..9, one swap per tick). Then a while loop drops garbage: items(9, hotbar?45:36) collects slots 9..44 (or 9..35) whose stack fails isUseful, RandomSlot shuffles the candidate list, and each iteration picks one candidate and drops it via windowClick(windowId, slot, 4, 4) — button 4, mode 4, the drop-whole-stack click. Every iteration rolls a fresh random delay between MinDelay and MaxDelay (defaults 400-600ms)."
+    },
+    {
+      "h": "The usefulness predicate",
+      "p": "isUseful is the module's brain. Swords and tools are compared by attack damage plus 1.25 per Sharpness level against every other stack of the same class; bows by their Power enchantment; armor through AutoArmor's ARMOR_COMPARATOR per armor piece; compasses, food, arrows, beds, diamonds, iron ingots, pearls, potions, and buckets are kept outright, while blocks, enchanted books, and water/lava buckets are kept only up to per-type stack caps. Each dropped stack is chosen independently, so the drop pattern is a stream of identical-slot DROP_ONE_SLOT clicks whenever several junk stacks sit in the same slot region."
+    },
+    {
+      "h": "The simulated inventory",
+      "p": "windowClick only means something to the server while a window is open. When the GUI is closed and SimulateInventory is on, the module first sends C16PacketClientStatus(EnumState.OPEN_INVENTORY_ACHIEVEMENT) — the packet the vanilla client sends when the player opens their own inventory screen — so the server opens the player's 2x2 crafting container, then clicks, then closes with C0DPacketCloseWindow. The click stream the server sees is therefore indistinguishable from a human opening the vanilla inventory and dropping items, which is exactly why inventory anticheats count clicks and window-open state rather than the packets themselves. The C09 half of the stream comes from syncCurrentPlayItem: every controller action compares inventory.currentItem against the last synced slot and emits C09PacketHeldItemChange when a sort swap changes the held item."
+    }
+  ],
+  "packets": [
+    "C0EPacketClickWindow",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "InventoryCleaner.kt",
+      "rel": "net/ccbluex/liquidbounce/features/module/modules/player/InventoryCleaner.kt",
+      "explanation": "The module body. onUpdate gates the whole pass, sortHotbar performs the mode-2 swap clicks (windowClick(0, bestItem, index, 2)), and the clean loop performs the mode-4 drop clicks. Each windowClick call goes through mc.playerController, which is what turns the Kotlin-level slot arithmetic into C0EPacketClickWindow traffic; the C16 open / C0D close pair brackets every click when the GUI is closed and SimulateInventory is on. The delay bookkeeping is local (a single delay field) but the actual throttle is the static InventoryUtils.CLICK_TIMER that every LiquidSense inventory module shares, so InventoryCleaner and AutoArmor serialize their clicks through one timer. The usefulness predicate in isUseful is the module's only real logic beyond the clicking; its failure path logs and returns true, which means an exception mid-check silently keeps the item."
+    },
+    {
+      "label": "InventoryUtils.java (shared click timer)",
+      "rel": "net/ccbluex/liquidbounce/utils/InventoryUtils.java",
+      "explanation": "A tiny utility class whose entire relevance is the public static MSTimer CLICK_TIMER. Every LiquidSense inventory operation — window clicks, slot swaps, armor swaps — resets this timer, and every module waits on hasTimePassed(delay) before the next click. InventoryCleaner's per-iteration random delay is only applied through this shared gate, so two inventory modules running at once still emit a single serialized click stream rather than two interleaved ones. From a detection standpoint this is the module's throttle: the minimum inter-click gap the client will ever produce is whatever MinDelay is set to."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastClick (window-click rate and continuous-drop ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/FastClick.java",
+      "explanation": "NCP's inventory click-rate check, invoked from InventoryListener on every server-side InventoryClickEvent (the Bukkit view of a C0EPacketClickWindow). Each click is scored into data.fastClickFreq, an ActionFrequency with a configurable bucket width, with an amount derived from the click. getAmountWithAction contains a branch written for exactly this module's pattern: a DROP_ONE_SLOT click on the same slot whose clicked material matches the previous click while the inventory type is CRAFTING scores 0.6f instead of 1f — the 'continuous drop feature with open inventories' discount that still accumulates a short-term bucket score against cc.fastClickShortTermLimit and a window score against cc.fastClickNormalLimit; the max of the two becomes the violation fed into fastClickVL and the configured actions. checkContainerInteraction adds a second, independent gate: any click landing within cc.chestOpenLimit of the container's open time is flagged interact_time.\n\nThe module's defaults (400-600ms between drops plus the shared CLICK_TIMER) sit well under the limits, and because the simulated open is a genuine server-side window open (C16), NCP's crafting-inventory state matches the branch condition exactly. The failure mode is MinDelay: with MinDelay at 0 and ItemDelay at 0, the while loop drains the whole inventory in a burst of DROP_ONE_SLOT clicks inside one tick, and the short-term bucket trips. FastClick also feeds Improbable with the weighted click amount, so sustained cleaning drags the player's combined-check improbability even when the raw rate is under the limit."
+    },
+    {
+      "label": "Open (inventory-open enforcement on movement)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/Open.java",
+      "explanation": "Open watches the server-side open-inventory state. checkOnMove is called from the moving listener whenever InventoryUtil.hasInventoryOpen(player) is true, and it closes the inventory if the player is actively moving while it is open — with a WASD-impulse path on 1.21.1+ and a move-data impulse path on 1.8-1.20. Closing also resets inventoryOpenTime and containerInteractTime, which directly shrinks the FastClick chest-open window for the next click.\n\nThis is the server-side answer to the SimulateInventory dance: the module opens the crafting window with C16 while the player keeps walking, and Open's contract is that a walking player cannot have an inventory open. With NoMove off, one move event closes the fake window and the click stream hits a closed-container state; the module's NoMove and InvOpen options exist precisely to keep the fake-open window from being torn down mid-clean. The static checkClose path is the companion that enforces a closed inventory on generic events."
+    },
+    {
+      "label": "MoreInventory (crafting-slot abuse)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/inventory/MoreInventory.java",
+      "explanation": "The smallest NCP inventory check: when the player's open inventory type is CRAFTING — the 2x2 player inventory — and the player is sprinting, changing pitch/yaw, holding shift, or using an item, the check fires and InventoryListener closes the inventory. It exists to stop the 4-slot-crafting-storage exploit, but its trigger set is exactly the state SimulateInventory creates: a server-side crafting window that stays open while the player behaves as if it were not there. A cleaner run that moves (NoMove off) while the fake window is open reproduces the 'acting while the crafting inventory is open' contradiction and gets the window closed mid-stream, after which further C0E clicks are clicks into a window the server already closed."
+    },
+    {
+      "label": "FastConsume (Arc v2 inventory-action rate)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/inventory/FastConsume.java",
+      "explanation": "Arc v2's only inventory check. It measures the wall-clock gap between consecutive item-consumption events via InventoryData.getConsumeTime and flags any gap shorter than the configured consume-time ('consume time less than allowed.'). Honest note: the check watches eating and drinking consumption, not window clicks, so InventoryCleaner's drop stream never reaches it — it is the closest Arc v2 check to the action-rate class the module exercises, and its presence in the Arc v2 inventory family is the entire inventory surface Arc offers against this module. Arc v2 has no C0E handling of its own; its packet wrapper for window clicks exists but no check consumes it."
+    }
+  ]
+}

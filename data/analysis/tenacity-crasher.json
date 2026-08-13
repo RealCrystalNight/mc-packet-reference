@@ -1,0 +1,59 @@
+{
+  "module": "Crasher",
+  "client": "Tenacity 6.0",
+  "category": "crasher",
+  "source_rel": "dev/tenacity/module/impl/exploit/Crasher.java",
+  "overview": "Tenacity 6.0's Crasher is a single-purpose packet flooder. Every MotionEvent it pushes 2000 C0APacketAnimation packets (Vanilla mode) or 10000 (Boom mode) into the send queue through mc.thePlayer.sendQueue.addToSendQueue, so the wire carries roughly 40,000 to 200,000 animations per second. There are no guard rails: unlike Rise 5.99's Crasher, there is no integrated-server or localhost bail and no world-change self-disable, so the flood starts the moment the module is toggled regardless of where the player is. The timer field and most imports are unused leftovers. The module's real wire presence is the C0A flood alone; the C03 and C0E pins from the brief describe the broader crasher family (movement floods and NBT window-click bombs in sibling implementations) and are covered in prose rather than claimed as sends.",
+  "sections": [
+    {
+      "h": "Mechanism",
+      "p": "The onMotionEvent IEventListener is bound by the EventSubscriberPool when the module is enabled, and the switch over the mode setting runs once per MotionEvent, which fires every client tick. Each iteration constructs fresh C0APacketAnimation objects in a loop and hands them to addToSendQueue, the same queue vanilla uses for ordinary traffic, so the packets are written to the Netty channel in order. At 20 ticks per second the Vanilla mode sustains 40,000 animations per second and Boom mode 200,000. A stock server processes every animation as a swing on the player entity, so the payload is pure packet-processing saturation: the server's Netty thread drains a queue that never empties, and the practical outcome is a dead connection or a kicked player rather than a server restart."
+    },
+    {
+      "h": "Missing guard rails and mode design",
+      "p": "Rise 5.99's Crasher bails while the integrated server is running or the player is on 127.0.0.1 and disables itself within five ticks of a world change, precisely so a self-hosted test world is never attacked. Tenacity's Crasher has none of that: the handler has no location checks and no tick counter, so toggling it in singleplayer or on localhost floods the loopback connection immediately. The two modes differ only in the loop bound (2000 versus 10000 per tick), and the unused timerUtil and the ChatUtil, PacketBuffer, Unpooled, TimeUnit and IO imports show that more elaborate payloads (custom payload floods, buffered bombs) were planned but never implemented; the shipped module is the animation loop only."
+    },
+    {
+      "h": "Packet surface",
+      "p": "The only packets the module sends are C0APacketAnimation. The brief-pinned C03PacketPlayer and C0EPacketClickWindow are the crasher family's other surfaces: sibling implementations flood movement packets or push NBT recursion bombs through window clicks, and those are the surfaces NCP MorePackets, Arc v2 MorePackets and Hawk InventoryActions were built for. Against this module they are honest gaps: Arc v2's rate ledger counts only the C03 family, so a pure animation flood is invisible to the entire Arc v2 tree, and Hawk InventoryActions only scores C0E clicks with no open window. The checks that actually see the C0A flood are the packet-level rate ledgers below, which count every Play.Client packet or the animation stream specifically."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C0EPacketClickWindow",
+    "C0APacketAnimation"
+  ],
+  "files": [
+    {
+      "label": "Crasher.java",
+      "rel": "dev/tenacity/module/impl/exploit/Crasher.java",
+      "explanation": "The module file is the entire crash payload. onMotionEvent is the single handler the EventSubscriberPool binds on enable, and the mode switch builds C0APacketAnimation objects inline in a loop of 2000 or 10000 per event, delivered through mc.thePlayer.sendQueue.addToSendQueue. The file declares a TimerUtil that is never used and imports ChatUtil, PacketBuffer, Unpooled, StandardCharsets, TimeUnit and the IO package without referencing them, which marks the shipped file as a stripped-down version of a larger planned toolbox. There is no disable logic and no world or address check anywhere in the class."
+    }
+  ],
+  "countering": [
+    {
+      "label": "PacketFrequency (all-Play.Client rate ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/net/PacketFrequency.java",
+      "explanation": "NCP's pre-1.9 fallback rate check is fed by the ProtocolLib CatchAllAdapter, which registers the entire PacketType.Play.Client set, so C0APacketAnimation is counted like every other serverbound packet. The check scores the stream into an ActionFrequency window with a config-driven packets-per-second ceiling and flags when the measured rate exceeds it. The flood's 40,000 to 200,000 packets per second exceeds any configured ceiling by orders of magnitude in the first tick, so the violation fires on the very first window. This is the decisive NCP counter because NCP's other rate checks are movement-specific: MorePackets scores only C03-family traffic, and the animation flood never touches it."
+    },
+    {
+      "label": "ClicksListener (C0A sampling feed)",
+      "ac": "CheatSolutions-Spartan-AntiCheat",
+      "rel": "src/main/java/ai/idealistic/spartan/listeners/protocol/ClicksListener.java",
+      "explanation": "Spartan's ClicksListener is the animation-packet feed for the click checks: a ProtocolLib adapter on ARM_ANIMATION and BLOCK_DIG computes delay = now - oldClickTime per C0A, clears the click blocker when the delay exceeds 150ms, and otherwise fires PlayerLeftClickEvent into the check runners. In the flood every animation arrives in the same tick, so delay is near zero, the blocker never clears, and the runner chain executes for all 2000 to 10000 packets with sub-millisecond spacing, which is exactly the profile the FastClicks executor is designed to punish. The honest caveat: the FastClicks implementation class is absent from this anticheat snapshot, so the threshold values are unquotable, but the listener that routes every animation into the click checks is real and resolves."
+    },
+    {
+      "label": "ClickStats (swing-period histogram)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/ClickStats.java",
+      "explanation": "ClickStats consumes ArmSwingEvent and builds a histogram of inter-click periods from 0 to 4 ticks, noting in its own comment that it is impossible to swing twice in one tick through the vanilla leftClickCounter gate. The flood places thousands of swings in a single tick, so every recorded delta is 0 and the histogram degenerates to a single period-0 bin, which is the statistical signature of an autoclicker. The honest limit is that in this snapshot the check only prints the histogram and clears it after 80 samples: it has no punish or reward call, so it is telemetry rather than an enforcement point, and the entry documents why Hawk's swing statistics do not stop the flood on their own. Hawk's punishing swing check, FightNoSwing, is the inverse and misses by design: it flags hits without swings, and the flood contains no hits."
+    },
+    {
+      "label": "MorePackets (C03-family ceiling, honest gap)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/MorePackets.java",
+      "explanation": "Arc v2's MorePackets check counts only the flying and position packet streams: PacketListener increments MovingData's flyingPackets and positionPackets counters on the C03 family, flags above max-packets (default 30 per second) and kicks above max-packets-kick (default 70). The Tenacity Crasher sends none of those packets, so the entire Arc v2 rate layer is blind to the animation flood; this entry is the honest gap for the brief-pinned C03 surface, and it is the check that would detonate on a sibling crasher's movement floods instead. On an Arc server the flood is therefore visible only to the packet-level ledgers that count all Play.Client traffic, and the practical defense shifts to the server's own connection-level rate limiting."
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "module": "SpeedMine",
+  "client": "Sigma 4.11",
+  "category": "speedmine",
+  "source_rel": "info/sigmaclient/module/impl/player/SpeedMine.java",
+  "overview": "Sigma 4.11's SpeedMine accelerates block breaking by rewriting the client-side dig state every tick. On each EventTick it sets mc.playerController.blockHitDelay to 0 and, whenever curBlockDamageMP reaches 0.7, snaps it to 1.0. In the fork's PlayerControllerMP.breakBlock, blockHitDelay throttles damage accrual: while it is positive the method decrements it and returns, so vanilla accrues one damage increment per five ticks, and after a block completes the same 5-tick delay gates the next block. Zeroing the delay makes damage accrue every tick, a fivefold accrual rate, and the 0.7-to-1.0 snap finishes each block at roughly 70% of its damage requirement, so a held click completes blocks in a fraction of the vanilla time and the C07 stream shows START_DESTROY_BLOCK followed by STOP_DESTROY_BLOCK far sooner than the block's hardness allows. The module itself sends no packets; the C07 bursts are the fork's own emission driven by the tampered state.",
+  "sections": [
+    {
+      "h": "The two client-state writes",
+      "p": "EventTick fires once per client tick (the fork's TickEvent dispatcher), and the handler performs both writes unconditionally: blockHitDelay = 0 erases the throttle field, and the 0.7 threshold snap is a one-way clamp (below 0.7 the value is left to accumulate naturally). The writes target the two fields PlayerControllerMP.breakBlock actually reads: the delay gate at line 274 and the completion check at line 297. Because the module runs on the tick event, it re-applies both writes on every tick, so no other code path can re-arm the delay between the module's turns."
+    },
+    {
+      "h": "What the fork's dig loop does with the tampered state",
+      "p": "breakBlock (line 265) fires the fork's EventDamageBlock, syncs the held item, then checks the delay: a positive blockHitDelay decrements and returns without damaging (line 274-276). Otherwise the block's getPlayerRelativeBlockHardness is added to curBlockDamageMP (line 289), and when the accumulator reaches 1.0 the client sends C07 STOP_DESTROY_BLOCK, calls func_178888_a to actually break the block, resets the accumulator and re-arms blockHitDelay = 5 (lines 297-303). With the module's zeroed delay, the first branch never runs, so hardness is added every tick and the completion threshold is reached in one fifth of the vanilla tick count; the 0.7 snap then cuts the last 30% of that already-shortened accrual. The START_DESTROY_BLOCK packet itself comes from onPlayerDamageBlock (lines 221-229), which the module does not touch."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The observable is the C07 dig stream timing: for a given block and held item, the START-to-STOP gap is a small fraction of the hardness-derived duration, and successive blocks complete back to back with no 5-tick pause between them. The server-side break order and the block positions are otherwise normal, so the signature is purely temporal. The client also shows the local break-progress particles completing early, but that is not visible on the wire."
+    }
+  ],
+  "packets": [
+    "C07PacketPlayerDigging"
+  ],
+  "files": [
+    {
+      "label": "SpeedMine.java",
+      "rel": "info/sigmaclient/module/impl/player/SpeedMine.java",
+      "explanation": "The module is this file alone: a constructor, an EventTick handler, and an empty onDisable. The handler performs the two writes on every tick - mc.playerController.blockHitDelay = 0 and the curBlockDamageMP >= 0.7F snap to 1.0F - and nothing else. There is no packet access, no world interaction, and no state of its own; the entire module is a periodic tamper with two fields of the shared PlayerControllerMP. The onDisable override calls super and adds nothing, so disabling the module simply stops the writes and the controller's own logic resumes (the delay re-arms itself via the vanilla assignments at lines 278 and 303). The 0.7 threshold is hard-coded rather than a setting."
+    },
+    {
+      "label": "PlayerControllerMP.java (dig state machine)",
+      "rel": "net/minecraft/client/multiplayer/PlayerControllerMP.java",
+      "explanation": "This file is where the tampered fields live and where the C07 stream is emitted. blockHitDelay (declared line 62) is the throttle: breakBlock decrements it and returns while positive (lines 274-276), and both the creative/Freecam branch (line 278) and the completion branch (line 303) re-arm it to 5, so vanilla damage accrues at one increment per five ticks and each finished block gates the next by five ticks. curBlockDamageMP (declared line 52) accumulates getPlayerRelativeBlockHardness per damage tick (line 289) and, at 1.0, triggers C07 STOP_DESTROY_BLOCK plus func_178888_a (lines 297-301). The START_DESTROY_BLOCK packet is emitted from onPlayerDamageBlock (lines 221-229), which also re-arms the delay. Zeroing blockHitDelay makes the gate at line 274 always fall through, which is what converts the five-tick cycle into a per-tick cycle; the module's snap then pushes the completion check forward. The file also shows the fork's EventDamageBlock hook (line 267), an event SpeedMine does not use."
+    }
+  ],
+  "countering": [
+    {
+      "label": "FastBreak (expected break duration)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/FastBreak.java",
+      "explanation": "NCP's FastBreak computes the expected breaking time for the target block from BlockProperties.getBreakingDuration(blockType, player) scaled by the fastBreakModSurvival percentage, then compares it against the elapsed time between the first damage and the completion (or between the last two breaks in non-strict mode). If the elapsed time plus the fastBreakDelay is below the expectation, the missing time is added as a penalty to data.fastBreakPenalties, and once the bucketed penalty score exceeds fastBreakGrace the check raises a violation, adds missingTime/1000 to fastBreakVL, and executes the configured actions - cancellation being the usual outcome.\n\nSpeedMine is a direct hit. The per-tick accrual breaks blocks in about a fifth of the vanilla duration and the 0.7 snap trims the tail further, so the elapsed time is a fraction of the expected breaking duration on every block. The first few breaks accumulate penalty faster than the grace bucket absorbs, and sustained use keeps the penalties flowing; NCP's lag adaptation (TickTask) cannot explain a consistent sub-fifth duration. The check cancels the break outright once the VL threshold is crossed, which turns the module's advantage into a broken-block-nothing loop."
+    },
+    {
+      "label": "Frequency (blocks per time window)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/Frequency.java",
+      "explanation": "NCP's blockbreak Frequency check bounds the rate of completed breaks. Every break adds the configured interval (survival or creative) to data.frequencyBuckets, and the check evaluates two windows: the full-period bucket score against frequencyBucketDur * frequencyBuckets, and a short-term counter that counts breaks inside frequencyShortTermTicks, flagging when the count exceeds frequencyShortTermLimit. Violations are the maximum of the two, scaled and added to frequencyVL, with the actions cancelling.\n\nThe module's chain-breaking is exactly the short-term burst this check is built for. The zeroed blockHitDelay removes the five-tick pause between blocks, so a player holding the mouse on a vein completes successive blocks back to back, driving the short-term counter past the limit in a handful of ticks; the full-period window also fills because each block still completes in a fifth of its normal time. NCP's lag tolerance (frequencyShortTermCount is only incremented when the lag factor is under 1.5) does not excuse a sustained sub-tick cadence. Where FastBreak catches the duration of individual breaks, Frequency catches the rate of the chain."
+    },
+    {
+      "label": "BlockBreakSpeedSurvival (damage reconstruction)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/terrain/BlockBreakSpeedSurvival.java",
+      "explanation": "Hawk's BlockBreakSpeedSurvival rebuilds the block damage the client should have accumulated, independently of the client's own counter. On every move while the player is digging it adds getDamage(target, pp) - the vanilla hardness formula with tool efficiency, Efficiency enchantment and Haste potion factored in - to a cumulative map; on the C07-complete event it compares the total against 1.0. If the accumulated damage is below 1 (or the break landed on the same tick as the START, under the default flagSameTick setting), it computes speedFactor = 1 / totalDamage, sets the VL to min((speedFactor - 1) * 10, 10), punishes, and resyncs the block with e.resync().\n\nThe module is caught on both prongs. Because damage accrues per tick instead of per five ticks, the client's completion arrives after a fifth of the expected damage has accumulated, so totalDamage is well below 1 and the speedFactor is around 5, maxing the VL at 10 on the first block; the 0.7 snap makes the same-tick case likely, which the PREVENT_SAME_TICK branch punishes on its own. The resync then forces the block back into place, so on Hawk servers the module's breaks are undone as fast as they are claimed."
+    }
+  ]
+}

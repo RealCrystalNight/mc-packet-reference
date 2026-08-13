@@ -1,0 +1,65 @@
+{
+  "module": "AntiFreeze",
+  "client": "Sigma 4.11",
+  "category": "antifreeze",
+  "source_rel": "info/sigmaclient/module/impl/movement/AntiFreeze.java",
+  "overview": "Sigma's AntiFreeze is a per-tick packet buffer that intercepts the C03, C02, C08 and C07 stream, holds the packets for exactly one tick, and replays them from an EventTick flush. Every tick the flush sets a sending flag so the replayed packets are not re-intercepted, then walks the buffer and pushes each entry back through addToSendQueue, swinging the arm for C02, C08 and C07 replays. The module's stated intent, countering anticheat freezes, is unimplemented: the setBacks, ticksSinceLastSetBack and unstuck fields are declared but never read, and the S08 comment at the top of the handler has no matching code.",
+  "sections": [
+    {
+      "h": "Architecture",
+      "p": "Two events drive the module. EventTick increments delay and, whenever delay is at least 1, sets sending, flushes the buffer through sendPackets and resets delay, so the flush runs every client tick. EventPacket handles interception: while sending is false it cancels every C03, C08, C07 and C02. The condition is ep.isOutgoing() and C03, or C08, or C07, or C02, so the trailing three branches do not actually need the direction test, since the client never receives those serverbound classes. C03 packets are buffered only while a movement key is pressed; every C02 is buffered and flips rotationYaw by 180 degrees. onDisable sets sending and flushes once more so no packet is stranded."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The cancel-then-replay cycle turns the module into a one-tick blink. Because only C03s sent while a movement key is down are buffered, a C03 that carries only a look change while the player stands still is cancelled and never replayed: the server-side yaw and pitch freeze at the last movement-tick values. Movement C03s are replayed a tick late but are positionally self-consistent, so the delayed stream is a valid trajectory. Each intercepted C02 flips the local yaw by 180 degrees and the next movement C03 carries the flipped look, so the server sees the player's look snap 180 degrees around every attack that happens while moving. Replayed C02, C08 and C07 packets are each preceded by swingItem(), so an extra C0A animation rides every flush that contains them."
+    },
+    {
+      "h": "Dead intent",
+      "p": "The three fields that would make this an anti-freeze module, setBacks, ticksSinceLastSetBack and unstuck, are never assigned or read anywhere in the class, and the //S08PacketPosLook comment sits above no S08 handler at all: there is no set-back detection, no freeze counter and no position re-assertion. The module therefore does not counter freezes; its only observable behavior is the one-tick packet delay, the dropped idle-look packets and the attack-time yaw flip, which is why its honest countering story is about stale looks and rotation anomalies rather than about teleport or velocity exploits."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C02PacketUseEntity",
+    "C07PacketPlayerDigging",
+    "C08PacketPlayerBlockPlacement"
+  ],
+  "files": [
+    {
+      "label": "AntiFreeze.java (per-tick buffer and replay)",
+      "rel": "info/sigmaclient/module/impl/movement/AntiFreeze.java",
+      "explanation": "The whole module. EventTick is the flush clock: delay increments each tick and the flush runs whenever it reaches 1, so the buffer drains every tick. EventPacket is the interception point: while the sending flag is false it cancels outgoing C03, C08, C07 and C02 packets, buffers C03 only while a movement key is pressed, and buffers every C02 while flipping rotationYaw by 180 degrees. sendPackets iterates the CopyOnWriteArrayList, swings the arm for C02, C08 and C07 entries, and re-emits each packet through addToSendQueue; the sending flag makes the handler return early during the flush so replayed packets are not cancelled again."
+    },
+    {
+      "label": "EventPacket.java (direction guard and cancel carrier)",
+      "rel": "info/sigmaclient/event/impl/EventPacket.java",
+      "explanation": "EventPacket carries the outgoing flag the module keys on. NetworkManager.sendPacket fires fire(packet, true) for every serverbound packet before the write, and channelRead0 fires fire(packet) for received packets, so isOutgoing() is true only on the send path. The module's cancel branch calls event.setCancelled(true), which makes the network layer suppress the write, and the same event object is what delivers the packet instance to the buffer. Because the C08, C07 and C02 branches of the module's condition do not check isOutgoing(), and those classes are never received, the guard only really gates the C03 branch."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly validates each move against a physics envelope built from the block cache and the previous move's momentum, with set-backs on violation. The AntiFreeze replay stream is positionally consistent: every buffered C03 was generated at the player's real position and is replayed one tick later, so consecutive server-visible positions still form a valid trajectory and the envelope never opens. The check matters here as the honest boundary: it proves the one-tick delay grants no movement advantage, while the dropped idle-look packets leave the server's stored rotation stale, a look-side artifact that SurvivalFly does not police."
+    },
+    {
+      "label": "fight Angle (attack direction vs stored look)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/Angle.java",
+      "explanation": "NCP's fight Angle scores the angle between the direction to the attacked entity and the player's server-stored look, accumulating angleVL in a 1000ms window with a 0.98 decay between hits. The module's 180-degree yaw flip per C02 makes every attack that lands while moving arrive against a stored look pointing the opposite way, the maximum possible mismatch for this check. At the stock thresholds in this tree (move 100, time 150, yaw 60, switch 50) per-call signal scores cap below the action threshold, so the check is dormant until an admin lowers the limits, but the flip is exactly the input it is built to accumulate."
+    },
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "MorePackets counts raw movement packets into half-second buckets against an EPS max of 22 with 20 ideal, plus a burst path on the newest bucket for concentrated flushes. The replay holds the C03 rate: each packet is cancelled once and re-emitted once, so the count is unchanged; only the replayed C02, C08 and C07 traffic rides on top, which matters only during sustained combat or digging. At stock settings the module's stream passes, an honest boundary, and a flush that concentrated many buffered packets into one tick would be the burst path's target."
+    },
+    {
+      "label": "Flight (vertical envelope)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Flight.java",
+      "explanation": "Arc v2's Flight checks vertical motion against ascend and descend speed ladders, an ascension distance and time budget, and a hover timer, with the vertical-clip branch scanning solid blocks between the safe and current locations whenever a vertical move exceeds 0.99 blocks. The module adds no vertical gain: its replayed C03s carry the player's genuine positions, so ascent and descent follow vanilla gravity and none of the branches arm. It is the honest boundary on the vertical axis, included because the delay trick produces no change in altitude at all, only in packet timing."
+    }
+  ]
+}

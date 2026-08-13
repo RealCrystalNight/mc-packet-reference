@@ -1,0 +1,64 @@
+{
+  "module": "AutoMLG",
+  "client": "Sigma 4.11",
+  "category": "automlg",
+  "source_rel": "info/sigmaclient/module/impl/movement/AutoMLG.java",
+  "overview": "Sigma's AutoMLG automates the water clutch: it watches for a fall of more than two blocks, predicts the block the player is about to land on from the current motion vector, aims the look at it through the pre-update rotations, and in the post phase swaps a water bucket into the hand with a C09, fires the use-item C08 that the server ray-traces along the freshly aimed look, and restores the previous slot locally without a sync packet. When the player lands in the placed water it repeats the swap with an empty bucket to collect the water back.",
+  "sections": [
+    {
+      "h": "Fall prediction",
+      "p": "The pre phase tracks fallStartY, keeping the highest y reached during the fall; once the fall exceeds 2 blocks and motionY is negative, it probes the predicted landing cell at posX plus motionX times 1.25, posZ plus motionZ times 1.25 and posY minus the eye height. The probe requires the block below the feet cell to be a solid full cube, the feet cell itself to be air, snow or tallgrass, and the player not to be sneaking, all gated by a 100ms Timer. getBlockData then wraps the cell below as a BlockData with EnumFacing.UP, and the module computes the aim with MoveUtils.getRotationsBlock, atan2 yaw with the face offset and atan2 pitch from the eye to the block center, and writes it into the pre-update so the tick's C03 carries the new look before any placement goes out."
+    },
+    {
+      "h": "Placement pipeline",
+      "p": "The post phase calls placeWater, which scans the hotbar for Items.water_bucket and calls swapToItem: it sets rightClickDelayTimer to 2, sends C09PacketHeldItemChange with the hotbar index, writes inventory.currentItem directly, and calls updateController. It then sends the single-argument C08PacketPlayerBlockPlacement with the held stack, the use-item form that serializes BlockPos.ORIGIN with face -1, and restores inventory.currentItem to the original slot locally with no C09, so the server believes the player still holds the bucket while the client shows the original hand. The server's processPlayerBlockPlacement routes the face -1 packet into the use-item path, and the water lands at the block its own ray trace from the player's eyes along the look that the module just set."
+    },
+    {
+      "h": "Wire profile",
+      "p": "The module emits exactly two packet classes: one C09 per swap and one face -1 C08 per placement or collection, at human-scale cadence with one action per fall behind a 100ms gate. It sends no C03 of its own: the movement packets are the vanilla stream and the fall is unmodified vanilla motion, so the pinned movement packet is untouched. The one artifact an observer could notice is the held-slot desync after the local-only restore: the server-side slot stays on the bucket until the next client-driven slot change or inventory action triggers syncCurrentPlayItem and realigns it."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer",
+    "C08PacketPlayerBlockPlacement",
+    "C09PacketHeldItemChange"
+  ],
+  "files": [
+    {
+      "label": "AutoMLG.java (fall watcher and water pipeline)",
+      "rel": "info/sigmaclient/module/impl/movement/AutoMLG.java",
+      "explanation": "The whole module. The pre phase tracks the fall, predicts the landing cell from the motion vector scaled by 1.25, validates the block below as a solid full cube, and arms nextPlaceWater with the aim rotations; the post phase runs placeWater or getWaterBack. swapToItem sends the C09, rewrites inventory.currentItem and calls updateController, and the placement is a single-argument C08 with the held stack, the use-item form with face -1 that the server ray-traces along the current look. The local-only slot restore after the C08 is the held-slot desync: the server keeps the bucket slot while the client shows the original hand."
+    },
+    {
+      "label": "MoveUtils.java (placement aim math)",
+      "rel": "info/sigmaclient/management/MoveUtils.java",
+      "explanation": "getRotationsBlock computes the aim the placement depends on: yaw from atan2(z, x) minus 90 degrees with the block face offset halved, pitch from the eye-height difference to the block center. The water only lands where the server's ray trace from the player's eyes along that look hits, so this helper is what makes the predicted cell the water cell: without it the face -1 C08 would empty the bucket wherever the player happened to be looking at the moment of the post-phase send."
+    }
+  ],
+  "countering": [
+    {
+      "label": "blockplace Direction (placement-facing validation)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockplace/Direction.java",
+      "explanation": "Direction extends AbstractBlockDirectionCheck, which ray-traces from the player's look across the queued movement positions to the placed block and accumulates directionVL with the distance of the ray to the block, decaying the total by 0.9 between placements; the whole check runs only from the Bukkit BlockPlaceEvent path. The module's C08 is the use-item form with face -1, which never fires BlockPlaceEvent, so the check never executes for it; even a real water placement is face UP on the cell below, a direction the ray would accept. The entry is an honest gap: the automation is invisible to the blockplace package because it uses the item-use path, not a placement path."
+    },
+    {
+      "label": "UseItemAdapter (use-item ledger)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCompatProtocolLib/src/main/java/fr/neatmonster/nocheatplus/checks/net/protocollib/UseItemAdapter.java",
+      "explanation": "UseItemAdapter timestamps C08 use-items and C07 releases through ProtocolLib, marking mightUseItem for face values above 5 and setting CombinedData.isHackingRI when a release arrives within 70ms of the use start, which SurvivalFly then consumes as the noslow packet penalty. The module's face -1 C08s are spaced by entire falls and are never followed by a C07 release, since the water collection is another face -1 C08, so the release ledger never arms. It is the closest server-side item-use bookkeeping and an honest gap for this cadence."
+    },
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly scores horizontal and vertical movement against a physics envelope rebuilt from the block cache and the previous move's momentum, with set-backs on violation and onGround taken from the cache rather than the packet flag. AutoMLG modifies no motion: the fall, the aim snap and the placement all ride the vanilla C03 stream, so the envelope sees an ordinary fall and never opens. It is the honest boundary that defines the module's profile: everything detectable is in the use-item and slot-switch traffic, not in the movement, which is exactly why the other entries target those packets."
+    },
+    {
+      "label": "FastConsume (consume-time ledger)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/inventory/FastConsume.java",
+      "explanation": "Arc v2's FastConsume flags when the elapsed time between a consume start and its completion is below the configured consume-time, default 1280ms. The consume start is stamped by InventoryListener only when the right-clicked item is edible or a potion, and the completion side requires a real item consumption, so a water bucket never enters the ledger: neither the start stamp nor a completion event exists for it. The check therefore cannot arm against the module's C08s, making this an honest gap entry: Arc's consume bookkeeping is built for food and potions, not for bucket empties."
+    }
+  ]
+}

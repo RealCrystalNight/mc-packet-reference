@@ -1,0 +1,63 @@
+{
+  "module": "InfiniteAura",
+  "client": "Sigma 4.11",
+  "category": "infiniteaura",
+  "source_rel": "info/sigmaclient/module/impl/combat/InfiniteAura.java",
+  "overview": "Sigma 4.11's InfiniteAura is a teleporting killaura: instead of attacking from the player's position it pathfinds to each target (up to MAXT at once, default 5), dashes along an A*-computed route using bursts of C04PacketPlayerPosition packets (onGround true), attacks at the endpoint, and dashes back - all from a RANGE slider that defaults to 30 blocks and tops out at 100. The Vanilla mode is the raw dash cycle; the Hypixel mode is a premium-addon two-phase trick that on enable sends two upward C04 packets (y+0.16, y+0.07, onGround true), cancels every outgoing C03 until the server's S08 lagback confirmation arrives, and then grants a client-side reach window (TIMER, default 2.5s) during which the EntityRenderer reach check is bypassed before the module disables itself. Both modes translate into the same server-visible signatures: dozens of movement packets per tick and attacks issued from teleported positions.",
+  "sections": [
+    {
+      "h": "Vanilla dash cycle",
+      "p": "Every EventUpdate pre phase the module rebuilds its target list (all loaded EntityLivingBase within RANGE, sorted by distance, filtered by player/animal flags, teams, invisibles, friends and the AntiBot list), then, when the cps timer expires (delayValue = (20/CPS) * 50 ms, so about 142ms at the default 7 CPS), iterates up to MAXT targets. For each target it runs computePath: AStarCustomPathFinder from the player's position to the target's position with canPassThrow passability, then compresses the block-by-block route with dashDistance = 5 - a node is kept only when the walker has moved more than 5 blocks from the last kept node (with a block-validity scan of the gap), plus the two endpoints. Every kept node is sent as a C04PacketPlayerPosition with onGround true, then swingItem + playerController.attackEntity fire the attack (C02 ATTACK + C0A swing), the path is reversed and re-sent to dash home. A 30-block dash therefore bursts roughly a dozen C04s in each direction per target, and the cps timer re-arms the whole cycle about 7 times per second."
+    },
+    {
+      "h": "Hypixel premium mode",
+      "p": "The Hypixel mode only runs with PremiumInfiniteAuraAddon registered (the addon's constructor wires itself into InfiniteAura via setPremiumAddon). onEnable requires a grounded start (MoveUtils.isOnGround(0.001) && isCollidedVertically) and immediately sends two C04 packets claiming y+0.16 and y+0.07 with onGround true - the step-up pair that primes the reach window. canReach is false from then on: the addon cancels every outgoing C03PacketPlayer while it stays false, and the module zeroes motionX/Y/Z, forces onGround false and jumpMovementFactor 0 in the update handler. The window opens when the server's S08PacketPlayerPosLook lagback arrives: the addon sets canReach = true, resets the timer, and overwrites the S08's yaw/pitch with the local rotation so the client never snaps. From then on the module attacks normally with the client-side reach check in EntityRenderer modified (the source comment 'MODIFICATION DE LA REACH DANS ENTITYRENDERER'), and disables itself when the TIMER window (default 2.5s) expires or a further S08 arrives mid-window ('Disabled due to a lagback')."
+    },
+    {
+      "h": "Packet economy",
+      "p": "The per-cycle traffic is the defining signature. Each target contributes (path nodes forward) + (path nodes reverse) C04 packets; with the 5-block dash compression a 30-block path is roughly 6-7 nodes each way, and with the default 5 targets a single cycle emits on the order of 60-70 C04s in one tick, repeating ~7 times per second. Every one of those packets claims onGround true regardless of the block below, and the moves are 5-block horizontal jumps against a physics envelope built for ~0.1-0.3 blocks per tick. The C02 attack count is one per target per cycle, so at 7 CPS with 5 targets the module sustains 35 attacks per second."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity",
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "InfiniteAura.java (module)",
+      "rel": "info/sigmaclient/module/impl/combat/InfiniteAura.java",
+      "explanation": "The module is one @RegisterEvent handler over EventUpdate, EventRender3D and EventPacket with the whole dash pipeline in the pre-update branch. The setting surface is RANGE (default 30, slider 8-100), CPS (1-20), MAXT (1-50), TIMER (0.1-3s), MODE (Vanilla/Hypixel), plus player/animal/team/invisible filters and ESP toggles. validEntity gates targets by distance, sleep state, friends, teams, invisibles and the shared AntiBot blacklist, and the Hypixel branch also bounds target Y within -4/+5 of the player. computePath holds the A* compression: AStarCustomPathFinder produces the block path, then the dash filter drops nodes closer than dashDistance=5 to the last kept node, re-adding an intermediate node (with the block-validity cord loop) whenever the gap crosses a wall. The send loop uses addToSendQueue directly rather than the event bus, so the path C04s are not re-observable by the module's own EventPacket handler. The EventPacket branch is Hypixel-only: an S08 while canReach is true (and timer over 10ms) disables the module and rewrites the S08 yaw/pitch to the local look."
+    },
+    {
+      "label": "PremiumInfiniteAuraAddon.java (Hypixel reach window)",
+      "rel": "info/sigmaclient/module/impl/premium/PremiumInfiniteAuraAddon.java",
+      "explanation": "The addon is the Hypixel-mode payload and the only file that touches the reach window. Its constructor looks up the running InfiniteAura and registers itself via setPremiumAddon, and shouldRegister() returns false so it never appears as a standalone module. Its EventPacket handler implements the two state transitions: while !canReach, every outgoing C03PacketPlayer is cancelled (ep.setCancelled(true)) - the client holds its position while the server settles - and the first S08PacketPlayerPosLook flips canReach to true, resets the shared timer and overwrites the S08's yaw/pitch with mc.thePlayer.rotationYaw/Pitch so the teleport does not re-aim the client. The EventUpdate branch is empty in this snapshot; the actual reach modification lives in the client's EntityRenderer (per the comment in InfiniteAura.java). The cancel-C03 window is what makes the mode distinguishable from vanilla: a server watching movement sees the player go silent for the lagback round-trip and then resume from an S08-confirmed position."
+    }
+  ],
+  "countering": [
+    {
+      "label": "MorePackets (movement packet rate)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/MorePackets.java",
+      "explanation": "NCP's MorePackets check scores every serverbound move into an ActionFrequency ledger with 500ms buckets (MovingData.morePacketsFreq) and compares the window score against cc.morePacketsEPSMax, default 22 packets per second with 20 ideal (DefaultConfig lines 458-459), plus a burst path on the newest half-second bucket. InfiniteAura's dash cycle is the direct target: each cycle flushes on the order of 60-70 C04 packets in a single tick (5 targets, ~6-7 dash nodes each way at range 30), which is a 3x overshoot of even the full-window ceiling inside one bucket, repeated about 7 times per second. The sustained rate of several hundred move packets per second keeps vEPSAcc positive for the entire window, so the check accumulates violation weight and cancels with the morePackets set-back (seeded from the SurvivalFly set-back when one exists) on the first cycle. Because the check is content-blind, the onGround-true flag on every C04 does not help the module - every position packet counts the same, including the return dash."
+    },
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the allowed trajectory from the world and compares each move against it. The horizontal allowance comes from the inertia/acceleration recurrence (0.1-0.28 blocks per tick for ground and air movement), and the violation is (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100 with a set-back to the stored location. A dash node moves the player 5 blocks horizontally in one packet - roughly 18-50 times the per-tick allowance - so hDistanceAboveLimit lands near 4.7 and the score near 470 on the very first C04 of the path. The onGround-true flag on every dash packet does not relax anything: the check derives ground from RichBoundsLocation.isOnGround(), a ray/block-cache scan at the claimed position, and a 5-block jump through air cannot be on ground, so NoFall's envelope logic (fall distance zero while not grounded) would also fire on the same packets. The set-back snaps the player to the last accepted location, which breaks the path mid-dash, and since the module re-sends the whole path on the next cycle it re-flags immediately."
+    },
+    {
+      "label": "Speed (horizontal discrepancy)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed check predicts the next move from the previous one (expected = friction * lastSpeed * multipliers + maxForce + adders) and accumulates positive discrepancies per player until the total passes the 0.1 threshold, then punishes and rubber-bands. A dash node of 5 blocks in one tick produces a discrepancy of ~4.7-4.9 against an expected value near 0.1-0.3 - 40-50 times the threshold - so the first dash flags immediately. The reverse path is no help: the check compares each move against the previous one, and the return dash is another 5-block jump in the opposite direction, adding another ~4.7 to the ledger. The module's burst pattern also defeats the check's tolerance: even if a single dash were forgiven, the discrepancies accumulate across the whole cycle because the ledger only decays on passes. Hawk additionally scores the C02 attacks through FightSpeed/FightHitbox, but the Speed check alone is sufficient to stop the Vanilla mode on the first cycle."
+    },
+    {
+      "label": "KillAura (combat rate ledger)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/KillAura.java",
+      "explanation": "Arc v2's KillAura check carries the rate ledger that matches InfiniteAura's attack shape. max-attacks defaults to 16 per second and max-attack-packets to 20 per second (config.yml lines 225-228), with the per-second counters reset in check() and checkFrequency(); every C02 - interact and attack alike - increments the packet counter. The module sends one ATTACK C02 per target per cycle and, with the default 5 targets at 7 CPS, sustains 35 attacks per second - more than double the 16/s ceiling - and the same 35 packets exceed the 20/s packet ceiling, so both Speed variants flag within the first second. The Direction branch (angle between the server-side look direction and the vector to the attacked entity, max-direction-angle 1.2 rad) is where the dash shape shows: the player attacks from the path endpoint without rotating, so the yaw carried in the movement packets is the pre-dash heading, and for targets approached off-axis the angle to the attack vector exceeds 1.2 radians. Reach (max-reach 4.2) is the one branch that passes - the attack is issued from the dash endpoint adjacent to the target - which makes the combination of a clean reach with a flooded attack ledger and an off-axis direction a strong multi-check signal."
+    }
+  ]
+}

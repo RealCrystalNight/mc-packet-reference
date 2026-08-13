@@ -1,0 +1,58 @@
+{
+  "module": "ComboOneHit",
+  "client": "Rise 6.1.30",
+  "category": "comboonehit",
+  "source_rel": "com/alan/clients/module/impl/combat/ComboOneHit.java",
+  "overview": "ComboOneHit turns every single attack into a burst. Its only setting, Attack Packets (default 50, range 1-1000), is the loop bound of an AttackEvent listener: whenever the player attacks through the vanilla click path, the module re-sends the same C02PacketUseEntity ATTACK packet against the same target that many times through PacketUtil.send. On 1.8.9 the server applies each C02 as a separate attack with no cooldown, so a default burst lands 50 hits in the same tick, and the ceiling of 1000 makes the module a one-shot kill against any entity. The burst inherits the player's real position and look because the module never touches rotations or movement; the ambient C03 movement stream continues at its normal 20/s cadence and positions the player for all of the burst's packets, but the module itself emits only C02s.",
+  "sections": [
+    {
+      "h": "Burst mechanics",
+      "p": "The listener is four lines: for i in 0..packets, PacketUtil.send(new C02PacketUseEntity(event.getTarget(), ATTACK)). The event fires from the fork's clickMouse before the swing and attack are sent, so the original click still produces its own C0A and C02, and the loop adds packets.getValue() more attacks on top. The server-side handler applies each attack immediately: entity damage, knockback accumulation, and the target's hurt-time re-arm, so 50 packets are 50 hits regardless of the client's swing state. The range 1-1000 makes the setting the only knob; there is no timing, randomization or rotation logic anywhere in the module."
+    },
+    {
+      "h": "Wire fingerprint",
+      "p": "The burst is a same-tick C02 concentration: the ambient stream carries one C02 per click, and the module multiplies that by the setting in a single tick. There are no matching C0A swings for the extra packets, because only the original click passes through clickMouse; the re-sent C02s are raw PacketUtil.send calls. Server-side, the burst shows up as a one-tick spike in the attack count, an attack-to-swing imbalance, and a wall of damage events; the player's position and look are unchanged, so reach and direction stay legal."
+    },
+    {
+      "h": "Countering surface",
+      "p": "Three of the four checks below attack the same-tick concentration: Arc v2's attack-packet window cancels the overflow packet, Hawk's rate check reads an effectively infinite CPS, and NCP's swing ledger converts the swing imbalance into violations that cancel at level 2. The reach-based check is the honest boundary: the burst is a range-legal attack stream, so it stays quiet and the detection burden falls on the rate and swing ledgers."
+    }
+  ],
+  "packets": [
+    "C02PacketUseEntity",
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "ComboOneHit.java",
+      "rel": "com/alan/clients/module/impl/combat/ComboOneHit.java",
+      "explanation": "The whole module is 24 lines. The NumberValue Attack Packets (default 50, range 1-1000) is the burst size; the onAttack listener loops over it and re-sends the target's C02 with the ATTACK action via PacketUtil.send. The module never aims, moves or swings on its own; it only multiplies attacks that the vanilla path already started. The aliases declare the intent (Insta Kill, Instant Kill), and the description string is empty in this snapshot, which is why the behavior documented here comes from the code."
+    }
+  ],
+  "countering": [
+    {
+      "label": "KillAura (attack-packet window with cancel)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/combat/KillAura.java",
+      "explanation": "Arc v2 counts the C02 stream in two one-second windows. PacketListener increments totalAttacks on every USE_ENTITY packet and attackPackets on every ATTACK action; checkFrequency runs per ATTACK packet and cancels the packet as soon as the rolling second holds more than maxAttackPackets 20, and check() flags Kill Aura (Speed) when totalAttacks passes maxAttacks 16 in the window. Both defaults come from config.yml (max-attacks 16, max-attack-packets 20).\n\nA default 50-packet burst crosses the 20 cap on the 21st attack packet of that second, so the tail of the burst is cancelled server-side before it applies damage; even a small burst layers onto the normal clicking rate and overflows the window. This is the direct wire-level counter: it does not care about reach or angle, only the count of C02 ATTACK packets per second, which is exactly the dimension ComboOneHit multiplies."
+    },
+    {
+      "label": "FightSpeed (same-tick rate spike)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/combat/FightSpeed.java",
+      "explanation": "FightSpeed caps the attack rate at 16 CPS (maxCps). It logs the tick delta between consecutive non-INTERACT InteractEntityEvents when the delta is at most RECORD_SENSITIVITY 4 ticks; after SAMPLES 10 deltas it computes 20 divided by the mean spacing and punishes when that exceeds the cap. A burst of 50 attacks in one tick produces 49 deltas of zero ticks, the divisor collapses toward zero and the reported CPS goes infinite, so the first complete window punishes immediately.\n\nThe check only needs 10 deltas to arm, which a 50-packet burst satisfies within one tick; the punish path (punish(1, true)) lifts the violation level and Hawk's action system reacts. The honest caveat: a single burst is one window, so a player who kills with one burst and stops is flagged once, while sustained combos keep feeding windows."
+    },
+    {
+      "label": "NoSwing (attack-to-swing imbalance)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/fight/NoSwing.java",
+      "explanation": "NCP's fight NoSwing requires an arm movement between attacks. FightListener counts noSwingCount up on every C02 attack and down on every PlayerAnimationEvent; check() lets a single swingless attack pass with a 0.9 decay of the violation level, and on the second consecutive swingless attack resets the count, adds one violation level and executes the configured actions, whose default is cancel at level 2.\n\nThe burst is exactly the imbalance the check exists for: the original click supplies one C0A swing, the 49 re-sent C02s supply none, so attacks two, four, six and so on each add a violation level, and the default cancel at level 2 kills the rest of the burst server-side. The first attack of the burst is the honest grace: one swingless attack per click passes, which is why the check needs the second attack to bite."
+    },
+    {
+      "label": "Reach (range-legal burst boundary)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/combat/Reach.java",
+      "explanation": "Grim's Reach check validates each C02 against the survival reach bound using the latency-compensated entity position: the attack distance is measured to the interpolated entity box, and an attack beyond the reach limit flags and triggers the setback path. It sits in the C02 corpus and is the standard reach counter for killaura modules.\n\nFor ComboOneHit it is an honest boundary, not a counter: the module attacks the entity it is already standing next to, so every packet of the burst is range-legal and Reach stays quiet. Its inclusion is the negative result that frames the rate checks above: the burst defeats reach-based detection by construction, and the observable surface is the packet count, not the geometry."
+    }
+  ]
+}

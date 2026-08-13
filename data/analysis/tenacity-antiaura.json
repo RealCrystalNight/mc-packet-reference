@@ -1,0 +1,57 @@
+{
+  "module": "AntiAura",
+  "client": "Tenacity 6.0",
+  "category": "antiaura",
+  "source_rel": "dev/tenacity/module/impl/exploit/AntiAura.java",
+  "overview": "Tenacity 6.0's AntiAura is an exploit that breaks enemy killauras by destabilizing the local movement stream they predict against. The Mode setting picks Legit or Rage. Legit cancels every outbound C03PacketPlayer into a queue and flushes the queue on a 50ms timer, so the server still receives a roughly 20/s movement stream but each packet arrives delayed by up to 50ms, which desynchronizes aim assist and aura modules that key their rotations off the tick boundary. Rage instead yanks the local position 2 blocks sideways relative to the yaw, alternating forward and back every other tick, so the server sees repeated 2-block horizontal jumps that no movement model can explain. The module description states the intent plainly: 'can sometimes cause your enemies aura to stop working properly'.",
+  "sections": [
+    {
+      "h": "Legit mode",
+      "p": "A PacketSendEvent listener intercepts every C03PacketPlayer: it appends the packet to a CopyOnWriteArrayList and cancels it. The MotionEvent listener drains the list on a 50ms TimerUtil gate (hasTimeElapsed(50, true) then reset), sending each packet with PacketUtils.sendPacketNoEvent so the flush never re-enters the cancel listener. The queue is drained once per 50ms window, so on a steady 20-tick client each C03 spends 0-50ms in the queue and arrives in flushes of one or two. The delivery rate is unchanged: this is a delay line, not a rate change, which is the fact that decides which countering checks can see it."
+    },
+    {
+      "h": "Rage mode",
+      "p": "Every MotionEvent recomputes the yaw basis: xValue is minus sin(yaw) times 2 and zValue is cos(yaw) times 2, then setPosition moves the player to (x plus xValue, y, z plus zValue); on even ticks the position snaps back by the same vector. setPosition writes the local coordinates directly, so the next C03PacketPlayer the client sends carries the teleported position: the server observes a 2-block lateral move every tick, alternating direction every two ticks, roughly 40 m/s sustained. There is no C04 teleport involved, so the moves present as ordinary movement packets with impossible deltas."
+    },
+    {
+      "h": "Countering surface",
+      "p": "The two modes split cleanly. Rage is fully detectable: the 2-block steps violate the movement envelope, the ground speed budget and the prediction model, and the three movement checks below all fire on the first step. Legit is nearly invisible: the delayed-but-steady stream keeps the same packet rate, so rate windows and timer balances stay flat, and only the timing relationship between the C03 stream and the transaction clock could expose it, which the Grim Timer entry below documents as an honest gap."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "AntiAura.java",
+      "rel": "dev/tenacity/module/impl/exploit/AntiAura.java",
+      "explanation": "The module is 66 lines. The ModeSetting (Legit default, Rage) switches the MotionEvent branch; the CopyOnWriteArrayList is the C03 queue; the PacketSendEvent listener is the cancel side; the MotionEvent listener is the flush side in Legit and the position yank in Rage. PacketUtils.sendPacketNoEvent is what makes the flush safe from re-cancellation. There is no rotation or attack logic anywhere, which is the module's defining property: it only shapes the local movement stream."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (movement envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the movement envelope from the world. The horizontal allowance comes from prepareSpeedEstimation, which starts from the previous move's momentum and the block cache, and the violation is (max(hDistanceAboveLimit, 0) plus max(yDistanceAboveLimit, 0)) times 100, with handleViolation setting the player back. On the ground the allowed horizontal delta per tick is the sprint and friction budget of a few tenths of a block, and the packet's onGround flag does not relax it because NCP derives ground from its own ray trace.\n\nThe Rage mode's 2-block lateral step is an hDistance of 2.0 against an allowance near 0.3, so the violation lands around 170 on the first step and the player is setback to the pre-teleport position; the alternating snap-back repeats the same violation every two ticks. Legit mode never moves more than a normal step, so the envelope stays quiet for it, which is why the honest framing separates the modes."
+    },
+    {
+      "label": "Speed (ground move budget)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Speed.java",
+      "explanation": "Arc v2's Speed check scores horizontal moves against the ground budget. On the ground with groundTicks at the 8-tick cap, the expected move is thisMove divided by groundTime plus the base move speed, and a move above the budget flags Speed (onGround); moves over 8 blocks are cancelled outright. The 2-block Rage step produces a thisMove of 2.0 against an expected value near 0.45, so the onGround branch flags immediately.\n\nThe check needs groundTicks to accumulate, which it does while the player stands between yanks, and the teleport keeps the same y so the ground state never resets. The Legit mode's normal steps sit inside the budget and pass, the same honest split as SurvivalFly."
+    },
+    {
+      "label": "Speed (one-directional gain bound)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/Speed.java",
+      "explanation": "Hawk's Speed is a one-directional gain bound: expected speed is friction times the previous speed plus the maximum input force, and only moves faster than expected accumulate discrepancy toward the 0.1 threshold, with the violation level failing by VL_FAIL_DISCREPANCY_FACTOR 10. A 2-block step from a standing start is a discrepancy near 1.8 against the 0.1 threshold, so the Rage mode fails on the first move.\n\nBecause the check is a max-speed bound it never fires on the Legit mode, whose delayed steps are normal-sized; the honest note is that Hawk Speed punishes the Rage teleport only because the move is faster than the physics model allows, which is the same mechanism as the other two movement checks."
+    },
+    {
+      "label": "Timer (acceleration-only balance)",
+      "ac": "GrimAnticheat-Grim",
+      "rel": "common/src/main/java/ac/grim/grimac/checks/impl/timer/Timer.java",
+      "explanation": "Grim's Timer check balances the movement stream against real time: every counted tick packet adds 50ms to timerBalanceRealTime, and the check flags when the balance runs ahead of System.nanoTime, meaning the player delivered more movement time than real time elapsed; limitFallBehind clamps the balance to the transaction-derived player clock minus clockDrift (120ms default) so a stream can lag real time by at most the drift. It is an acceleration check.\n\nThe Legit mode's flush delivers roughly 20 C03s per real second with each delayed up to 50ms, so the balance never runs ahead of the wall clock and the check stays quiet: the delay is absorbed by the drift clamp. This is the honest gap entry: the one-directional timer model cannot see a delay line, and the Rage mode is caught by the movement checks above rather than by Timer."
+    }
+  ]
+}

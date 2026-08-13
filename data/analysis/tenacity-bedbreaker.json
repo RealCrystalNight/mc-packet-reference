@@ -1,0 +1,58 @@
+{
+  "module": "BedBreaker",
+  "client": "Tenacity 6.0",
+  "category": "bedbreaker",
+  "source_rel": "dev/tenacity/module/impl/player/BedBreakerModule.java",
+  "overview": "Tenacity 6.0's BedBreaker is a settings-only stub in this snapshot. The class registers a Mode setting (Through Walls by default, Around Walls as the alternative), a Distance setting from 1 to 7 blocks, and declares a TimerUtil, a List of Packet objects and a lastMovementYaw field, but it defines no event handler at all: onEnable and onDisable are empty and there is no IEventListener field for the EventSubscriberPool to bind. When the module is toggled, the bus subscribes the instance, scans its declared fields for IEventListener types and finds none, so nothing ever runs. The module appears in the client's module list in Tenacity.java and is toggleable, but it has no wire effect. The fields and settings are the skeleton of the intended bed destroyer, and the analysis below covers both the inert reality and the technique the vestigial code points at.",
+  "sections": [
+    {
+      "h": "The stub and the subscription contract",
+      "p": "Module.onEnable calls Tenacity.getInstance().getEventBus().subscribe(this), and EventSubscriberPool.subscribe iterates the instance's declared fields, binding every non-null IEventListener field by the event type from its generic signature. BedBreakerModule declares only setting fields, a TimerUtil, an unused ArrayList of Packet and a float, so the subscription binds nothing and the module idles forever. The unused packetList is the strongest clue to the missing design: a bed breaker that must dig through walls typically buffers the tick's C07 dig packets to re-order or re-send them, and lastMovementYaw is exactly the state an Around Walls mode needs to rotate the aim onto a bed it cannot see."
+    },
+    {
+      "h": "Latent design",
+      "p": "The setting names reconstruct the intended mechanism. Through Walls skips the line-of-sight gate so the dig goes out against a bed cell the player cannot see, which requires the C03 look to be rotated toward the target or the server-side direction validation to be bypassed; Around Walls keeps a ray-trace gate and aims only at beds within view, which is where lastMovementYaw would be consumed to write the aim into the tick's C03. The Distance range 1-7 matches the scan radius of working bed breakers (Rise's Breaker scans an 11 by 11 by 11 cube, equivalent to a radius of 5, and optionally ray-traces 4.5 blocks). A complete implementation would emit C07 START_DESTROY_BLOCK plus STOP_DESTROY_BLOCK pairs against the bed cell, optionally with a swing and a same-tick pair for instant destruction."
+    },
+    {
+      "h": "Wire reality",
+      "p": "The module emits nothing. The brief pins S0A and C07 as its packet surface: C07PacketPlayerDigging is the packet a working breaker would use for the instant dig, and S0APacketUseBed is the server's bed-interaction response, but this file never references either class. The honest statement for the page is that the analysis documents a dormant module: no server-side check can fire against it because there is no traffic, and the countering entries below describe what the intended C07 technique would face once the missing handler is reimplemented. This mirrors the Rise 5.99 Breaker, whose live same-tick C07 pairs and optional rotation are the reference behaviour for the Tenacity stub."
+    }
+  ],
+  "packets": [
+    "S0APacketUseBed",
+    "C07PacketPlayerDigging"
+  ],
+  "files": [
+    {
+      "label": "BedBreakerModule.java",
+      "rel": "dev/tenacity/module/impl/player/BedBreakerModule.java",
+      "explanation": "The module file is the whole snapshot. The constructor registers the Mode and Distance settings, onEnable and onDisable are empty overrides, and the fields timerUtil, packetList and lastMovementYaw are declared but never referenced anywhere in the class. Because the EventSubscriberPool only binds IEventListener fields, the absence of any listener field is the mechanical proof of inertness: toggling the module subscribes an object with no bindable handlers. The file is 41 lines and contains no packet imports beyond the generic Packet class used by the unused packetList, which confirms the missing dig logic is not hidden in a helper."
+    }
+  ],
+  "countering": [
+    {
+      "label": "blockbreak FastBreak (zero-duration digs)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/FastBreak.java",
+      "explanation": "FastBreak runs from BlockBreakListener.onBlockBreak, so it only scores digs that end in a real harvest. The check computes the expected breaking time from the block's hardness and compares it with the elapsed time since the first damage packet, accumulating the missing time into a bucket that tolerates 2000ms of grace. The intended same-tick START plus STOP pair against a bed (hardness 0.2, no tool, roughly 300ms expected hand-dig time) would add almost the full expected duration to the bucket on every harvested bed, exhausting the grace within a couple of beds and pushing the violation level. The honest caveat applies to both sides: the Tenacity stub emits no C07 at all so nothing reaches the listener, and a server that rejects instant digs never fires BlockBreakEvent, leaving the stream to packet-level checks only."
+    },
+    {
+      "label": "blockbreak NoSwing (digs without arm movement)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/blockbreak/NoSwing.java",
+      "explanation": "NCP requires one arm swing between breaks. NoSwing increments a per-player counter on every break check and decrements it when a C0A animation arrives, and a counter above 1 at break time is a violation. An instant-mode breaker that never calls swingItem would climb the counter on every consecutive harvest and flag from the second break onward, adding 1 to noSwingVL per pair; a single bed that takes several START/STOP pairs before the server harvests it accumulates the same way. The countering value against this module is conditional: the stub sends no C07 and no C0A, so the ledger is never touched, but the instant-dig design the settings imply would trip it, and a damage-accumulating path that swings once per bed would pass it cleanly."
+    },
+    {
+      "label": "BlockBreakSpeedSurvival (same-tick dig completion)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/terrain/BlockBreakSpeedSurvival.java",
+      "explanation": "Hawk tracks the dig lifecycle per player from the raw C07 stream, independent of Bukkit harvest events. On START it records the target block and the current tick and resets the accumulated damage; on every subsequent MoveEvent while digging it adds the expected per-tick damage from the held item against the block strength; on COMPLETE it punishes when the accumulated total is below 1 or when the complete lands on the same tick as the start, with a violation of min((1/totalDamage - 1) * 10, 10) and a resync. The same-tick START/STOP pair of an instant bed breaker satisfies both conditions at once: totalDamage is 0 and the tick stamps match, so every harvested bed resyncs the player. This is the decisive packet-level counter for the intended technique, and it is the check that bites on servers where NCP's Bukkit-gated path is silent."
+    },
+    {
+      "label": "BlockBreakDirection (dig against the look ray)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/interaction/terrain/BlockBreakDirection.java",
+      "explanation": "BlockBreakDirection validates the dig against the player's look on COMPLETE, building the target block's AABB and requiring the ray from the head along the current yaw and pitch to intersect it, punishing and resyncing otherwise. The intended Around Walls mode rotates the C03 look onto the bed before the C07 pair, which makes the ray land and the check pass; a Through Walls dig with rotation disabled, or a bed picked outside the view cone, misses the ray and is punished. The check is therefore a conditional counter decided by the rotation toggle, exactly as with Rise's Breaker: direction validation is defeated by the built-in aim and bites when it is off. Against the dormant Tenacity stub nothing fires at all, since no dig ever reaches the wire."
+    }
+  ]
+}

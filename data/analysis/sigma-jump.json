@@ -1,0 +1,62 @@
+{
+  "module": "Jump",
+  "client": "Sigma 4.11",
+  "category": "jump",
+  "source_rel": "info/sigmaclient/module/impl/movement/Jump.java",
+  "overview": "Sigma 4.11's Jump is an auto-hop module that hijacks the player's vertical and horizontal motion on the pre phase of every EventUpdate. A wasOnGround latch tracks the ground state: on the first airborne tick after leaving the ground, when the jump key is not pressed, it calls mc.thePlayer.jump() (motionY 0.42) and then normalizes the horizontal motion vector and scales it to exactly 0.4, so each hop is a vanilla-sized jump with speed capped to the movement direction. While airborne with a block within 0.9 blocks below and no jump key, it instead sets motionY to -1.0, a slam-fall roughly thirteen times gravity, and zeroes horizontal motion when no movement key is held. The module never sends a packet itself; the fork's motionUpdates() captures position and rotation when it fires the event and emits the C03 stream afterward, so the motion changes surface as hop deltas (y +0.42) and slam-fall deltas (y -1.0) in the following tick's position packet.",
+  "sections": [
+    {
+      "h": "State latch and the two airborne branches",
+      "p": "wasOnGround is set true on every tick the player is on the ground and cleared the first tick airborne. The first airborne branch (the 'just left the ground' case, commented in French 'S'il vient de quitter le sol') runs once: if the jump key is not held it calls jump(), then builds a Vector2d from motionX/motionZ, normalizes it and scales it by 0.4, writing the result back into motionX/motionZ. The second branch runs on every later airborne tick while the bounding box offset 0.9 blocks down still collides with a block: motionY is forced to -1.0, and if neither forward nor left nor right is held, motionX and motionZ are zeroed. The jump-key guard means the module only acts when the user is not already jumping, and the onGround else-branch contains only a commented-out setSprinting(true) attempt, so the module is purely a motion writer."
+    },
+    {
+      "h": "Where the wire effect comes from",
+      "p": "The fork's EntityPlayerSP.motionUpdates() fires EventUpdate with the current position, rotation, sneak and ground state, then, if the event was not cancelled, diffs the sprint and sneak state (emitting C0B on transitions) and emits one C03 packet for the tick using the values captured at fire time. The module's pre handler mutates motion fields, not the captured position, so the C03 for the current tick is untouched; the physics pass that follows the event applies motionY 0.42 or -1.0 to posY, and the result appears as the delta in the next tick's C03. The observable fingerprint is therefore the position stream itself: a +0.42 hop on the tick after the player leaves ground without the jump key, -1.0 slam deltas while descending onto nearby ground, and a horizontal rate pinned to 0.4 blocks per tick (8 blocks per second) against a vanilla sprint pace of roughly 0.286 per tick."
+    },
+    {
+      "h": "Why the module looks clean on the packet axis",
+      "p": "The hop uses the vanilla jump value, so the vertical delta matches a legitimate jump the server could have caused, and the horizontal 0.4 cap sits below most speed-check thresholds: the burst is a per-hop transient that decays by 0.91 per tick in air, averaging back toward sprint pace. The slam-fall is the one genuinely anomalous delta, because -1.0 per tick is far outside gravity fall (about -0.078 per tick) and requires no knockback or slime launch to explain."
+    }
+  ],
+  "packets": [
+    "C03PacketPlayer"
+  ],
+  "files": [
+    {
+      "label": "Jump.java",
+      "rel": "info/sigmaclient/module/impl/movement/Jump.java",
+      "explanation": "The module is entirely this file: two fields, a constructor, and one EventUpdate handler. The wasOnGround boolean is the ground latch, set on ground ticks and cleared on the first airborne tick, which is what lets the module distinguish the hop moment from sustained airtime. The hop branch is gated on !mc.thePlayer.onGround, wasOnGround, and !keyBindJump.pressed, then performs jump() and the 0.4 normalization through a javax.vecmath.Vector2d. The slam branch requires the same airborne state plus a non-empty collision scan of the bounding box offset (0, -0.9, 0), forcing motionY to -1.0. The remaining else branch (on the ground) just re-arms the latch; its setSprinting(true) is commented out. There is no onDisable override and no packet access anywhere, so every effect flows through the motion fields."
+    },
+    {
+      "label": "EntityPlayerSP.java (fork tick machinery)",
+      "rel": "net/minecraft/client/entity/EntityPlayerSP.java",
+      "explanation": "motionUpdates() is the fork's movement-update replacement. It fires EventUpdate first (line 179) with the position, rotation, sneak and ground state captured at that instant, and only after the event completes does it emit the tick's C03: C06PacketPlayerPosLook when both position and look changed (line 215), C04 when only position changed (line 217), C05 when only look changed (line 219), or a bare C03 otherwise (line 221). Because the emitted values are the captured em.getX()/getY()/getZ()/getYaw()/getPitch(), the Jump module's pre-phase motion writes never leak into the current tick's packet; the physics pass applies the new motion afterward and the delta surfaces one tick later. The method also diffs isSprinting() against field_175171_bO and emits C0B START/STOP_SPRINTING on transitions (lines 185-193), the stream a keep-sprint style module would normally suppress."
+    }
+  ],
+  "countering": [
+    {
+      "label": "SurvivalFly (movement physics envelope)",
+      "ac": "Updated-NoCheatPlus-NoCheatPlus",
+      "rel": "NCPCore/src/main/java/fr/neatmonster/nocheatplus/checks/moving/player/SurvivalFly.java",
+      "explanation": "SurvivalFly rebuilds the client's physics envelope from the world. The vertical allowance comes from vDistRel (line 1839, invoked at line 212), which seeds the allowed vertical distance from the previous move's momentum and accepts only a few named envelopes: zero-y moves on ground, a jump (line 1889), a step-up and a riptide launch. The violation is (max(hDistanceAboveLimit, 0) + max(yDistanceAboveLimit, 0)) * 100, and a violation sets the player back to the stored setBack location.\n\nThe module's slam-fall is the direct hit: a C03 carrying y delta -1.0 presents a yDistance of about -1.0 against an allowed descent of a few tenths of a block per tick, so yDistanceAboveLimit lands near 0.9 and the result is around 90-100, an immediate violation and set-back before the block below can be reached. The auto-hop is the designed non-event: jump() produces 0.42 upward on a tick where NCP's own ground state still reports grounded (the previous move ended on the ground), which is exactly the jump envelope at line 1889, so the hop itself passes. The module's exploitability on NCP servers is therefore bounded by the slam branch, which the check punishes on the first occurrence."
+    },
+    {
+      "label": "FastFall (vertical delta vs gravity)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/FastFall.java",
+      "explanation": "Hawk's FastFall compares each descending move against the gravity model. It bails for grounded players, accepted teleports, flying, knockback, sleeping and swimming, then computes deltaY from the move and expected = (velocity.y - 0.08) * 0.98, the one-tick gravity+air-resistance forecast; when no solid block sits within 2.5 blocks above, deltaY + 0.02 < expected triggers punishAndTryRubberband.\n\nThe module's motionY = -1.0 slam produces deltaY of -1.0 against an expected descent of about -0.078, so deltaY + 0.02 is more than ten times the expected magnitude: every slam tick fails by a wide margin and the player is rubber-banded. The auto-hop, by contrast, is upward motion, which FastFall never examines. The slam branch is the part of the module that Hawk's vertical checks erase, and because the module slams on every airborne tick with ground within 0.9 blocks, the check fires continuously once the branch is reached."
+    },
+    {
+      "label": "SmallHop (undersized jump cadence)",
+      "ac": "HawkAnticheat-Hawk",
+      "rel": "src/me/islandscout/hawk/check/movement/position/SmallHop.java",
+      "explanation": "SmallHop exists specifically because undersized jumps are an exploit vector: the header comment notes small jumps bypass speed and criticals checks. It flags any upward move with deltaY in (0, 0.4) while the player was grounded, with previous vertical velocity at or below zero, outside cobweb, ladder, vine, slime and liquid adjacency. A legitimate ground jump has deltaY 0.42, just above the 0.4 ceiling.\n\nThe module's hop uses the vanilla jump value, so a clean hop from a flat block lands at 0.42 and brushes past the threshold; the check does not fire on the common path. But the module hops from whatever surface it left, so hops off stairs, slabs, snow layers or a partially sunk position carry less than 0.4 of vertical gain, and those land inside the window: wasOnGround true, deltaY positive and under 0.4, prior vertical velocity zero. Each such hop raises the VL toward the 5-punish threshold with probability 0.99 per occurrence. The check is the one Hawk entry that polices the hop cadence itself rather than the fast fall."
+    },
+    {
+      "label": "Speed (horizontal envelope)",
+      "ac": "Vrekt-Arc-v2",
+      "rel": "src/main/java/me/vrekt/arc/check/moving/Speed.java",
+      "explanation": "Arc v2's Speed check scores each move against an expected distance. On the ground the expectation is thisMove/groundTime + baseMove (base 0.2873, potion-adjusted), evaluated once groundTicks reach 5; off the ground the expectation is baseMove plus a vertical-dependent stage (0.049 stationary, 0.08 for small ascent, 0.3261 for a full 0.42 jump), with knockback velocity folded in from the recent-velocity buffer and the ping capped at 300. Any move beyond the expectation flags (BunnyHop / onGround variants), and a horizontal move over 8 blocks in one tick is cancelled outright.\n\nThe module's per-hop normalization pins horizontal motion to 0.4 blocks per tick, which is above the 0.286 sprint baseline: on the hop tick the 0.4 surge is compared against baseMove plus the jump stage (about 0.613), so the isolated hop tick passes, but the ground branch catches the sustained case once groundTicks accumulate and the module is moving at 0.4 against an expected of roughly 0.287 plus the small ground-time dividend. In practice the hop cycle keeps the player airborne, which parks the check in the off-ground branch where the cap is deliberately under the threshold; the honest pressure here is modest, which is why the vertical checks above are the module's real counters."
+    }
+  ]
+}
