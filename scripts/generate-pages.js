@@ -336,7 +336,7 @@ function main() {
       + '<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="' + modules + '">\n'
       + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
       + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
-      + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
+      + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=optional" rel="stylesheet">\n'
       + '<link rel="stylesheet" href="../../css/style.css">\n'
       + '<link rel="stylesheet" href="../../assets/github-dark.min.css">\n'
       + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"TechArticle","headline":"' + metaTitle + '","description":"' + metaDesc.replace(/&quot;/g, '\\"') + '","datePublished":"' + pubDate + '","dateModified":"' + modDate + '","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"' + pageUrl + '"},"author":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"publisher":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"' + pkt.state + ' Protocol \u2014 ' + dirLabel + '"}\n</script>\n'
@@ -444,7 +444,7 @@ function main() {
     + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
     + '<meta name="twitter:card" content="summary_large_image">\n'
     + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
-    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
+    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=optional" rel="stylesheet">\n'
     + '<link rel="stylesheet" href="../css/style.css">\n'
     + '</head>\n<body>\n'
     + '<aside class="sidebar" id="sidebar">\n'
@@ -505,7 +505,7 @@ function main() {
     + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
     + '<meta name="twitter:card" content="summary_large_image">\n'
     + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
-    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
+    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=optional" rel="stylesheet">\n'
     + '<link rel="stylesheet" href="../css/style.css">\n'
     + '</head>\n<body>\n'
     + '<aside class="sidebar" id="sidebar">\n'
@@ -549,8 +549,13 @@ function main() {
   const block = '<div class="detail-section" id="staticPacketIndex">' + staticLinks + '</div>';
   if (home.indexOf('<!-- PACKET_LINKS -->') !== -1) {
     home = home.replace('<!-- PACKET_LINKS -->', block);
-    fs.writeFileSync(homePath, home);
   }
+  // inline the site CSS into the home page (kills the render-blocking css/style.css request)
+  if (home.indexOf('<!-- STYLE_CSS_INLINE -->') !== -1) {
+    const css = fs.readFileSync(path.join(BASE, 'css', 'style.css'), 'utf8');
+    home = home.replace('<!-- STYLE_CSS_INLINE -->', '<style>\n' + css + '\n</style>');
+  }
+  fs.writeFileSync(homePath, home);
 
   console.log('Generated ' + allPkts.length + ' standalone packet pages + module index (' + modNames.length + ' modules) + packet listing + static home links + sitemap');
 }
