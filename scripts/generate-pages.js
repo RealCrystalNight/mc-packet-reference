@@ -42,6 +42,118 @@ function mcpPathFor(pkt) {
 const VANILLA_DIR = path.join(BASE, 'data', 'vanilla');
 const MAVEN_BLOB = 'https://github.com/Marcelektro/MavenMCP-1.8.9/blob/master/src/main/java';
 
+// ============================================================
+// Minecraft logic classes (full vanilla sources, catted verbatim
+// from disk into data/vanilla-logic/) — prototype: EntityPlayerSP
+// ============================================================
+const LOGIC_DIR = path.join(BASE, 'data', 'vanilla-logic');
+const LOGIC_CLASSES = [
+  { slug: 'EntityPlayerSP', rel: 'net/minecraft/client/entity/EntityPlayerSP.java', title: 'EntityPlayerSP', desc: 'Client player entity: emits C03 movement, C0A swings, C0B actions and C0C input every tick from onUpdateWalkingPlayer.' },
+  { slug: 'EntityPlayerMP', rel: 'net/minecraft/entity/player/EntityPlayerMP.java', title: 'EntityPlayerMP', desc: 'Server player entity: health, XP and inventory sync fan out S06, S1F, S2F and S30 packets from onUpdateEntity.' },
+  { slug: 'EntityTrackerEntry', rel: 'net/minecraft/entity/EntityTrackerEntry.java', title: 'EntityTrackerEntry', desc: 'Server per-entity tracker: builds spawn packets and pushes S12 velocity, S14 movement and S18 teleports to tracking players.' },
+  { slug: 'ServerConfigurationManager', rel: 'net/minecraft/server/management/ServerConfigurationManager.java', title: 'ServerConfigurationManager', desc: 'Login/join orchestrator: fires S01 JoinGame, S38 tab-list, S39 abilities and S41 difficulty during initializeConnectionToPlayer.' },
+  { slug: 'NetHandlerPlayServer', rel: 'net/minecraft/network/NetHandlerPlayServer.java', title: 'NetHandlerPlayServer', desc: 'Server play-state net handler: validates every C-packet (processPlayer movement gates, C02 reach, C0E clicks) and sends S08 corrections.' },
+  { slug: 'NetHandlerPlayClient', rel: 'net/minecraft/client/network/NetHandlerPlayClient.java', title: 'NetHandlerPlayClient', desc: 'Client play-state net handler: handle<Entity> dispatch for every S-packet plus C00/C03/C0F/C17/C19 replies upstream.' },
+  { slug: 'WorldServer', rel: 'net/minecraft/world/WorldServer.java', title: 'WorldServer', desc: 'Server world: broadcasts S24 block actions, S27 explosions, S2A particles and S2C lightning to nearby players.' },
+  { slug: 'PlayerControllerMP', rel: 'net/minecraft/client/multiplayer/PlayerControllerMP.java', title: 'PlayerControllerMP', desc: 'Client interaction controller: attackEntity/interact send C02, clickBlock sends C07, windowClick sends C0E, slot sync sends C10.' },
+  { slug: 'ServerScoreboard', rel: 'net/minecraft/scoreboard/ServerScoreboard.java', title: 'ServerScoreboard', desc: 'Server scoreboard: objective/team/score mutations broadcast S3B, S3C, S3D and S3E to all players.' },
+  { slug: 'NetHandlerLoginServer', rel: 'net/minecraft/server/network/NetHandlerLoginServer.java', title: 'NetHandlerLoginServer', desc: 'Server login state machine (HELLO/KEY/AUTHENTICATING/READY): S01 encryption challenge, S02 success, S03 compression.' },
+  { slug: 'WorldManager', rel: 'net/minecraft/world/WorldManager.java', title: 'WorldManager', desc: 'Server world listener: relays S25 break progress, S28 effects and S29 sounds to players near the event.' },
+  { slug: 'PlayerManager', rel: 'net/minecraft/server/management/PlayerManager.java', title: 'PlayerManager', desc: 'Chunk watch manager: streams S21 chunk data, S22 multi-block deltas and S26 bulk loads to watching players.' },
+  { slug: 'EntityLivingBase', rel: 'net/minecraft/entity/EntityLivingBase.java', title: 'EntityLivingBase', desc: 'Living-entity base: swingItem, potion-effect add/remove and item pickup emit S0B, S1D/S1E and S0D through the tracker.' },
+  { slug: 'OldServerPinger', rel: 'net/minecraft/client/network/OldServerPinger.java', title: 'OldServerPinger', desc: 'Server-list prober: C00Handshake(47, STATUS) + C00 query + C01 ping sequence feeding the multiplayer latency readout.' },
+  { slug: 'NetHandlerStatusServer', rel: 'net/minecraft/server/network/NetHandlerStatusServer.java', title: 'NetHandlerStatusServer', desc: 'Server status responder: answers C00 query with S00 JSON and C01 ping with S01 echo, then closes the channel.' },
+  { slug: 'ItemInWorldManager', rel: 'net/minecraft/server/management/ItemInWorldManager.java', title: 'ItemInWorldManager', desc: 'Survival interaction handler: block break/place and creative resync emit S23 corrections and S38 list updates.' }
+];
+function loadLogicSource(entry) {
+  const p = path.join(LOGIC_DIR, entry.slug + '.java');
+  if (!fs.existsSync(p)) return null;
+  return { code: fs.readFileSync(p, 'utf8'), blob: MAVEN_BLOB + '/' + entry.rel };
+}
+function packetsUsedBy(code, allPkts) {
+  return allPkts.filter(function(p) {
+    return new RegExp('new\\s+' + p.id + '[\\s\\.(]').test(code);
+  }).map(function(p) { return p.id; });
+}
+function renderLogicRefs(slugs) {
+  if (!slugs || !slugs.length) return '';
+  return '<div class="detail-section"><h3>Minecraft Logic</h3><div class="related-list">'
+    + slugs.map(function(s) { return '<a class="related-chip" href="../../classes/' + s + '/">' + esc(s) + '</a>'; }).join('')
+    + '</div><p style="font-size:0.75rem;color:var(--text-muted);margin-top:6px">Full 1.8.9 logic-class sources that send or handle this packet, stored verbatim.</p></div>';
+}
+
+const ANALYSIS_DIR = path.join(BASE, 'data', 'logic-analysis');
+function loadLogicAnalysis() {
+  const merged = {};
+  try {
+    fs.readdirSync(ANALYSIS_DIR).filter(function(f) { return f.endsWith('.json'); }).forEach(function(f) {
+      const o = JSON.parse(fs.readFileSync(path.join(ANALYSIS_DIR, f), 'utf8'));
+      Object.keys(o).forEach(function(k) { merged[k] = o[k]; });
+    });
+  } catch (e) { /* no analysis yet */ }
+  return merged;
+}
+// Turn free-form packet tokens (e.g. "C03_C04", "S21/S26", "C07/C08") into
+// chips, linking every token that names a real packet id.
+function linkifyPacketRefs(tokens, allPkts, prefix) {
+  const idSet = {};
+  allPkts.forEach(function(p) { idSet[p.id] = 1; });
+  const seen = {};
+  const out = [];
+  (tokens || []).forEach(function(t) {
+    const m = String(t).match(/[CS][0-9A-F]{2}[A-Za-z0-9]*/g) || [];
+    let linked = false;
+    m.forEach(function(id) {
+      if (idSet[id] && !seen[id]) { seen[id] = 1; linked = true; out.push('<a class="related-chip" href="' + prefix + id + '/">' + esc(id) + '</a>'); }
+    });
+    if (!linked) out.push('<span class="related-chip" style="opacity:.65">' + esc(String(t)) + '</span>');
+  });
+  return out.join('');
+}
+function renderAnalysis(a, allPkts, slugSet) {
+  if (!a) return '';
+  const parts = ['<div class="detail-section"><h3>Deep Analysis</h3><div class="writeup-block">'];
+  parts.push('<p>' + esc(a.overview) + '</p>');
+  parts.push('</div></div>');
+  if (a.methods && a.methods.length) {
+    parts.push('<div class="detail-section"><h3>Key Methods (' + a.methods.length + ')</h3>');
+    a.methods.forEach(function(m) {
+      parts.push('<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">' + esc(m.name) + '</span></div>');
+      parts.push('<p class="impl-pattern">' + esc(m.purpose) + '</p>');
+      parts.push('<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">' + esc(m.detail) + '</p>');
+      if (m.packets && m.packets.length) parts.push('<div class="related-list" style="margin-top:6px">' + linkifyPacketRefs(m.packets, allPkts, '../../packets/') + '</div>');
+      parts.push('</div>');
+    });
+    parts.push('</div>');
+  }
+  if (a.packet_usage && a.packet_usage.length) {
+    parts.push('<div class="detail-section"><h3>Packet Usage</h3><table class="fields-table"><thead><tr><th>Packet</th><th>Dir</th><th>Trigger</th></tr></thead><tbody>');
+    a.packet_usage.forEach(function(u) {
+      const id = String(u.id);
+      const m = id.match(/[CS][0-9A-F]{2}[A-Za-z0-9]*/g) || [];
+      const idSet = {};
+      allPkts.forEach(function(p) { idSet[p.id] = 1; });
+      const linked = m.filter(function(x) { return idSet[x]; }).map(function(x) {
+        return '<a class="related-chip" href="../../packets/' + x + '/">' + esc(x) + '</a>';
+      }).join(' ') || esc(id);
+      parts.push('<tr><td class="f-name">' + linked + '</td><td class="f-type">' + esc(u.direction) + '</td><td class="f-desc">' + esc(u.trigger) + '</td></tr>');
+    });
+    parts.push('</tbody></table></div>');
+  }
+  if (a.internal_fields && a.internal_fields.length) {
+    parts.push('<div class="detail-section"><h3>Internal State</h3><div class="subclass-list">');
+    a.internal_fields.forEach(function(f) { parts.push('<div class="subclass-item"><span class="sub-name">' + esc(f.name) + '</span><span class="sub-desc">' + esc(f.role) + '</span></div>'); });
+    parts.push('</div></div>');
+  }
+  if (a.peers && a.peers.length) {
+    parts.push('<div class="detail-section"><h3>Related Logic Classes</h3><div class="related-list">'
+      + a.peers.map(function(s) {
+          return slugSet[s] ? '<a class="related-chip" href="../' + s + '/">' + esc(s) + '</a>' : '<span class="related-chip" style="opacity:.65">' + esc(s) + '</span>';
+        }).join('') + '</div></div>');
+  }
+  return parts.join('\n');
+}
+
 // Full vanilla MCP source of a packet class, fetched at build time from
 // Marcelektro/MavenMCP-1.8.9 (scripts/fetch-vanilla-sources.js) — never the
 // local disk copies.
@@ -158,7 +270,7 @@ function renderRelated(ids) {
   return parts.join('\n');
 }
 
-function renderDetail(p) {
+function renderDetail(p, logic) {
   var parts = [];
   if (p.fields && p.fields.length) {
     parts.push('<div class="detail-section"><h3>Fields</h3><table class="fields-table"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>');
@@ -236,6 +348,12 @@ function renderDetail(p) {
     }
     if (impl.related && impl.related.length) parts.push(renderRelated(impl.related));
   }
+  if (p.wiki_notes && p.wiki_notes.length) {
+    parts.push('<div class="detail-section"><h3>Wiki Cross-Reference</h3><div class="writeup-block">'
+      + p.wiki_notes.map(function(n) { return '<p>' + n + '</p>'; }).join('\n')
+      + '</div><p style="font-size:0.75rem;color:var(--text-muted);margin-top:6px">Cross-checked against <a href="https://minecraft.wiki/w/Java_Edition_protocol/Packets" target="_blank" rel="noopener" style="color:var(--accent)">minecraft.wiki</a> (CC BY-SA 3.0) for 1.8.9 accuracy.</p></div>');
+  }
+  parts.push(renderLogicRefs(logic));
   return parts.join('\n');
 }
 
@@ -262,9 +380,37 @@ function analysisSitemap() {
 function main() {
   const files = fs.readdirSync(PACKETS_DIR).filter(f => f.endsWith('.json'));
   const allPkts = files.map(function(f) { return JSON.parse(fs.readFileSync(path.join(PACKETS_DIR, f), 'utf8')); });
+  allPkts.sort(function(a, b) { return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0); });
 
   // Build sidebar once
   const sidebarHtml = buildSidebarHtml(allPkts);
+
+  // Logic-class cross references: packet id -> [slugs], slug -> {entry, code, packets, peers}
+  const logicData = {};
+  const logicRefs = {};
+  LOGIC_CLASSES.forEach(function(e) {
+    const ls = loadLogicSource(e);
+    if (!ls) return;
+    const pkts = packetsUsedBy(ls.code, allPkts);
+    const peers = LOGIC_CLASSES.filter(function(o) {
+      return o.slug !== e.slug && new RegExp('\\b' + o.slug + '\\b').test(ls.code);
+    }).map(function(o) { return o.slug; });
+    logicData[e.slug] = { entry: e, code: ls.code, blob: ls.blob, packets: pkts, peers: peers };
+    pkts.forEach(function(pid) { (logicRefs[pid] = logicRefs[pid] || []).push(e.slug); });
+  });
+  // Subagent deep analyses (data/logic-analysis/*.json, keyed by slug)
+  const logicAnalysis = loadLogicAnalysis();
+  const logicSlugSet = {};
+  LOGIC_CLASSES.forEach(function(e) { logicSlugSet[e.slug] = 1; });
+  Object.keys(logicData).forEach(function(slug) {
+    const a = logicAnalysis[slug];
+    if (!a) return;
+    logicData[slug].analysis = a;
+    // merge analysis peers that are real class pages with code-detected peers
+    const seen = {};
+    const merged = logicData[slug].peers.concat((a.peers || []).filter(function(s) { return logicSlugSet[s]; }));
+    logicData[slug].peers = merged.filter(function(s) { if (seen[s]) return false; seen[s] = 1; return true; });
+  });
 
   for (let i = 0; i < files.length; i++) {
     const pkt = allPkts[i];
@@ -374,7 +520,7 @@ function main() {
       + '      ' + tagHtml + '\n'
       + '    </div>\n'
       + '    <div class="detail-body" id="detailBody">\n'
-      + renderDetail(pkt) + '\n'
+      + renderDetail(pkt, logicRefs[pkt.id]) + '\n'
       + '    </div>\n'
       + '    <div style="margin-top:32px;text-align:center">\n'
       + '      <a href="../../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to all packets</a>\n'
@@ -388,11 +534,168 @@ function main() {
     fs.writeFileSync(path.join(dir2, 'index.html'), html);
   }
 
+  // ============================================================
+  // Logic-class pages — full vanilla sources catted verbatim from
+  // disk (data/vanilla-logic/), one page per class (prototype: 2)
+  // ============================================================
+  const logicDir = path.join(BASE, 'classes');
+  fs.mkdirSync(logicDir, { recursive: true });
+  Object.keys(logicData).forEach(function(slug) {
+    const ld = logicData[slug];
+    const e = ld.entry;
+    const code = ld.code.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n$/, '');
+    const lines = code.split('\n');
+    const rows = lines.map(function(line, i) {
+      return '<tr class="cv-row"><td class="cv-ln"><span class="cv-num">' + (i + 1) + '</span></td>'
+        + '<td class="cv-code"><pre><code>' + esc(line) + '</code></pre></td></tr>';
+    }).join('\n');
+    const pageUrl = SITE + '/classes/' + slug + '/';
+    const ogImage = SITE + '/assets/og-image.png';
+    const modDate = mtime(path.join(LOGIC_DIR, slug + '.java'));
+    const metaTitle = e.title + ' \u2014 Minecraft 1.8.9 Logic Class Reference';
+    const metaDesc = (e.title + ' (' + e.rel + '): full MCP 1.8.9 source. Packets used: ' + ld.packets.join(', ') + '.').substring(0, 155);
+    const pktChips = ld.packets.map(function(pid) {
+      return '<a class="related-chip" href="../../packets/' + pid + '/">' + esc(pid) + '</a>';
+    }).join('');
+    const peerChips = ld.peers.map(function(s) {
+      return '<a class="related-chip" href="../' + s + '/">' + esc(s) + '</a>';
+    }).join('');
+    const clsHtml = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
+      + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+      + '<title>' + metaTitle + '</title>\n'
+      + '<meta name="description" content="' + metaDesc + '">\n'
+      + '<meta name="keywords" content="Minecraft, 1.8.9, ' + e.title + ', MCP, vanilla source, logic class, ' + ld.packets.join(', ') + '">\n'
+      + '<meta name="author" content="MC Packet Reference">\n'
+      + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
+      + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
+      + '<meta name="theme-color" content="#0a0a0a">\n'
+      + '<link rel="manifest" href="../../assets/site.webmanifest">\n'
+      + '<link rel="canonical" href="' + pageUrl + '">\n'
+      + '<meta property="og:title" content="' + metaTitle + '">\n'
+      + '<meta property="og:description" content="' + metaDesc + '">\n'
+      + '<meta property="og:type" content="article">\n'
+      + '<meta property="og:url" content="' + pageUrl + '">\n'
+      + '<meta property="og:site_name" content="MC 1.8.9 Packet Reference">\n'
+      + '<meta property="og:image" content="' + ogImage + '">\n'
+      + '<meta property="article:modified_time" content="' + modDate + '">\n'
+      + '<meta name="twitter:card" content="summary_large_image">\n'
+      + '<meta name="twitter:title" content="' + metaTitle + '">\n'
+      + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+      + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
+      + '<link rel="stylesheet" href="../../css/style.css">\n'
+      + '<link rel="stylesheet" href="../../assets/github-dark.min.css">\n'
+      + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"TechArticle","headline":"' + metaTitle + '","description":"' + metaDesc.replace(/"/g, '\\"') + '","dateModified":"' + modDate + '","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"' + pageUrl + '"},"author":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"1.8.9 Logic Classes"}\n</script>\n'
+      + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"' + SITE + '/"},{"@type":"ListItem","position":2,"name":"Logic Classes","item":"' + SITE + '/classes/"},{"@type":"ListItem","position":3,"name":"' + e.title + '","item":"' + pageUrl + '"}]}\n</script>\n'
+      + '</head>\n<body>\n'
+      + '<aside class="sidebar" id="sidebar">\n'
+      + '  <div class="sidebar-header">\n'
+      + '    <a href="../../" class="logo" style="text-decoration:none">\n'
+      + '      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 7h10M7 12h10M7 17h6"/></svg>\n'
+      + '      <span>MC <strong>1.8.9</strong></span>\n'
+      + '    </a>\n'
+      + '  </div>\n'
+      + '  <nav class="sidebar-nav" id="sidebarNav">' + sidebarHtml + '</nav>\n'
+      + '</aside>\n'
+      + '<main class="main" id="main">\n'
+      + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
+      + '  <div class="content-detail" style="display:block;max-width:860px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
+      + '    <div class="detail-header">\n'
+      + '      <h1>' + e.title + '</h1>\n'
+      + '      <p class="detail-desc">' + e.desc + '</p>\n'
+      + '      <div class="detail-meta"><span class="meta-mcp">' + esc(e.rel) + '</span></div>\n'
+      + '    </div>\n'
+      + '    <div class="detail-body">\n'
+      + '      <div class="detail-section"><h3>Packets Referenced (' + ld.packets.length + ')</h3><div class="related-list">' + pktChips + '</div></div>\n'
+      + (ld.peers.length ? '      <div class="detail-section"><h3>Related Logic Classes</h3><div class="related-list">' + peerChips + '</div></div>\n' : '')
+      + renderAnalysis(ld.analysis, allPkts, logicSlugSet)
+      + '      <div class="detail-section"><h3>Full Source</h3>\n'
+      + '      <div class="code-viewer"><div class="cv-toolbar">'
+      + '<span class="cv-file">' + esc(e.title + '.java') + '</span>'
+      + '<span class="cv-meta">' + lines.length + ' lines \u00b7 MCP 1.8.9 \u00b7 verbatim</span>'
+      + '<button class="cv-copy">Copy</button>'
+      + '<a class="cv-link" href="' + ld.blob + '" target="_blank" rel="noopener">Original \u2197</a>'
+      + '</div><div class="cv-body"><table class="cv-table">' + rows + '</table></div></div>\n'
+      + '<p style="font-size:0.75rem;color:var(--text-muted);margin-top:6px">Deobfuscated MCP 1.8.9 source of <code>' + esc(e.title) + '</code> from <a href="https://github.com/Marcelektro/MavenMCP-1.8.9" target="_blank" rel="noopener" style="color:var(--accent)">Marcelektro/MavenMCP-1.8.9</a> (' + esc(e.rel) + '), stored verbatim.</p>'
+      + '</div>\n'
+      + '    </div>\n'
+      + '    <div style="margin-top:32px;text-align:center">\n'
+      + '      <a href="../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to logic classes</a> \u00b7 <a href="../../" style="color:var(--accent);font-size:0.85rem">All packets</a>\n'
+      + '    </div>\n'
+      + '  </div>\n'
+      + '</main>\n'
+      + '<script src="../../assets/highlight.min.js"></script>\n'
+      + '<script>\n(function() {\n  var toggle = document.getElementById(\'sidebarToggle\');\n  if (toggle) toggle.addEventListener(\'click\', function() {\n    document.getElementById(\'sidebar\').classList.toggle(\'open\');\n  });\n  document.querySelectorAll(\'.cv-table\').forEach(function(table) {\n    var rows = table.querySelectorAll(\'tr.cv-row\');\n    if (!rows.length) return;\n    var texts = [];\n    rows.forEach(function(r) { texts.push(r.querySelector(\'code\').textContent); });\n    var src = texts.join(\'\\n\');\n    var hl = hljs.highlight(src, {language: \'java\'}).value.split(\'\\n\');\n    rows.forEach(function(r, i) { r.querySelector(\'code\').innerHTML = hl[i] || \'\'; });\n    table.dataset.src = src;\n  });\n  document.querySelectorAll(\'.cv-copy\').forEach(function(btn) {\n    btn.addEventListener(\'click\', function() {\n      var t = document.createElement(\'textarea\');\n      t.value = btn.closest(\'.code-viewer\').querySelector(\'.cv-table\').dataset.src || \'\';\n      document.body.appendChild(t); t.select();\n      try { document.execCommand(\'copy\'); btn.textContent = \'Copied!\'; } catch (e) {}\n      document.body.removeChild(t);\n      var b = btn; setTimeout(function() { b.textContent = \'Copy\'; }, 1500);\n    });\n  });\n})();\n</script>\n'
+      + '</body>\n</html>';
+    const cdir = path.join(logicDir, slug);
+    fs.mkdirSync(cdir, { recursive: true });
+    fs.writeFileSync(path.join(cdir, 'index.html'), clsHtml);
+  });
+  const logicCards = Object.keys(logicData).map(function(slug) {
+    const ld = logicData[slug];
+    return '<div class="mod-card">'
+      + '<div class="mod-card-head"><span class="mod-card-name">' + esc(ld.entry.title) + '</span>'
+      + '<span class="mod-card-count">' + ld.packets.length + (ld.packets.length === 1 ? ' packet' : ' packets') + '</span></div>'
+      + '<div class="mod-card-pkts"><a class="related-chip" href="./' + slug + '/">' + esc(slug + '.java') + '</a></div>'
+      + '<div class="mod-card-clients">' + esc(ld.entry.rel) + '</div>'
+      + '</div>';
+  }).join('\n');
+  const logicIndex = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
+    + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+    + '<title>Logic Classes \u2014 Minecraft 1.8.9 Packet Reference</title>\n'
+    + '<meta name="description" content="Full MCP 1.8.9 logic-class sources that send and handle network packets: EntityPlayerSP, EntityPlayerMP and more, each linked to every packet they use.">\n'
+    + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
+    + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
+    + '<meta name="theme-color" content="#0a0a0a">\n'
+    + '<link rel="manifest" href="../assets/site.webmanifest">\n'
+    + '<link rel="canonical" href="' + SITE + '/classes/">\n'
+    + '<meta property="og:title" content="Logic Classes \u2014 Minecraft 1.8.9 Packet Reference">\n'
+    + '<meta property="og:type" content="website">\n'
+    + '<meta property="og:url" content="' + SITE + '/classes/">\n'
+    + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
+    + '<meta name="twitter:card" content="summary_large_image">\n'
+    + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
+    + '<link rel="stylesheet" href="../css/style.css">\n'
+    + '</head>\n<body>\n'
+    + '<aside class="sidebar" id="sidebar">\n'
+    + '  <div class="sidebar-header">\n'
+    + '    <a href="../" class="logo" style="text-decoration:none">\n'
+    + '      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 7h10M7 12h10M7 17h6"/></svg>\n'
+    + '      <span>MC <strong>1.8.9</strong></span>\n'
+    + '    </a>\n'
+    + '  </div>\n'
+    + '  <nav class="sidebar-nav">\n'
+    + '    <div class="nav-section"><div class="nav-section-header"><span>Logic Classes</span><span class="count">' + Object.keys(logicData).length + '</span></div></div>\n'
+    + '    <div class="nav-section"><div class="nav-section-header"><span>All Packets</span></div><div class="nav-items"><a href="../" class="nav-item"><span class="nav-name">Back to packet reference</span></a></div></div>\n'
+    + '  </nav>\n'
+    + '</aside>\n'
+    + '<main class="main" id="main">\n'
+    + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
+    + '  <div class="content-detail" style="display:block;max-width:960px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
+    + '    <div class="detail-header">\n'
+    + '      <h1>Logic Classes</h1>\n'
+    + '      <p class="detail-desc">Full MCP 1.8.9 logic-class sources that send and handle network packets, stored verbatim and linked to every packet they reference.</p>\n'
+    + '    </div>\n'
+    + '    <div class="mod-grid">\n' + logicCards + '\n'
+    + '    </div>\n'
+    + '    <div style="margin-top:32px;text-align:center">\n'
+    + '      <a href="../" style="color:var(--accent);font-size:0.85rem">\u2190 Back to all packets</a>\n'
+    + '    </div>\n'
+    + '  </div>\n'
+    + '</main>\n'
+    + '<script>(function(){var t=document.getElementById(\'sidebarToggle\');if(t)t.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.toggle(\'open\');});})();</script>\n'
+    + '</body>\n</html>';
+  fs.writeFileSync(path.join(logicDir, 'index.html'), logicIndex);
+
   // Sitemap — use real file mtimes, priority by module density
   const sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
     + '  <url><loc>' + SITE + '/</loc><lastmod>' + mtime(path.join(BASE, 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>1.0</priority></url>\n'
     + '  <url><loc>' + SITE + '/packets/</loc><lastmod>' + mtime(path.join(BASE, 'packets', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.9</priority></url>\n'
     + '  <url><loc>' + SITE + '/modules/</loc><lastmod>' + mtime(path.join(BASE, 'modules', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>\n'
+    + '  <url><loc>' + SITE + '/classes/</loc><lastmod>' + mtime(path.join(BASE, 'classes', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>\n'
+    + Object.keys(logicData).map(function(slug) {
+      return '  <url><loc>' + SITE + '/classes/' + slug + '/</loc><lastmod>' + mtime(path.join(LOGIC_DIR, slug + '.java')) + '</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>';
+    }).join('\n') + '\n'
     + allPkts.map(function(p) {
       const mc = (p.implementation && p.implementation.modules) ? p.implementation.modules.length : 0;
       const prio = mc >= 4 ? '0.9' : (mc >= 1 ? '0.8' : '0.6');
