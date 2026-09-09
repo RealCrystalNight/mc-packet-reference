@@ -403,10 +403,12 @@ function main() {
     + '</urlset>\n';
 
   fs.writeFileSync(path.join(BASE, 'sitemap.xml'), sitemap);
-  // John Mueller's fix for a valid-but-unread sitemap: serve the same content
-  // under a fresh filename so Google treats it as a new submission
-  // (clears any cached "couldn't fetch" state from the old name).
-  fs.writeFileSync(path.join(BASE, 'sitemap-index.xml'), sitemap);
+  // Proper sitemap index (per Google large-sitemaps spec: <sitemapindex>,
+  // not a urlset twin) so sitemap-index.xml stays a valid discovery URL.
+  const sitemapIndex = '<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    + '  <sitemap><loc>' + SITE + '/sitemap.xml</loc><lastmod>' + mtime(path.join(BASE, 'sitemap.xml')) + '</lastmod></sitemap>\n'
+    + '</sitemapindex>\n';
+  fs.writeFileSync(path.join(BASE, 'sitemap-index.xml'), sitemapIndex);
 
   // ============================================================
   // Modules index — every module name across all packets
