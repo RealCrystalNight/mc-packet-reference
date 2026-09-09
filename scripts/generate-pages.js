@@ -279,8 +279,8 @@ function main() {
     const modules = moduleList.map(function(m) { return m.name; }).join(', ');
     const moduleCount = moduleList.length;
 
-    // Description: protocol facts + module names for richer search snippets.
-    const metaDesc = (fullDesc + (modules ? ' Modules: ' + modules + '.' : '')).replace(/"/g, '&quot;').substring(0, 320);
+    // Description: protocol facts + module names for richer search snippets (kept ≤160 chars for SERPs).
+    const metaDesc = (fullDesc + (modules ? ' Modules: ' + modules + '.' : '')).replace(/"/g, '&quot;').substring(0, 155);
 
     const dirClass = pkt.dir === 'SERVERBOUND' ? 'dir-sb' : 'dir-cb';
     const dirLabelFull = pkt.dir === 'SERVERBOUND' ? 'Serverbound (Client \u2192 Server)' : 'Clientbound (Server \u2192 Client)';
@@ -312,7 +312,9 @@ function main() {
       + '<meta name="description" content="' + metaDesc + '">\n'
       + '<meta name="keywords" content="Minecraft, 1.8.9, ' + pkt.id + ', ' + pkt.state + ', ' + dirLabel + ', packet, protocol, ' + tags + (modules ? ', ' + modules : '') + '">\n'
       + '<meta name="author" content="MC Packet Reference">\n'
-      + '<meta name="robots" content="index, follow">\n'
+      + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
+      + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
+      + '<meta http-equiv="X-Content-Type-Options" content="nosniff">\n'
       + '<meta name="theme-color" content="#0a0a0a">\n'
       + '<link rel="manifest" href="../../assets/site.webmanifest">\n'
       + '<link rel="apple-touch-icon" href="../../assets/icon-192.png">\n'
@@ -336,7 +338,7 @@ function main() {
       + '<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="' + modules + '">\n'
       + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
       + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
-      + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=optional" rel="stylesheet">\n'
+      + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
       + '<link rel="stylesheet" href="../../css/style.css">\n'
       + '<link rel="stylesheet" href="../../assets/github-dark.min.css">\n'
       + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"TechArticle","headline":"' + metaTitle + '","description":"' + metaDesc.replace(/&quot;/g, '\\"') + '","datePublished":"' + pubDate + '","dateModified":"' + modDate + '","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"' + pageUrl + '"},"author":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"publisher":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"' + pkt.state + ' Protocol \u2014 ' + dirLabel + '"}\n</script>\n'
@@ -439,7 +441,8 @@ function main() {
     + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
     + '<title>Module Index \u2014 Minecraft 1.8.9 Packet Reference</title>\n'
     + '<meta name="description" content="Index of every cheat module implementation across the 10 reference clients, mapped to the Minecraft 1.8.9 packets they use: KillAura, Scaffold, Velocity, Disabler, Fly, Speed and more.">\n'
-    + '<meta name="robots" content="index, follow">\n'
+    + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
+    + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
     + '<meta name="theme-color" content="#0a0a0a">\n'
     + '<link rel="manifest" href="../assets/site.webmanifest">\n'
     + '<link rel="canonical" href="' + SITE + '/modules/">\n'
@@ -449,7 +452,7 @@ function main() {
     + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
     + '<meta name="twitter:card" content="summary_large_image">\n'
     + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
-    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=optional" rel="stylesheet">\n'
+    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
     + '<link rel="stylesheet" href="../css/style.css">\n'
     + '</head>\n<body>\n'
     + '<aside class="sidebar" id="sidebar">\n'
@@ -501,8 +504,9 @@ function main() {
   const packetsIndex = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
     + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
     + '<title>All Packets \u2014 Minecraft 1.8.9 Packet Reference</title>\n'
-    + '<meta name="description" content="Browse all 105 Minecraft 1.8.9 network packets organized by protocol state and direction: handshaking, login, status, and play. Fields, wire encoding, and implementation cases.">\n'
-    + '<meta name="robots" content="index, follow">\n'
+    + '<meta name="description" content="Browse all 105 Minecraft 1.8.9 network packets organized by protocol state and direction: handshaking, login, status, and play.">\n'
+    + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
+    + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
     + '<meta name="theme-color" content="#0a0a0a">\n'
     + '<link rel="manifest" href="../assets/site.webmanifest">\n'
     + '<link rel="canonical" href="' + SITE + '/packets/">\n'
@@ -512,7 +516,7 @@ function main() {
     + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
     + '<meta name="twitter:card" content="summary_large_image">\n'
     + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
-    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=optional" rel="stylesheet">\n'
+    + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
     + '<link rel="stylesheet" href="../css/style.css">\n'
     + '</head>\n<body>\n'
     + '<aside class="sidebar" id="sidebar">\n'
