@@ -117,6 +117,52 @@ function packetPager(id, allPkts) {
     + '<a href="../' + next.id + '/" style="color:var(--accent)">' + next.id + ' \u2192</a></div>';
 }
 
+// ============================================================
+// Concept docs (data/concepts/*.txt, verified with corrections)
+// rendered as cohesive pages inside Vanilla Internals
+// ============================================================
+const CONCEPTS = [
+  { slug: 'codebase-map', file: 'codebase-map.txt', doc: 'codebase-map.txt', title: 'Codebase Map', desc: 'Complete reference of the deobfuscated 1.8.9 net/minecraft source: world model, protocol, client runtime, utilities — every signature copied verbatim.' },
+  { slug: 'diagrams', file: 'diagrams.txt', doc: 'diagrams.txt', title: 'Diagrams', desc: 'Visual companion: architecture layers, packet lifecycle, threading, collision, raytrace and movement constants in plain ASCII.' }
+];
+function renderConceptsBody(text) {
+  const out = [];
+  const chunks = text.split(/```/);
+  for (let i = 0; i < chunks.length; i++) {
+    if (i % 2 === 1) {
+      const code = chunks[i].replace(/^\n/, '').replace(/\s+$/, '');
+      out.push('<pre class="writeup-code"><code>' + esc(code) + '</code></pre>');
+      continue;
+    }
+    const paras = chunks[i].split(/\n{2,}/);
+    paras.forEach(function(para) {
+      const t = para.trim();
+      if (!t) return;
+      if (/^#{1,4} /.test(t)) {
+        const lvl = t.match(/^(#{1,4}) /)[1].length;
+        out.push('<h4>' + esc(t.replace(/^#{1,4} /, '')) + '</h4>');
+        return;
+      }
+      let e = esc(t).replace(/`([^`]+)`/g, '<code>$1</code>');
+      if (/^[-*] /m.test(t)) {
+        const items = t.split(/\n/).filter(function(l) { return /^[-*] /.test(l.trim()); });
+        if (items.length) { out.push('<ul class="writeup-list">' + items.map(function(it) { return '<li>' + it.replace(/^[-*] /, '').trim() + '</li>'; }).join('') + '</ul>'); return; }
+      }
+      out.push('<p>' + e.replace(/\n/g, '<br>') + '</p>');
+    });
+  }
+  return out.join('\n');
+}
+function renderCorrections(all, doc) {
+  const list = (all || []).filter(function(c) { return c.doc === doc; });
+  if (!list.length) return '';
+  return '<div class="detail-section"><h3>Verification Notes (' + list.length + ')</h3><div class="callout callout-ac">'
+    + '<p>Checked claim-by-claim against Marcelektro/MavenMCP-1.8.9. The source text above is kept verbatim; these notes correct what it gets wrong:</p>'
+    + '<ul class="writeup-list">' + list.map(function(c) {
+        return '<li><strong>' + esc(c.section) + ' [' + esc(c.verdict) + ']:</strong> ' + esc(c.fix) + '</li>';
+      }).join('') + '</ul></div></div>';
+}
+
 const ANALYSIS_DIR = path.join(BASE, 'data', 'logic-analysis');
 function loadLogicAnalysis() {
   const merged = {};
@@ -710,8 +756,15 @@ function main() {
     fs.mkdirSync(cdir, { recursive: true });
     fs.writeFileSync(path.join(cdir, 'index.html'), clsHtml);
   });
-  const logicCards = Object.keys(logicData).map(function(slug) {
-    const ld = logicData[slug];
+  const conceptCards = CONCEPTS.map(function(cp) {
+    return '<div class="mod-card">'
+      + '<div class="mod-card-head"><span class="mod-card-name">' + esc(cp.title) + '</span>'
+      + '<span class="mod-card-count">concepts</span></div>'
+      + '<div class="mod-card-pkts"><a class="related-chip" href="./' + cp.slug + '/">Read →</a></div>'
+      + '<div class="mod-card-clients">' + esc(cp.desc) + '</div>'
+      + '</div>';
+  }).join('\n');
+  const logicCards = conceptCards + '\n' + Object.keys(logicData).map(function(slug) {    const ld = logicData[slug];
     return '<div class="mod-card">'
       + '<div class="mod-card-head"><span class="mod-card-name">' + esc(ld.entry.title) + '</span>'
       + '<span class="mod-card-count">' + ld.packets.length + (ld.packets.length === 1 ? ' packet' : ' packets') + '</span></div>'
@@ -765,6 +818,81 @@ function main() {
     + '<script>(function(){var t=document.getElementById(\'sidebarToggle\');if(t)t.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.toggle(\'open\');});})();</script>\n'
     + '</body>\n</html>';
   fs.writeFileSync(path.join(logicDir, 'index.html'), logicIndex);
+
+  // ---- concept pages (inside Vanilla Internals) ----
+  let corrections = [];
+  try { corrections = JSON.parse(fs.readFileSync(path.join(BASE, 'data', 'concepts', 'corrections.json'), 'utf8')); } catch (e) { /* none */ }
+  CONCEPTS.forEach(function(cp) {
+    const raw = fs.readFileSync(path.join(BASE, 'data', 'concepts', cp.file), 'utf8');
+    const split = raw.split(/^## /m);
+    const intro = renderConceptsBody(split[0].replace(/^#[^\n]*\n/, ''));
+    const sections = split.slice(1).map(function(sec) {
+      const nl = sec.indexOf('\n');
+      const head = sec.slice(0, nl).trim();
+      const body = sec.slice(nl + 1);
+      const chips = linkifyPacketRefs([body], allPkts, '../../packets/');
+      return '<div class="detail-section"><h3>' + esc(head) + '</h3><div class="writeup-block">'
+        + renderConceptsBody(body)
+        + (chips.indexOf('<a ') !== -1 ? '</div><div class="related-list" style="margin-top:10px">' + chips + '</div>' : '</div>')
+        + '</div>';
+    }).join('\n');
+    const pageUrl = SITE + '/classes/' + cp.slug + '/';
+    const metaTitle = cp.title + ' \u2014 Minecraft 1.8.9 Vanilla Internals';
+    const metaDesc = cp.desc.substring(0, 155);
+    const clsHtml = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
+      + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+      + '<title>' + metaTitle + '</title>\n'
+      + '<meta name="description" content="' + esc(metaDesc) + '">\n'
+      + '<meta name="keywords" content="Minecraft, 1.8.9, MCP, ' + cp.title + ', vanilla internals, protocol, architecture">\n'
+      + '<meta name="author" content="MC Packet Reference">\n'
+      + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
+      + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
+      + '<meta name="theme-color" content="#0a0a0a">\n'
+      + '<link rel="manifest" href="../../assets/site.webmanifest">\n'
+      + '<link rel="canonical" href="' + pageUrl + '">\n'
+      + '<meta property="og:title" content="' + metaTitle + '">\n'
+      + '<meta property="og:description" content="' + esc(metaDesc) + '">\n'
+      + '<meta property="og:type" content="article">\n'
+      + '<meta property="og:url" content="' + pageUrl + '">\n'
+      + '<meta property="og:site_name" content="MC 1.8.9 Packet Reference">\n'
+      + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
+      + '<meta name="twitter:card" content="summary_large_image">\n'
+      + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+      + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
+      + '<link rel="stylesheet" href="../../css/style.css">\n'
+      + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"TechArticle","headline":"' + metaTitle + '","description":"' + esc(metaDesc).replace(/"/g, '\\"') + '","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"' + pageUrl + '"},"author":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"Vanilla Internals"}\n</script>\n'
+      + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"' + SITE + '/"},{"@type":"ListItem","position":2,"name":"Vanilla Internals","item":"' + SITE + '/classes/"},{"@type":"ListItem","position":3,"name":"' + cp.title + '","item":"' + pageUrl + '"}]}\n</script>\n'
+      + '</head>\n<body>\n'
+      + '<aside class="sidebar" id="sidebar">\n'
+      + '  <div class="sidebar-header">\n'
+      + '    <a href="../../" class="logo" style="text-decoration:none">\n'
+      + '      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 7h10M7 12h10M7 17h6"/></svg>\n'
+      + '      <span>MC <strong>1.8.9</strong></span>\n'
+      + '    </a>\n'
+      + '  </div>\n'
+      + '  <nav class="sidebar-nav" id="sidebarNav">' + hubNav('../../') + sidebarHtml + '</nav>\n'
+      + '</aside>\n'
+      + '<main class="main" id="main">\n'
+      + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
+      + '  <div class="content-detail" style="display:block;max-width:860px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
+      + '    <div class="detail-header">\n'
+      + '      <h1>' + cp.title + '</h1>\n'
+      + '      <p class="detail-desc">' + esc(cp.desc) + '</p>\n'
+      + '    </div>\n'
+      + '    <div class="detail-body">\n'
+      + '      <div class="writeup-block">' + intro + '</div>\n'
+      + sections + '\n'
+      + renderCorrections(corrections, cp.doc)
+      + '    </div>\n'
+      + siteFooter('../../') + '\n'
+      + '  </div>\n'
+      + '</main>\n'
+      + '<script>(function(){var t=document.getElementById(\'sidebarToggle\');if(t)t.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.toggle(\'open\');});document.querySelectorAll(\'#sidebar a\').forEach(function(a){a.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.remove(\'open\');});});})();</script>\n'
+      + '</body>\n</html>';
+    const cdir = path.join(logicDir, cp.slug);
+    fs.mkdirSync(cdir, { recursive: true });
+    fs.writeFileSync(path.join(cdir, 'index.html'), clsHtml);
+  });
 
   // ============================================================
   // Start Here guide — guided reading path (data/guide.json)
@@ -835,7 +963,10 @@ function main() {
     + Object.keys(logicData).map(function(slug) {
       return '  <url><loc>' + SITE + '/classes/' + slug + '/</loc><lastmod>' + mtime(path.join(LOGIC_DIR, slug + '.java')) + '</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>';
     }).join('\n') + '\n'
-    + ['api/', 'api/packets.json', 'api/classes.json', 'api/modules.json', 'api/analyses.json', 'api/index.json', 'llms.txt'].map(function(u) {
+    + CONCEPTS.map(function(cp) {
+      return '  <url><loc>' + SITE + '/classes/' + cp.slug + '/</loc><lastmod>' + mtime(path.join(BASE, 'data', 'concepts', cp.file)) + '</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>';
+    }).join('\n') + '\n'
+    + ['api/packets.json', 'api/classes.json', 'api/modules.json', 'api/analyses.json', 'api/index.json', 'llms.txt'].map(function(u) {
       return '  <url><loc>' + SITE + '/' + u + '</loc><changefreq>weekly</changefreq><priority>0.5</priority></url>';
     }).join('\n') + '\n'
     + allPkts.map(function(p) {
@@ -1067,6 +1198,8 @@ function main() {
   });
   llmsLines.push('', '## Vanilla Internals (' + apiClasses.length + ' — full MCP sources + analysis)');
   apiClasses.forEach(function(c) { llmsLines.push('- [' + c.title + '](' + c.url + '): ' + c.desc + ' Packets: ' + c.packets.join(', ') + '.'); });
+  llmsLines.push('', '## Vanilla Internals — Concepts (' + CONCEPTS.length + ' verified guides)');
+  CONCEPTS.forEach(function(c) { llmsLines.push('- [' + c.title + '](' + SITE + '/classes/' + c.slug + '/): ' + c.desc); });
   llmsLines.push('', '## Protocol states', '- Handshaking: C00Handshake',
     '- Login: C00PacketLoginStart, C01PacketEncryptionResponse, S00PacketDisconnect, S01PacketEncryptionRequest, S02PacketLoginSuccess, S03PacketEnableCompression',
     '- Status: C00PacketServerQuery, C01PacketPing, S00PacketServerInfo, S01PacketPong',

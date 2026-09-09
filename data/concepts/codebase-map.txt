@@ -1,1228 +1,2434 @@
-# MCP 1.8.9 Diagrams — Companion Reference
+# MCP 1.8.9 Codebase Map — `net/minecraft/`
 
-This file is the visual companion to `MCP_1_8_9_CODEBASE_MAP.md`. The map describes *what* exists in the codebase; these diagrams describe *how* the parts connect and *how data flows* between them. Read the map first to learn the names; read this file to learn the shapes.
+This document is a complete reference of the deobfuscated Minecraft 1.8.9 source under the `net/minecraft/` package. It is meant to be given to an AI as context before any task that touches this codebase, so the model does not waste tokens grepping for symbols, does not invent helper methods that already exist, and does not reinvent geometry, packet, or inventory primitives that are already provided.
 
-Every diagram below is plain ASCII so it survives copy-paste into any context window. They are organized roughly from outermost (how the whole game is laid out) inward to specific subsystems (collision, raytracing, friction). Each diagram is followed by a short explanation of what it teaches.
+The document is organized so you can read it top-to-bottom and understand how the game fits together, or jump to any section and find the actual field names and method signatures available. Every signature in this file is copied verbatim from the source — if a name appears here, it exists in the codebase exactly as shown.
 
----
+## How to read this map
 
-## 1. The four architectural layers
+The codebase has 1,612 Java files spread across 23 top-level packages. The architecture follows a clear separation: the `net.minecraft` root holds shared types used on both client and server; `net.minecraft.client` holds everything that only runs on the player's machine (rendering, GUI, the local player); and `net.minecraft.server` holds the integrated server used in singleplayer (in multiplayer this code does not run on the player's side — the dedicated server is a separate jar that uses the shared types). The `net.minecraft.network` package is shared because both ends speak the same protocol.
 
-The codebase has a clear concentric structure. At the center is the world model — what blocks, entities, and items are. One ring out is the network protocol — how that model is serialized. One ring further is the client runtime — the game loop, renderer, GUI, local player. The outermost ring is the integrated server, which only exists in singleplayer.
+A useful mental model: imagine the program as four concentric layers. At the center is the **world model** — blocks, entities, items, NBT. One layer out is the **network protocol** that serializes that model. One more layer out is the **client runtime** — `Minecraft` class, the render pipeline, the GUI system, the local player. The outermost layer is the **integrated server**, which only matters in singleplayer.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                  LAYER 4 — INTEGRATED SERVER                            │
-│              (singleplayer only; lives in its own thread)               │
-│       net.minecraft.server.*  +  net.minecraft.server.integrated.*      │
-│                                                                         │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │              LAYER 3 — CLIENT RUNTIME                             │  │
-│  │           (everything that runs on the player's machine)          │  │
-│  │   net.minecraft.client.*                                          │  │
-│  │                                                                   │  │
-│  │   Minecraft  ──  EntityRenderer  ──  RenderGlobal                 │  │
-│  │       │                                                           │  │
-│  │       ├─→  PlayerControllerMP   (left-/right-click logic)         │  │
-│  │       ├─→  GuiScreen            (currentScreen, menus)            │  │
-│  │       ├─→  GuiIngame            (HUD)                             │  │
-│  │       ├─→  GameSettings         (mouseSensitivity, keybinds, ...) │  │
-│  │       ├─→  NetHandlerPlayClient (RECEIVES S→C packets)            │  │
-│  │       └─→  thePlayer (EntityPlayerSP) + theWorld (WorldClient)    │  │
-│  │                                                                   │  │
-│  │   ┌─────────────────────────────────────────────────────────┐     │  │
-│  │   │         LAYER 2 — NETWORK PROTOCOL  (shared)            │     │  │
-│  │   │   net.minecraft.network.*                               │     │  │
-│  │   │                                                         │     │  │
-│  │   │   NetworkManager (Netty channel wrapper)                │     │  │
-│  │   │     │                                                   │     │  │
-│  │   │     ├── EnumConnectionState: HANDSHAKING/STATUS/        │     │  │
-│  │   │     │    LOGIN/PLAY  +  packet ID registry              │     │  │
-│  │   │     ├── PacketBuffer (VarInt, BlockPos, NBT, ItemStack) │     │  │
-│  │   │     ├── 23 C→S play packets (C00..C19)                  │     │  │
-│  │   │     └── 71 S→C play packets (S00..S49)                  │     │  │
-│  │   │                                                         │     │  │
-│  │   │   ┌───────────────────────────────────────────────┐     │     │  │
-│  │   │   │   LAYER 1 — WORLD MODEL  (shared)             │     │     │  │
-│  │   │   │   net.minecraft.{block, item, entity,         │     │     │  │
-│  │   │   │     world, inventory, nbt, potion, tile,      │     │     │  │
-│  │   │   │     util}                                     │     │     │  │
-│  │   │   │                                               │     │     │  │
-│  │   │   │   Block, IBlockState, Item, ItemStack         │     │     │  │
-│  │   │   │   Entity → EntityLivingBase → EntityPlayer    │     │     │  │
-│  │   │   │   World, Chunk, BlockPos, AxisAlignedBB       │     │     │  │
-│  │   │   │   NBTTagCompound, MathHelper, Vec3, EnumFacing│     │     │  │
-│  │   │   └───────────────────────────────────────────────┘     │     │  │
-│  │   └─────────────────────────────────────────────────────────┘     │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+When you build something that interacts with the game, you almost always work in the third layer (client runtime) and use the inner two layers as primitives. Knowing which class lives in which layer tells you what is and isn't safe to mutate from where.
 
-The teaching point: outer layers depend on inner layers, but never the reverse. `Block` doesn't know about packets; `Packet` doesn't know about `Minecraft.theWorld`. When you write new code, find the innermost layer where it belongs and put it there — code in the wrong layer creates circular dependencies or accidentally depends on `Minecraft.getMinecraft()` from a place that should be reusable on the server side too.
-
-In multiplayer, Layer 4 doesn't run on your machine — it runs on the dedicated server, which is a separate jar that uses Layers 1 and 2 but has its own implementation of Layer 3-equivalent code (`MinecraftServer`, `NetHandlerPlayServer`, `EntityPlayerMP`, `WorldServer`). The client side never touches `WorldServer` or `EntityPlayerMP` even in singleplayer except through carefully threaded boundaries.
-
----
-
-## 2. Entity class hierarchy
-
-The entity tree is deep but well-organized. Most of the methods you'll call on the local player are defined two or three levels up the chain, which is why knowing the hierarchy matters: if a method isn't on `EntityPlayerSP`, it's almost certainly inherited from `EntityLivingBase` or `Entity`.
+## Package directory at a glance
 
 ```
-                              Entity
-                                │
-       ┌────────────────┬───────┴────────┬──────────────────┐
-       │                │                │                  │
-EntityLivingBase   EntityItem    EntityXPOrb         EntityArrow
-       │           (dropped       (xp drops)         EntityFireball
-       │            items)                           EntitySnowball
-       │                                             EntityFishHook
-       │                                             EntityEnderPearl
-       │                                             ... (all in
-       │                                              .projectile)
-       │
-   ┌───┴────────────────┬─────────────┬──────────────────────┐
-   │                    │             │                      │
-EntityPlayer    EntityCreature  EntityFlying           EntityAmbient
-   │           (most mobs use   (Ghast)                (Bat)
-   │            this base)              
-   │                │
-   │       ┌────────┴────────┐
-   │       │                 │
-   │   EntityMob       EntityAnimal
-   │   (hostile)      (passive)
-   │       │                 │
-   │   Zombie, Skeleton, Cow, Sheep, Pig,
-   │   Creeper, Spider,    Chicken, Horse,
-   │   Witch, Enderman,    Villager, Wolf,
-   │   ...                 Rabbit, ...
-   │
-AbstractClientPlayer
-   │
-   ├──→ EntityPlayerSP      (the local "you")
-   │       fields: sendQueue, movementInput, sprintingTicksLeft
-   │       method: onUpdateWalkingPlayer() — builds C03/C04/C05/C06
-   │
-   └──→ EntityOtherPlayerMP (any other player visible)
-           method: setPositionAndRotation2() — receives S14/S18
+net/minecraft/
+├── block/              155 files   Block class + every concrete block (BlockStone, BlockChest, ...)
+│   ├── material/                   Material enum (water, wood, stone, ...) — determines tool, sound
+│   ├── properties/                 IProperty: typed block-state keys (PropertyBool, PropertyEnum, ...)
+│   └── state/                      BlockState container + IBlockState immutable views
+├── client/                         Everything client-only
+│   ├── Minecraft.java              Game singleton + main loop
+│   ├── audio/                      Sound system
+│   ├── entity/                     AbstractClientPlayer, EntityPlayerSP, EntityOtherPlayerMP
+│   ├── gui/                        81 files: GuiScreen base + every menu/overlay
+│   ├── main/                       Main entry point (Main.java)
+│   ├── model/                      52 files: ModelBase + per-entity model meshes
+│   ├── multiplayer/                PlayerControllerMP, WorldClient, ChunkProviderClient, ServerData
+│   ├── network/                    NetHandlerPlayClient — receives every S→C packet
+│   ├── particle/                   35 files
+│   ├── renderer/                   32 files at top + subpackages
+│   │   ├── block/                  BlockRendererDispatcher, model bakery
+│   │   ├── chunk/                  ChunkRenderDispatcher (the batched chunk renderer)
+│   │   ├── culling/                ICamera, Frustum
+│   │   ├── entity/                 57 files: Render<T> per entity type + RenderManager
+│   │   ├── texture/                Texture loading, sprite atlas
+│   │   ├── tileentity/             TileEntityRenderer<T>
+│   │   └── vertex/                 VertexFormat, vertex buffer abstractions
+│   ├── resources/                  Resource packs, languages, IResourceManager
+│   ├── settings/                   GameSettings, KeyBinding
+│   ├── shader/                     ShaderGroup, Framebuffer
+│   ├── stream/                     Twitch integration (legacy)
+│   └── util/                       Client-only helpers
+├── command/            49 files    /command implementations, CommandHandler
+├── crash/                          CrashReport plumbing
+├── creativetab/                    Creative-mode inventory tabs
+├── dispenser/                      Dispenser behaviour registry
+├── enchantment/        21 files    Enchantment base + each enchantment type
+├── entity/                         Shared entity hierarchy (used on both sides)
+│   ├── Entity.java                 Root of all entities
+│   ├── EntityLivingBase.java       Adds health, potion effects, rotation head
+│   ├── player/EntityPlayer.java    Adds inventory, capabilities, food, attack
+│   ├── ai/                         58 files: EntityAI* tasks (server-side AI)
+│   ├── boss/                       EnderDragon, Wither
+│   ├── effect/                     EntityLightningBolt
+│   ├── item/                       20 files: EntityItem (dropped item), EntityArmorStand, EntityMinecart, ...
+│   ├── monster/                    21 files
+│   ├── passive/                    Cow, Sheep, Horse, Villager, ...
+│   └── projectile/                 EntityArrow, EntityFireball, EntityPotion
+├── event/                          (Vanilla event types — minimal)
+├── init/                           Blocks, Items, Bootstrap (static registries)
+├── inventory/          30 files    Container*, IInventory, Slot
+├── item/               72 files    Item base + each item type (ItemSword, ItemBow, ItemBlock, ...)
+│   └── crafting/                   CraftingManager, recipes
+├── nbt/                            NBTTagCompound, NBTTagList, CompressedStreamTools
+├── network/                        Wire protocol (shared)
+│   ├── NetworkManager.java         Netty channel wrapper
+│   ├── Packet.java                 Base interface
+│   ├── PacketBuffer.java           Read/write helpers for VarInt, BlockPos, ItemStack, NBT, ...
+│   ├── EnumConnectionState.java    HANDSHAKING / STATUS / LOGIN / PLAY + packet registry
+│   ├── handshake/client/           C00Handshake
+│   ├── login/                      Login phase packets
+│   ├── play/client/                23 C→S packets
+│   ├── play/server/                71 S→C packets
+│   └── status/                     Server-list-ping protocol
+├── pathfinding/                    PathFinder, PathPoint (used by entity AI)
+├── potion/                         Potion + PotionEffect
+├── profiler/                       Profiler (the F3 debug timing tree)
+├── realms/             23 files    Mojang Realms integration
+├── scoreboard/                     Teams, scoreboard objectives
+├── server/                         Integrated server (singleplayer only)
+├── stats/                          Achievements, statistics
+├── tileentity/         24 files    TileEntity base + each type (TileEntityChest, TileEntitySign, ...)
+├── util/               82 files    MathHelper, Vec3, BlockPos, AxisAlignedBB, EnumFacing, ...
+├── village/                        Village data structures
+└── world/              30 files    World, Chunk, WorldBorder
+    ├── biome/                      25 files: BiomeGenBase + each biome
+    ├── border/                     WorldBorder
+    ├── chunk/                      Chunk, IChunkProvider, ExtendedBlockStorage, storage/
+    └── gen/                        World generation (server-side mostly)
 ```
 
-The teaching point: `EntityPlayerSP` is the only one of the two `AbstractClientPlayer` subclasses that *sends* packets. `EntityOtherPlayerMP` only *receives* updates from the server about other players and interpolates them smoothly. So `sendQueue` only exists on `EntityPlayerSP` — don't go looking for it on a generic player reference.
+Now let's walk through it.
 
-Also: the abstract `EntityLivingBase.getHeldItem()` is overridden by `EntityPlayer` to read from `inventory.getCurrentItem()`, and by mobs to read from their internal equipment array. So calling `getHeldItem()` on a generic `EntityLivingBase` does the right thing regardless of whether you have a player or a mob.
+## The inner layer: the world model
 
----
+### Block (`net.minecraft.block.Block`, 148 methods)
 
-## 3. The packet protocol lifecycle
+A `Block` instance describes a *kind* of block — not a specific position. There is exactly one `Block` instance for stone, one for dirt, one for every block type. Each one is a singleton stored in the static registry `Block.blockRegistry`. To get from a position to the block at that position, you go through `World.getBlockState(BlockPos).getBlock()` — the state tells you what variant (e.g. wool color, log axis) sits there, and `getBlock()` recovers the singleton.
 
-A connection goes through four states. Each state has its own packet ID space, so packet ID 0x01 in `LOGIN` is a completely different packet from 0x01 in `PLAY`. The state transitions are deterministic.
+`Block` carries protected fields for its bounding box (`minX, minY, minZ, maxX, maxY, maxZ`), `blockHardness`, `blockResistance`, `lightOpacity`, `lightValue`, `stepSound`, `blockParticleGravity`, `blockMaterial`, and `slipperiness` (used for ice physics — anything that overrides this affects entity friction on top of it).
 
-```
-        ┌─────────────────────┐
-        │     HANDSHAKING     │   Initial state on TCP connect
-        │   (state ID = -1)   │
-        └──────────┬──────────┘
-                   │
-                   │ Client sends:
-                   │   C00Handshake(protocolVersion, host, port, nextState)
-                   │     nextState = 1 → STATUS
-                   │     nextState = 2 → LOGIN
-                   ▼
-        ┌─────────────────────┐
-        │   STATUS or LOGIN   │
-        │   (state ID = 1/2)  │
-        └──────────┬──────────┘
-                   │
-                   │ STATUS path (server-list ping):
-                   │   C →  C00PacketServerQuery
-                   │   S →  S00PacketServerInfo
-                   │   C →  C01PacketPing
-                   │   S →  S01PacketPong
-                   │   ─ connection closes ─
-                   │
-                   │ LOGIN path (joining a server):
-                   │   C →  C00PacketLoginStart(username)
-                   │   S →  S01PacketEncryptionRequest  (only if online-mode)
-                   │   C →  C01PacketEncryptionResponse
-                   │   S →  S03PacketEnableCompression  (sets threshold)
-                   │   S →  S02PacketLoginSuccess(uuid, name)
-                   ▼
-        ┌─────────────────────┐
-        │        PLAY         │   Now you exchange play-state packets
-        │   (state ID = 0)    │   every tick, 20 times per second
-        └──────────┬──────────┘
-                   │
-                   │ Server immediately sends:
-                   │   S46PacketSetCompressionLevel   (often)
-                   │   S01PacketJoinGame(entityId, gameMode, dimension,
-                   │                     difficulty, maxPlayers,
-                   │                     worldType, reducedDebugInfo)
-                   │   S05PacketSpawnPosition         (world spawn)
-                   │   S39PacketPlayerAbilities       (fly/invuln state)
-                   │   S08PacketPlayerPosLook         (initial teleport)
-                   │   S26PacketMapChunkBulk          (visible chunks)
-                   │
-                   │ Client replies:
-                   │   C15PacketClientSettings(lang, viewDist, chatVis,
-                   │                            chatColors, skinFlags)
-                   │   C17PacketCustomPayload("MC|Brand", "vanilla")
-                   │   C16PacketClientStatus(PERFORM_RESPAWN)  // signals
-                   │                                              "ready"
-                   ▼
-              ── steady state ──
+The methods you will use most often are:
+
+```java
+public static Block getBlockFromName(String name)
+public static Block getBlockById(int id)
+public static int getIdFromBlock(Block blockIn)
+public static IBlockState getStateById(int id)
+public static int getStateId(IBlockState state)
+public Material getMaterial()
+public IBlockState getStateFromMeta(int meta)
+public int getMetaFromState(IBlockState state)
+public boolean isOpaqueCube()
+public boolean isFullCube()
+public boolean isPassable(IBlockAccess worldIn, BlockPos pos)
+public boolean isReplaceable(World worldIn, BlockPos pos)
+public AxisAlignedBB getCollisionBoundingBox(World worldIn, BlockPos pos, IBlockState state)
+public AxisAlignedBB getSelectedBoundingBox(World worldIn, BlockPos pos)
+public void addCollisionBoxesToList(World worldIn, BlockPos pos, IBlockState state, AxisAlignedBB mask, List<AxisAlignedBB> list, Entity collidingEntity)
+public boolean canCollideCheck(IBlockState state, boolean hitIfLiquid)
+public boolean isBlockSolid(IBlockAccess worldIn, BlockPos pos, EnumFacing side)
+public float getBlockHardness(World worldIn, BlockPos pos)
 ```
 
-The teaching point: state transitions are driven by specific packets, not by timestamps or timeouts. If you ever see a packet ID that "doesn't exist", you're probably looking at it in the wrong state's lookup table. `EnumConnectionState.PLAY.directionMaps` is the lookup you want for the 94 PLAY-state packets.
+The named singletons live in `net.minecraft.init.Blocks` as static fields: `Blocks.air`, `Blocks.stone`, `Blocks.dirt`, `Blocks.cobblestone`, `Blocks.planks`, `Blocks.bedrock`, `Blocks.gravel`, `Blocks.gold_ore`, `Blocks.iron_ore`, `Blocks.coal_ore`, `Blocks.log`, `Blocks.glass`, `Blocks.dispenser`, `Blocks.sandstone`, `Blocks.bed`, `Blocks.web`, `Blocks.wool`, `Blocks.tnt`, `Blocks.bookshelf`, and so on. The naming convention is lowercase Minecraft IDs with underscores.
 
----
+`IBlockState` is the immutable view of a block-at-a-position. Its interface is tiny:
 
-## 4. Steady-state packet exchange (PLAY)
-
-Once you're in PLAY, the per-tick exchange looks like this. The arrows show direction (`C →` means client to server, `S →` means server to client):
-
-```
-                                          ╔═════════════════════╗
-   ┌──────────────────────────┐           ║                     ║
-   │     Every tick (50ms)    │           ║      SERVER         ║
-   └────────────┬─────────────┘           ║                     ║
-                │                         ║                     ║
-                │  C →  C03/C04/C05/C06   ║                     ║
-                ├────────────────────────→║  Position/rotation  ║
-                │                         ║                     ║
-                │  S →  S12 (knockback)   ║                     ║
-                │←────────────────────────╣  Velocity change    ║
-                │                         ║                     ║
-                │  S →  S08 (correction)  ║                     ║
-                │←────────────────────────╣  Anti-cheat setback ║
-                │                         ║                     ║
-   ┌────────────┴─────────────┐           ║                     ║
-   │      On player input     │           ║                     ║
-   └────────────┬─────────────┘           ║                     ║
-                │                         ║                     ║
-                │ Left-click on entity:   ║                     ║
-                │  C →  C02 (ATTACK)      ║                     ║
-                ├────────────────────────→║                     ║
-                │                         ║                     ║
-                │ Left-click on block:    ║                     ║
-                │  C →  C07 START_DESTROY ║                     ║
-                ├────────────────────────→║                     ║
-                │                         ║                     ║
-                │ Mining continues...     ║                     ║
-                │  C →  C07 STOP_DESTROY  ║                     ║
-                │       when done         ║                     ║
-                ├────────────────────────→║                     ║
-                │                         ║                     ║
-                │ Right-click block:      ║                     ║
-                │  C →  C08 (placement)   ║                     ║
-                ├────────────────────────→║                     ║
-                │                         ║                     ║
-                │ Right-click air:        ║                     ║
-                │  C →  C08 (sentinel)    ║                     ║
-                ├────────────────────────→║                     ║
-                │                         ║                     ║
-                │ Inventory click:        ║                     ║
-                │  C →  C0E ClickWindow   ║                     ║
-                ├────────────────────────→║                     ║
-                │                         ║                     ║
-                │  S →  S2F SetSlot       ║                     ║
-                │←────────────────────────╣                     ║
-                │  S →  S32 Confirm       ║                     ║
-                │←────────────────────────╣                     ║
-                │                         ║                     ║
-                │ Animation:              ║                     ║
-                │  C →  C0A (arm swing)   ║                     ║
-                ├────────────────────────→║                     ║
-                │                         ║                     ║
-   ┌────────────┴─────────────┐           ║                     ║
-   │       Continuously       │           ║                     ║
-   └────────────┬─────────────┘           ║                     ║
-                │                         ║                     ║
-                │  S →  S00 KeepAlive id  ║                     ║
-                │←────────────────────────╣  Every 20 seconds   ║
-                │  C →  C00 KeepAlive id  ║                     ║
-                ├────────────────────────→║                     ║
-                │                         ║                     ║
-                │  S →  S14/S15/S16/S17   ║                     ║
-                │←────────────────────────╣  Other entities     ║
-                │  S →  S18 (teleport     ║   moved             ║
-                │       if large delta)   ║                     ║
-                │                         ║                     ║
-                │  S →  S23/S22           ║                     ║
-                │←────────────────────────╣  Block updates      ║
-                │                         ║                     ║
-                │  S →  S26 (chunk bulk)  ║                     ║
-                │←────────────────────────╣  New chunks loaded  ║
-                │  S →  S21 (single)      ║                     ║
-                │←────────────────────────╣                     ║
-                ▼                         ╚═════════════════════╝
+```java
+public interface IBlockState {
+    Collection<IProperty> getPropertyNames();
+    <T extends Comparable<T>> T getValue(IProperty<T> property);
+    <T extends Comparable<T>, V extends T> IBlockState withProperty(IProperty<T> property, V value);
+    <T extends Comparable<T>> IBlockState cycleProperty(IProperty<T> property);
+    ImmutableMap<IProperty, Comparable> getProperties();
+    Block getBlock();
+}
 ```
 
-The teaching point: the client is mostly a thin shell that mirrors server state and predicts a little ahead. Almost every meaningful action you take (breaking a block, hitting a player, opening a chest, swapping a slot) results in a packet whose response you must believe even when it contradicts what your client thought happened. This is why a server can "rubber-band" your position with S08 and your client must teleport back — the server is the source of truth.
+Notice `withProperty` returns a *new* `IBlockState` — these are flyweights, so don't try to mutate them in place.
 
----
+### Item and ItemStack
 
-## 5. The C03PacketPlayer family — choosing which subclass to send
+An `Item` instance, like a `Block`, is a singleton describing a *kind* of item. The runtime stack on the ground or in an inventory is an `ItemStack`, which combines `Item` + count + metadata + optional NBT.
 
-Every tick `EntityPlayerSP.onUpdateWalkingPlayer()` decides which of four position packets to send. The decision tree:
+`Item` (in `net.minecraft.item.Item`, 64 methods) holds the static registry `Item.itemRegistry`. The methods you reach for first are:
 
-```
-   onUpdateWalkingPlayer() — runs once per tick, ~20 Hz
-
-         ┌──────────────────────────────────────────┐
-         │  Compute delta from last reported state: │
-         │                                          │
-         │    dx     = posX - lastReportedPosX      │
-         │    dy     = bb.minY - lastReportedPosY   │
-         │    dz     = posZ - lastReportedPosZ      │
-         │    dyaw   = yaw   - lastReportedYaw      │
-         │    dpitch = pitch - lastReportedPitch    │
-         │                                          │
-         │    moved   = (dx²+dy²+dz² > 9.0E-4)      │
-         │            ││ (positionUpdateTicks ≥ 20) │
-         │    rotated = (dyaw ≠ 0 ││ dpitch ≠ 0)    │
-         └────────────────────┬─────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              │               │               │
-              ▼               ▼               ▼
-        moved=true       moved=true       moved=false
-        rotated=true     rotated=false    rotated=true
-              │               │               │
-              ▼               ▼               ▼
-       C06PosLook       C04Position      C05Look
-       (x,y,z,yaw,      (x,y,z,         (yaw,pitch,
-        pitch,onGr)      onGr)           onGr)
-                              │
-                              │
-                              ▼
-                    moved=false, rotated=false
-                              │
-                              ▼
-                       C03Player(onGround)
-                       (the "still here" ping)
-
-
-   Even when idle, every 20 ticks (1 second) positionUpdateTicks
-   forces moved=true so a full position is re-sent.
-
-   When riding (ridingEntity != null), the rules change:
-     - Send C06 with x=motionX, y=-999.0, z=motionZ as a sentinel
-     - Always treat this as "no position update" for delta tracking
+```java
+public static int getIdFromItem(Item itemIn)
+public static Item getItemById(int id)
+public static Item getItemFromBlock(Block blockIn)
+public static Item getByNameOrId(String id)
+public boolean onItemUse(ItemStack stack, EntityPlayer player, World world, BlockPos pos, EnumFacing side, float hitX, float hitY, float hitZ)
+public ItemStack onItemRightClick(ItemStack stack, World world, EntityPlayer player)
+public float getStrVsBlock(ItemStack stack, Block state)
+public boolean hitEntity(ItemStack stack, EntityLivingBase target, EntityLivingBase attacker)
+public EnumAction getItemUseAction(ItemStack stack)
+public int getMaxItemUseDuration(ItemStack stack)
+public boolean canHarvestBlock(Block blockIn)
 ```
 
-The teaching point: there is no single "send position" packet — there are four, and which one goes out depends on what changed. The shared base `C03PacketPlayer` carries only `onGround`; subclasses add fields. The Y coordinate sent is always `boundingBox.minY` (your feet), never `posY`. The 9.0E-4 threshold corresponds to a 0.03-block radius — moves smaller than that are treated as "not moving" and won't trigger a C04 unless the 20-tick forcing fires.
+The vanilla item singletons live in `net.minecraft.init.Items`: `Items.iron_shovel`, `Items.iron_pickaxe`, `Items.iron_axe`, `Items.flint_and_steel`, `Items.apple`, `Items.arrow`, `Items.coal`, `Items.diamond`, `Items.iron_ingot`, `Items.gold_ingot`, `Items.iron_sword`, `Items.wooden_sword`, `Items.stone_sword`, `Items.diamond_sword`, `Items.golden_sword`, the corresponding shovel/pickaxe/axe lines, `Items.stick`, `Items.bowl`, `Items.mushroom_stew`, and so on.
 
----
+`ItemStack` (`net.minecraft.item.ItemStack`) has two public mutable fields — `public int stackSize;` and `public int animationsToGo;` — and the rest is accessed through methods. The most useful ones:
 
-## 6. Sending a packet — the call graph
-
-This is the path a packet takes from the moment your code constructs it to the moment Netty hands the bytes to the OS socket.
-
-```
-   Your code calls one of:
-
-        mc.thePlayer.sendQueue.addToSendQueue(packet)
-        mc.getNetHandler().addToSendQueue(packet)
-                          │
-                          ▼
-        ┌─────────────────────────────────┐
-        │   NetHandlerPlayClient          │
-        │     .addToSendQueue(Packet p)   │
-        └─────────────────┬───────────────┘
-                          │
-                          ▼
-        ┌─────────────────────────────────┐
-        │   NetworkManager                │
-        │     .sendPacket(Packet p)       │
-        └─────────────────┬───────────────┘
-                          │
-              ┌───────────┴───────────┐
-              │ Channel in event-     │
-              │ loop thread?          │
-              └───────────┬───────────┘
-                          │
-                ┌─────────┴─────────┐
-                │                   │
-              YES                  NO
-                │                   │
-                ▼                   ▼
-     dispatchPacket(p, null)   queue into
-                │              outboundPacketsQueue,
-                │              schedule flushOutboundQueue()
-                │              on event loop, return
-                ▼
-        ┌─────────────────────────────────┐
-        │   Netty pipeline:               │
-        │                                 │
-        │   PacketEncoder.encode()        │
-        │     ↓                           │
-        │   ByteBuf with VarInt ID +      │
-        │   p.writePacketData(buffer)     │
-        │     ↓                           │
-        │   NettyCompressionEncoder       │
-        │   (if compression enabled)      │
-        │     ↓                           │
-        │   NettyVarint21FrameEncoder     │
-        │   (prepends length VarInt)      │
-        │     ↓                           │
-        │   socket write                  │
-        └─────────────────────────────────┘
+```java
+public Item getItem()
+public ItemStack copy()
+public int getMaxStackSize()
+public boolean isItemStackDamageable()
+public int getItemDamage()
+public int getMetadata()
+public void setItemDamage(int meta)
+public int getMaxDamage()
+public boolean attemptDamageItem(int amount, Random rand)
+public void damageItem(int amount, EntityLivingBase entityIn)
+public boolean hasTagCompound()
+public NBTTagCompound getTagCompound()
+public NBTTagCompound getSubCompound(String key, boolean create)
+public NBTTagList getEnchantmentTagList()
+public void setTagCompound(NBTTagCompound nbt)
+public String getDisplayName()
+public ItemStack setStackDisplayName(String displayName)
+public boolean hasDisplayName()
+public List<String> getTooltip(EntityPlayer player, boolean advanced)
+public EnumRarity getRarity()
+public boolean isItemEnchantable()
+public void addEnchantment(Enchantment ench, int level)
+public boolean isItemEnchanted()
+public int getMaxItemUseDuration()
+public EnumAction getItemUseAction()
+public static boolean areItemStacksEqual(ItemStack a, ItemStack b)
+public static boolean areItemsEqual(ItemStack a, ItemStack b)
+public static boolean areItemStackTagsEqual(ItemStack a, ItemStack b)
+public boolean isItemEqual(ItemStack other)
+public Multimap<String, AttributeModifier> getAttributeModifiers()
 ```
 
-The teaching point: `sendPacket` is thread-safe — you can call it from any thread. If you're not on the Netty event loop, the manager queues your packet and schedules a flush. Don't try to be clever with threading; just call `addToSendQueue` from wherever you are.
+There are also several constructors — `new ItemStack(Block)`, `new ItemStack(Block, int amount)`, `new ItemStack(Block, int amount, int meta)`, `new ItemStack(Item)`, `new ItemStack(Item, int)`, `new ItemStack(Item, int amount, int meta)`, and `ItemStack.loadItemStackFromNBT(NBTTagCompound)`.
 
----
+### Entity hierarchy
 
-## 7. Receiving a packet — the call graph and the thread hand-off
+The entity class chain is `Entity → EntityLivingBase → EntityPlayer → AbstractClientPlayer → EntityPlayerSP` for the local player, and `Entity → EntityLivingBase → EntityPlayer → AbstractClientPlayer → EntityOtherPlayerMP` for any other player visible in the world. Mobs split off after `EntityLivingBase` into `EntityCreature`, `EntityMob`, `EntityAnimal`, etc.
 
-Inbound is more interesting because it involves a thread switch. The Netty thread reads bytes; the main game thread does the work. The mechanism is `PacketThreadUtil.checkThreadAndEnqueue`:
+Every entity carries position, motion, and rotation as **public mutable fields**, not getters. This is a deliberate choice in vanilla; you write `entity.posX = newX` rather than calling a setter. Knowing the exact field names is therefore essential.
 
-```
-   ┌───────────────────────────────────────────────────────┐
-   │   Netty I/O thread                                    │
-   │                                                       │
-   │   Bytes arrive on socket                              │
-   │              │                                        │
-   │              ▼                                        │
-   │   NettyVarint21FrameDecoder reads length VarInt       │
-   │              │                                        │
-   │              ▼                                        │
-   │   NettyCompressionDecoder (if compressed)             │
-   │              │                                        │
-   │              ▼                                        │
-   │   PacketDecoder.decode() reads packet ID VarInt,      │
-   │   looks up class in EnumConnectionState's registry,   │
-   │   instantiates packet, calls readPacketData(buffer)   │
-   │              │                                        │
-   │              ▼                                        │
-   │   NetworkManager.channelRead0(ctx, packet)            │
-   │              │                                        │
-   │              ▼                                        │
-   │   packet.processPacket(netHandler)                    │
-   │              │                                        │
-   │              ▼                                        │
-   │   netHandler.handleXxx(packet) called                 │
-   │              │                                        │
-   │              ▼                                        │
-   │   First line of handleXxx is usually:                 │
-   │     PacketThreadUtil.checkThreadAndEnqueue(           │
-   │         this, packet, mc);                            │
-   │              │                                        │
-   │              ▼                                        │
-   │   If we're NOT on the Minecraft thread:               │
-   │     - Schedule a Runnable on mc that will             │
-   │       re-call handleXxx(packet)                       │
-   │     - Throw ThreadQuickExitException                  │
-   │     - Netty thread unwinds and is done                │
-   │                                                       │
-   └───────────────────────┬───────────────────────────────┘
-                           │
-                           │  Runnable enqueued on
-                           │  Minecraft thread's
-                           │  scheduledTasks queue
-                           ▼
-   ┌───────────────────────────────────────────────────────┐
-   │   Minecraft main thread (inside Minecraft.runTick)    │
-   │                                                       │
-   │   Calls mc.scheduledTasks polling loop                │
-   │              │                                        │
-   │              ▼                                        │
-   │   Runnable fires → handleXxx(packet) called AGAIN     │
-   │              │                                        │
-   │              ▼                                        │
-   │   This time checkThreadAndEnqueue is a no-op,         │
-   │   so handleXxx proceeds past it                       │
-   │              │                                        │
-   │              ▼                                        │
-   │   handleXxx mutates mc.theWorld, mc.thePlayer,        │
-   │   spawns entities, processes inventory, ...           │
-   │   (safe — we're on the main thread)                   │
-   └───────────────────────────────────────────────────────┘
+#### Entity (`net.minecraft.entity.Entity`, 182 methods)
+
+The fields you will reference constantly:
+
+```java
+public World worldObj;
+public double posX, posY, posZ;                       // Current world position
+public double prevPosX, prevPosY, prevPosZ;           // Previous tick (for render interpolation)
+public double lastTickPosX, lastTickPosY, lastTickPosZ;
+public double motionX, motionY, motionZ;              // Velocity in blocks/tick
+public float rotationYaw, rotationPitch;              // Body / camera rotation
+public float prevRotationYaw, prevRotationPitch;
+public boolean onGround;
+public boolean isCollidedHorizontally;
+public boolean isCollidedVertically;
+public boolean isCollided;
+public boolean velocityChanged;                       // Set true when server velocity packet arrives
+public boolean isDead;
+public float width;                                   // Hitbox half-width (full width is 2*this)
+public float height;                                  // Hitbox total height
+public float fallDistance;
+public float stepHeight;                              // Auto-step height; usually 0.5, 0.6 for player
+public boolean noClip;
+public float entityCollisionReduction;
+public int ticksExisted;                              // Increments once per tick from spawn
+public int fireResistance;
+public int hurtResistantTime;
+public Entity ridingEntity;                           // What this entity is riding
+public Entity riddenByEntity;                         // What is riding this entity
+public boolean preventEntitySpawning;
+public boolean forceSpawn;
+public double renderDistanceWeight;
+public float prevDistanceWalkedModified;
+public float distanceWalkedModified;
+public float distanceWalkedOnStepModified;
 ```
 
-The teaching point: every `handleXxx` method is *called twice* — first on the Netty thread (where it bails out immediately) and then on the main thread (where it does real work). When you read a handler's body, you can assume the world and player are safe to touch.
+The key methods, grouped by what they do:
 
-If you ever need to do work on the main thread from elsewhere (a custom thread, a callback, anything), use `mc.addScheduledTask(Runnable)`. Never just touch `mc.theWorld` from a thread you don't control.
+Position and rotation:
 
----
-
-## 8. The Minecraft.runTick / render loop
-
-The outer loop drives everything. `runGameLoop` runs as fast as the FPS allows. Inside it, `runTick` runs at 20 Hz (more if behind), and rendering runs at FPS Hz with `partialTicks` interpolation between the most recent two ticks.
-
-```
-   Minecraft.run() — called once at startup
-            │
-            ▼
-   Minecraft.runGameLoop() — loops until shutdown
-   ┌───────────────────────────────────────────────────────┐
-   │                                                       │
-   │   while (running) {                                   │
-   │                                                       │
-   │     timer.updateTimer()                               │
-   │     ┌────────────────────────────────────────────┐    │
-   │     │ Computes how many full ticks (50ms slices) │    │
-   │     │ have elapsed since the last frame, AND     │    │
-   │     │ how far into the next tick we are          │    │
-   │     │ (partialTicks ∈ [0.0, 1.0))                │    │
-   │     └────────────────────────────────────────────┘    │
-   │                                                       │
-   │     for (int i = 0; i < timer.elapsedTicks; i++) {    │
-   │       runTick()    ← THE GAME-LOGIC TICK              │
-   │     }                                                 │
-   │                                                       │
-   │     entityRenderer.updateCameraAndRender(             │
-   │       timer.renderPartialTicks, systemTime)           │
-   │                                                       │
-   │     updateDisplay()    ← swap buffers + LWJGL poll    │
-   │                                                       │
-   │     // FPS limiting, vsync                            │
-   │   }                                                   │
-   └───────────────────────────────────────────────────────┘
+```java
+public void setPosition(double x, double y, double z)
+public void setRotation(float yaw, float pitch)
+public void setAngles(float yaw, float pitch)
+public void setLocationAndAngles(double x, double y, double z, float yaw, float pitch)
+public void setPositionAndRotation(double x, double y, double z, float yaw, float pitch)
+public void setPositionAndRotation2(double x, double y, double z, float yaw, float pitch, int incr, boolean p_10_)
+public void setPositionAndUpdate(double x, double y, double z)
+public void moveToBlockPosAndAngles(BlockPos pos, float yaw, float pitch)
+public void copyLocationAndAnglesFrom(Entity entityIn)
+public BlockPos getPosition()
+public Vec3 getPositionVector()
+public Vec3 getPositionEyes(float partialTicks)
+public AxisAlignedBB getEntityBoundingBox()
+public void setEntityBoundingBox(AxisAlignedBB bb)
+public float getEyeHeight()
+public EnumFacing getHorizontalFacing()
 ```
 
-What happens inside `runTick`:
+Movement and physics:
 
-```
-   Minecraft.runTick()
-            │
-            ▼
-   ┌───────────────────────────────────────────────────────┐
-   │                                                       │
-   │  1. Process scheduledTasks queue (drain Runnables)    │
-   │                                                       │
-   │  2. ingameGUI.updateTick()       (chat fade, etc.)    │
-   │                                                       │
-   │  3. entityRenderer.getMouseOver(1.0F)                 │
-   │      ┌──────────────────────────────────────┐         │
-   │      │ Raycast from camera, results stored: │         │
-   │      │   mc.objectMouseOver (MovingObjPos)  │         │
-   │      │   entityRenderer.pointedEntity       │         │
-   │      └──────────────────────────────────────┘         │
-   │                                                       │
-   │  4. dispatchKeypresses()         (process key queue)  │
-   │     handleMouseInput()                                │
-   │     handleKeyboardInput()                             │
-   │                                                       │
-   │     ┌─────────────────────────────────────────┐       │
-   │     │ Within keyboard/mouse handling:         │       │
-   │     │  - leftClick → clickMouse()             │       │
-   │     │     → playerController.clickBlock()     │       │
-   │     │       or attackTargetEntityWithItem()   │       │
-   │     │  - rightClick → rightClickMouse()       │       │
-   │     │     → playerController.onPlayerRight…   │       │
-   │     │       or sendUseItem()                  │       │
-   │     │  - middle → middleClickMouse()          │       │
-   │     └─────────────────────────────────────────┘       │
-   │                                                       │
-   │  5. if (theWorld != null) {                           │
-   │       playerController.updateController()             │
-   │         ┌─────────────────────────────────────┐       │
-   │         │ Drives block-breaking progress:     │       │
-   │         │   - calls onPlayerDamageBlock per   │       │
-   │         │     tick while LMB held             │       │
-   │         │   - sends C0A swing animation       │       │
-   │         │   - sends C07 STOP_DESTROY when     │       │
-   │         │     curBlockDamageMP ≥ 1.0          │       │
-   │         └─────────────────────────────────────┘       │
-   │                                                       │
-   │       myNetworkManager.processReceivedPackets()       │
-   │         (drains any inbound packets queued by Netty)  │
-   │                                                       │
-   │       theWorld.tick()                                 │
-   │       theWorld.updateEntities()                       │
-   │         ┌─────────────────────────────────────┐       │
-   │         │ For each entity:                    │       │
-   │         │   theWorld.updateEntity(e)          │       │
-   │         │     → e.onUpdate()                  │       │
-   │         │       → e.onEntityUpdate()          │       │
-   │         │       → (for living) onLivingUpdate │       │
-   │         │       → (for player) updateEntity-  │       │
-   │         │         ActionState +               │       │
-   │         │         onUpdateWalkingPlayer       │       │
-   │         └─────────────────────────────────────┘       │
-   │     }                                                 │
-   │                                                       │
-   │  6. soundHandler.update()                             │
-   │  7. musicTicker.update()                              │
-   │  8. ... (stats, achievements, snooper, etc.)          │
-   └───────────────────────────────────────────────────────┘
+```java
+public void moveEntity(double x, double y, double z)            // Actual movement with collision
+public void moveFlying(float strafe, float forward, float friction)
+public void addVelocity(double x, double y, double z)
+public void setVelocity(double x, double y, double z)
+public boolean isInWater()
+public boolean isInLava()
+public boolean isWet()
+public boolean handleWaterMovement()
+public boolean isInsideOfMaterial(Material materialIn)
+public boolean isOffsetPositionInLiquid(double x, double y, double z)
 ```
 
-What happens inside `updateCameraAndRender`:
+Distance, looking, raytracing:
 
-```
-   EntityRenderer.updateCameraAndRender(partialTicks, nanoTime)
-            │
-            ▼
-   ┌───────────────────────────────────────────────────────┐
-   │                                                       │
-   │  if (mc.theWorld != null && mc.getRenderViewEntity() != null) {
-   │    renderWorld(partialTicks, finishTimeNano)          │
-   │      ┌─────────────────────────────────────┐          │
-   │      │ For each stereoscopic pass (0..N):  │          │
-   │      │   renderWorldPass(pass, partial, …) │          │
-   │      │     ├ updateLightmap()              │          │
-   │      │     ├ setupCameraTransform()        │          │
-   │      │     ├ renderGlobal.setupTerrain()   │          │
-   │      │     ├ renderGlobal.renderEntities() │          │
-   │      │     ├ for each block layer:         │          │
-   │      │     │   renderGlobal.renderBlockLayer(SOLID),  │
-   │      │     │                              (CUTOUT_MIPPED),
-   │      │     │                              (CUTOUT),   │
-   │      │     │                              (TRANSLUCENT)
-   │      │     ├ renderHand()                 │          │
-   │      │     └ renderRainSnow()             │          │
-   │      └─────────────────────────────────────┘          │
-   │  }                                                    │
-   │                                                       │
-   │  setupOverlayRendering()        ← switches to 2D      │
-   │                                                       │
-   │  if (mc.currentScreen != null) {                      │
-   │    currentScreen.drawScreen(mouseX, mouseY, partial)  │
-   │  } else if (mc.theWorld != null) {                    │
-   │    ingameGUI.renderGameOverlay(partial)               │
-   │      ├ renderTooltip (selected hotbar item)           │
-   │      ├ renderExpBar                                   │
-   │      ├ renderPlayerStats (hearts, hunger, armor)      │
-   │      ├ renderHorseJumpBar (if riding horse)           │
-   │      ├ renderChat                                     │
-   │      ├ renderBossHealth                               │
-   │      ├ renderScoreboard                               │
-   │      └ renderTitle                                    │
-   │  }                                                    │
-   └───────────────────────────────────────────────────────┘
+```java
+public float getDistanceToEntity(Entity entityIn)
+public double getDistanceSq(double x, double y, double z)
+public double getDistanceSq(BlockPos pos)
+public double getDistanceSqToCenter(BlockPos pos)
+public double getDistance(double x, double y, double z)
+public double getDistanceSqToEntity(Entity entityIn)
+public Vec3 getLookVec()
+public Vec3 getLook(float partialTicks)
+protected final Vec3 getVectorForRotation(float pitch, float yaw)
+public MovingObjectPosition rayTrace(double blockReachDistance, float partialTicks)
+public boolean canBeCollidedWith()
+public boolean canBePushed()
 ```
 
-The teaching point: tick-rate work goes in `runTick` paths, render-rate work goes in `updateCameraAndRender` paths. The two are decoupled — the game can render 200 FPS while still only ticking 20 times per second. `partialTicks` is the glue: between ticks N and N+1, render-rate code interpolates `prevPosX + (posX - prevPosX) * partialTicks` to make motion smooth.
+State flags (these all read/write bits in a shared `DataWatcher` byte at index 0):
 
----
-
-## 9. The block-breaking pipeline (left-click → server confirmation)
-
-This is the most complex of the input pipelines because it spans many ticks. Watch the state machine in `PlayerControllerMP`:
-
-```
-   Tick 0: Player presses LMB while pointing at a block
-            │
-            ▼
-   Minecraft.clickMouse()
-            │
-            ▼
-   playerController.clickBlock(pos, sideHit)
-   ┌───────────────────────────────────────────────────┐
-   │ Records: currentBlock = pos                       │
-   │          curBlockDamageMP = 0.0                   │
-   │          isHittingBlock = true                    │
-   │ Sends:   C07PacketPlayerDigging(                  │
-   │            START_DESTROY_BLOCK, pos, sideHit)     │
-   │ Sends:   C0APacketAnimation()    (arm swing)      │
-   │                                                   │
-   │ If creative mode: also calls onPlayerDestroyBlock │
-   │ and the block disappears immediately.             │
-   └───────────────────────────────────────────────────┘
-
-   Tick 1..N: Player still holding LMB on same block
-
-            │
-            ▼
-   playerController.onPlayerDamageBlock(pos, side)
-   ┌───────────────────────────────────────────────────┐
-   │ Increments curBlockDamageMP by the per-tick rate  │
-   │ (depends on item, enchants, haste, water, ...)    │
-   │                                                   │
-   │ Every 4 ticks (stepSoundTickCounter): play hit    │
-   │ sound, send C0APacketAnimation                    │
-   │                                                   │
-   │ Block break-progress 0-9 is sent to the server    │
-   │ via S25PacketBlockBreakAnim — but the SERVER      │
-   │ tracks its own progress and the client's value    │
-   │ is mostly visual.                                 │
-   └───────────────────────┬───────────────────────────┘
-                           │
-              ┌────────────┴────────────┐
-              │                         │
-              ▼                         ▼
-       curBlockDamageMP < 1.0    curBlockDamageMP ≥ 1.0
-              │                         │
-              │ (loop next tick)        ▼
-              │                  onPlayerDestroyBlock()
-              │                  ┌────────────────────────────┐
-              │                  │ Sends: C07 STOP_DESTROY    │
-              │                  │ Sets:  isHittingBlock=false│
-              │                  │        curBlockDamageMP=0  │
-              │                  │ Locally: world.setBlockTo- │
-              │                  │   Air(pos) for prediction  │
-              │                  │                            │
-              │                  │ Block actually gets removed│
-              │                  │ when S23PacketBlockChange  │
-              │                  │ arrives from server.       │
-              │                  └────────────────────────────┘
-              ▼
-   Player releases LMB or aims elsewhere
-            │
-            ▼
-   playerController.resetBlockRemoving()
-   ┌───────────────────────────────────────────────────┐
-   │ Sends: C07 ABORT_DESTROY_BLOCK                    │
-   │ Resets: isHittingBlock=false, curBlockDamageMP=0  │
-   └───────────────────────────────────────────────────┘
+```java
+public boolean isBurning()
+public boolean isRiding()
+public boolean isSneaking()
+public void setSneaking(boolean sneaking)
+public boolean isSprinting()
+public void setSprinting(boolean sprinting)
+public boolean isInvisible()
+public void setInvisible(boolean invisible)
+public boolean isEating()
+public void setEating(boolean eating)
+public boolean isSilent()
+public void setSilent(boolean isSilent)
 ```
 
-The teaching point: block-breaking is not a single event. It's a state machine driven by ticks, with three C07 packet sub-types marking the start, abort, and completion. The server validates everything — the client's `setBlockToAir` is just a visual prediction, and the real removal happens when S23 confirms it.
+Combat and damage:
 
----
-
-## 10. The inventory click pipeline
-
-Every click in an inventory GUI follows the same path, regardless of which container is open.
-
-```
-   Player clicks slot in any GuiContainer
-
-                   │
-                   ▼
-   GuiContainer.mouseClicked(x, y, button)
-                   │
-                   ▼
-   GuiContainer.handleMouseClick(slot, slotId, button, mode)
-                   │
-                   │   mode meaning:
-                   │     0 = normal click
-                   │     1 = shift-click
-                   │     2 = hotbar key (numbers 0–8)
-                   │     3 = middle-click (creative pick)
-                   │     4 = drop (Q key, etc.)
-                   │     5 = drag (split/distribute)
-                   │     6 = double-click (collect all)
-                   │
-                   ▼
-   playerController.windowClick(windowId, slotId, button, mode, player)
-                   │
-                   ▼
-   ┌──────────────────────────────────────────────────────┐
-   │ 1. Generate a fresh transaction short via            │
-   │    container.getNextTransactionID(inventory)         │
-   │                                                      │
-   │ 2. Call container.slotClick(slotId, button, mode,    │
-   │    player) to apply the click LOCALLY                │
-   │                                                      │
-   │ 3. Send C0EPacketClickWindow(windowId, slotId,       │
-   │    button, mode, slotStackAfterClick, transactionId) │
-   └──────────────────────────────────────────────────────┘
-                   │
-                   ▼ ...server processes the click...
-                   │
-            ┌──────┴───────────┐
-            │                  │
-            ▼                  ▼
-   Server accepts        Server rejects
-            │                  │
-            ▼                  ▼
-   S32 ConfirmTrans-   S32 ConfirmTrans-
-   action(accept=true) action(accept=false)
-            │                  │
-            ▼                  ▼
-   handleConfirm-      handleConfirm-
-   Transaction reads   Transaction sees
-   accept=true,        accept=false, REVERTS
-   nothing to do       client state by re-applying
-                       opposite, then sends a
-                       C0FPacketConfirmTransaction
-                       to acknowledge
-
-   Independently, on big changes the server sends:
-     S2F SetSlot(slotId, stack)   — single slot fix
-     S30 WindowItems(stacks[])    — full re-sync
+```java
+public boolean attackEntityFrom(DamageSource source, float amount)
+public void performHurtAnimation()
+public boolean hitByEntity(Entity entityIn)
+public boolean isEntityInvulnerable(DamageSource source)
+public void fall(float distance, float damageMultiplier)
 ```
 
-The teaching point: the client *predicts* every inventory click and the server *confirms or rolls back*. If the server is laggy or there's a desync, you may briefly see a wrong slot before S2F fixes it. The transaction ID system is what lets the server identify which specific click it's confirming.
+Lifecycle and metadata:
 
----
-
-## 11. The collision pipeline
-
-When you call `entity.moveEntity(dx, dy, dz)`, this is what happens. Understanding this is essential for anything related to movement, AABB queries, or step-up.
-
-```
-   Entity.moveEntity(dx, dy, dz)
-            │
-            ▼
-   ┌────────────────────────────────────────────────────────┐
-   │                                                        │
-   │  1. Save the original dx, dy, dz for sneak detection   │
-   │                                                        │
-   │  2. Sneak-edge logic (player only, on the ground):     │
-   │     Probe forward and sideways with                    │
-   │     world.getCollisionBoxes(bb.offset(dx,-1,dz))       │
-   │     Iteratively shrink dx, dz until you can't fall off │
-   │     ┌────────────────────────────────────────────┐     │
-   │     │ This is the "sneak doesn't let you fall    │     │
-   │     │ off the edge" feature. It works by         │     │
-   │     │ repeatedly checking whether the next       │     │
-   │     │ position would have ground below it; if    │     │
-   │     │ not, dx (or dz) is set to 0.               │     │
-   │     └────────────────────────────────────────────┘     │
-   │                                                        │
-   │  3. Query collision boxes intersecting the swept AABB: │
-   │     List<AxisAlignedBB> boxes =                        │
-   │       world.getCollidingBoundingBoxes(                 │
-   │         this, this.bb.addCoord(dx, dy, dz))            │
-   │                                                        │
-   │  4. Resolve Y first (gravity & ceiling):               │
-   │     for (AABB other : boxes)                           │
-   │       dy = other.calculateYOffset(this.bb, dy);        │
-   │     this.bb = this.bb.offset(0, dy, 0);                │
-   │     if (dy was reduced)                                │
-   │       (we hit a floor or ceiling — onGround if dy<0)   │
-   │                                                        │
-   │  5. Resolve X:                                         │
-   │     for (AABB other : boxes)                           │
-   │       dx = other.calculateXOffset(this.bb, dx);        │
-   │     this.bb = this.bb.offset(dx, 0, 0);                │
-   │                                                        │
-   │  6. Resolve Z:                                         │
-   │     for (AABB other : boxes)                           │
-   │       dz = other.calculateZOffset(this.bb, dz);        │
-   │     this.bb = this.bb.offset(0, 0, dz);                │
-   │                                                        │
-   │  7. Step-up handling (if we hit a wall horizontally    │
-   │     AND there's a block ≤ stepHeight tall in the way): │
-   │     Try the move again at higher Y. If it works,       │
-   │     accept the higher result. Otherwise revert.        │
-   │     ┌────────────────────────────────────────────┐     │
-   │     │ This is why you "auto-step" up 0.5–0.6     │     │
-   │     │ block stairs without jumping. stepHeight   │     │
-   │     │ is 0.6 for the player, 1.0 for horses.     │     │
-   │     └────────────────────────────────────────────┘     │
-   │                                                        │
-   │  8. Update fields:                                     │
-   │     posX, posY, posZ ← bb center / minY                │
-   │     isCollidedHorizontally ← (dx or dz reduced)        │
-   │     isCollidedVertically ← (dy reduced)                │
-   │     isCollided ← either of the above                   │
-   │     onGround ← (dy reduced AND original dy ≤ 0)        │
-   │     fallDistance accumulates                           │
-   │     doBlockCollisions() — fire onEntityCollidedWithBlock│
-   └────────────────────────────────────────────────────────┘
+```java
+public void onUpdate()                                   // Called once per tick
+public void onEntityUpdate()                             // Called from onUpdate() — base behaviour
+public void setDead()
+public void setFire(int seconds)
+public void extinguish()
+public boolean isEntityAlive()
+public int getEntityId()
+public UUID getUniqueID()
+public String getName()
+public IChatComponent getDisplayName()
+public void setCustomNameTag(String name)
+public String getCustomNameTag()
+public boolean hasCustomName()
+public DataWatcher getDataWatcher()
+public void writeToNBT(NBTTagCompound tag)
+public void readFromNBT(NBTTagCompound tag)
+public int getAir()
+public void setAir(int air)
+public void mountEntity(Entity entityIn)
+public void travelToDimension(int dimensionId)
+public void playSound(String name, float volume, float pitch)
 ```
 
-The teaching point: collision resolution is axis-separated. Y is resolved first (so you land on a floor before checking horizontal motion), then X, then Z. Each axis uses the relevant `calculateXOffset` / `calculateYOffset` / `calculateZOffset` helper on `AxisAlignedBB`. Step-up is a fallback that retries the failed horizontal move at a higher Y.
+#### EntityLivingBase (`net.minecraft.entity.EntityLivingBase`, 128 methods)
 
-A subtle consequence: an entity's `onGround` state is set *during* `moveEntity`, not on a separate query. So if you read `entity.onGround` immediately after assigning motion but before calling `moveEntity`, you get last tick's value.
+Adds health, combat tracking, potion effects, head rotation independent of body, and arm-swing animation. The fields:
 
----
-
-## 12. The raytrace pipeline (getMouseOver / objectMouseOver)
-
-Every tick, the crosshair re-raytraces the world to figure out what you're pointing at. This populates `mc.objectMouseOver` (a `MovingObjectPosition`) and `entityRenderer.pointedEntity`.
-
-```
-   EntityRenderer.getMouseOver(float partialTicks)
-            │
-            ▼
-   ┌────────────────────────────────────────────────────────┐
-   │                                                        │
-   │  Entity viewEntity = mc.getRenderViewEntity();         │
-   │  Vec3 eyes = viewEntity.getPositionEyes(partialTicks); │
-   │  Vec3 look = viewEntity.getLook(partialTicks);         │
-   │  double reach = playerController.getBlockReachDistance(│
-   │                  ); // 5.0 surv, 6.0 creat             │
-   │  Vec3 endPoint = eyes.addVector(look.x*reach,          │
-   │                                  look.y*reach,         │
-   │                                  look.z*reach);        │
-   │                                                        │
-   │  // Block ray-trace:                                   │
-   │  mc.objectMouseOver = theWorld.rayTraceBlocks(         │
-   │      eyes, endPoint, false, false, true);              │
-   │                                                        │
-   │  // Now look for an entity in front of that block.     │
-   │  // Build an AABB containing the line eyes→endPoint    │
-   │  // and query every entity intersecting it.            │
-   │  AxisAlignedBB sweep = viewEntity.getEntityBoundingBox │
-   │      ().addCoord(look.x*reach,                         │
-   │                  look.y*reach,                         │
-   │                  look.z*reach).expand(1,1,1);          │
-   │                                                        │
-   │  List<Entity> candidates = theWorld.getEntitiesIn-     │
-   │      AABBexcluding(viewEntity, sweep, predicate);      │
-   │                                                        │
-   │  // For each candidate, expand its bb by its           │
-   │  // collisionBorderSize and call calculateIntercept    │
-   │  // on the eyes→endPoint line.                         │
-   │                                                        │
-   │  // Pick the closest hit that's also closer than       │
-   │  // the block hit (if any).                            │
-   │                                                        │
-   │  // If an entity was hit, replace objectMouseOver      │
-   │  // with a MovingObjectPosition built from that entity │
-   │  // (and set pointedEntity).                           │
-   │                                                        │
-   └────────────────────────────────────────────────────────┘
-
-   After getMouseOver, mc.objectMouseOver is one of:
-     - typeOfHit = MISS     → nothing in range
-     - typeOfHit = BLOCK    → blockPos and sideHit are valid
-     - typeOfHit = ENTITY   → entityHit is valid; hitVec is the
-                              point on the entity's hitbox that
-                              was hit
+```java
+public boolean isSwingInProgress;
+public int swingProgressInt;
+public int arrowHitTimer;
+public int hurtTime;                       // Counts down red-hurt overlay
+public int maxHurtTime;
+public float attackedAtYaw;                // Yaw direction the last hit came from
+public int deathTime;
+public float prevSwingProgress;
+public float swingProgress;                // 0.0–1.0 swing animation
+public float prevLimbSwingAmount;
+public float limbSwingAmount;
+public float limbSwing;
+public int maxHurtResistantTime = 20;
+public float prevCameraPitch;
+public float cameraPitch;
+public float renderYawOffset;              // Body yaw used by renderer
+public float prevRenderYawOffset;
+public float rotationYawHead;              // Head yaw (decoupled from body)
+public float prevRotationYawHead;
+public float jumpMovementFactor = 0.02F;
+public float moveStrafing;                 // Input strafe (set by movement input)
+public float moveForward;                  // Input forward
 ```
 
-The teaching point: this method is the bridge between "where the camera is pointing" and "what game object is the player about to interact with". Every left-click and right-click reads `objectMouseOver` to decide what to do. The raytrace is cheap — it's done every tick. You can call `entityRenderer.getMouseOver(1.0F)` at any time to force a re-raytrace.
+The methods you reach for:
 
-`World.rayTraceBlocks` has three overloads — the 5-arg version is what's used here. The `stopOnLiquid` parameter controls whether to stop on water/lava; the `ignoreBlockWithoutBoundingBox` flag affects how non-cube blocks (signs, torches) are handled; the `returnLastUncollidableBlock` flag is used to fall back to the last partially-collided block if nothing else hits.
+Health:
 
----
-
-## 13. Coordinate system
-
-```
-                    ↑ +Y (up)
-                    │
-                    │
-                    │
-                    │     ↗ -Z (north)
-                    │   ↗
-                    │ ↗
-   -X (east) ←──────●──────→ +X (west)
-                  ↙ │
-                ↙   │
-              ↙     │
-            +Z      │
-        (south)     ↓ -Y (down)
-                    
-   Wait — let me redraw that correctly:
-
-                    ↑ +Y (up)
-                    │
-                    │   ↗ +X (east, sunrise side)
-                    │ ↗
-                    ●─────────→ ... (this gets messy in 2D)
-                  ↙
-                ↙
-              +Z (south)
+```java
+public final float getHealth()
+public void setHealth(float health)
+public final float getMaxHealth()
+public void heal(float healAmount)
+public boolean isEntityAlive()
+public float getAbsorptionAmount()
+public void setAbsorptionAmount(float amount)
 ```
 
-A cleaner coordinate reference, as text:
+Potion effects:
 
-```
-   Axes:
-     +X = east   (toward sunrise)
-     -X = west
-     +Y = up
-     -Y = down
-     +Z = south
-     -Z = north  (toward sunset / "north" by compass)
-
-   Yaw (rotationYaw):
-     0°    or  ±360°  →  facing +Z  (south)
-     90°               →  facing -X  (west)
-     180°  or -180°    →  facing -Z  (north)
-     -90°  or 270°     →  facing +X  (east)
-     Yaw INCREASES clockwise when looking down at the player.
-
-   Pitch (rotationPitch):
-     -90°  →  looking straight up
-       0°  →  looking at horizon
-     +90°  →  looking straight down
-
-   The "look vector" from getLook(partialTicks) is computed as:
-     pitch_rad = pitch * π / 180
-     yaw_rad   = -yaw  * π / 180 - π
-     x =  sin(yaw_rad) * -cos(pitch_rad)
-     y =  -sin(pitch_rad)
-     z =  cos(yaw_rad) * -cos(pitch_rad)
-
-   The boundingBox is anchored differently from posX/posY/posZ:
-     posX, posZ   = horizontal center of entity
-     posY         = bottom of entity hitbox (== bb.minY for most)
-     bb.minX      = posX - width/2
-     bb.maxX      = posX + width/2
-     bb.minY      = posY                    ← what C03/C04/C06 sends
-     bb.maxY      = posY + height
-     bb.minZ      = posZ - width/2
-     bb.maxZ      = posZ + width/2
-
-   Eye position (used for raytracing):
-     eyeX = posX
-     eyeY = posY + getEyeHeight()    // 1.62 for player standing
-     eyeZ = posZ
+```java
+public boolean isPotionActive(int potionId)
+public boolean isPotionActive(Potion potionIn)
+public PotionEffect getActivePotionEffect(Potion potionIn)
+public Collection<PotionEffect> getActivePotionEffects()
+public void addPotionEffect(PotionEffect potioneffectIn)
+public void removePotionEffect(int potionId)
+public void removePotionEffectClient(int potionId)
+public void clearActivePotions()
+public boolean isEntityUndead()
 ```
 
-The teaching point: yaw 0 points south, not north. This trips people up constantly. Also: the wire protocol always sends `bb.minY`, never `posY`, even though for most entities they're equal — the safe habit is to use `getEntityBoundingBox().minY` when building position packets.
+Combat tracking:
 
----
-
-## 14. Friction and movement constants
-
-```
-   Per-tick velocity decay in EntityLivingBase.moveEntityWithHeading:
-
-   ┌─────────────────────────────────────────────────────────────┐
-   │                                                             │
-   │   On land (most of the time):                               │
-   │     motionX *= 0.91 * groundBlock.slipperiness              │
-   │     motionZ *= 0.91 * groundBlock.slipperiness              │
-   │     motionY = (motionY - 0.08) * 0.98     ← gravity         │
-   │                                                             │
-   │     groundBlock.slipperiness defaults:                      │
-   │       most blocks ............ 0.6                          │
-   │       slime block ............ 0.8                          │
-   │       ice / packed ice ....... 0.98                         │
-   │       blue ice (1.13+, n/a 1.8)                             │
-   │                                                             │
-   │     So normal ground friction is 0.91 * 0.6 = 0.546         │
-   │     Ice friction is             0.91 * 0.98 = 0.8918        │
-   │                                                             │
-   │   In air (off ground):                                      │
-   │     motionX *= 0.91                                         │
-   │     motionZ *= 0.91                                         │
-   │     motionY = (motionY - 0.08) * 0.98                       │
-   │                                                             │
-   │   In water:                                                 │
-   │     motionX, Z, Y *= 0.8 (or 0.8 + adjustments for depth-   │
-   │                          strider enchant up to 0.96)        │
-   │     motionY -= 0.02 (lower gravity in water)                │
-   │                                                             │
-   │   In lava:                                                  │
-   │     motionX, Y, Z *= 0.5                                    │
-   │                                                             │
-   │   moveFlying(strafe, forward, friction):                    │
-   │     float dist² = strafe² + forward²                        │
-   │     if (dist² < 0.0001) return     // no input              │
-   │     normalize, scale by friction                            │
-   │     yaw_rad = rotationYaw * π/180                           │
-   │     motionX += -sin(yaw_rad) * normalizedStrafe             │
-   │                + cos(yaw_rad) * normalizedForward           │
-   │     motionZ +=  cos(yaw_rad) * normalizedStrafe             │
-   │                + sin(yaw_rad) * normalizedForward           │
-   │                                                             │
-   │   The friction passed to moveFlying:                        │
-   │     On ground: 0.1 * (0.16277136 / (groundFric)³)           │
-   │       = "ground acceleration"; with slipperiness=0.6 this   │
-   │       evaluates to about 0.1 — the magic walk speed         │
-   │     In air:    0.02 (set as jumpMovementFactor)             │
-   │     In water:  0.02 (×depth-strider modifier)               │
-   │                                                             │
-   └─────────────────────────────────────────────────────────────┘
-
-   Vertical:
-     Base jump impulse:  motionY = 0.42  (getJumpUpwardsMotion)
-     Jump-boost potion:  motionY += (amplifier + 1) * 0.1
-     Sprint-jump adds horizontal motion:
-       motionX -= sin(yaw) * 0.2
-       motionZ += cos(yaw) * 0.2
-     Gravity:            motionY -= 0.08
-     Air drag on Y:      motionY *= 0.98
-
-   Terminal velocities (approx, after gravity converges):
-     Free-fall:  ≈ -3.92 blocks/tick (≈ -78.4 m/s)
-                 capped by S12 anyway at 3.9
+```java
+public CombatTracker getCombatTracker()
+public EntityLivingBase getAttackingEntity()
+public EntityLivingBase getLastAttacker()
+public int getLastAttackerTime()
+public void setLastAttacker(Entity entityIn)
+public EntityLivingBase getAITarget()
+public int getRevengeTimer()
+public void setRevengeTarget(EntityLivingBase livingBase)
+public final int getArrowCountInEntity()
+public final void setArrowCountInEntity(int count)
+public void knockBack(Entity entityIn, float strength, double dx, double dz)
 ```
 
-The teaching point: friction is multiplicative each tick, and the value depends on what you're standing on. The 0.91 ground constant and the 0.6 default slipperiness produce the familiar ~0.546 horizontal decay per tick. Ice's 0.98 slipperiness produces the slippery feel you know from gameplay.
+Movement and physics:
 
----
-
-## 15. The ItemStack ⇄ container ⇄ slot relationship
-
-```
-                     IInventory (interface)
-                    "I am a backing store for stacks"
-                    ┌────────────────────────────┐
-                    │ getStackInSlot(int)        │
-                    │ setInventorySlotContents() │
-                    │ decrStackSize()            │
-                    │ getSizeInventory()         │
-                    │ markDirty()                │
-                    └─────────────┬──────────────┘
-                                  │
-            ┌─────────────────────┼─────────────────────┐
-            │                     │                     │
-            ▼                     ▼                     ▼
-     InventoryPlayer       TileEntityChest      InventoryBasic
-     (40 slots:           (27 slots)            (used by ender
-      36 main +                                  chest, dispenser
-      4 armor)                                   minecart, etc.)
-            │
-            │ player.inventory
-            │
-            ▼
-   ┌──────────────────────┐
-   │   EntityPlayer       │
-   │     .inventory       │ ← InventoryPlayer
-   │     .inventoryContainer ← ContainerPlayer (the survival
-   │     .openContainer       inventory + 2x2 craft grid)
-   └──────────┬───────────┘
-              │
-              │ When you open a GUI, openContainer changes
-              │ to that GUI's Container subclass:
-              ▼
-   ┌──────────────────────┐
-   │      Container       │
-   │  (e.g. ContainerChest│
-   │   for a chest GUI)   │
-   │                      │
-   │  inventorySlots:     │
-   │    List<Slot>        │
-   │                      │
-   │  Each Slot is a VIEW │
-   │  that maps a (x,y)   │
-   │  GUI position to a   │
-   │  specific (IInventory,│
-   │  index) pair         │
-   └──────────┬───────────┘
-              │
-              ▼ inventorySlots[i]
-   ┌──────────────────────┐
-   │       Slot           │
-   │                      │
-   │  inventory: IInventory   ← the backing store
-   │  index: int              ← index into that store
-   │  xPosition, yPosition    ← where to draw on screen
-   │                      │
-   │  getStack()  → inventory.getStackInSlot(index)
-   │  putStack(s) → inventory.setInventorySlotContents(
-   │                  index, s)                          │
-   └──────────────────────┘
-              │
-              ▼
-       ItemStack instance
-   ┌──────────────────────┐
-   │      ItemStack       │
-   │                      │
-   │  stackSize: int      │
-   │  itemDamage           │
-   │  stackTagCompound:   │ ← optional NBT (enchants,
-   │     NBTTagCompound   │    custom name, display tag,
-   │                      │    cooldown, etc.)
-   │  item: Item          │ ← singleton from registry
-   └──────────────────────┘
+```java
+protected void jump()
+protected float getJumpUpwardsMotion()                       // Returns 0.42 by default
+public void moveEntityWithHeading(float strafe, float forward)
+public float getAIMoveSpeed()
+public void setAIMoveSpeed(float speedIn)
+public boolean isOnLadder()
+public void setJumping(boolean jumping)
+public boolean canEntityBeSeen(Entity entityIn)
+public Vec3 getLookVec()                                     // Overrides Entity.getLookVec
+public Vec3 getLook(float partialTicks)
+public float getSwingProgress(float partialTickTime)
+public boolean isPlayerSleeping()
 ```
 
-The teaching point: a `Slot` is a *view*, not a storage. It just remembers "I'm slot #5 of THAT chest" and forwards reads/writes to the chest's `IInventory`. When you have a `Container` open (e.g. a chest), the same player slot can appear in *two* slots simultaneously — once as part of the chest container (`inventorySlots[27..62]` mapping to `player.inventory`) and conceptually as part of the player's hotbar. The container's `transferStackInSlot(player, slotIndex)` is the shift-click handler that knows which target range to move a stack to.
+Equipment:
 
----
-
-## 16. Where to find what — a quick lookup table
-
-```
-   "I need to..."                  →  "Look in..."
-
-   Get the local player            →  Minecraft.getMinecraft().thePlayer
-   Get the world                   →  mc.theWorld (WorldClient)
-   Get what the crosshair is on    →  mc.objectMouseOver
-   Send a packet                   →  mc.thePlayer.sendQueue.addToSendQueue
-   Check a keybind                 →  mc.gameSettings.keyBind*.isKeyDown()
-   Get the current GUI             →  mc.currentScreen
-   Open a GUI                      →  mc.displayGuiScreen(new MyGui())
-   Get held item                   →  mc.thePlayer.getHeldItem() (ItemStack)
-   Get held slot index             →  mc.thePlayer.inventory.currentItem
-   Change held slot                →  send C09PacketHeldItemChange
-   Get/set block at position       →  mc.theWorld.getBlockState(pos),
-                                       .setBlockState(pos, state)
-   Raycast blocks                  →  mc.theWorld.rayTraceBlocks(start, end)
-   Raycast crosshair               →  mc.entityRenderer.getMouseOver(1.0F)
-   Entities in box                 →  mc.theWorld.getEntitiesWithinAABB(
-                                         Class, AxisAlignedBB)
-   Get player by name              →  mc.theWorld.getPlayerEntityByName()
-   Player attack entity            →  mc.playerController.attackEntity(
-                                         mc.thePlayer, target)
-   Player use item in hand         →  mc.playerController.sendUseItem(
-                                         mc.thePlayer, mc.theWorld, stack)
-   Player right-click block        →  mc.playerController.onPlayerRightClick(
-                                         mc.thePlayer, mc.theWorld, stack,
-                                         pos, side, hitVec)
-   Player break block (creative)   →  PlayerControllerMP.clickBlockCreative
-   Distance to entity              →  e1.getDistanceToEntity(e2)
-   Bounding box of entity          →  e.getEntityBoundingBox()
-   Eye position                    →  e.getPositionEyes(partialTicks)
-   Look vector                     →  e.getLook(partialTicks)
-   Yaw/pitch from delta            →  Math.atan2 + degrees conversion;
-                                       MathHelper.wrapAngleTo180_float
-   Run code on main thread         →  mc.addScheduledTask(Runnable)
-   Send chat                       →  mc.thePlayer.sendChatMessage(String)
-   Show toast/title                →  mc.ingameGUI.displayTitle(...)
-   FontRenderer                    →  mc.fontRendererObj
-   Draw a rectangle                →  Gui.drawRect(...)
-   Draw text                       →  fontRenderer.drawString(...) /
-                                       .drawStringWithShadow(...)
-   Bind a texture                  →  mc.getTextureManager().bindTexture(
-                                         resourceLocation)
-   Get screen size (scaled)        →  new ScaledResolution(mc).get*Width()
-   Math sin/cos (fast)             →  MathHelper.sin/cos (TABLE LOOKUP)
-   sqrt, floor, clamp              →  MathHelper.sqrt_*, floor_*, clamp_*
-   Block by name                   →  Blocks.<name>   or
-                                       Block.getBlockFromName("minecraft:x")
-   Item by name                    →  Items.<name>    or
-                                       Item.getByNameOrId("minecraft:x")
-   Read/write NBT                  →  NBTTagCompound get*/set* methods
-   Get enchantment level on item   →  EnchantmentHelper.getEnchantmentLevel(
-                                         enchId, stack)
-   Check if potion active          →  player.isPotionActive(Potion.x)
-   Add a potion effect             →  player.addPotionEffect(
-                                         new PotionEffect(id, dur, amp))
+```java
+public abstract ItemStack getHeldItem();
+public abstract ItemStack getEquipmentInSlot(int slotIn);    // 0=held, 1-4=armor slots
+public abstract ItemStack getCurrentArmor(int slotIn);
+public abstract void setCurrentItemOrArmor(int slotIn, ItemStack stack);
+public abstract ItemStack[] getInventory();
+public void renderBrokenItemStack(ItemStack stack)
 ```
 
----
+Attributes (vanilla's stat system):
 
-## 17. Mental shortcuts for navigating new code
-
-When you encounter a name in the codebase you don't recognize, the structure usually tells you where it lives:
-
-```
-   Starts with C##   →  Client-to-server packet
-                        net.minecraft.network.play.client.<name>
-
-   Starts with S##   →  Server-to-client packet
-                        net.minecraft.network.play.server.<name>
-
-   Starts with Gui   →  GUI screen or HUD element
-                        net.minecraft.client.gui.* (or subpackages)
-
-   Starts with Container  →  Inventory container
-                             net.minecraft.inventory.*
-
-   Starts with Entity     →  net.minecraft.entity.* (look for the
-                             matching subpackage: monster, passive,
-                             item, projectile, ...)
-
-   Starts with Block      →  net.minecraft.block.*
-
-   Starts with Item       →  net.minecraft.item.*
-
-   Starts with Render     →  net.minecraft.client.renderer.entity.*
-                             (or the entity's own renderer file)
-
-   Starts with Model      →  net.minecraft.client.model.*
-
-   Starts with TileEntity →  net.minecraft.tileentity.*
-
-   Starts with NBT        →  net.minecraft.nbt.*
-
-   Starts with Math/Vec/  →  net.minecraft.util.*
-   BlockPos/AABB/Enum
-   Facing/etc.
-
-   Ends with Packet       →  Look for the packet ID prefix (C##/S##)
-
-   Ends with Handler      →  An INetHandler implementation
-                             (NetHandlerPlayClient, NetHandlerLoginClient)
-
-   Ends with Provider     →  IChunkProvider / ISaveFormat / similar
+```java
+public IAttributeInstance getEntityAttribute(IAttribute attribute)
+public BaseAttributeMap getAttributeMap()
+public EnumCreatureAttribute getCreatureAttribute()
 ```
 
-The teaching point: vanilla naming is consistent enough that you can usually guess a class's location from its name alone. When grepping, prefer the full class name over partial substrings — `EntityPlayerSP` is unique while "Player" matches hundreds of files.
+Common shared attributes live in `net.minecraft.entity.SharedMonsterAttributes` as static fields: `movementSpeed`, `attackDamage`, `maxHealth`, `knockbackResistance`, `followRange`.
 
----
+Rotation:
 
-## Final note on usage
+```java
+public float getRotationYawHead()
+public void setRotationYawHead(float rotation)
+public void setRenderYawOffset(float offset)
+public void swingItem()
+protected void updateArmSwingProgress()
+```
 
-When pasting this into AI context along with the codebase map, the two files complement each other:
+#### EntityPlayer (`net.minecraft.entity.EntityPlayer`, 140 methods)
 
-The map (`MCP_1_8_9_CODEBASE_MAP.md`) is the *lexicon* — it tells the AI what symbols exist and what their signatures are. Without it, the AI will invent method names that don't exist or guess wrong parameter orders.
+Adds inventory, the food and capability systems, sleep, experience, and the attack pipeline. Fields:
 
-This diagram file is the *grammar* — it tells the AI how those symbols compose. Without it, the AI knows the parts but doesn't know which orders are correct, what's allowed in which thread, or which axis is which.
+```java
+public InventoryPlayer inventory;                  // The 36-slot inventory + 4 armor slots
+public Container inventoryContainer;               // The 2x2 crafting + inventory container
+public Container openContainer;                    // The current open GUI container (==inventoryContainer if none)
+protected FoodStats foodStats;                     // 0–20 hunger + saturation
+public PlayerCapabilities capabilities;            // disableDamage, isFlying, allowFlying, isCreativeMode, allowEdit, flySpeed, walkSpeed
+public float prevCameraYaw;
+public float cameraYaw;                            // Camera tilt during walking
+public int xpCooldown;                             // Cooldown after picking up XP
+public double prevChasingPosX, prevChasingPosY, prevChasingPosZ;
+public double chasingPosX, chasingPosY, chasingPosZ;
+public BlockPos playerLocation;                    // Where the player started this session
+public float renderOffsetX, renderOffsetY, renderOffsetZ;
+public int experienceLevel;
+public int experienceTotal;
+public float experience;
+public EntityFishHook fishEntity;
+```
 
-Used together they let the AI write code that compiles against vanilla, threads correctly, and produces packets the server will accept. A new task description, prepended with both files, should give an AI enough context to write substantive contributions without further searching the codebase.
+Item use (the "right click and hold" system):
+
+```java
+public ItemStack getItemInUse()
+public int getItemInUseCount()
+public boolean isUsingItem()
+public int getItemInUseDuration()
+public void stopUsingItem()
+public void clearItemInUse()
+public boolean isBlocking()                        // True iff holding a sword and right-clicking
+public void setItemInUse(ItemStack stack, int duration)
+```
+
+Combat and damage:
+
+```java
+public boolean attackEntityFrom(DamageSource source, float amount)
+public boolean canAttackPlayer(EntityPlayer other)
+public void attackTargetEntityWithCurrentItem(Entity targetEntity)
+public boolean interactWith(Entity targetEntity)
+public void onCriticalHit(Entity entityHit)
+public void onEnchantmentCritical(Entity entityHit)
+public void onKillEntity(EntityLivingBase entityLivingIn)
+public int getTotalArmorValue()
+public float getArmorVisibility()
+protected void damageArmor(float amount)
+```
+
+Inventory and equipment helpers:
+
+```java
+public ItemStack getCurrentEquippedItem()         // Same as inventory.getCurrentItem()
+public ItemStack getHeldItem()
+public ItemStack getCurrentArmor(int slotIn)
+public ItemStack[] getInventory()
+public ItemStack getEquipmentInSlot(int slotIn)
+public void setCurrentItemOrArmor(int slotIn, ItemStack stack)
+public void destroyCurrentEquippedItem()
+public EntityItem dropOneItem(boolean dropAll)
+public EntityItem dropPlayerItemWithRandomChoice(ItemStack stack, boolean unused)
+public EntityItem dropItem(ItemStack droppedItem, boolean dropAround, boolean traceItem)
+public InventoryEnderChest getInventoryEnderChest()
+public boolean replaceItemInInventory(int slot, ItemStack stack)
+```
+
+Block-breaking:
+
+```java
+public float getToolDigEfficiency(Block block)
+public boolean canHarvestBlock(Block block)
+public boolean canPlayerEdit(BlockPos pos, EnumFacing side, ItemStack stack)
+public boolean isAllowEdit()
+```
+
+GUI:
+
+```java
+public void openEditSign(TileEntitySign signTile)
+public void openEditCommandBlock(CommandBlockLogic logic)
+public void displayGui(IInteractionObject guiOwner)
+public void displayGUIBook(ItemStack bookStack)
+public void displayGUIChest(IInventory chestInventory)
+public void displayGUIHorse(EntityHorse horse, IInventory horseInventory)
+public void displayVillagerTradeGui(IMerchant villager)
+```
+
+Food, sleep, experience, scoreboard:
+
+```java
+public FoodStats getFoodStats()
+public boolean canEat(boolean ignoreHunger)
+public boolean shouldHeal()
+public void addExhaustion(float amount)
+public EntityPlayer.EnumStatus trySleep(BlockPos bedLocation)
+public void wakeUpPlayer(boolean immediately, boolean updateWorldFlag, boolean setSpawn)
+public boolean isPlayerSleeping()
+public boolean isPlayerFullyAsleep()
+public int getSleepTimer()
+public BlockPos getBedLocation()
+public boolean isSpawnForced()
+public void setSpawnPoint(BlockPos pos, boolean forced)
+public float getBedOrientationInDegrees()
+public void addExperience(int amount)
+public void addExperienceLevel(int levels)
+public void removeExperienceLevel(int levels)
+public int xpBarCap()
+public int getXPSeed()
+public int getScore()
+public void setScore(int p_85040_1_)
+public void addScore(int p_85039_1_)
+public void triggerAchievement(StatBase achievement)
+public void addStat(StatBase stat, int amount)
+public GameProfile getGameProfile()
+public boolean isUser()
+public abstract boolean isSpectator()
+public void setGameType(WorldSettings.GameType gameType)
+```
+
+Static helpers worth knowing:
+
+```java
+public static UUID getUUID(GameProfile profile)
+public static UUID getOfflineUUID(String username)
+public static BlockPos getBedSpawnLocation(World worldIn, BlockPos bedLocation, boolean forceSpawn)
+```
+
+#### EntityPlayerSP (`net.minecraft.client.entity.EntityPlayerSP`, the local player)
+
+This is the only entity in `worldObj.loadedEntityList` that represents *you*. It extends `AbstractClientPlayer` which extends `EntityPlayer`.
+
+Public fields:
+
+```java
+public final NetHandlerPlayClient sendQueue;       // Send packets via sendQueue.addToSendQueue(packet)
+public MovementInput movementInput;                // The current WASD/jump/sneak state
+public int sprintingTicksLeft;                     // Auto-sprint countdown after double-tap
+public float renderArmYaw, renderArmPitch;
+public float prevRenderArmYaw, prevRenderArmPitch;
+public float timeInPortal, prevTimeInPortal;
+```
+
+There are also private fields that exist for protocol bookkeeping. They're worth knowing about even though you can't read them without reflection or a mixin:
+
+```java
+private double lastReportedPosX, lastReportedPosY, lastReportedPosZ;  // Last position the server got
+private float lastReportedYaw, lastReportedPitch;                     // Last rotation the server got
+private boolean serverSneakState, serverSprintState;                  // Last C0B state sent
+private int positionUpdateTicks;                                      // Forces a full pos update every 20 ticks
+private boolean hasValidHealth;
+private String clientBrand;
+protected Minecraft mc;
+protected int sprintToggleTimer;
+private int horseJumpPowerCounter;
+private float horseJumpPower;
+```
+
+The methods unique to `EntityPlayerSP`:
+
+```java
+public boolean attackEntityFrom(DamageSource source, float amount)
+public void heal(float healAmount)
+public void mountEntity(Entity entityIn)
+public void onUpdate()
+public void onUpdateWalkingPlayer()                // The big motion-packet-sending method
+public EntityItem dropOneItem(boolean dropAll)
+public void sendChatMessage(String message)        // Sends C01PacketChatMessage
+public void swingItem()                            // Sends C0APacketAnimation
+public void respawnPlayer()                        // Sends C16PacketClientStatus(PERFORM_RESPAWN)
+protected void damageEntity(DamageSource damageSrc, float damageAmount)
+public void closeScreen()
+public void closeScreenAndDropStack()
+public void setPlayerSPHealth(float health)
+public void addStat(StatBase stat, int amount)
+public void sendPlayerAbilities()                  // Sends C13PacketPlayerAbilities
+public boolean isUser()
+protected void sendHorseJump()
+public void sendHorseInventory()
+public void setClientBrand(String brand)
+public String getClientBrand()
+public StatFileWriter getStatFileWriter()
+public void addChatComponentMessage(IChatComponent chatComponent)
+public void setSprinting(boolean sprinting)
+public void setXPStats(float currentXP, int maxXP, int level)
+public BlockPos getPosition()
+public boolean isServerWorld()
+public boolean isRidingHorse()
+public float getHorseJumpPower()
+public void onCriticalHit(Entity entityHit)
+public void onEnchantmentCritical(Entity entityHit)
+public boolean isSneaking()
+public void updateEntityActionState()
+protected boolean isCurrentViewEntity()
+public void onLivingUpdate()
+```
+
+#### EntityOtherPlayerMP (other players visible in your world)
+
+Tiny class — just enough to handle smoothed position interpolation from `S14`/`S18` packets. Methods:
+
+```java
+public boolean attackEntityFrom(DamageSource source, float amount)
+public void setPositionAndRotation2(double x, double y, double z, float yaw, float pitch, int incr, boolean p_10_)
+public void onUpdate()
+public void onLivingUpdate()
+public void setCurrentItemOrArmor(int slotIn, ItemStack stack)
+public void addChatMessage(IChatComponent component)
+public BlockPos getPosition()
+```
+
+#### InventoryPlayer (`net.minecraft.entity.player.InventoryPlayer`)
+
+This is what `player.inventory` is. Layout: indices 0–8 are the hotbar, 9–35 are the main inventory, with `mainInventory[36]` for the whole player area; `armorInventory[4]` holds boots, leggings, chestplate, helmet at indices 0, 1, 2, 3 respectively.
+
+Fields:
+
+```java
+public ItemStack[] mainInventory = new ItemStack[36];
+public ItemStack[] armorInventory = new ItemStack[4];
+public int currentItem;                  // Hotbar slot 0–8
+public EntityPlayer player;
+public boolean inventoryChanged;
+```
+
+Useful methods:
+
+```java
+public ItemStack getCurrentItem()
+public static int getHotbarSize()
+public int getFirstEmptyStack()
+public void setCurrentItem(Item item, int meta, boolean isMetaSpecific, boolean p_146030_4_)
+public void changeCurrentItem(int direction)         // Scroll wheel-style cycle
+public int clearMatchingItems(Item item, int meta, int removeCount, NBTTagCompound nbt)
+public void decrementAnimations()
+public boolean consumeInventoryItem(Item item)
+public boolean hasItem(Item item)
+public boolean addItemStackToInventory(ItemStack stack)
+public ItemStack decrStackSize(int index, int count)
+public ItemStack removeStackFromSlot(int index)
+public void setInventorySlotContents(int index, ItemStack stack)
+public float getStrVsBlock(Block block)
+public boolean canHeldItemHarvest(Block block)
+public ItemStack armorItemInSlot(int slotIn)
+public int getTotalArmorValue()
+public void damageArmor(float damage)
+public void dropAllItems()
+public boolean hasItemStack(ItemStack stack)
+public ItemStack getStackInSlot(int index)
+```
+
+### World (`net.minecraft.world.World`, 232 methods)
+
+`World` is the abstract base. On the client side, `WorldClient` (in `net.minecraft.client.multiplayer`) is the concrete subclass — that's what `mc.theWorld` is.
+
+Important public fields (instance-level, shared by both subclasses):
+
+```java
+public final List<Entity> loadedEntityList;
+public final List<TileEntity> loadedTileEntityList;
+public final List<TileEntity> tickableTileEntities;
+public final List<EntityPlayer> playerEntities;
+public final List<Entity> weatherEffects;
+public final Random rand;
+```
+
+Reading blocks:
+
+```java
+public IBlockState getBlockState(BlockPos pos)
+public boolean isAirBlock(BlockPos pos)
+public boolean isBlockLoaded(BlockPos pos)
+public boolean isBlockLoaded(BlockPos pos, boolean allowEmpty)
+public boolean isAreaLoaded(BlockPos center, int radius)
+public Chunk getChunkFromBlockCoords(BlockPos pos)
+public Chunk getChunkFromChunkCoords(int chunkX, int chunkZ)
+public int getLight(BlockPos pos)
+public int getLightFromNeighbors(BlockPos pos)
+public int getLightFor(EnumSkyBlock type, BlockPos pos)
+public float getLightBrightness(BlockPos pos)
+public boolean isDaytime()
+public boolean canSeeSky(BlockPos pos)
+public boolean canBlockSeeSky(BlockPos pos)
+public BlockPos getHeight(BlockPos pos)
+public BlockPos getTopSolidOrLiquidBlock(BlockPos pos)
+public boolean isBlockFullCube(BlockPos pos)
+public boolean isBlockNormalCube(BlockPos pos, boolean _default)
+```
+
+Writing blocks (server-authoritative — calling these on the client just predicts):
+
+```java
+public boolean setBlockState(BlockPos pos, IBlockState state)
+public boolean setBlockState(BlockPos pos, IBlockState state, int flags)
+public boolean setBlockToAir(BlockPos pos)
+public boolean destroyBlock(BlockPos pos, boolean dropBlock)
+public void markBlockForUpdate(BlockPos pos)
+public void markBlockRangeForRenderUpdate(BlockPos rangeMin, BlockPos rangeMax)
+```
+
+Raytracing — note the three overloads. The 3-arg version is what `Entity.rayTrace()` calls; the 5-arg is the most flexible:
+
+```java
+public MovingObjectPosition rayTraceBlocks(Vec3 start, Vec3 end)
+public MovingObjectPosition rayTraceBlocks(Vec3 start, Vec3 end, boolean stopOnLiquid)
+public MovingObjectPosition rayTraceBlocks(Vec3 start, Vec3 end, boolean stopOnLiquid, boolean ignoreBlockWithoutBoundingBox, boolean returnLastUncollidableBlock)
+```
+
+Collision queries (the AABB list is built by walking every block in the AABB region and asking each one for its collision box):
+
+```java
+public List<AxisAlignedBB> getCollidingBoundingBoxes(Entity entityIn, AxisAlignedBB bb)
+public List<AxisAlignedBB> getCollisionBoxes(AxisAlignedBB bb)
+public boolean checkNoEntityCollision(AxisAlignedBB bb)
+public boolean checkNoEntityCollision(AxisAlignedBB bb, Entity entityIn)
+public boolean checkBlockCollision(AxisAlignedBB bb)
+public boolean isAnyLiquid(AxisAlignedBB bb)
+public boolean isMaterialInBB(AxisAlignedBB bb, Material materialIn)
+public boolean isAABBInMaterial(AxisAlignedBB bb, Material materialIn)
+```
+
+Entity queries (these scan loaded chunks and filter — they are not free, but are unavoidable for AOE logic):
+
+```java
+public List<Entity> getEntitiesWithinAABBExcludingEntity(Entity entityIn, AxisAlignedBB bb)
+public List<Entity> getEntitiesInAABBexcluding(Entity entityIn, AxisAlignedBB bb, Predicate<? super Entity> predicate)
+public <T extends Entity> List<T> getEntities(Class<? extends T> entityType, Predicate<? super T> filter)
+public <T extends Entity> List<T> getPlayers(Class<? extends T> playerType, Predicate<? super T> filter)
+public <T extends Entity> List<T> getEntitiesWithinAABB(Class<? extends T> classEntity, AxisAlignedBB bb)
+public <T extends Entity> List<T> getEntitiesWithinAABB(Class<? extends T> clazz, AxisAlignedBB aabb, Predicate<? super T> filter)
+public <T extends Entity> T findNearestEntityWithinAABB(Class<? extends T> entityType, AxisAlignedBB aabb, T closestTo)
+public Entity getEntityByID(int id)
+public List<Entity> getLoadedEntityList()
+public int countEntities(Class<?> entityType)
+public EntityPlayer getClosestPlayerToEntity(Entity entityIn, double distance)
+public EntityPlayer getClosestPlayer(double x, double y, double z, double distance)
+public boolean isAnyPlayerWithinRangeAt(double x, double y, double z, double range)
+public EntityPlayer getPlayerEntityByName(String name)
+public EntityPlayer getPlayerEntityByUUID(UUID uuid)
+```
+
+Tile entities:
+
+```java
+public TileEntity getTileEntity(BlockPos pos)
+public void setTileEntity(BlockPos pos, TileEntity tileEntityIn)
+public void removeTileEntity(BlockPos pos)
+```
+
+Spawning, removing, sounds, particles:
+
+```java
+public boolean spawnEntityInWorld(Entity entityIn)
+public boolean addWeatherEffect(Entity entityIn)
+public void removeEntity(Entity entityIn)
+public void playSoundAtEntity(Entity entityIn, String name, float volume, float pitch)
+public void playSoundEffect(double x, double y, double z, String soundName, float volume, float pitch)
+public void spawnParticle(EnumParticleTypes type, double x, double y, double z, double offX, double offY, double offZ, int... params)
+```
+
+Weather, time, scoreboard, world border:
+
+```java
+public float getRainStrength(float delta)
+public float getThunderStrength(float delta)
+public boolean isRaining()
+public boolean isThundering()
+public long getWorldTime()
+public long getTotalWorldTime()
+public BlockPos getSpawnPoint()
+public Scoreboard getScoreboard()
+public WorldBorder getWorldBorder()
+public DifficultyInstance getDifficultyForLocation(BlockPos pos)
+public EnumDifficulty getDifficulty()
+public int getSeaLevel()
+public int getHeight()
+public WorldType getWorldType()
+public boolean isBlockPowered(BlockPos pos)
+public int getRedstonePower(BlockPos pos, EnumFacing facing)
+```
+
+`WorldClient` (`net.minecraft.client.multiplayer.WorldClient`) overrides a handful of these and adds:
+
+```java
+public void doPreChunk(int chunkX, int chunkZ, boolean loadChunk)
+public void addEntityToWorld(int entityID, Entity entityToSpawn)
+public Entity removeEntityFromWorld(int entityID)
+public boolean invalidateRegionAndSetBlock(BlockPos pos, IBlockState state)
+public void invalidateBlockReceiveRegion(int x1, int y1, int z1, int x2, int y2, int z2)
+public void removeAllEntities()
+public void playSoundAtPos(BlockPos pos, String soundName, float volume, float pitch, boolean distanceDelay)
+public void setWorldScoreboard(Scoreboard scoreboardIn)
+public void doVoidFogParticles(int posX, int posY, int posZ)
+```
+
+### Chunk (`net.minecraft.world.chunk.Chunk`)
+
+Chunks are 16×256×16. The client stores them in a `LongHashMap<Chunk>` inside `ChunkProviderClient`. Useful methods:
+
+```java
+public Block getBlock(int x, int y, int z)
+public Block getBlock(BlockPos pos)
+public IBlockState getBlockState(BlockPos pos)
+public IBlockState setBlockState(BlockPos pos, IBlockState state)
+public int getBlockMetadata(BlockPos pos)
+public int getHeight(BlockPos pos)
+public int getHeightValue(int x, int z)
+public int getTopFilledSegment()
+public ExtendedBlockStorage[] getBlockStorageArray()
+public int getBlockLightOpacity(BlockPos pos)
+public int getLightFor(EnumSkyBlock type, BlockPos pos)
+public boolean canSeeSky(BlockPos pos)
+public boolean isAtLocation(int x, int z)
+public void addEntity(Entity entity)
+public void removeEntity(Entity entity)
+public TileEntity getTileEntity(BlockPos pos, Chunk.EnumCreateEntityType type)
+public void addTileEntity(BlockPos pos, TileEntity tileEntity)
+public void removeTileEntity(BlockPos pos)
+public void getEntitiesWithinAABBForEntity(Entity entity, AxisAlignedBB aabb, List<Entity> listToFill, Predicate<? super Entity> filter)
+```
+
+### Container, Slot, IInventory
+
+The container system is how all GUI inventories work. When you open a chest, the server sends `S2DPacketOpenWindow` with a window ID, the client constructs the appropriate `Container` subclass, and from that point on every inventory click sends `C0EPacketClickWindow(windowId, slotId, button, mode, ...)` and the server responds with `S2FPacketSetSlot` / `S30PacketWindowItems` / `S32PacketConfirmTransaction`.
+
+`Container` (`net.minecraft.inventory.Container`) holds:
+
+```java
+public List<Slot> inventorySlots;                  // All slots, indexed by slotId
+public List<ItemStack> inventoryItemStacks;        // Current items at each slot (parallel list)
+
+protected Slot addSlotToContainer(Slot slotIn)
+public void onCraftGuiOpened(ICrafting listener)
+public List<ItemStack> getInventory()
+public void detectAndSendChanges()
+public Slot getSlot(int slotId)
+public Slot getSlotFromInventory(IInventory inv, int slotIn)
+public ItemStack slotClick(int slotId, int clickedButton, int mode, EntityPlayer player)
+public ItemStack transferStackInSlot(EntityPlayer player, int index)    // Shift-click logic
+public boolean canMergeSlot(ItemStack stack, Slot slot)
+public void onContainerClosed(EntityPlayer player)
+public void putStackInSlot(int slotID, ItemStack stack)
+public void putStacksInSlots(ItemStack[] stacks)
+public short getNextTransactionID(InventoryPlayer playerInv)
+public abstract boolean canInteractWith(EntityPlayer player);
+protected boolean mergeItemStack(ItemStack stack, int startIndex, int endIndex, boolean reverseDirection)
+public static int extractDragMode(int p_94529_0_)
+public static int getDragEvent(int p_94532_0_)
+```
+
+`Slot` (`net.minecraft.inventory.Slot`):
+
+```java
+public Slot(IInventory inventoryIn, int index, int xPosition, int yPosition)
+public ItemStack getStack()
+public boolean getHasStack()
+public void putStack(ItemStack stack)
+public boolean isItemValid(ItemStack stack)
+public int getSlotStackLimit()
+public int getItemStackLimit(ItemStack stack)
+public String getSlotTexture()
+public ItemStack decrStackSize(int amount)
+public boolean canTakeStack(EntityPlayer player)
+public boolean canBeHovered()
+public boolean isHere(IInventory inv, int slotIn)
+public void onPickupFromSlot(EntityPlayer player, ItemStack stack)
+public void onSlotChanged()
+```
+
+`IInventory` is the data interface implemented by every backing store (the player's main inventory, a chest, a furnace, etc.):
+
+```java
+public interface IInventory extends IWorldNameable {
+    int getSizeInventory();
+    ItemStack getStackInSlot(int index);
+    ItemStack decrStackSize(int index, int count);
+    ItemStack removeStackFromSlot(int index);
+    void setInventorySlotContents(int index, ItemStack stack);
+    int getInventoryStackLimit();
+    void markDirty();
+    boolean isUseableByPlayer(EntityPlayer player);
+    void openInventory(EntityPlayer player);
+    void closeInventory(EntityPlayer player);
+    boolean isItemValidForSlot(int index, ItemStack stack);
+    int getField(int id);
+    void setField(int id, int value);
+    int getFieldCount();
+    void clear();
+}
+```
+
+## The protocol layer
+
+Now we move outward to the network layer. The Minecraft protocol is stateful — at any moment the connection is in one of four states defined by `EnumConnectionState`: `HANDSHAKING`, `STATUS`, `LOGIN`, or `PLAY`. The state determines which packet IDs are valid in each direction.
+
+For a normal multiplayer session the lifecycle is:
+
+1. Client opens TCP to the server, connection state is `HANDSHAKING`.
+2. Client sends `C00Handshake(version, host, port, nextState)`. `nextState` is 1 for server list ping or 2 for login.
+3. State transitions to `STATUS` or `LOGIN`.
+4. Through `LOGIN`, encryption (`S01PacketEncryptionRequest` / `C01PacketEncryptionResponse`) and compression (`S03PacketEnableCompression`) negotiate, then `S02PacketLoginSuccess` arrives.
+5. State transitions to `PLAY`. The server sends `S01PacketJoinGame` with your entity ID, gamemode, dimension, difficulty.
+6. From here on you exchange play-state packets every tick (20 ticks per second).
+
+### Packet (`net.minecraft.network.Packet`)
+
+The base interface:
+
+```java
+public interface Packet<T extends INetHandler> {
+    void readPacketData(PacketBuffer buf) throws IOException;
+    void writePacketData(PacketBuffer buf) throws IOException;
+    void processPacket(T handler);
+}
+```
+
+`processPacket` is the dispatch point — every packet's implementation simply calls `handler.handleXxx(this)`. For client-bound packets `T` is `INetHandlerPlayClient` (whose only implementation is `NetHandlerPlayClient`), and for server-bound packets `T` is `INetHandlerPlayServer` (implemented on the dedicated server side, not on the client).
+
+### NetworkManager (`net.minecraft.network.NetworkManager`)
+
+This is the Netty channel wrapper. There is one `NetworkManager` per connection. The flow when you call `sendPacket`:
+
+```java
+public void sendPacket(Packet packetIn)        // The send entry point
+public void sendPacket(Packet packetIn, GenericFutureListener<...> listener, GenericFutureListener<...>... listeners)
+private void dispatchPacket(Packet inPacket, GenericFutureListener<...>[] futureListeners)
+private void flushOutboundQueue()
+public void processReceivedPackets()           // Called from Minecraft.runTick
+protected void channelRead0(ChannelHandlerContext ctx, Packet packet)
+```
+
+Other useful methods:
+
+```java
+public void setNetHandler(INetHandler handler)
+public void setConnectionState(EnumConnectionState newState)
+public SocketAddress getRemoteAddress()
+public void closeChannel(IChatComponent message)
+public boolean isLocalChannel()
+public static NetworkManager createNetworkManagerAndConnect(InetAddress address, int serverPort, boolean useNativeTransport)
+public static NetworkManager provideLocalClient(SocketAddress address)
+public void enableEncryption(SecretKey key)
+public boolean getIsencrypted()
+public boolean isChannelOpen()
+public boolean hasNoChannel()
+public INetHandler getNetHandler()
+public IChatComponent getExitMessage()
+public void disableAutoRead()
+public void setCompressionTreshold(int treshold)
+public void checkDisconnected()
+```
+
+The `channelRead0` method is invoked from the Netty I/O thread. For inbound `PLAY` packets, the implementations of `processPacket` call into `NetHandlerPlayClient.handleXxx`, but those handlers always re-schedule the work onto the main client thread by calling `PacketThreadUtil.checkThreadAndEnqueue(this, packet, mc)`. That call throws `ThreadQuickExitException` the first time through (to bail out of the Netty-thread invocation) and then later calls the same handler again from the main thread. So when you read a `handleXxx` method body, you can assume `mc.theWorld` and `mc.thePlayer` are safe to touch.
+
+### PacketBuffer (`net.minecraft.network.PacketBuffer`, 167 methods)
+
+The buffer is a Netty `ByteBuf` wrapper with Minecraft-specific helpers. The protocol-specific ones you will use when writing or reading a packet:
+
+```java
+public PacketBuffer(ByteBuf wrapped)
+public static int getVarIntSize(int input)
+public int readVarIntFromBuffer()
+public long readVarLong()
+public void writeVarIntToBuffer(int input)
+public void writeVarLong(long value)
+public void writeByteArray(byte[] array)
+public byte[] readByteArray()
+public BlockPos readBlockPos()
+public void writeBlockPos(BlockPos pos)
+public IChatComponent readChatComponent() throws IOException
+public void writeChatComponent(IChatComponent component) throws IOException
+public <T extends Enum<T>> T readEnumValue(Class<T> enumClass)
+public void writeEnumValue(Enum<?> value)
+public void writeUuid(UUID uuid)
+public UUID readUuid()
+public void writeNBTTagCompoundToBuffer(NBTTagCompound nbt)
+public NBTTagCompound readNBTTagCompoundFromBuffer() throws IOException
+public void writeItemStackToBuffer(ItemStack stack)
+public ItemStack readItemStackFromBuffer() throws IOException
+public String readStringFromBuffer(int maxLength)
+public PacketBuffer writeString(String string)
+```
+
+Plus every primitive `readByte/Short/Int/Long/Float/Double` and `writeByte/Short/...` you'd expect from a `ByteBuf`. Don't reinvent VarInt — `readVarIntFromBuffer` / `writeVarIntToBuffer` already handles the zigzag-free 7-bit encoding the protocol uses for all packet IDs and lengths.
+
+### Client → Server packets (`net.minecraft.network.play.client`, 23 packets)
+
+Each packet's full constructor parameters are shown; this is what you'd pass to `new C03PacketPlayer(...)`:
+
+`C00PacketKeepAlive(int id)` — reply to S00, the server pings every 20 seconds and expects this back within 30.
+
+`C01PacketChatMessage(String message)` — chat or `/commands` (server interprets a leading `/`).
+
+`C02PacketUseEntity` — attack or interact. Three constructors:
+```java
+C02PacketUseEntity(Entity targetEntity, C02PacketUseEntity.Action action)         // INTERACT or ATTACK
+C02PacketUseEntity(Entity targetEntity, Vec3 hitVec)                              // INTERACT_AT
+// Action enum: INTERACT, ATTACK, INTERACT_AT
+```
+Getters: `getEntityFromWorld(World)`, `getAction()`, `getHitVec()`.
+
+`C03PacketPlayer` is the motion packet family — there are four classes here, an inheritance tree. The base sends only `onGround`; subclasses add position, rotation, or both:
+
+```java
+C03PacketPlayer(boolean isOnGround)
+C03PacketPlayer.C04PacketPlayerPosition(double posX, double posY, double posZ, boolean isOnGround)
+C03PacketPlayer.C05PacketPlayerLook(float playerYaw, float playerPitch, boolean isOnGround)
+C03PacketPlayer.C06PacketPlayerPosLook(double playerX, double playerY, double playerZ, float playerYaw, float playerPitch, boolean playerIsOnGround)
+```
+
+Protected fields shared by all four:
+
+```java
+protected double x, y, z;
+protected float yaw, pitch;
+protected boolean onGround;
+protected boolean moving;                  // True for C04, C06
+protected boolean rotating;                // True for C05, C06
+```
+
+Getters: `getPositionX/Y/Z`, `getYaw`, `getPitch`, `isOnGround`, `isMoving`, `getRotating`. There is also a `setMoving(boolean)` setter on the base class.
+
+`C07PacketPlayerDigging(C07PacketPlayerDigging.Action status, BlockPos pos, EnumFacing facing)` — used for block breaking *and* dropping items *and* releasing bows. The `Action` enum:
+```java
+START_DESTROY_BLOCK, ABORT_DESTROY_BLOCK, STOP_DESTROY_BLOCK,
+DROP_ALL_ITEMS, DROP_ITEM, RELEASE_USE_ITEM
+```
+Getters: `getPosition()`, `getFacing()`, `getStatus()`.
+
+`C08PacketPlayerBlockPlacement` — right-click. Two constructor patterns are used:
+```java
+C08PacketPlayerBlockPlacement(BlockPos position, int placedBlockDirection, ItemStack stack, float facingX, float facingY, float facingZ)
+C08PacketPlayerBlockPlacement(ItemStack stack)   // For right-click in air; uses BlockPos(-1,-1,-1) and direction 255
+```
+Fields and getters: `getPosition()`, `getPlacedBlockDirection()` (0–5 = EnumFacing index, 255 = air), `getStack()`, `getPlacedBlockOffsetX/Y/Z()`.
+
+`C09PacketHeldItemChange(int slotId)` — slotId 0–8 for hotbar.
+
+`C0APacketAnimation()` — empty body, just swings the arm.
+
+`C0BPacketEntityAction(Entity entity, C0BPacketEntityAction.Action action)` or `(Entity, Action, int auxData)`. The `Action` enum:
+```java
+START_SNEAKING, STOP_SNEAKING, STOP_SLEEPING, START_SPRINTING, STOP_SPRINTING, RIDING_JUMP, OPEN_INVENTORY
+```
+`auxData` is used only for horse jump strength.
+
+`C0CPacketInput(float strafe, float forward, boolean jump, boolean sneak)` — only sent while riding an entity that accepts input (boat, horse).
+
+`C0DPacketCloseWindow(int windowId)`.
+
+`C0EPacketClickWindow(int windowId, int slotId, int usedButton, int mode, ItemStack clickedItem, short actionNumber)`. The `mode` parameter is what distinguishes the click type: 0=click, 1=shift-click, 2=hotbar key, 3=middle-click, 4=drop, 5=drag, 6=double-click.
+
+`C0FPacketConfirmTransaction(int windowId, short uid, boolean accepted)` — reply to S32 when the server asks for confirmation of an inventory action.
+
+`C10PacketCreativeInventoryAction(int slotId, ItemStack stack)`.
+
+`C11PacketEnchantItem(int windowId, int button)`.
+
+`C12PacketUpdateSign(BlockPos pos, IChatComponent[] lines)`.
+
+`C13PacketPlayerAbilities(PlayerCapabilities capabilities)` — toggles creative-flight, fly-allowed.
+
+`C14PacketTabComplete(String message, BlockPos lookingAt)`.
+
+`C15PacketClientSettings(String lang, int renderDistance, EntityPlayer.EnumChatVisibility chatVis, boolean chatColors, int skinFlags)`.
+
+`C16PacketClientStatus(C16PacketClientStatus.EnumState state)`. `EnumState`: `PERFORM_RESPAWN, REQUEST_STATS, OPEN_INVENTORY_ACHIEVEMENT`.
+
+`C17PacketCustomPayload(String channel, PacketBuffer data)` — for plugin channels like `MC|Brand`.
+
+`C18PacketSpectate(UUID id)`.
+
+`C19PacketResourcePackStatus(String hash, C19PacketResourcePackStatus.Action action)`.
+
+### Server → Client packets (`net.minecraft.network.play.server`, 71 packets)
+
+For S→C packets, the relevant signature is the `handleXxx` method on `NetHandlerPlayClient`. The full list:
+
+```java
+public void handleJoinGame(S01PacketJoinGame packetIn)
+public void handleSpawnObject(S0EPacketSpawnObject packetIn)
+public void handleSpawnExperienceOrb(S11PacketSpawnExperienceOrb packetIn)
+public void handleSpawnGlobalEntity(S2CPacketSpawnGlobalEntity packetIn)
+public void handleSpawnPainting(S10PacketSpawnPainting packetIn)
+public void handleEntityVelocity(S12PacketEntityVelocity packetIn)
+public void handleEntityMetadata(S1CPacketEntityMetadata packetIn)
+public void handleSpawnPlayer(S0CPacketSpawnPlayer packetIn)
+public void handleEntityTeleport(S18PacketEntityTeleport packetIn)
+public void handleHeldItemChange(S09PacketHeldItemChange packetIn)
+public void handleEntityMovement(S14PacketEntity packetIn)      // Also dispatches S15/S16/S17 subclasses
+public void handleEntityHeadLook(S19PacketEntityHeadLook packetIn)
+public void handleDestroyEntities(S13PacketDestroyEntities packetIn)
+public void handlePlayerPosLook(S08PacketPlayerPosLook packetIn)
+public void handleMultiBlockChange(S22PacketMultiBlockChange packetIn)
+public void handleChunkData(S21PacketChunkData packetIn)
+public void handleBlockChange(S23PacketBlockChange packetIn)
+public void handleDisconnect(S40PacketDisconnect packetIn)
+public void handleCollectItem(S0DPacketCollectItem packetIn)
+public void handleChat(S02PacketChat packetIn)
+public void handleAnimation(S0BPacketAnimation packetIn)
+public void handleUseBed(S0APacketUseBed packetIn)
+public void handleSpawnMob(S0FPacketSpawnMob packetIn)
+public void handleTimeUpdate(S03PacketTimeUpdate packetIn)
+public void handleSpawnPosition(S05PacketSpawnPosition packetIn)
+public void handleEntityAttach(S1BPacketEntityAttach packetIn)
+public void handleEntityStatus(S19PacketEntityStatus packetIn)
+public void handleUpdateHealth(S06PacketUpdateHealth packetIn)
+public void handleSetExperience(S1FPacketSetExperience packetIn)
+public void handleRespawn(S07PacketRespawn packetIn)
+public void handleExplosion(S27PacketExplosion packetIn)
+public void handleOpenWindow(S2DPacketOpenWindow packetIn)
+public void handleSetSlot(S2FPacketSetSlot packetIn)
+public void handleConfirmTransaction(S32PacketConfirmTransaction packetIn)
+public void handleWindowItems(S30PacketWindowItems packetIn)
+public void handleSignEditorOpen(S36PacketSignEditorOpen packetIn)
+public void handleUpdateSign(S33PacketUpdateSign packetIn)
+public void handleUpdateTileEntity(S35PacketUpdateTileEntity packetIn)
+public void handleWindowProperty(S31PacketWindowProperty packetIn)
+public void handleEntityEquipment(S04PacketEntityEquipment packetIn)
+public void handleCloseWindow(S2EPacketCloseWindow packetIn)
+public void handleBlockAction(S24PacketBlockAction packetIn)
+public void handleBlockBreakAnim(S25PacketBlockBreakAnim packetIn)
+public void handleMapChunkBulk(S26PacketMapChunkBulk packetIn)
+public void handleChangeGameState(S2BPacketChangeGameState packetIn)
+public void handleMaps(S34PacketMaps packetIn)
+public void handleEffect(S28PacketEffect packetIn)
+public void handleStatistics(S37PacketStatistics packetIn)
+public void handleEntityEffect(S1DPacketEntityEffect packetIn)
+public void handleCombatEvent(S42PacketCombatEvent packetIn)
+public void handleServerDifficulty(S41PacketServerDifficulty packetIn)
+public void handleCamera(S43PacketCamera packetIn)
+public void handleWorldBorder(S44PacketWorldBorder packetIn)
+public void handleTitle(S45PacketTitle packetIn)
+public void handleSetCompressionLevel(S46PacketSetCompressionLevel packetIn)
+public void handlePlayerListHeaderFooter(S47PacketPlayerListHeaderFooter packetIn)
+public void handleRemoveEntityEffect(S1EPacketRemoveEntityEffect packetIn)
+public void handlePlayerListItem(S38PacketPlayerListItem packetIn)
+public void handleKeepAlive(S00PacketKeepAlive packetIn)
+public void handlePlayerAbilities(S39PacketPlayerAbilities packetIn)
+public void handleTabComplete(S3APacketTabComplete packetIn)
+public void handleSoundEffect(S29PacketSoundEffect packetIn)
+public void handleResourcePack(S48PacketResourcePackSend packetIn)
+public void handleEntityNBT(S49PacketUpdateEntityNBT packetIn)
+public void handleCustomPayload(S3FPacketCustomPayload packetIn)
+public void handleScoreboardObjective(S3BPacketScoreboardObjective packetIn)
+public void handleUpdateScore(S3CPacketUpdateScore packetIn)
+public void handleDisplayScoreboard(S3DPacketDisplayScoreboard packetIn)
+public void handleTeams(S3EPacketTeams packetIn)
+public void handleParticles(S2APacketParticles packetIn)
+public void handleEntityProperties(S20PacketEntityProperties packetIn)
+```
+
+The packets you'll inspect the fields of most often:
+
+`S08PacketPlayerPosLook` — the teleport/setback. Fields and getters:
+```java
+private double x, y, z;
+private float yaw, pitch;
+private Set<S08PacketPlayerPosLook.EnumFlags> field_179835_f;
+public double getX(), getY(), getZ();
+public float getYaw(), getPitch();
+```
+The `EnumFlags` set marks which axes are relative (server may send a teleport that's "add 5 to X, set Y absolutely").
+
+`S12PacketEntityVelocity` — knockback. The constructor accepts blocks/tick values but stores them as `int = velocity * 8000` (clamped to ±3.9 blocks/tick before scaling), so `getMotionX() / 8000.0` recovers blocks/tick:
+```java
+private int entityID, motionX, motionY, motionZ;
+public int getEntityID();
+public int getMotionX(), getMotionY(), getMotionZ();
+```
+
+`S01PacketJoinGame` — sent once on world entry. Carries `entityId, hardcoreMode, gameType, dimension, difficulty, maxPlayers, worldType, reducedDebugInfo`.
+
+`S0CPacketSpawnPlayer`, `S0FPacketSpawnMob`, `S0EPacketSpawnObject` — entity spawns; each carries a server-side entity ID, position, motion (where applicable), and metadata.
+
+`S14PacketEntity` is special: it's a base class with three inner subclasses for delta-encoded position updates:
+- `S14PacketEntity.S15PacketEntityRelMove` (relative move only, ≤4 blocks delta)
+- `S14PacketEntity.S16PacketEntityLook` (rotation only)
+- `S14PacketEntity.S17PacketEntityLookMove` (both)
+For larger moves the server sends `S18PacketEntityTeleport` (absolute).
+
+`S22PacketMultiBlockChange` — up to several block updates in one chunk in a single packet.
+
+`S23PacketBlockChange` — single block update.
+
+`S2BPacketChangeGameState` — gamemode change, rain on/off, "demo" notifications.
+
+`S40PacketDisconnect` — kick.
+
+`S46PacketSetCompressionLevel` — sent during login to enable packet compression above a threshold.
+
+### The packet registry
+
+`EnumConnectionState` contains the full mapping of packet ID to class. Each state has an inner block registering all its packets:
+
+```java
+public enum EnumConnectionState {
+    HANDSHAKING(-1) { { this.registerPacket(EnumPacketDirection.SERVERBOUND, C00Handshake.class); } },
+    PLAY(0)        { { /* ~94 lines of registerPacket calls for play state */ } },
+    STATUS(1)      { { /* ... */ } },
+    LOGIN(2)       { { /* ... */ } };
+}
+```
+
+`EnumPacketDirection` is the trivial `SERVERBOUND, CLIENTBOUND` enum.
+
+## The client runtime layer
+
+### Minecraft (`net.minecraft.client.Minecraft`, 115 methods)
+
+The game singleton. Almost everything else can be reached from here. `Minecraft.getMinecraft()` returns the instance.
+
+The publicly visible state — these fields are mutable and not synchronized, so always read/write from the main client thread:
+
+```java
+public final FrameTimer frameTimer;
+public final Profiler mcProfiler;
+public PlayerControllerMP playerController;
+public WorldClient theWorld;                          // null on main menu
+public EntityPlayerSP thePlayer;                      // null on main menu
+public GuiScreen currentScreen;                       // null when in-game with no GUI
+public EntityRenderer entityRenderer;
+public MovingObjectPosition objectMouseOver;          // Crosshair raytrace result
+public GameSettings gameSettings;
+public GuiIngame ingameGUI;
+public int displayWidth, displayHeight;               // Raw window pixels
+public int rightClickDelayTimer;
+public boolean skipRenderWorld;
+public int leftClickCounter;
+public boolean inGameHasFocus;
+public boolean renderChunksMany;
+public LoadingScreenRenderer loadingScreen;
+public String debug;
+public boolean debugWireframe;
+public long mcDataDir;
+```
+
+Private fields you usually access via accessors:
+
+```java
+private Timer timer;                                  // mc.getMinecraft() — used by EntityRenderer
+private NetworkManager myNetworkManager;
+private final Session session;
+private RenderManager renderManager;
+private RenderItem renderItem;
+private TextureManager renderEngine;
+```
+
+Methods grouped by purpose. Game lifecycle:
+
+```java
+public Minecraft(GameConfiguration gameConfig)
+public void run()
+public void crashed(CrashReport crash)
+public void displayCrashReport(CrashReport report)
+public void shutdownMinecraftApplet()
+public void shutdown()
+public void freeMemory()
+public void refreshResources()
+public ListenableFuture<Object> scheduleResourcesRefresh()
+```
+
+The tick / render loop:
+
+```java
+public void runTick() throws IOException             // The per-tick main loop (~50ms)
+private void runGameLoop() throws IOException        // The outer loop with frame-rate logic
+public void updateDisplay()
+```
+
+Worlds and connection:
+
+```java
+public void launchIntegratedServer(String folderName, String worldName, WorldSettings worldSettings)
+public void loadWorld(WorldClient world)
+public void loadWorld(WorldClient world, String loadingMessage)
+public void setDimensionAndSpawnPlayer(int dimension)
+public NetHandlerPlayClient getNetHandler()
+public void setServerData(ServerData serverData)
+public ServerData getCurrentServerData()
+public boolean isIntegratedServerRunning()
+public boolean isSingleplayer()
+public IntegratedServer getIntegratedServer()
+public static void stopIntegratedServer()
+public final boolean isDemo()
+public boolean isConnectedToRealms()
+public void setConnectedToRealms(boolean isConnected)
+```
+
+GUI screen switching:
+
+```java
+public void displayGuiScreen(GuiScreen screen)       // Pass null to close all GUIs
+public void displayInGameMenu()
+public void setIngameFocus()
+public void setIngameNotInFocus()
+public boolean isFullScreen()
+public void toggleFullscreen()
+public boolean isGuiEnabled()
+public static boolean isFancyGraphicsEnabled()
+public static boolean isAmbientOcclusionEnabled()
+public boolean isUnicode()
+```
+
+Input:
+
+```java
+private void clickMouse()
+private void rightClickMouse()
+private void middleClickMouse()
+public void dispatchKeypresses()
+```
+
+Threading and scheduling — these are the safe way to enqueue work from non-main threads:
+
+```java
+public <V> ListenableFuture<V> addScheduledTask(Callable<V> callable)
+public ListenableFuture<Object> addScheduledTask(Runnable runnable)
+public boolean isCallingFromMinecraftThread()
+```
+
+Accessors:
+
+```java
+public static Minecraft getMinecraft()
+public static long getSystemTime()
+public Session getSession()
+public Proxy getProxy()
+public TextureManager getTextureManager()
+public IResourceManager getResourceManager()
+public ResourcePackRepository getResourcePackRepository()
+public LanguageManager getLanguageManager()
+public TextureMap getTextureMapBlocks()
+public SoundHandler getSoundHandler()
+public MusicTicker getMusicTicker()
+public ISaveFormat getSaveLoader()
+public Entity getRenderViewEntity()                  // Usually thePlayer
+public void setRenderViewEntity(Entity entity)       // Used by F5/spectate camera switching
+public BlockRendererDispatcher getBlockRendererDispatcher()
+public RenderManager getRenderManager()
+public RenderItem getRenderItem()
+public ItemRenderer getItemRenderer()
+public FrameTimer getFrameTimer()
+public Framebuffer getFramebuffer()
+public IStream getTwitchStream()
+public MinecraftSessionService getSessionService()
+public SkinManager getSkinManager()
+public int getLimitFramerate()
+public boolean isFramerateLimitBelowMax()
+public boolean isGamePaused()
+public String getVersion()
+public static int getDebugFPS()
+public boolean isJava64bit()
+```
+
+### PlayerControllerMP (`net.minecraft.client.multiplayer.PlayerControllerMP`)
+
+This is `mc.playerController`. It owns the "what the player is currently doing" state — block-breaking progress, current gamemode — and routes left-click / right-click / window-click into the appropriate packets.
+
+Fields:
+
+```java
+private final Minecraft mc;
+private final NetHandlerPlayClient netClientHandler;
+private BlockPos currentBlock;                       // Position of block currently being mined
+private ItemStack currentItemHittingBlock;
+public float curBlockDamageMP;                       // 0.0–1.0 progress
+private float stepSoundTickCounter;
+private int blockHitDelay;
+private boolean isHittingBlock;
+private WorldSettings.GameType currentGameType;
+private int currentPlayerItem;                       // Slot the server thinks you have selected
+```
+
+Methods:
+
+```java
+public PlayerControllerMP(Minecraft mcIn, NetHandlerPlayClient netHandler)
+public static void clickBlockCreative(Minecraft mc, PlayerControllerMP playerController, BlockPos pos, EnumFacing facing)
+public void setPlayerCapabilities(EntityPlayer player)
+public boolean isSpectator()
+public void setGameType(WorldSettings.GameType type)
+public void flipPlayer(EntityPlayer player)
+public boolean shouldDrawHUD()
+public boolean onPlayerDestroyBlock(BlockPos pos, EnumFacing side)        // Final-tick break: sends C07 STOP_DESTROY_BLOCK
+public boolean clickBlock(BlockPos loc, EnumFacing face)                   // Start break: sends C07 START_DESTROY_BLOCK
+public void resetBlockRemoving()                                           // Sends C07 ABORT_DESTROY_BLOCK
+public boolean onPlayerDamageBlock(BlockPos posBlock, EnumFacing facing)   // Per-tick block damage; sends C0A
+public float getBlockReachDistance()                                       // 5.0 survival, 6.0 creative
+public void updateController()
+private boolean isHittingPosition(BlockPos pos)
+private void syncCurrentPlayItem()                                         // Send C09 if slot differs from server
+public boolean onPlayerRightClick(EntityPlayerSP player, WorldClient world, ItemStack heldStack, BlockPos hitPos, EnumFacing side, Vec3 hitVec)
+public boolean sendUseItem(EntityPlayer player, World world, ItemStack itemStack)
+public EntityPlayerSP func_178892_a(World world, StatFileWriter statWriter)
+public void attackEntity(EntityPlayer player, Entity targetEntity)         // C02 ATTACK + attackTargetEntityWithCurrentItem
+public boolean interactWithEntitySendPacket(EntityPlayer player, Entity targetEntity)   // C02 INTERACT
+public boolean isPlayerRightClickingOnEntity(EntityPlayer player, Entity entityIn, MovingObjectPosition movingObject)
+public ItemStack windowClick(int windowId, int slotId, int mouseButtonClicked, int mode, EntityPlayer player)
+public void sendEnchantPacket(int windowID, int button)
+public void sendSlotPacket(ItemStack stack, int slotId)
+public void sendPacketDropItem(ItemStack stack)
+public void onStoppedUsingItem(EntityPlayer player)                        // C07 RELEASE_USE_ITEM
+public boolean gameIsSurvivalOrAdventure()
+public boolean isNotCreative()
+public boolean isInCreativeMode()
+public boolean extendedReach()                                             // True in creative
+public boolean isRidingHorse()
+public boolean isSpectatorMode()
+public WorldSettings.GameType getCurrentGameType()
+public boolean getIsHittingBlock()
+```
+
+### NetHandlerPlayClient (`net.minecraft.client.network.NetHandlerPlayClient`)
+
+The S→C dispatcher. It also exposes the send method that almost everything on the client uses to talk to the server:
+
+```java
+public void addToSendQueue(Packet packet)            // → NetworkManager.sendPacket
+public NetworkManager getNetworkManager()
+public Collection<NetworkPlayerInfo> getPlayerInfoMap()
+public NetworkPlayerInfo getPlayerInfo(UUID id)
+public NetworkPlayerInfo getPlayerInfo(String name)
+public GameProfile getGameProfile()
+public void cleanup()
+public void onDisconnect(IChatComponent reason)
+```
+
+Plus all 71 `handleXxx` methods listed in the protocol section above.
+
+### GameSettings (`net.minecraft.client.settings.GameSettings`)
+
+`mc.gameSettings`. All public mutable fields you can read and write:
+
+```java
+public float mouseSensitivity;
+public boolean invertMouse;
+public int renderDistanceChunks;
+public boolean viewBobbing;
+public boolean anaglyph;
+public boolean fboEnable;
+public int limitFramerate;
+public int clouds;
+public boolean fancyGraphics;
+public int ambientOcclusion;
+public EntityPlayer.EnumChatVisibility chatVisibility;
+public boolean chatColours, chatLinks, chatLinksPrompt;
+public float chatOpacity;
+public boolean snooperEnabled;
+public boolean fullScreen;
+public boolean enableVsync;
+public boolean useVbo;
+public boolean allowBlockAlternatives;
+public boolean reducedDebugInfo;
+public boolean hideServerAddress;
+public boolean advancedItemTooltips;
+public boolean pauseOnLostFocus;
+public boolean touchscreen;
+public int overrideWidth, overrideHeight;
+public boolean heldItemTooltips;
+public float chatScale, chatWidth, chatHeightUnfocused, chatHeightFocused;
+public boolean showInventoryAchievementHint;
+public int mipmapLevels;
+public boolean useNativeTransport;
+public boolean entityShadows;
+public boolean realmsNotifications;
+
+// Keybinds — all KeyBinding instances
+public KeyBinding keyBindForward;          // W (LWJGL code 17)
+public KeyBinding keyBindLeft;             // A (30)
+public KeyBinding keyBindBack;             // S (31)
+public KeyBinding keyBindRight;            // D (32)
+public KeyBinding keyBindJump;             // Space (57)
+public KeyBinding keyBindSneak;            // L-Shift (42)
+public KeyBinding keyBindSprint;           // L-Ctrl (29)
+public KeyBinding keyBindInventory;        // E (18)
+public KeyBinding keyBindUseItem;          // Right click (-99)
+public KeyBinding keyBindDrop;             // Q (16)
+public KeyBinding keyBindAttack;           // Left click (-100)
+public KeyBinding keyBindPickBlock;        // Middle click (-98)
+public KeyBinding keyBindChat;             // T (20)
+public KeyBinding keyBindPlayerList;       // Tab (15)
+public KeyBinding keyBindCommand;          // / (53)
+public KeyBinding keyBindScreenshot;       // F2 (60)
+public KeyBinding keyBindTogglePerspective; // F5 (63)
+public KeyBinding keyBindSmoothCamera;
+public KeyBinding keyBindFullscreen;       // F11 (87)
+public KeyBinding keyBindSpectatorOutlines;
+public KeyBinding[] keyBindsHotbar;        // 1-9
+public KeyBinding[] keyBindings;           // All of the above flattened
+
+public EnumDifficulty difficulty;
+```
+
+### KeyBinding (`net.minecraft.client.settings.KeyBinding`)
+
+```java
+public KeyBinding(String description, int keyCode, String category)
+public boolean isKeyDown()                  // Held right now
+public boolean isPressed()                  // Pressed since last call (consumes the press count)
+public int getKeyCode()
+public void setKeyCode(int keyCode)
+public String getKeyDescription()
+public int getKeyCodeDefault()
+public String getKeyCategory()
+public static void onTick(int keyCode)
+public static void setKeyBindState(int keyCode, boolean pressed)
+public static void unPressAllKeys()
+public static void resetKeyBindingArrayAndHash()
+public static Set<String> getKeybinds()
+```
+
+Mouse buttons are encoded as negative key codes: -100 = LMB, -99 = RMB, -98 = MMB.
+
+### MovementInput (`net.minecraft.util.MovementInput`)
+
+This is the input layer that becomes the entity's `moveStrafing` and `moveForward`. It is set on `mc.thePlayer.movementInput`. The base class:
+
+```java
+public class MovementInput {
+    public float moveStrafe;       // -1, 0, or 1 (negative = right)
+    public float moveForward;      // -1, 0, or 1 (positive = forward)
+    public boolean jump;
+    public boolean sneak;
+
+    public void updatePlayerMoveState() { }
+}
+```
+
+The concrete subclass on `mc.thePlayer.movementInput` is `MovementInputFromOptions`, which reads from `keyBindForward/Back/Left/Right/Jump/Sneak` in its `updatePlayerMoveState`.
+
+### EntityPlayerSP.onUpdateWalkingPlayer — the tick that builds C03
+
+For a complete understanding, here is the *literal* logic of how the local player's position is sent to the server every tick. This method is called from `EntityPlayerSP.onUpdate()` when not riding (riding sends `C0CPacketInput` plus a `C05PacketPlayerLook` instead):
+
+```java
+public void onUpdateWalkingPlayer() {
+    // 1. Sync sprint state if it changed since last tick
+    boolean flag = this.isSprinting();
+    if (flag != this.serverSprintState) {
+        this.sendQueue.addToSendQueue(new C0BPacketEntityAction(this,
+            flag ? START_SPRINTING : STOP_SPRINTING));
+        this.serverSprintState = flag;
+    }
+
+    // 2. Sync sneak state if it changed
+    boolean flag1 = this.isSneaking();
+    if (flag1 != this.serverSneakState) {
+        this.sendQueue.addToSendQueue(new C0BPacketEntityAction(this,
+            flag1 ? START_SNEAKING : STOP_SNEAKING));
+        this.serverSneakState = flag1;
+    }
+
+    // 3. If this player is the camera (i.e. not spectating someone else)
+    if (this.isCurrentViewEntity()) {
+        double dx = this.posX - this.lastReportedPosX;
+        double dy = this.getEntityBoundingBox().minY - this.lastReportedPosY;
+        double dz = this.posZ - this.lastReportedPosZ;
+        double dyaw = this.rotationYaw - this.lastReportedYaw;
+        double dpitch = this.rotationPitch - this.lastReportedPitch;
+        boolean moved   = (dx*dx + dy*dy + dz*dz > 9.0E-4) || this.positionUpdateTicks >= 20;
+        boolean rotated = (dyaw != 0) || (dpitch != 0);
+
+        if (this.ridingEntity == null) {
+            // Pick the smallest packet that conveys the change
+            if (moved && rotated) {
+                send new C06PacketPlayerPosLook(posX, bb.minY, posZ, yaw, pitch, onGround);
+            } else if (moved) {
+                send new C04PacketPlayerPosition(posX, bb.minY, posZ, onGround);
+            } else if (rotated) {
+                send new C05PacketPlayerLook(yaw, pitch, onGround);
+            } else {
+                send new C03PacketPlayer(onGround);          // The "still here" ground-only ping
+            }
+        } else {
+            // Riding case: tell the server motionX/motionZ but use -999 as the Y sentinel
+            send new C06PacketPlayerPosLook(motionX, -999.0, motionZ, yaw, pitch, onGround);
+            moved = false;
+        }
+
+        this.positionUpdateTicks++;
+        if (moved)   { lastReportedPosX/Y/Z = current; positionUpdateTicks = 0; }
+        if (rotated) { lastReportedYaw/Pitch = current; }
+    }
+}
+```
+
+Two non-obvious facts: the Y coordinate sent is `boundingBox.minY` (your feet), not `posY` (your hip), and even when idle a `C03PacketPlayer(onGround)` goes out every 20 ticks because `positionUpdateTicks` forces a full re-send. This is why the connection feels "alive" even when you stand still.
+
+### EntityLivingBase.jump and moveEntityWithHeading — the physics
+
+When you press space and you're on the ground, `EntityLivingBase.jump()` runs:
+
+```java
+protected void jump() {
+    this.motionY = (double)this.getJumpUpwardsMotion();      // 0.42
+    if (this.isPotionActive(Potion.jump)) {
+        this.motionY += (amplifier + 1) * 0.1F;              // jump-boost
+    }
+    if (this.isSprinting()) {
+        float f = this.rotationYaw * 0.017453292F;           // degrees → radians
+        this.motionX -= MathHelper.sin(f) * 0.2F;
+        this.motionZ += MathHelper.cos(f) * 0.2F;            // sprint jump impulse
+    }
+    this.isAirBorne = true;
+}
+```
+
+Every tick, `EntityLivingBase.moveEntityWithHeading(strafe, forward)` runs the rest of the physics. The friction coefficient `0.91F` is applied to motion each tick on land; on the ground it gets multiplied by the block's `slipperiness` (default 0.6, ice 0.98). In water and lava the same skeleton runs with different constants. `moveFlying(strafe, forward, friction)` is the inner step that transforms input strafe/forward into actual `motionX/motionZ` deltas after applying the friction.
+
+### EntityRenderer (`net.minecraft.client.renderer.EntityRenderer`)
+
+`mc.entityRenderer`. Fields:
+
+```java
+public static boolean anaglyphEnable;
+public static int anaglyphField;
+public final ItemRenderer itemRenderer;
+private float farPlaneDistance;
+private int rendererUpdateCount;
+private Entity pointedEntity;                        // The entity under the crosshair
+private float thirdPersonDistance;
+private float smoothCamYaw, smoothCamPitch;
+private float fovModifierHand, fovModifierHandPrev;
+private float bossColorModifier, bossColorModifierPrev;
+private double cameraZoom;
+private double cameraYaw, cameraPitch;
+private ShaderGroup theShaderGroup;
+public static final int shaderCount;
+```
+
+Key methods:
+
+```java
+public boolean isShaderActive()
+public void stopUseShader()
+public void switchUseShader()
+public void loadEntityShader(Entity entity)
+public void activateNextShader()
+public void updateRenderer()
+public ShaderGroup getShaderGroup()
+public void updateShaderGroupSize(int width, int height)
+public void getMouseOver(float partialTicks)         // Re-raycasts the crosshair; result goes to mc.objectMouseOver and pointedEntity
+public void updateCameraAndRender(float partialTicks, long nanoTime)
+public void renderWorld(float partialTicks, long finishTimeNano)
+public void disableLightmap()
+public void enableLightmap()
+public void setupOverlayRendering()
+public MapItemRenderer getMapItemRenderer()
+```
+
+### RenderManager (`net.minecraft.client.renderer.entity.RenderManager`)
+
+Tracks per-entity-class `Render<T>` objects, the camera position, and screen-space player rotation. Most useful methods:
+
+```java
+public void setRenderPosition(double renderPosX, double renderPosY, double renderPosZ)
+public <T extends Entity> Render<T> getEntityClassRenderObject(Class<? extends Entity> entityClass)
+public <T extends Entity> Render<T> getEntityRenderObject(Entity entity)
+public void cacheActiveRenderInfo(World world, FontRenderer fontRenderer, Entity livingPlayer, Entity pointedEntity, GameSettings options, float partialTicks)
+public void setPlayerViewY(float playerViewY)
+public boolean isRenderShadow()
+public void setRenderShadow(boolean renderShadow)
+public void setDebugBoundingBox(boolean debugBoundingBox)
+public boolean isDebugBoundingBox()
+public boolean renderEntitySimple(Entity entity, float partialTicks)
+public boolean shouldRender(Entity entity, ICamera camera, double camX, double camY, double camZ)
+public boolean renderEntityStatic(Entity entity, float partialTicks, boolean hideDebugBox)
+public boolean renderEntityWithPosYaw(Entity entity, double x, double y, double z, float entityYaw, float partialTicks)
+public boolean doRenderEntity(Entity entity, double x, double y, double z, float entityYaw, float partialTicks, boolean hideDebugBox)
+public void set(World world)
+public double getDistanceToCamera(double x, double y, double z)
+public FontRenderer getFontRenderer()
+public void setRenderOutlines(boolean renderOutlines)
+```
+
+### Tessellator and WorldRenderer
+
+The vanilla immediate-mode-style draw API. There is one global `Tessellator` instance — `Tessellator.getInstance()` — and it owns a single `WorldRenderer` buffer.
+
+```java
+// Tessellator
+public static Tessellator getInstance()
+public void draw()                                   // Submit the buffer to the GPU
+public WorldRenderer getWorldRenderer()
+
+// WorldRenderer (the buffer you fill with vertices)
+public void reset()
+public void begin(int glMode, VertexFormat format)   // glMode = GL_QUADS, GL_LINES, GL_TRIANGLES, etc.
+public WorldRenderer pos(double x, double y, double z)
+public WorldRenderer tex(double u, double v)
+public WorldRenderer color(float r, float g, float b, float a)
+public WorldRenderer color(int r, int g, int b, int a)
+public WorldRenderer normal(float x, float y, float z)
+public WorldRenderer lightmap(int p1, int p2)
+public void endVertex()
+public void finishDrawing()
+public void setTranslation(double x, double y, double z)
+public ByteBuffer getByteBuffer()
+public void sortVertexData(float x, float y, float z)
+public WorldRenderer.State getVertexState()
+public void setVertexState(WorldRenderer.State state)
+```
+
+The vertex-format constants live in `net.minecraft.client.renderer.vertex.DefaultVertexFormats`. The pattern is: `begin → for each vertex: pos(...).tex(...).color(...).endVertex() → Tessellator.getInstance().draw()`.
+
+### Gui and GuiScreen (`net.minecraft.client.gui.Gui`, `GuiScreen`)
+
+`Gui` is the base class with static drawing helpers — every GUI inherits from it.
+
+```java
+// Static drawing primitives
+public static void drawRect(int left, int top, int right, int bottom, int color)
+protected void drawGradientRect(int left, int top, int right, int bottom, int startColor, int endColor)
+protected void drawHorizontalLine(int startX, int endX, int y, int color)
+protected void drawVerticalLine(int x, int startY, int endY, int color)
+public void drawString(FontRenderer fr, String text, int x, int y, int color)
+public void drawCenteredString(FontRenderer fr, String text, int x, int y, int color)
+public void drawTexturedModalRect(int x, int y, int texU, int texV, int width, int height)
+public static void drawModalRectWithCustomSizedTexture(int x, int y, float u, float v, int w, int h, float texW, float texH)
+public static void drawScaledCustomSizeModalRect(int x, int y, float u, float v, int uW, int vH, int w, int h, float tileW, float tileH)
+```
+
+`GuiScreen` extends `Gui` and adds lifecycle, input, and screen-management methods:
+
+```java
+protected List<GuiButton> buttonList;
+protected List<GuiLabel> labelList;
+public int width, height;                           // ScaledResolution dimensions
+
+public void drawScreen(int mouseX, int mouseY, float partialTicks)
+public void initGui()
+public void onGuiClosed()
+public void updateScreen()
+public void setWorldAndResolution(Minecraft mc, int width, int height)
+public void setGuiSize(int w, int h)
+public void handleInput() throws IOException
+public void handleMouseInput() throws IOException
+public void handleKeyboardInput() throws IOException
+protected void mouseClicked(int mouseX, int mouseY, int mouseButton)
+protected void mouseReleased(int mouseX, int mouseY, int state)
+protected void mouseClickMove(int mouseX, int mouseY, int clickedMouseButton, long timeSinceLastClick)
+protected void keyTyped(char typedChar, int keyCode)
+protected void actionPerformed(GuiButton button)
+public void drawDefaultBackground()
+public void drawWorldBackground(int tint)
+public void drawBackground(int tint)
+public boolean doesGuiPauseGame()
+protected void renderToolTip(ItemStack stack, int x, int y)
+protected void drawHoveringText(List<String> textLines, int x, int y)
+public void sendChatMessage(String msg)
+public void sendChatMessage(String msg, boolean addToChat)
+public void confirmClicked(boolean result, int id)
+
+// Static helpers
+public static String getClipboardString()
+public static void setClipboardString(String copyText)
+public static boolean isCtrlKeyDown()
+public static boolean isShiftKeyDown()
+public static boolean isAltKeyDown()
+public static boolean isKeyComboCtrlX(int keyID)
+public static boolean isKeyComboCtrlV(int keyID)
+public static boolean isKeyComboCtrlC(int keyID)
+public static boolean isKeyComboCtrlA(int keyID)
+```
+
+### GuiIngame (`net.minecraft.client.gui.GuiIngame`)
+
+The HUD. Reachable via `mc.ingameGUI`.
+
+```java
+public GuiIngame(Minecraft mc)
+public void setDefaultTitlesTimes()
+public void renderGameOverlay(float partialTicks)
+protected void renderTooltip(ScaledResolution sr, float partialTicks)
+public void renderHorseJumpBar(ScaledResolution sr, int x)
+public void renderExpBar(ScaledResolution sr, int x)
+public void renderSelectedItem(ScaledResolution sr)
+public void renderDemo(ScaledResolution sr)
+protected boolean showCrosshair()
+public void renderStreamIndicator(ScaledResolution sr)
+public void updateTick()
+public void setRecordPlayingMessage(String recordName)
+public void displayTitle(String title, String subTitle, int timeFadeIn, int displayTime, int timeFadeOut)
+public GuiNewChat getChatGUI()
+public int getUpdateCounter()
+public FontRenderer getFontRenderer()
+public GuiSpectator getSpectatorGui()
+```
+
+### FontRenderer (`net.minecraft.client.gui.FontRenderer`)
+
+The default font renderer is `mc.fontRendererObj`. Public draw methods:
+
+```java
+public int drawStringWithShadow(String text, float x, float y, int color)
+public int drawString(String text, int x, int y, int color)
+public int drawString(String text, float x, float y, int color, boolean dropShadow)
+public int getStringWidth(String text)
+public int getCharWidth(char character)
+public String trimStringToWidth(String text, int width)
+public String trimStringToWidth(String text, int width, boolean reverse)
+public void drawSplitString(String str, int x, int y, int wrapWidth, int textColor)
+public int splitStringWidth(String str, int maxLength)
+public void setUnicodeFlag(boolean unicodeFlag)
+public boolean getUnicodeFlag()
+public void setBidiFlag(boolean bidiFlag)
+public boolean getBidiFlag()
+public List<String> listFormattedStringToWidth(String str, int wrapWidth)
+public static String getFormatFromString(String text)
+public int getColorCode(char character)
+```
+
+### ScaledResolution (`net.minecraft.client.gui.ScaledResolution`)
+
+Created fresh each frame from `new ScaledResolution(mc)`. It converts raw pixel dimensions to GUI-space dimensions according to the user's GUI scale option.
+
+```java
+public ScaledResolution(Minecraft mc)
+public int getScaledWidth()
+public int getScaledHeight()
+public double getScaledWidth_double()
+public double getScaledHeight_double()
+public int getScaleFactor()
+```
+
+### Render base class (`net.minecraft.client.renderer.entity.Render<T>`)
+
+```java
+protected Render(RenderManager renderManager)
+public boolean shouldRender(T entity, ICamera camera, double camX, double camY, double camZ)
+public void doRender(T entity, double x, double y, double z, float entityYaw, float partialTicks)
+protected abstract ResourceLocation getEntityTexture(T entity)
+protected boolean bindEntityTexture(T entity)
+public void bindTexture(ResourceLocation location)
+public void doRenderShadowAndFire(Entity entity, double x, double y, double z, float yaw, float partialTicks)
+public static void renderOffsetAABB(AxisAlignedBB box, double x, double y, double z)
+protected void renderLivingLabel(T entity, String str, double x, double y, double z, int maxDistance)
+public FontRenderer getFontRendererFromRenderManager()
+public RenderManager getRenderManager()
+```
+
+## The utility layer
+
+### MathHelper (`net.minecraft.util.MathHelper`)
+
+Fast trig + integer math + angle helpers. Always prefer these over `java.lang.Math` — the trig is lookup-table-based, much faster than `Math.sin`.
+
+```java
+public static final float SQRT_2;
+public static float sin(float value)                 // Table lookup
+public static float cos(float value)                 // Table lookup
+public static float sqrt_float(float value)
+public static float sqrt_double(double value)
+public static int floor_float(float value)
+public static int floor_double(double value)
+public static long floor_double_long(double value)
+public static int truncateDoubleToInt(double value)
+public static float abs(float value)
+public static int abs_int(int value)
+public static int ceiling_float_int(float value)
+public static int ceiling_double_int(double value)
+public static int clamp_int(int num, int min, int max)
+public static float clamp_float(float num, float min, float max)
+public static double clamp_double(double num, double min, double max)
+public static double denormalizeClamp(double lowerBnd, double upperBnd, double slide)
+public static double abs_max(double a, double b)
+public static int bucketInt(int a, int b)
+public static int getRandomIntegerInRange(Random rand, int min, int max)
+public static float randomFloatClamp(Random rand, float min, float max)
+public static double getRandomDoubleInRange(Random rand, double min, double max)
+public static double average(long[] values)
+public static boolean epsilonEquals(float a, float b)
+public static int normalizeAngle(int angle, int normTo)
+public static float wrapAngleTo180_float(float value)        // → (-180, 180]
+public static double wrapAngleTo180_double(double value)
+public static int parseIntWithDefault(String s, int def)
+public static int parseIntWithDefaultAndMax(String s, int def, int max)
+public static double parseDoubleWithDefault(String s, double def)
+public static double parseDoubleWithDefaultAndMax(String s, double def, double max)
+public static int roundUpToPowerOfTwo(int value)
+public static int calculateLogBaseTwo(int value)
+public static int roundUp(int a, int b)
+public static long getPositionRandom(Vec3i pos)
+public static long getCoordinateRandom(int x, int y, int z)
+public static UUID getRandomUuid(Random rand)
+public static double atan2(double y, double x)
+public static int hsvToRGB(float hue, float saturation, float value)
+```
+
+### Vec3 (`net.minecraft.util.Vec3`)
+
+Immutable `(x, y, z)` double vector. Each operation returns a new `Vec3` — don't expect in-place updates.
+
+```java
+public Vec3(double x, double y, double z)
+public Vec3(Vec3i pos)
+public Vec3 subtractReverse(Vec3 vec)
+public Vec3 normalize()
+public double dotProduct(Vec3 vec)
+public Vec3 crossProduct(Vec3 vec)
+public Vec3 subtract(Vec3 vec)
+public Vec3 subtract(double x, double y, double z)
+public Vec3 add(Vec3 vec)
+public Vec3 addVector(double x, double y, double z)
+public double distanceTo(Vec3 vec)
+public double squareDistanceTo(Vec3 vec)
+public double lengthVector()
+public Vec3 getIntermediateWithXValue(Vec3 vec, double x)
+public Vec3 getIntermediateWithYValue(Vec3 vec, double y)
+public Vec3 getIntermediateWithZValue(Vec3 vec, double z)
+public Vec3 rotatePitch(float pitch)
+public Vec3 rotateYaw(float yaw)
+```
+
+Fields: `xCoord, yCoord, zCoord` (all `public final double`).
+
+### BlockPos (`net.minecraft.util.BlockPos`)
+
+Immutable integer-typed position. Extends `Vec3i`. The `MutableBlockPos` inner class is for hot loops where you want to avoid allocation.
+
+```java
+public static final BlockPos ORIGIN;
+public BlockPos(int x, int y, int z)
+public BlockPos(double x, double y, double z)
+public BlockPos(Entity source)
+public BlockPos(Vec3 source)
+public BlockPos(Vec3i source)
+public BlockPos add(double x, double y, double z)
+public BlockPos add(int x, int y, int z)
+public BlockPos add(Vec3i vec)
+public BlockPos subtract(Vec3i vec)
+public BlockPos up()
+public BlockPos up(int n)
+public BlockPos down()
+public BlockPos down(int n)
+public BlockPos north()
+public BlockPos north(int n)
+public BlockPos south()
+public BlockPos south(int n)
+public BlockPos west()
+public BlockPos west(int n)
+public BlockPos east()
+public BlockPos east(int n)
+public BlockPos offset(EnumFacing facing)
+public BlockPos offset(EnumFacing facing, int n)
+public BlockPos crossProduct(Vec3i vec)
+public long toLong()
+public static BlockPos fromLong(long serialized)
+public static Iterable<BlockPos> getAllInBox(BlockPos from, BlockPos to)
+public static Iterable<BlockPos.MutableBlockPos> getAllInBoxMutable(BlockPos from, BlockPos to)
+```
+
+From the parent `Vec3i`: `getX()`, `getY()`, `getZ()` are how you read coordinates.
+
+### AxisAlignedBB (`net.minecraft.util.AxisAlignedBB`)
+
+Immutable axis-aligned bounding box.
+
+```java
+public final double minX, minY, minZ, maxX, maxY, maxZ;
+
+public AxisAlignedBB(double x1, double y1, double z1, double x2, double y2, double z2)
+public AxisAlignedBB(BlockPos pos1, BlockPos pos2)
+public static AxisAlignedBB fromBounds(double x1, double y1, double z1, double x2, double y2, double z2)
+public AxisAlignedBB addCoord(double x, double y, double z)      // Stretch toward a direction
+public AxisAlignedBB expand(double x, double y, double z)        // Expand in all directions
+public AxisAlignedBB union(AxisAlignedBB other)
+public AxisAlignedBB offset(double x, double y, double z)
+public AxisAlignedBB contract(double x, double y, double z)
+public double calculateXOffset(AxisAlignedBB other, double offsetX)    // Used by sweep collision
+public double calculateYOffset(AxisAlignedBB other, double offsetY)
+public double calculateZOffset(AxisAlignedBB other, double offsetZ)
+public boolean intersectsWith(AxisAlignedBB other)
+public boolean isVecInside(Vec3 vec)
+public double getAverageEdgeLength()
+public MovingObjectPosition calculateIntercept(Vec3 vecA, Vec3 vecB)   // Ray-vs-box
+public boolean hasNaN()
+```
+
+### EnumFacing (`net.minecraft.util.EnumFacing`)
+
+The six block-face / cardinal-direction enum: `DOWN, UP, NORTH, SOUTH, WEST, EAST`. Each has an `index` (which matches the wire-protocol value used by C08 and C07) and a `horizontalIndex` (only for the four horizontal directions).
+
+```java
+public int getIndex()                                // 0=DOWN, 1=UP, 2=NORTH, 3=SOUTH, 4=WEST, 5=EAST
+public int getHorizontalIndex()
+public EnumFacing.AxisDirection getAxisDirection()
+public EnumFacing getOpposite()
+public EnumFacing rotateAround(EnumFacing.Axis axis)
+public EnumFacing rotateY()
+public EnumFacing rotateYCCW()
+public int getFrontOffsetX(), getFrontOffsetY(), getFrontOffsetZ()
+public EnumFacing.Axis getAxis()
+public Vec3i getDirectionVec()
+
+public static EnumFacing byName(String name)
+public static EnumFacing getFront(int index)
+public static EnumFacing getHorizontal(int index)
+public static EnumFacing fromAngle(double angle)
+public static EnumFacing random(Random rand)
+public static EnumFacing getFacingFromVector(float x, float y, float z)
+public static EnumFacing getFacingFromAxis(EnumFacing.AxisDirection dir, EnumFacing.Axis axis)
+```
+
+### MovingObjectPosition (`net.minecraft.util.MovingObjectPosition`)
+
+The result of a raytrace. The `typeOfHit` field tells you which other fields are valid.
+
+```java
+public MovingObjectPosition.MovingObjectType typeOfHit;   // MISS, BLOCK, ENTITY
+public EnumFacing sideHit;                                 // For BLOCK hits: which face was hit
+public Vec3 hitVec;                                        // World-space hit point
+public Entity entityHit;                                   // For ENTITY hits
+private BlockPos blockPos;                                 // For BLOCK hits — access via getBlockPos()
+
+public MovingObjectPosition(Vec3 hitVecIn, EnumFacing facing, BlockPos blockPosIn)
+public MovingObjectPosition(Vec3 hitVecIn, EnumFacing facing)
+public MovingObjectPosition(Entity entityIn)
+public MovingObjectPosition(MovingObjectPosition.MovingObjectType typeOfHit, Vec3 hitVec, EnumFacing sideHit, BlockPos blockPos)
+public MovingObjectPosition(Entity entityHit, Vec3 hitVec)
+public BlockPos getBlockPos()
+```
+
+### DamageSource (`net.minecraft.util.DamageSource`)
+
+Identifies how something got hurt. Static instances exist for common cases:
+
+```java
+public static DamageSource inFire;
+public static DamageSource lightningBolt;
+public static DamageSource onFire;
+public static DamageSource lava;
+public static DamageSource inWall;
+public static DamageSource drown;
+public static DamageSource starve;
+public static DamageSource cactus;
+public static DamageSource fall;
+public static DamageSource outOfWorld;
+public static DamageSource generic;
+public static DamageSource magic;
+public static DamageSource wither;
+public static DamageSource anvil;
+public static DamageSource fallingBlock;
+
+public String damageType;        // The string name like "fall" or "lava"
+
+// Factory methods for damage from an entity
+public static DamageSource causeMobDamage(EntityLivingBase mob)
+public static DamageSource causePlayerDamage(EntityPlayer player)
+public static DamageSource causeArrowDamage(EntityArrow arrow, Entity indirect)
+public static DamageSource causeFireballDamage(EntityFireball fb, Entity indirect)
+public static DamageSource causeThrownDamage(Entity source, Entity indirect)
+public static DamageSource causeIndirectMagicDamage(Entity source, Entity indirect)
+public static DamageSource causeThornsDamage(Entity source)
+public static DamageSource setExplosionSource(Explosion explosion)
+
+// Property checks / setters (the setters return `this` for chaining)
+public boolean isProjectile()
+public DamageSource setProjectile()
+public boolean isExplosion()
+public DamageSource setExplosion()
+public boolean isUnblockable()
+public float getHungerDamage()
+public boolean canHarmInCreative()
+```
+
+### EnumChatFormatting (`net.minecraft.util.EnumChatFormatting`)
+
+The 22 chat color/style codes. Common values: `BLACK, DARK_BLUE, DARK_GREEN, DARK_AQUA, DARK_RED, DARK_PURPLE, GOLD, GRAY, DARK_GRAY, BLUE, GREEN, AQUA, RED, LIGHT_PURPLE, YELLOW, WHITE, OBFUSCATED, BOLD, STRIKETHROUGH, UNDERLINE, ITALIC, RESET`. Each has a `formattingCode` char like `'0'`–`'f'` and `'k'`–`'r'`. Useful methods include `getFormattingCode()`, `toString()` (returns `"§<code>"`), and `EnumChatFormatting.getValueByName(String)`.
+
+### Other utility classes
+
+`net.minecraft.util.Timer` — the system timer that drives the tick loop:
+
+```java
+public float renderPartialTicks;                  // 0.0–1.0 progress into the next tick
+public int elapsedTicks;                          // Ticks that elapsed since last updateTimer
+public float timerSpeed = 1.0F;
+public float elapsedPartialTicks;
+float ticksPerSecond;                             // 20.0 always
+```
+
+`net.minecraft.util.Session` — your authentication info:
+
+```java
+public String getSessionID()                      // "token:<token>:<playerID>"
+public String getPlayerID()
+public String getUsername()
+public String getToken()
+public GameProfile getProfile()
+public Session.Type getSessionType()
+```
+
+`net.minecraft.profiler.Profiler`:
+
+```java
+public void clearProfiling()
+public void startSection(String name)
+public void endSection()
+public void endStartSection(String name)
+public List<Profiler.Result> getProfilingData(String profilerName)
+public String getNameOfLastSection()
+```
+
+The pattern is `startSection("name")` ... work ... `endSection()`. Don't leak unbalanced sections — the F3 debug screen reads the stack and a leak corrupts it.
+
+`net.minecraft.util.IChatComponent` — Minecraft's structured chat text. The two main implementations are `ChatComponentText` (literal text) and `ChatComponentTranslation` (locale-key with args). Methods on the interface:
+
+```java
+IChatComponent setChatStyle(ChatStyle style);
+ChatStyle getChatStyle();
+IChatComponent appendText(String text);
+IChatComponent appendSibling(IChatComponent component);
+String getUnformattedTextForChat();
+String getUnformattedText();
+String getFormattedText();
+List<IChatComponent> getSiblings();
+IChatComponent createCopy();
+```
+
+`net.minecraft.util.FoodStats` — `player.foodStats`:
+
+```java
+public void addStats(int foodLevel, float saturation)
+public void addStats(ItemFood food, ItemStack stack)
+public void onUpdate(EntityPlayer player)
+public int getFoodLevel()                         // 0–20
+public int getPrevFoodLevel()
+public boolean needFood()
+public void addExhaustion(float amount)
+public float getSaturationLevel()
+public void setFoodLevel(int foodLevel)
+public void setFoodSaturationLevel(float saturation)
+```
+
+`net.minecraft.entity.player.PlayerCapabilities` — `player.capabilities`:
+
+```java
+public boolean disableDamage;
+public boolean isFlying;
+public boolean allowFlying;
+public boolean isCreativeMode;
+public boolean allowEdit = true;
+private float flySpeed = 0.05F;
+private float walkSpeed = 0.1F;
+public float getFlySpeed();
+public void setFlySpeed(float speed);
+public float getWalkSpeed();
+public void setPlayerWalkSpeed(float speed);
+public void writeCapabilitiesToNBT(NBTTagCompound tag);
+public void readCapabilitiesFromNBT(NBTTagCompound tag);
+```
+
+### NBT (`net.minecraft.nbt`)
+
+NBT is Minecraft's tag tree used for persistent data. `NBTTagCompound` is the dictionary-like type:
+
+```java
+public Set<String> getKeySet()
+public byte getId()
+public void setTag(String key, NBTBase value)
+public void setByte(String key, byte value)
+public void setShort(String key, short value)
+public void setInteger(String key, int value)
+public void setLong(String key, long value)
+public void setFloat(String key, float value)
+public void setDouble(String key, double value)
+public void setString(String key, String value)
+public void setByteArray(String key, byte[] value)
+public void setIntArray(String key, int[] value)
+public void setBoolean(String key, boolean value)
+public NBTBase getTag(String key)
+public byte getTagId(String key)
+public boolean hasKey(String key)
+public boolean hasKey(String key, int type)
+public byte getByte(String key)
+public short getShort(String key)
+public int getInteger(String key)
+public long getLong(String key)
+public float getFloat(String key)
+public double getDouble(String key)
+public String getString(String key)
+public byte[] getByteArray(String key)
+public int[] getIntArray(String key)
+public NBTTagCompound getCompoundTag(String key)
+public NBTTagList getTagList(String key, int type)
+public boolean getBoolean(String key)
+public void removeTag(String key)
+public boolean hasNoTags()
+public NBTBase copy()
+public void merge(NBTTagCompound other)
+```
+
+## The remaining packages — quick orientation
+
+### Potion (`net.minecraft.potion`)
+
+`Potion` instances are singletons indexed by ID in `Potion.potionTypes[32]`. The vanilla static fields by name:
+
+```java
+public static final Potion moveSpeed;          // ID 1
+public static final Potion moveSlowdown;       // 2
+public static final Potion digSpeed;           // 3 (haste)
+public static final Potion digSlowdown;        // 4 (mining fatigue)
+public static final Potion damageBoost;        // 5 (strength)
+public static final Potion heal;               // 6 (instant health)
+public static final Potion harm;               // 7 (instant damage)
+public static final Potion jump;               // 8 (jump boost)
+public static final Potion confusion;          // 9 (nausea)
+public static final Potion regeneration;       // 10
+public static final Potion resistance;         // 11
+public static final Potion fireResistance;     // 12
+public static final Potion waterBreathing;     // 13
+public static final Potion invisibility;       // 14
+public static final Potion blindness;          // 15
+public static final Potion nightVision;        // 16
+public static final Potion hunger;             // 17
+public static final Potion weakness;           // 18
+public static final Potion poison;             // 19
+public static final Potion wither;             // 20
+public static final Potion healthBoost;        // 21
+public static final Potion absorption;         // 22
+public static final Potion saturation;         // 23
+```
+
+`PotionEffect`:
+
+```java
+public PotionEffect(int id, int duration)
+public PotionEffect(int id, int duration, int amplifier)
+public PotionEffect(int id, int duration, int amplifier, boolean ambient, boolean showParticles)
+public PotionEffect(PotionEffect other)
+public int getPotionID()
+public int getDuration()
+public int getAmplifier()
+public boolean getIsAmbient()
+public boolean getIsShowParticles()
+public boolean onUpdate(EntityLivingBase entity)
+public void performEffect(EntityLivingBase entity)
+public String getEffectName()
+public void combine(PotionEffect other)
+public void setSplashPotion(boolean splash)
+public NBTTagCompound writeCustomPotionEffectToNBT(NBTTagCompound nbt)
+public static PotionEffect readCustomPotionEffectFromNBT(NBTTagCompound nbt)
+public void setPotionDurationMax(boolean max)
+public boolean getIsPotionDurationMax()
+```
+
+### TileEntity (`net.minecraft.tileentity.TileEntity`)
+
+Block-bound state, like the contents of a chest or the text of a sign:
+
+```java
+public World getWorld()
+public void setWorldObj(World world)
+public boolean hasWorldObj()
+public void readFromNBT(NBTTagCompound nbt)
+public void writeToNBT(NBTTagCompound nbt)
+public static TileEntity createAndLoadEntity(NBTTagCompound nbt)
+public int getBlockMetadata()
+public void markDirty()
+public double getDistanceSq(double x, double y, double z)
+public double getMaxRenderDistanceSquared()
+public BlockPos getPos()
+public Block getBlockType()
+public Packet getDescriptionPacket()
+public boolean isInvalid()
+public void invalidate()
+public void validate()
+public boolean receiveClientEvent(int id, int type)
+public void updateContainingBlockInfo()
+public void setPos(BlockPos posIn)
+```
+
+Concrete types include `TileEntityChest`, `TileEntityFurnace`, `TileEntitySign`, `TileEntityEnderChest`, `TileEntityBeacon`, `TileEntityHopper`, `TileEntityMobSpawner`, and others.
+
+### Enchantment (`net.minecraft.enchantment.Enchantment`)
+
+Singleton enchantments accessed via the static registry. `EnchantmentHelper` (static methods) is what most code uses to query enchantment levels on items:
+
+```java
+public static int getEnchantmentLevel(int enchID, ItemStack stack)
+public static Map<Integer, Integer> getEnchantments(ItemStack stack)
+public static void setEnchantments(Map<Integer, Integer> enchMap, ItemStack stack)
+public static int getMaxEnchantmentLevel(int enchID, ItemStack[] stacks)
+public static void applyThornEnchantments(EntityLivingBase target, Entity attacker)
+public static void applyArthropodEnchantments(EntityLivingBase user, Entity target)
+public static int getKnockbackModifier(EntityLivingBase user)
+public static int getFireAspectModifier(EntityLivingBase user)
+public static int getRespiration(Entity entity)
+public static int getDepthStriderModifier(Entity entity)
+public static int getEfficiencyModifier(EntityLivingBase user)
+public static boolean getSilkTouchModifier(EntityLivingBase user)
+public static int getFortuneModifier(EntityLivingBase user)
+public static int getLuckOfSeaModifier(EntityLivingBase user)
+public static int getLureModifier(EntityLivingBase user)
+public static int getLootingModifier(EntityLivingBase user)
+public static boolean getAquaAffinityModifier(EntityLivingBase user)
+public static float getModifierForCreature(ItemStack stack, EnumCreatureAttribute creatureAttribute)
+```
+
+### Audio (`net.minecraft.client.audio`)
+
+`SoundHandler` (via `mc.getSoundHandler()`) is the main entry point.
+
+```java
+public void playSound(ISound sound)
+public void playDelayedSound(ISound sound, int delay)
+public void stopSound(ISound sound)
+public boolean isSoundPlaying(ISound sound)
+public void pauseSounds()
+public void resumeSounds()
+public void stopSounds()
+```
+
+### EntityList (`net.minecraft.entity.EntityList`)
+
+Static helpers for entity creation and lookup by ID/name:
+
+```java
+public static Entity createEntityByName(String name, World world)
+public static Entity createEntityByID(int entityID, World world)
+public static Entity createEntityFromNBT(NBTTagCompound nbt, World world)
+public static String getEntityString(Entity entity)
+public static int getEntityID(Entity entity)
+public static int getIDFromString(String entityName)
+public static String getStringFromID(int entityID)
+public static Class<? extends Entity> getClassFromID(int entityID)
+public static String getEntityStringFromClass(Class<? extends Entity> entityClass)
+```
+
+### Worth knowing: the rendering call sites
+
+Rendering for the world happens inside `EntityRenderer.renderWorldPass(int pass, float partialTicks, long finishTimeNano)`, which calls `RenderGlobal.renderEntities` and `RenderGlobal.renderBlockLayer` for each block layer (`SOLID, CUTOUT_MIPPED, CUTOUT, TRANSLUCENT`). The HUD is rendered separately in `GuiIngame.renderGameOverlay(float partialTicks)` which is called once per frame from `EntityRenderer.updateCameraAndRender`.
+
+The order each frame is roughly: `runTick` (game logic, may run more than once if behind on ticks) → `updateCameraAndRender(partialTicks)` → `renderWorld` → `renderWorldPass` for each stereoscopic pass → `GuiIngame.renderGameOverlay` → `currentScreen.drawScreen` (if any GUI is open).
+
+## Coordinate, threading, and timing conventions
+
+It is worth burning into memory a few things that are easy to get wrong if you don't know them.
+
+The Y axis is vertical, X is east-positive, Z is south-positive. Yaw 0 means facing south (+Z); yaw 90 means west (-X); yaw -90 means east (+X); yaw 180 or -180 means north (-Z). Pitch -90 is straight up, +90 is straight down, 0 is horizon. Yaw increases clockwise when looking down at the player.
+
+When sending position packets, vanilla sends `boundingBox.minY` (the feet Y) and not `posY` (which is the same value, equivalent to feet, for most entities — but never assume; always use `getEntityBoundingBox().minY` to be safe and consistent with vanilla's packet builder).
+
+A tick is 50 milliseconds — 20 ticks per second. `Timer.renderPartialTicks` is the 0.0–1.0 fraction of the next tick already elapsed when a frame is being rendered; you use it to interpolate `prevPosX + (posX - prevPosX) * partialTicks` so things move smoothly between ticks.
+
+The main client thread is the only thread safe for touching `mc.theWorld`, `mc.thePlayer`, GUI state, or the renderer. The Netty I/O thread arrives in `NetworkManager.channelRead0` and packet `processPacket` methods, but `NetHandlerPlayClient.handleXxx` immediately re-schedules onto the main thread via `PacketThreadUtil.checkThreadAndEnqueue`. If you ever need to schedule work onto the main thread from another thread, `mc.addScheduledTask(Runnable)` is the supported entry.
+
+The S12 velocity packet encodes blocks/tick as `int = blocksPerTick * 8000`, clamped to ±3.9 before scaling. So a horizontal knockback of `0.4` blocks/tick goes over the wire as `3200`.
+
+Block-state IDs are packed as `(blockId << 4) | meta` in the legacy serialization path; modern code uses `Block.BLOCK_STATE_IDS` to map `IBlockState ↔ int` without that constraint.
+
+The 0.91 friction constant in `EntityLivingBase.moveEntityWithHeading` is multiplied by the ground block's `slipperiness` when the entity is on the ground. Default `slipperiness` is `0.6F`; ice is `0.98F`; slime is also higher. Multiply 0.91 by the appropriate value to see the per-tick decay.
+
+Reach distance is `4.5` survival when calculated from eyes (`getBlockReachDistance()` returns `5.0` for blocks, `3.0` for entity interact in survival; creative is `5.0` everywhere except entity which is `6.0`).
 
