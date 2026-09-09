@@ -1,0 +1,169 @@
+{
+ "overview": "Server-side World dimension instance owning EntityTracker and PlayerManager fan-out. Gates broadcasts by dimension ID and distance-squared radii. Handles global weather, explosion, block-event, particle and game-state sync. Delegates chunk block deltas to PlayerManager and entity visibility to EntityTracker.",
+ "methods": [
+  {
+   "detail": "Calls super then sendToAllNear at entity pos with 512.0D radius. Gated by provider.getDimensionId. Only sent if super accepts effect. Returns false otherwise.",
+   "name": "addWeatherEffect",
+   "packets": [
+    "S2C"
+   ],
+   "purpose": "Broadcast lightning spawn to nearby players in same dimension."
+  },
+  {
+   "detail": "Iterates playerEntities checking distanceSq < 4096.0D (64 blocks). Sends S27PacketExplosion with strength, affected blocks, per-player Vec3 knockback. No dimension check; assumes same WorldServer player list.",
+   "name": "newExplosion",
+   "packets": [
+    "S27"
+   ],
+   "purpose": "Run explosion then send knockback and block list to players in range."
+  },
+  {
+   "detail": "Swaps blockEventCacheIndex, fires fireBlockEvent validation. On success sends S24PacketBlockAction via sendToAllNear with 64.0D radius. Gated by dimension ID. Deduped in addBlockEvent.",
+   "name": "sendQueuedBlockEvents",
+   "packets": [
+    "S24"
+   ],
+   "purpose": "Flush double-buffered block events as block-action packets."
+  },
+  {
+   "detail": "Delegates to EntityTracker.func_151248_b with S19PacketEntityStatus. Viewer set determined by tracker distance, not WorldServer radius. Used for totem, hurt, tame states.",
+   "name": "setEntityState",
+   "packets": [
+    "S19"
+   ],
+   "purpose": "Forward entity status byte to tracking viewers."
+  },
+  {
+   "detail": "If rainingStrength changed sends S2B reason 7 to dimension. If thunderingStrength changed sends reason 8 to dimension. On rain start/stop sends reasons 1/2 plus 7/8 globally to all players.",
+   "name": "updateWeather",
+   "packets": [
+    "S2B"
+   ],
+   "purpose": "Sync rain and thunder strength changes to clients."
+  },
+  {
+   "detail": "Builds single S2APacketParticles reused for all players. Sends if distanceSq <=256.0D (16 blocks), or if longDistance and <=65536.0D (256 blocks). Iterates playerEntities directly.",
+   "name": "spawnParticle(longDistance)",
+   "packets": [
+    "S2A"
+   ],
+   "purpose": "Send particle packet with short vs long view-distance gating."
+  },
+  {
+   "detail": "Calls PlayerManager.updatePlayerInstances for block deltas and chunk sync. Calls sendQueuedBlockEvents for S24 fan-out. Also updates villages, mob spawner, portal forcer. No direct packet send.",
+   "name": "tick",
+   "packets": [
+    "S21",
+    "S22",
+    "S23",
+    "S24"
+   ],
+   "purpose": "Per-tick drive chunk maps and queued block events."
+  }
+ ],
+ "packet_usage": [
+  {
+   "direction": "sent",
+   "id": "S2C",
+   "trigger": "addWeatherEffect lightning added"
+  },
+  {
+   "direction": "sent",
+   "id": "S27",
+   "trigger": "newExplosion within 4096.0D"
+  },
+  {
+   "direction": "sent",
+   "id": "S24",
+   "trigger": "queued block event fired, 64.0D"
+  },
+  {
+   "direction": "sent",
+   "id": "S19",
+   "trigger": "setEntityState via EntityTracker"
+  },
+  {
+   "direction": "sent",
+   "id": "S2B",
+   "trigger": "updateWeather strength or rain toggle"
+  },
+  {
+   "direction": "sent",
+   "id": "S2A",
+   "trigger": "spawnParticle 256.0D or 65536.0D longDistance"
+  }
+ ],
+ "internal_fields": [
+  {
+   "name": "theEntityTracker",
+   "role": "Tracks entities and fans out entity packets to viewers"
+  },
+  {
+   "name": "thePlayerManager",
+   "role": "Manages chunk watchers and block-change packets"
+  },
+  {
+   "name": "blockEventQueue",
+   "role": "Double-buffered ServerBlockEventList dedup queue"
+  },
+  {
+   "name": "mcServer",
+   "role": "Access to ServerConfigurationManager broadcast helpers"
+  },
+  {
+   "name": "entitiesByUuid",
+   "role": "UUID to Entity lookup for resolution"
+  }
+ ],
+ "peers": [
+  "PlayerManager",
+  "EntityTracker",
+  "ServerConfigurationManager",
+  "ServerScoreboard",
+  "WorldManager"
+ ],
+ "methods_detailed": [
+  {
+   "name": "addWeatherEffect",
+   "detail_long": "This method is the server entry point for global weather entities such as lightning bolts. It first calls super.addWeatherEffect to register the entity in the world simulation and validate placement. Only if super returns true does any network fan-out occur, otherwise it returns false with no packets. On success it calls ServerConfigurationManager.sendToAllNear using the entity exact posX posY posZ coordinates. The radius is fixed at 512.0D and the call is gated by provider.getDimensionId so only players in the same dimension receive it. The packet constructed is S2CPacketSpawnGlobalEntity wrapping the entity instance. This large 512 block radius reflects that lightning is a sky-visible global event. Compared to 16.0D sound or 64.0D block-action ranges, this is intentionally wide. No batching is used because each strike is a discrete spawn.",
+   "code": "    public boolean addWeatherEffect(Entity entityIn)\n    {\n        if (super.addWeatherEffect(entityIn))\n        {\n            this.mcServer.getConfigurationManager().sendToAllNear(entityIn.posX, entityIn.posY, entityIn.posZ, 512.0D, this.provider.getDimensionId(), new S2CPacketSpawnGlobalEntity(entityIn));\n            return true;\n        }\n        else\n        {\n            return false;\n        }\n    }",
+   "code_walkthrough": "The boolean method signature takes the weather Entity to spawn. The super call gates all networking on simulation acceptance. The sendToAllNear line builds S2CPacketSpawnGlobalEntity from the entity and passes 512.0D plus dimension ID for gating. The true branch returns success after queuing the broadcast. The else branch returns false with no packet when super rejects. This shows dimension-gated wide-radius spawn fan-out."
+  },
+  {
+   "name": "newExplosion",
+   "detail_long": "This method runs the full server explosion simulation then notifies nearby clients. It first constructs an Explosion object with entity source, coordinates, strength, and flaming and smoking flags. It then calls doExplosionA for block resistance calculation and doExplosionB with false for no fire spawning here. If isSmoking is false it clears the affected block position list so clients receive an empty list. It then iterates directly over playerEntities belonging to this WorldServer dimension instance. Each player is distance checked with getDistanceSq against x y z with threshold 4096.0D which equals 64 blocks squared. Only players inside that sphere get a direct S27PacketExplosion via playerNetServerHandler.sendPacket. The packet carries x y z strength block list and per-player Vec3 knockback from getPlayerKnockbackMap. No explicit dimension check is needed because playerEntities are already dimension scoped.",
+   "code": "    public Explosion newExplosion(Entity entityIn, double x, double y, double z, float strength, boolean isFlaming, boolean isSmoking)\n    {\n        Explosion explosion = new Explosion(this, entityIn, x, y, z, strength, isFlaming, isSmoking);\n        explosion.doExplosionA();\n        explosion.doExplosionB(false);\n\n        if (!isSmoking)\n        {\n            explosion.clearAffectedBlockPositions();\n        }\n\n        for (EntityPlayer entityplayer : this.playerEntities)\n        {\n            if (entityplayer.getDistanceSq(x, y, z) < 4096.0D)\n            {\n                ((EntityPlayerMP)entityplayer).playerNetServerHandler.sendPacket(new S27PacketExplosion(x, y, z, strength, explosion.getAffectedBlockPositions(), (Vec3)explosion.getPlayerKnockbackMap().get(entityplayer)));\n            }\n        }\n\n        return explosion;\n    }",
+   "code_walkthrough": "The signature accepts source entity, position, strength, and flags. The next three lines create the Explosion and run both phases. The isSmoking check empties the block list for non-destructive blasts. The loop plus distanceSq less than 4096.0D gates recipients to a 64 block radius. The sendPacket line constructs S27PacketExplosion with strength, block list, and per-player knockback Vec3. This is direct per-player send, not chunk-scoped."
+  },
+  {
+   "name": "sendQueuedBlockEvents",
+   "detail_long": "This method flushes the double-buffered block event queue at end of tick. The queue consists of two ServerBlockEventList buffers with blockEventCacheIndex selecting the active fill buffer. The while loop continues until the current read buffer is empty, handling events added during flushing. It snapshots the read index into i then flips blockEventCacheIndex with xor 1 so new addBlockEvent calls go to the other buffer. For each BlockEventData it calls fireBlockEvent to verify the block still matches and to run onBlockEventReceived. Only if validation returns true does it broadcast via sendToAllNear. That broadcast uses the event position coordinates with fixed 64.0D radius gated by provider.getDimensionId. The packet is S24PacketBlockAction built from position, block, event ID, and event parameter. Finally it clears the processed buffer list before looping.",
+   "code": "    private void sendQueuedBlockEvents()\n    {\n        while (!this.blockEventQueue[this.blockEventCacheIndex].isEmpty())\n        {\n            int i = this.blockEventCacheIndex;\n            this.blockEventCacheIndex ^= 1;\n\n            for (BlockEventData blockeventdata : this.blockEventQueue[i])\n            {\n                if (this.fireBlockEvent(blockeventdata))\n                {\n                    this.mcServer.getConfigurationManager().sendToAllNear((double)blockeventdata.getPosition().getX(), (double)blockeventdata.getPosition().getY(), (double)blockeventdata.getPosition().getZ(), 64.0D, this.provider.getDimensionId(), new S24PacketBlockAction(blockeventdata.getPosition(), blockeventdata.getBlock(), blockeventdata.getEventID(), blockeventdata.getEventParameter()));\n                }\n            }\n\n            this.blockEventQueue[i].clear();\n        }\n    }",
+   "code_walkthrough": "The private method takes no args and loops on the active queue. The index snapshot plus xor flip implements double buffering. The for loop iterates BlockEventData entries in the frozen buffer. The fireBlockEvent condition gates packet construction on block match and handler acceptance. The sendToAllNear line shows 64.0D radius, dimension gating, and S24PacketBlockAction args. The clear call resets the buffer for the next tick."
+  },
+  {
+   "name": "setEntityState",
+   "detail_long": "This method forwards a single-byte entity status to all tracking viewers. It does not implement its own radius check with 16.0D or 64.0D or 512.0D values. Instead it delegates viewer selection to EntityTracker via getEntityTracker. The tracker determines who currently tracks the entity based on tracking range and type. The packet created is S19PacketEntityStatus wrapping the entity and state byte. Typical states include hurt flash, totem use, tame hearts, and other entity events. The call func_151248_b performs the fan-out to that viewer set. Because WorldServer owns theEntityTracker field, this keeps visibility logic centralized. No dimension check appears here because tracker entries are already per-world.",
+   "code": "    /**\n     * sends a Packet 38 (Entity Status) to all tracked players of that entity\n     */\n    public void setEntityState(Entity entityIn, byte state)\n    {\n        this.getEntityTracker().func_151248_b(entityIn, new S19PacketEntityStatus(entityIn, state));\n    }\n\n    /**\n     * returns a new explosion. Does initiation (at time of writing Explosion is not finished)\n     */",
+   "code_walkthrough": "The comment identifies this as Packet 38 entity status handling. The method signature takes entity and byte state. The body delegates to EntityTracker func_151248_b for viewer resolution. The constructor S19PacketEntityStatus binds entity ID and status byte into the packet. The trailing comment marks the start of the next explosion method. This shows tracker-based fan-out rather than explicit radius gating."
+  },
+  {
+   "name": "updateWeather",
+   "detail_long": "This method synchronizes rain and thunder state changes from server simulation to clients. It caches the old isRaining value in flag before calling super.updateWeather to advance strengths. If rainingStrength changed it sends S2BPacketChangeGameState reason 7 with the new strength to all players in the dimension. If thunderingStrength changed it sends reason 8 similarly dimension gated. These two paths handle gradual fade without a full rain toggle. If the boolean raining state flipped, it sends a global toggle to all players with reason 2 for stop or reason 1 for start. It then follows with global sends of reason 7 and reason 8 to resync strengths everywhere. The dimension-scoped sends use sendPacketToAllPlayersInDimension while toggles use sendPacketToAllPlayers. No distance radius like 64.0D or 512.0D is used because weather is global. This produces at most four packets per transition.",
+   "code": "    protected void updateWeather()\n    {\n        boolean flag = this.isRaining();\n        super.updateWeather();\n\n        if (this.prevRainingStrength != this.rainingStrength)\n        {\n            this.mcServer.getConfigurationManager().sendPacketToAllPlayersInDimension(new S2BPacketChangeGameState(7, this.rainingStrength), this.provider.getDimensionId());\n        }\n\n        if (this.prevThunderingStrength != this.thunderingStrength)\n        {\n            this.mcServer.getConfigurationManager().sendPacketToAllPlayersInDimension(new S2BPacketChangeGameState(8, this.thunderingStrength), this.provider.getDimensionId());\n        }\n\n        if (flag != this.isRaining())\n        {\n            if (flag)\n            {\n                this.mcServer.getConfigurationManager().sendPacketToAllPlayers(new S2BPacketChangeGameState(2, 0.0F));\n            }\n            else\n            {\n                this.mcServer.getConfigurationManager().sendPacketToAllPlayers(new S2BPacketChangeGameState(1, 0.0F));\n            }\n\n            this.mcServer.getConfigurationManager().sendPacketToAllPlayers(new S2BPacketChangeGameState(7, this.rainingStrength));\n            this.mcServer.getConfigurationManager().sendPacketToAllPlayers(new S2BPacketChangeGameState(8, this.thunderingStrength));\n        }\n    }",
+   "code_walkthrough": "The flag save plus super call detects rain edges and strength deltas. The first two if blocks compare prev versus current strengths and send S2B reason 7 or 8 dimension gated. The outer flag comparison detects start versus stop transitions. The inner if sends reason 2 stop or reason 1 start globally. The final two sends rebroadcast strengths 7 and 8 globally after a toggle. This separates gradual strength sync from discrete rain state sync."
+  },
+  {
+   "name": "spawnParticle(longDistance)",
+   "detail_long": "This overload is the core particle broadcast with explicit longDistance flag. It first builds a single S2APacketParticles instance reused for every recipient to save allocation. The packet packs particle type, longDistance flag, float position, float offsets, float speed, count, and varargs. It then loops over playerEntities in this dimension by index. For each EntityPlayerMP it gets the player BlockPos and computes distanceSq to the spawn coordinates. If that squared distance is at most 256.0D the player receives it, which equals 16 blocks normal view distance. Alternatively if longDistance is true and distance is at most 65536.0D the player receives it, which equals 256 blocks. The same Packet object is sent via playerNetServerHandler.sendPacket to each qualifier. No dimension helper is called because the list is already dimension scoped. This dual threshold lets command or beacon effects travel far while normal effects stay local.",
+   "code": "    public void spawnParticle(EnumParticleTypes particleType, boolean longDistance, double xCoord, double yCoord, double zCoord, int numberOfParticles, double xOffset, double yOffset, double zOffset, double particleSpeed, int... particleArguments)\n    {\n        Packet packet = new S2APacketParticles(particleType, longDistance, (float)xCoord, (float)yCoord, (float)zCoord, (float)xOffset, (float)yOffset, (float)zOffset, (float)particleSpeed, numberOfParticles, particleArguments);\n\n        for (int i = 0; i < this.playerEntities.size(); ++i)\n        {\n            EntityPlayerMP entityplayermp = (EntityPlayerMP)this.playerEntities.get(i);\n            BlockPos blockpos = entityplayermp.getPosition();\n            double d0 = blockpos.distanceSq(xCoord, yCoord, zCoord);\n\n            if (d0 <= 256.0D || longDistance && d0 <= 65536.0D)\n            {\n                entityplayermp.playerNetServerHandler.sendPacket(packet);\n            }\n        }\n    }",
+   "code_walkthrough": "The signature exposes particle type, longDistance, position, count, offsets, speed, and extra args. The packet construction line casts doubles to floats and reuses one instance. The loop resolves each player position and computes distanceSq. The if condition implements 256.0D short versus 65536.0D long gating. The sendPacket line delivers the shared instance only to qualifiers. This is per-player distance filtering without chunk map lookup."
+  },
+  {
+   "name": "tick",
+   "detail_long": "This is the per-tick driver for the server world simulation and network flush. It first advances pending block ticks via tickUpdates and random block ticks via updateBlocks with no direct packets. It then enters the chunkMap section by calling thePlayerManager.updatePlayerInstances which flushes S21 S22 S23 block deltas to chunk watchers. Village ticking, siege ticking, and portal staleness removal run next without networking. The profiler sections wrap each subsystem for timing. At the very end it calls sendQueuedBlockEvents to fan out validated S24 block-action packets at 64.0D radius. This ordering ensures block state changes are sent before dependent block events in the same tick. If no players are present, updatePlayerInstances still runs but has no recipients. The method therefore indirectly causes all chunk block packets plus S24 each tick.",
+   "code": "        this.theProfiler.endStartSection(\"tickPending\");\n        this.tickUpdates(false);\n        this.theProfiler.endStartSection(\"tickBlocks\");\n        this.updateBlocks();\n        this.theProfiler.endStartSection(\"chunkMap\");\n        this.thePlayerManager.updatePlayerInstances();\n        this.theProfiler.endStartSection(\"village\");\n        this.villageCollectionObj.tick();\n        this.villageSiege.tick();\n        this.theProfiler.endStartSection(\"portalForcer\");\n        this.worldTeleporter.removeStalePortalLocations(this.getTotalWorldTime());\n        this.theProfiler.endSection();\n        this.sendQueuedBlockEvents();\n    }",
+   "code_walkthrough": "The tickPending plus tickUpdates lines advance scheduled block ticks. The chunkMap plus updatePlayerInstances line is the indirect S21 S22 S23 fan-out point. The village and portal lines run non-network simulation. The final sendQueuedBlockEvents line triggers S24 64.0D fan-out. Profiler markers show ordering but do not affect packets. This excerpt is the packet-relevant tail of the tick method."
+  }
+ ]
+}

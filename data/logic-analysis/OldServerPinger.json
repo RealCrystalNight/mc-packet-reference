@@ -1,0 +1,163 @@
+{
+ "overview": "Client-side multiplayer list pinger owned by server-selection GUI. Opens a temporary STATUS connection, parses MOTD, version, player count and favicon, then measures ping. Falls back to pre-1.7 MC|PingHost legacy ping when modern handshake fails.",
+ "methods": [
+  {
+   "detail": "Creates NetworkManager, installs anonymous INetHandlerStatusClient, sends handshake state STATUS plus C00PacketServerQuery; reply chain sends C01PacketPing.",
+   "name": "ping",
+   "packets": [
+    "C00Handshake",
+    "C00PacketServerQuery",
+    "C01PacketPing"
+   ],
+   "purpose": "Start modern STATUS ping against a ServerData entry"
+  },
+  {
+   "detail": "Copies MOTD, protocol version, player sample, population string and favicon; records timestamp and sends C01PacketPing for latency.",
+   "name": "handleServerInfo",
+   "packets": [
+    "S00PacketServerInfo"
+   ],
+   "purpose": "Parse S00 server info into ServerData display fields"
+  },
+  {
+   "detail": "Subtracts stored send time from current time into server.pingToServer, then closes channel with Finished message.",
+   "name": "handlePong",
+   "packets": [
+    "S01PacketPong"
+   ],
+   "purpose": "Compute latency and close ping channel"
+  },
+  {
+   "detail": "If query never completed, marks MOTD as cant-connect and delegates to tryCompatibilityPing for old servers.",
+   "name": "onDisconnect",
+   "packets": [],
+   "purpose": "Handle failed modern ping and trigger legacy fallback"
+  },
+  {
+   "detail": "Writes MC|PingHost payload with host and port, parses NUL-split UTF-16BE 0xFF response into version, MOTD and player counts.",
+   "name": "tryCompatibilityPing",
+   "packets": [
+    "0xFE",
+    "0xFF"
+   ],
+   "purpose": "Legacy 1.6 Beta-style 0xFE ping over raw Netty"
+  },
+  {
+   "detail": "Iterates pingDestinations, processes received packets while open, otherwise removes and checks disconnect reason.",
+   "name": "pingPendingNetworks",
+   "packets": [],
+   "purpose": "Pump pending ping connections each client tick"
+  },
+  {
+   "detail": "Closes every open NetworkManager in pingDestinations with Cancelled message and removes it from the list.",
+   "name": "clearPendingNetworks",
+   "packets": [],
+   "purpose": "Cancel all outstanding server-list pings"
+  }
+ ],
+ "packet_usage": [
+  {
+   "direction": "sent",
+   "id": "C00Handshake",
+   "trigger": "ping sends protocol 47 with STATUS next state"
+  },
+  {
+   "direction": "sent",
+   "id": "C00PacketServerQuery",
+   "trigger": "ping server query after handshake"
+  },
+  {
+   "direction": "sent",
+   "id": "C01PacketPing",
+   "trigger": "handleServerInfo timestamp echo for latency"
+  },
+  {
+   "direction": "handled",
+   "id": "S00PacketServerInfo",
+   "trigger": "handleServerInfo updates MOTD and player list"
+  },
+  {
+   "direction": "handled",
+   "id": "S01PacketPong",
+   "trigger": "handlePong computes pingToServer"
+  },
+  {
+   "direction": "sent",
+   "id": "0xFE/0xFF",
+   "trigger": "tryCompatibilityPing legacy MC|PingHost exchange"
+  }
+ ],
+ "internal_fields": [
+  {
+   "name": "pingDestinations",
+   "role": "Synchronized list of active ping NetworkManagers"
+  },
+  {
+   "name": "PING_RESPONSE_SPLITTER",
+   "role": "NUL splitter with limit 6 for legacy ping parsing"
+  },
+  {
+   "name": "logger",
+   "role": "Logs ping failures and invalid favicon formats"
+  },
+  {
+   "name": "field_175092_e",
+   "role": "Ping send timestamp used for latency calc"
+  },
+  {
+   "name": "field_147403_d",
+   "role": "Marks query completion to gate fallback ping"
+  }
+ ],
+ "peers": [
+  "NetworkManager",
+  "ServerData",
+  "ServerAddress",
+  "INetHandlerStatusClient",
+  "ServerStatusResponse"
+ ],
+ "methods_detailed": [
+  {
+   "name": "ping",
+   "detail_long": "ping starts a modern STATUS ping from the multiplayer list against a ServerData entry. It resolves ServerAddress from serverIP, creates a NetworkManager with createNetworkManagerAndConnect, and adds it to pingDestinations for ticking. It initializes serverMOTD to Pinging, pingToServer to -1, and playerList to null as pending state. It installs an anonymous INetHandlerStatusClient whose handleServerInfo parses S00, handlePong computes latency, and onDisconnect triggers legacy fallback. After installing the handler it sends C00Handshake with protocol 47, host, port, and STATUS next state to switch the channel from HANDSHAKE to STATUS. It then sends C00PacketServerQuery to request ServerStatusResponse. The server replies with S00PacketServerInfo followed by S01PacketPong echo after the client C01PacketPing. Failures are logged without crashing the list thread.",
+   "code": "        try\n        {\n            networkmanager.sendPacket(new C00Handshake(47, serveraddress.getIP(), serveraddress.getPort(), EnumConnectionState.STATUS));\n            networkmanager.sendPacket(new C00PacketServerQuery());\n        }\n        catch (Throwable throwable)\n        {\n            logger.error((Object)throwable);\n        }\n    }",
+   "code_walkthrough": "The try block sends the two-packet STATUS opening sequence on the fresh NetworkManager. C00Handshake carries protocol 47 plus host and port and requests STATUS state. C00PacketServerQuery then asks for MOTD, version, players, and favicon. Throwables are logged so a bad address does not break the server list. Replies arrive as S00 and S01 handled by the anonymous handler."
+  },
+  {
+   "name": "handleServerInfo",
+   "detail_long": "handleServerInfo handles incoming S00PacketServerInfo and prepares the latency probe. It first rejects duplicate S00 with a Received unrequested status close to avoid double parsing. On first reply it marks field_183009_e true and extracts ServerStatusResponse via getResponse. It copies MOTD formatted text into serverMOTD, protocol name and number into gameVersion and version, and online versus max counts into populationInfo with gray formatting. It builds playerList tooltip from GameProfile names plus an and N more suffix when sampled players are fewer than online count. It validates favicon prefix data:image/png;base64 before storing base64 icon data else logs invalid icon. It records field_175092_e with Minecraft.getSystemTime and sends C01PacketPing with that timestamp. The server will echo it in S01PacketPong so handlePong can compute pingToServer. It sets field_147403_d true to suppress legacy fallback.",
+   "code": "                    if (serverstatusresponse.getFavicon() != null)\n                    {\n                        String s = serverstatusresponse.getFavicon();\n\n                        if (s.startsWith(\"data:image/png;base64,\"))\n                        {\n                            server.setBase64EncodedIconData(s.substring(\"data:image/png;base64,\".length()));\n                        }\n                        else\n                        {\n                            OldServerPinger.logger.error(\"Invalid server icon (unknown format)\");\n                        }\n                    }\n                    else\n                    {\n                        server.setBase64EncodedIconData((String)null);\n                    }\n\n                    this.field_175092_e = Minecraft.getSystemTime();\n                    networkmanager.sendPacket(new C01PacketPing(this.field_175092_e));\n                    this.field_147403_d = true;",
+   "code_walkthrough": "The favicon branch validates the data URL prefix before caching icon bytes else logs an error. Clearing icon to null when absent removes stale images from the list. Recording system time in field_175092_e provides the latency baseline. Sending C01PacketPing with that value asks the server for an S01 echo. Setting field_147403_d marks the query complete to block compatibility ping."
+  },
+  {
+   "name": "handlePong",
+   "detail_long": "handlePong handles incoming S01PacketPong and finalizes latency measurement. It reads the stored send time field_175092_e set when C01PacketPing was sent from handleServerInfo. It reads current time via Minecraft.getSystemTime as the receive time. It subtracts send from receive into server.pingToServer in milliseconds for the list display. It then closes the channel with Finished message to terminate the STATUS session cleanly. The outer pingPendingNetworks loop will later remove the closed NetworkManager and call checkDisconnected. No further packets are sent on this connection after close. Duplicate pongs are unlikely because the server closes after one S01.",
+   "code": "            public void handlePong(S01PacketPong packetIn)\n            {\n                long i = this.field_175092_e;\n                long j = Minecraft.getSystemTime();\n                server.pingToServer = j - i;\n                networkmanager.closeChannel(new ChatComponentText(\"Finished\"));\n            }\n            public void onDisconnect(IChatComponent reason)",
+   "code_walkthrough": "The handler ignores packetIn time and uses the stored send timestamp for consistency. Getting system time at receipt captures round-trip delay including server processing. Assigning j minus i to pingToServer updates the list column. Closing with Finished ends the STATUS connection so resources are freed."
+  },
+  {
+   "name": "onDisconnect",
+   "detail_long": "onDisconnect runs when the STATUS channel closes and decides whether to try legacy ping. It checks field_147403_d which is set true only after a valid S00 plus C01PacketPing sequence completed. If true it does nothing because modern ping succeeded even if the close reason is Finished or Cancelled. If false it logs Can't ping plus server IP and reason text via OldServerPinger logger. It sets serverMOTD to dark red Can't connect to server and clears populationInfo. It then calls tryCompatibilityPing on the outer OldServerPinger to attempt a pre-1.7 0xFE MC|PingHost exchange over raw Netty. That fallback can populate version, MOTD, and counts for old servers. Modern servers that refused the handshake will show the error text if legacy also fails.",
+   "code": "            public void onDisconnect(IChatComponent reason)\n            {\n                if (!this.field_147403_d)\n                {\n                    OldServerPinger.logger.error(\"Can\\'t ping \" + server.serverIP + \": \" + reason.getUnformattedText());\n                    server.serverMOTD = EnumChatFormatting.DARK_RED + \"Can\\'t connect to server.\";\n                    server.populationInfo = \"\";\n                    OldServerPinger.this.tryCompatibilityPing(server);\n                }\n            }",
+   "code_walkthrough": "The !field_147403_d guard distinguishes failed queries from normal Finished closes. Logging includes serverIP and disconnect text for diagnostics. Setting MOTD and populationInfo provides immediate list feedback. Delegating to tryCompatibilityPing opens a raw 0xFE channel for 1.6-era servers."
+  },
+  {
+   "name": "tryCompatibilityPing",
+   "detail_long": "tryCompatibilityPing implements the legacy 1.6 Beta-style 0xFE server-list ping over raw Netty. It resolves ServerAddress and builds a Bootstrap on CLIENT_NIO_EVENTLOOP with NioSocketChannel and a ChannelInitializer. The initializer enables TCP_NODELAY and installs a SimpleChannelInboundHandler for ByteBuf. On channelActive it writes packet 0xFE, 1, 0xFA MC|PingHost with host string length, IP chars, and port integer, then flushes with CLOSE_ON_FAILURE. On channelRead0 it reads unsigned byte and expects 0xFF kick response, decodes UTF-16BE length-prefixed string, and splits on NUL with PING_RESPONSE_SPLITTER limit 6. If element zero equals section-1 it parses protocol, version, MOTD, online, and max with parseIntWithDefault into server fields. It then closes the context while exceptionCaught also closes on error. No modern C00 or S00 packets are used on this path.",
+   "code": "                        public void channelActive(ChannelHandlerContext p_channelActive_1_) throws Exception\n                        {\n                            super.channelActive(p_channelActive_1_);\n                            ByteBuf bytebuf = Unpooled.buffer();\n\n                            try\n                            {\n                                bytebuf.writeByte(254);\n                                bytebuf.writeByte(1);\n                                bytebuf.writeByte(250);\n                                char[] achar = \"MC|PingHost\".toCharArray();\n                                bytebuf.writeShort(achar.length);\n\n                                for (char c0 : achar)\n                                {\n                                    bytebuf.writeChar(c0);\n                                }\n\n                                bytebuf.writeShort(7 + 2 * serveraddress.getIP().length());\n                                bytebuf.writeByte(127);\n                                achar = serveraddress.getIP().toCharArray();\n                                bytebuf.writeShort(achar.length);\n\n                                for (char c1 : achar)\n                                {\n                                    bytebuf.writeChar(c1);\n                                }\n\n                                bytebuf.writeInt(serveraddress.getPort());\n                                p_channelActive_1_.channel().writeAndFlush(bytebuf).addListener(ChannelFutureListener.CLOSE_ON_FAILURE);\n                            }",
+   "code_walkthrough": "channelActive fires when the raw TCP connection opens before any STATUS handshake. Allocating an Unpooled buffer lets the code manually encode the 0xFE plus MC|PingHost payload. Writing 254, 1, 250 plus length-prefixed chars reproduces the Beta 1.8 ping format. Appending IP chars and port tells legacy servers which virtual host is queried. Flushing with CLOSE_ON_FAILURE sends the probe while cleaning up on write error."
+  },
+  {
+   "name": "pingPendingNetworks",
+   "detail_long": "pingPendingNetworks pumps all outstanding server-list pings each client tick. It synchronizes on pingDestinations because ping and network threads can add or iterate concurrently. It obtains an iterator so closed channels can be removed safely during traversal. For each NetworkManager it checks isChannelOpen and if open calls processReceivedPackets to dispatch S00 to handleServerInfo and S01 to handlePong. If closed it removes the entry from the list and calls checkDisconnected to fire onDisconnect with the close reason. That disconnect step is what triggers legacy fallback when modern query never completed. It runs on the client thread from GuiMultiplayer update logic. Without this pump no STATUS replies would be processed.",
+   "code": "    public void pingPendingNetworks()\n    {\n        synchronized (this.pingDestinations)\n        {\n            Iterator<NetworkManager> iterator = this.pingDestinations.iterator();\n\n            while (iterator.hasNext())\n            {\n                NetworkManager networkmanager = (NetworkManager)iterator.next();\n\n                if (networkmanager.isChannelOpen())\n                {\n                    networkmanager.processReceivedPackets();\n                }\n                else\n                {\n                    iterator.remove();\n                    networkmanager.checkDisconnected();\n                }\n            }\n        }\n    }",
+   "code_walkthrough": "Synchronizing on pingDestinations prevents concurrent modification from ping creation. The iterator loop visits each pending NetworkManager once per tick. Open channels have processReceivedPackets decode and dispatch STATUS packets. Closed channels are removed and passed to checkDisconnected to deliver the disconnect reason. That callback completes latency display or legacy fallback."
+  },
+  {
+   "name": "clearPendingNetworks",
+   "detail_long": "clearPendingNetworks cancels every outstanding server-list ping, typically when leaving multiplayer GUI. It synchronizes on pingDestinations for thread safety with concurrent ping adds. It iterates with an iterator to allow removal while traversing. For each NetworkManager it checks isChannelOpen and only acts on still-open connections. It removes the open entry from the list first to prevent pingPendingNetworks from processing it. It then calls closeChannel with Cancelled message to close TCP and fire onDisconnect. Already-closed entries are left for pingPendingNetworks cleanup rather than double-closed here. After return no modern STATUS or legacy 0xFE probes from this pinger remain active.",
+   "code": "    public void clearPendingNetworks()\n    {\n        synchronized (this.pingDestinations)\n        {\n            Iterator<NetworkManager> iterator = this.pingDestinations.iterator();\n\n            while (iterator.hasNext())\n            {\n                NetworkManager networkmanager = (NetworkManager)iterator.next();\n\n                if (networkmanager.isChannelOpen())\n                {\n                    iterator.remove();\n                    networkmanager.closeChannel(new ChatComponentText(\"Cancelled\"));\n                }\n            }\n        }\n    }",
+   "code_walkthrough": "The synchronized block guards the shared ping list during cancellation. The iterator with isChannelOpen filter targets only live connections. Removing before close avoids race with the tick pump. Closing with Cancelled terminates handshake, query, or ping waits and releases Netty resources."
+  }
+ ]
+}

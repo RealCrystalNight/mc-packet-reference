@@ -1,0 +1,205 @@
+{
+ "overview": "Server per-entity tracker state machine. Decides spawn, delta move/look, velocity, metadata for each tick. Tick flow: updatePlayerList (range/ride/ItemFrame) -> motion branch (rel vs teleport) + head/velocity/metadata. Pushes via EntityPlayerMP.playerNetServerHandler to trackingPlayers set.",
+ "methods": [
+  {
+   "detail": "Refreshes player set if moved >16 blocks. Sends S1B on ride change. Every 10 ticks syncs ItemFrame maps+metadata. On frequency/airborne/dataChanged sends rel/teleport, velocity, metadata, head look.",
+   "name": "updatePlayerList",
+   "packets": [
+    "S1B",
+    "S14",
+    "S18",
+    "S12",
+    "S19",
+    "S1C"
+   ],
+   "purpose": "Per-tick sync: range scan, attach, ItemFrame maps, movement branch."
+  },
+  {
+   "detail": "Range+chunk+isSpectatedByPlayer gate. On add sends createSpawnPacket then metadata, NBT S49, attributes S20, velocity S12, attach S1B, equipment S04, bed S0A, effects S1D.",
+   "name": "updatePlayerEntity",
+   "packets": [
+    "S1C",
+    "S49",
+    "S20",
+    "S12",
+    "S04",
+    "S1D"
+   ],
+   "purpose": "Adds/removes one player from tracking set with full spawn burst."
+  },
+  {
+   "detail": "Switches Item/Player/Minecart/Boat/IAnimals/mobs, projectiles by type IDs (60 arrow,73 potion,etc), FallingBlock state ID, Painting/ItemFrame/LeashKnot with pos overrides.",
+   "name": "createSpawnPacket",
+   "packets": [
+    "S0C",
+    "S0E",
+    "S0F",
+    "S10",
+    "S11"
+   ],
+   "purpose": "Factory mapping entity class to spawn packet type."
+  },
+  {
+   "detail": "If hasObjectChanged sends S1C metadata. If EntityLivingBase with non-empty attribute set sends S20 properties then clears set to avoid resend.",
+   "name": "sendMetadataToAllAssociatedPlayers",
+   "packets": [
+    "S1C",
+    "S20"
+   ],
+   "purpose": "Pushes DataWatcher and attribute deltas."
+  },
+  {
+   "detail": "sendPacket loops trackingPlayers sendPacket. func_151261_b also echoes to tracked EntityPlayerMP self, used for metadata/attributes/velocityChanged.",
+   "name": "sendPacketToTrackedPlayers/func_151261_b",
+   "packets": [
+    "S1C",
+    "S20",
+    "S12"
+   ],
+   "purpose": "Fan-out helpers with self-include variant."
+  },
+  {
+   "detail": "Removes from trackingPlayers set and calls player.removeEntity which queues S13 destroy or immediate send for players.",
+   "name": "removeFromTrackedPlayers/removeTrackedPlayerSymmetric",
+   "packets": [
+    "S13"
+   ],
+   "purpose": "Stops tracking and destroys entity client-side."
+  },
+  {
+   "detail": "Compares player XZ to encodedPos/32 within trackingDistanceThreshold and isSpectatedByPlayer. Prevents sending hidden/spectator-blocked entities.",
+   "name": "func_180233_c",
+   "packets": [],
+   "purpose": "Range + spectator visibility gate."
+  }
+ ],
+ "packet_usage": [
+  {
+   "direction": "sent",
+   "id": "S0C",
+   "trigger": "Player spawn burst in createSpawnPacket."
+  },
+  {
+   "direction": "sent",
+   "id": "S0E",
+   "trigger": "Item/projectile/object spawn by type ID."
+  },
+  {
+   "direction": "sent",
+   "id": "S12",
+   "trigger": "Motion delta >0.02 or velocityChanged flag."
+  },
+  {
+   "direction": "sent",
+   "id": "S14",
+   "trigger": "Small delta move/look within +-128 and 400-tick window."
+  },
+  {
+   "direction": "sent",
+   "id": "S18",
+   "trigger": "Large delta, 400-tick force sync, or ground change."
+  },
+  {
+   "direction": "sent",
+   "id": "S19",
+   "trigger": "Head yaw change >=4/256."
+  },
+  {
+   "direction": "sent",
+   "id": "S1B",
+   "trigger": "Ride/leash change."
+  },
+  {
+   "direction": "sent",
+   "id": "S1C",
+   "trigger": "DataWatcher dirty."
+  },
+  {
+   "direction": "sent",
+   "id": "S20",
+   "trigger": "Attribute set non-empty."
+  },
+  {
+   "direction": "sent",
+   "id": "S04/S0A/S49",
+   "trigger": "Initial burst equipment/bed/NBT."
+  }
+ ],
+ "internal_fields": [
+  {
+   "name": "trackedEntity/trackingPlayers",
+   "role": "Watched entity and subscribed EntityPlayerMP set"
+  },
+  {
+   "name": "encodedPosX/Y/Z + RotationYaw/Pitch",
+   "role": "Last sent fixed-point pos (*32) and angle (*256/360) for delta"
+  },
+  {
+   "name": "updateFrequency/trackingDistanceThreshold",
+   "role": "Per-type tick divisor and XZ range gate"
+  },
+  {
+   "name": "ticksSinceLastForcedTeleport",
+   "role": "Forces S18 every 400 ticks to fix drift"
+  },
+  {
+   "name": "lastTrackedEntityMotionX/Y/motionZ",
+   "role": "Last sent velocity; 0.02 threshold for S12"
+  },
+  {
+   "name": "updateCounter/firstUpdateDone",
+   "role": "Tick count and initial scan flag with 16-block moved check"
+  }
+ ],
+ "peers": [
+  "EntityTracker",
+  "EntityPlayerMP",
+  "EntityPlayer",
+  "DataWatcher",
+  "ServersideAttributeMap"
+ ],
+ "methods_detailed": [
+  {
+   "name": "updatePlayerList",
+   "detail_long": "updatePlayerList runs each server tick and first checks firstUpdateDone or distance squared over 16 to decide whether to rescan tracking membership via updatePlayerEntities. It detects ridingEntity changes or a 60-tick refresh and broadcasts S1BPacketEntityAttach type 0 so vehicle mounts stay glued on remote clients. For EntityItemFrame every 10 ticks it re-sends map data for displayed ItemMaps and forces sendMetadataToAllAssociatedPlayers for frame rotation. The main motion gate fires when updateCounter modulo updateFrequency is zero, isAirBorne is true, or DataWatcher reports a change, ensuring idle entities still heartbeat. Inside it encodes positions times 32 and rotations times 256 over 360, computes deltas against encoded caches, and sets flag for 4-unit move and flag1 for 4-unit look change. It chooses S15 rel-move, S16 look, S17 look-move or S18 teleport based on the 128-unit byte range, 400-tick forced teleport, ridingEntity and onGround flip, then handles S12 velocity and S19 head look. Finally it increments updateCounter and flushes velocityChanged via func_151261_b.",
+   "code": "        if (this.updateCounter % this.updateFrequency == 0 || this.trackedEntity.isAirBorne || this.trackedEntity.getDataWatcher().hasObjectChanged())\n        {\n            if (this.trackedEntity.ridingEntity == null)\n            {\n                ++this.ticksSinceLastForcedTeleport;\n                int k = MathHelper.floor_double(this.trackedEntity.posX * 32.0D);\n                int j1 = MathHelper.floor_double(this.trackedEntity.posY * 32.0D);\n                int k1 = MathHelper.floor_double(this.trackedEntity.posZ * 32.0D);\n                int l1 = MathHelper.floor_float(this.trackedEntity.rotationYaw * 256.0F / 360.0F);\n                int i2 = MathHelper.floor_float(this.trackedEntity.rotationPitch * 256.0F / 360.0F);\n                int j2 = k - this.encodedPosX;\n                int k2 = j1 - this.encodedPosY;\n                int i = k1 - this.encodedPosZ;\n                Packet packet1 = null;\n                boolean flag = Math.abs(j2) >= 4 || Math.abs(k2) >= 4 || Math.abs(i) >= 4 || this.updateCounter % 60 == 0;\n                boolean flag1 = Math.abs(l1 - this.encodedRotationYaw) >= 4 || Math.abs(i2 - this.encodedRotationPitch) >= 4;\n\n                if (this.updateCounter > 0 || this.trackedEntity instanceof EntityArrow)\n                {\n                    if (j2 >= -128 && j2 < 128 && k2 >= -128 && k2 < 128 && i >= -128 && i < 128 && this.ticksSinceLastForcedTeleport <= 400 && !this.ridingEntity && this.onGround == this.trackedEntity.onGround)",
+   "code_walkthrough": "The outer modulo plus isAirBorne plus hasObjectChanged condition throttles per-type updates, for example mobs every 3 ticks versus arrows every 20, while forcing immediate send on motion or metadata dirt. The times-32 and times-256 encoding lines convert doubles to fixed-point protocol units the client decodes, matching S14 byte deltas and S18 int positions. The flag and flag1 thresholds of 4 encoded units filter sub-pixel jitter to save bandwidth. The inner range check on -128 to 128 plus 400-tick and onGround tests selects cheap S14 deltas versus authoritative S18 teleport, which is why large teleports or long drift always correct with S18."
+  },
+  {
+   "name": "updatePlayerEntity",
+   "detail_long": "updatePlayerEntity manages one candidate player against one tracked entity, skipping when the player is the tracked entity itself to avoid self-tracking loops. It calls func_180233_c for XZ range plus spectator visibility, then requires either chunk watch via isPlayerWatchingThisChunk or forceSpawn to admit a new tracker. On admission it adds to trackingPlayers, sends createSpawnPacket as the entity-type-correct S0C, S0E, S0F, S10 or S11 birth packet, then follows with S1C metadata if the DataWatcher is non-blank. It sends S49 NBT when getNBTTagCompound is non-null, S20 attributes for watched collections, and caches motion into lastTracked fields for future S12 deltas. It sends S12 velocity immediately unless the spawn was S0F mob which already carries motion, then replays S1B attach for riding or leashed states, S04 equipment for five armor slots, S0A bed if sleeping, and S1D for each active potion. On range exit it removes from trackingPlayers and calls removeEntity which emits S13 destroy, keeping client worlds garbage-collected.",
+   "code": "    public void updatePlayerEntity(EntityPlayerMP playerMP)\n    {\n        if (playerMP != this.trackedEntity)\n        {\n            if (this.func_180233_c(playerMP))\n            {\n                if (!this.trackingPlayers.contains(playerMP) && (this.isPlayerWatchingThisChunk(playerMP) || this.trackedEntity.forceSpawn))\n                {\n                    this.trackingPlayers.add(playerMP);\n                    Packet packet = this.createSpawnPacket();\n                    playerMP.playerNetServerHandler.sendPacket(packet);\n\n                    if (!this.trackedEntity.getDataWatcher().getIsBlank())\n                    {\n                        playerMP.playerNetServerHandler.sendPacket(new S1CPacketEntityMetadata(this.trackedEntity.getEntityId(), this.trackedEntity.getDataWatcher(), true));\n                    }\n\n                    NBTTagCompound nbttagcompound = this.trackedEntity.getNBTTagCompound();\n\n                    if (nbttagcompound != null)\n                    {\n                        playerMP.playerNetServerHandler.sendPacket(new S49PacketUpdateEntityNBT(this.trackedEntity.getEntityId(), nbttagcompound));\n                    }\n\n                    if (this.trackedEntity instanceof EntityLivingBase)\n                    {\n                        ServersideAttributeMap serversideattributemap = (ServersideAttributeMap)((EntityLivingBase)this.trackedEntity).getAttributeMap();",
+   "code_walkthrough": "The self-inequality plus func_180233_c plus isPlayerWatchingThisChunk chain ensures a player only receives entities in range, in a watched chunk and visible through spectator rules. createSpawnPacket returns the polymorphic birth packet the client needs to allocate the entity shell with correct ID and position. The S1C and S49 follow-ups hydrate DataWatcher flags and tile NBT that the spawn packet alone cannot carry. Missing this burst leaves invisible or untextured entities, while the else-branch S13 destroy on range exit is what removes them when walking away."
+  },
+  {
+   "name": "createSpawnPacket",
+   "detail_long": "createSpawnPacket is a type-switch factory that warns when the entity isDead yet still requested, then returns the exact spawn packet for each class. EntityItem maps to S0E type 2 data 1, EntityPlayerMP to S0C spawn player, minecarts to S0E type 10 with network ID, boats to S0E type 1, and IAnimals plus other EntityLivingBase to S0F mob with head yaw refresh. Projectiles use fixed S0E type IDs including 60 arrow with shooter ID, 61 snowball, 62 egg, 65 pearl, 72 eye, 73 potion with damage, 75 bottle, 76 firework, 90 fish hook with angler fallback, plus fireballs 63, 64 small, 66 wither with acceleration scaled by 8000. FallingBlock uses S0E 70 with Block.getStateId, armor stands 78, XP orbs S11, paintings S10 and item frames or leash knots S0E 71 or 77 with overridden fixed-point hanging coordinates. Any unknown class throws IllegalArgumentException, failing fast rather than sending a corrupt spawn. The caller updatePlayerEntity sends the result before metadata, attributes and equipment so the client has an ID to attach them to.",
+   "code": "        else if (this.trackedEntity instanceof EntityArrow)\n        {\n            Entity entity = ((EntityArrow)this.trackedEntity).shootingEntity;\n            return new S0EPacketSpawnObject(this.trackedEntity, 60, entity != null ? entity.getEntityId() : this.trackedEntity.getEntityId());\n        }\n        else if (this.trackedEntity instanceof EntitySnowball)\n        {\n            return new S0EPacketSpawnObject(this.trackedEntity, 61);\n        }\n        else if (this.trackedEntity instanceof EntityPotion)\n        {\n            return new S0EPacketSpawnObject(this.trackedEntity, 73, ((EntityPotion)this.trackedEntity).getPotionDamage());\n        }\n        else if (this.trackedEntity instanceof EntityExpBottle)\n        {\n            return new S0EPacketSpawnObject(this.trackedEntity, 75);\n        }",
+   "code_walkthrough": "Each branch constructs S0E with the hardcoded vanilla type ID the client uses to pick a renderer and physics, so 60 versus 61 versus 73 is not interchangeable. The arrow line threads shootingEntity ID with a self-ID fallback when the shooter is gone, letting the client attribute kill credit. The potion line passes getPotionDamage as the data int so the client shows the correct splash color and effect. Sending the wrong ID or data spawns the wrong visual or crashes old clients, which is why the final else throws instead of guessing."
+  },
+  {
+   "name": "sendMetadataToAllAssociatedPlayers",
+   "detail_long": "sendMetadataToAllAssociatedPlayers first fetches the trackedEntity DataWatcher and checks hasObjectChanged to avoid spamming identical S1C packets every tick. On dirty it calls func_151261_b with S1CPacketEntityMetadata carrying entity ID, watcher and false for non-initial, which fans out to trackers plus the tracked player if it is an EntityPlayerMP. It then checks for EntityLivingBase, pulls the ServersideAttributeMap, and reads getAttributeInstanceSet as the delta set of recently modified max-health, speed or attack attributes. If that set is non-empty it sends S20PacketEntityProperties with the set through func_151261_b and immediately clears the set to prevent resend on the next tick. This two-channel push keeps flags like sneaking, hurt color and custom names via S1C separate from numeric attributes via S20. The method is called after every movement send and every 10 ticks for item frames, so metadata converges quickly. Suppressing it leaves ghost names or stale health scaling.",
+   "code": "    private void sendMetadataToAllAssociatedPlayers()\n    {\n        DataWatcher datawatcher = this.trackedEntity.getDataWatcher();\n\n        if (datawatcher.hasObjectChanged())\n        {\n            this.func_151261_b(new S1CPacketEntityMetadata(this.trackedEntity.getEntityId(), datawatcher, false));\n        }\n\n        if (this.trackedEntity instanceof EntityLivingBase)\n        {\n            ServersideAttributeMap serversideattributemap = (ServersideAttributeMap)((EntityLivingBase)this.trackedEntity).getAttributeMap();\n            Set<IAttributeInstance> set = serversideattributemap.getAttributeInstanceSet();\n\n            if (!set.isEmpty())\n            {\n                this.func_151261_b(new S20PacketEntityProperties(this.trackedEntity.getEntityId(), set));\n            }\n\n            set.clear();\n        }\n    }",
+   "code_walkthrough": "The hasObjectChanged guard reads the DataWatcher dirty flag set by updateObject calls, so S1C is only built when a watched byte actually flipped. func_151261_b is used instead of sendPacketToTrackedPlayers so the tracked player itself also receives its own metadata for self-render like skin flags. The attribute set fetch plus isEmpty check isolates numeric modifier changes that DataWatcher cannot express, sending them as S20. The trailing clear resets the delta set, meaning a lost S20 will not auto-retry until the attribute changes again."
+  },
+  {
+   "name": "sendPacketToTrackedPlayers/func_151261_b",
+   "detail_long": "sendPacketToTrackedPlayers iterates the trackingPlayers hash set and calls playerNetServerHandler.sendPacket for each member, delivering movement, look, metadata or velocity to exactly those in range. It performs no range recheck itself, relying on updatePlayerEntity and func_180233_c to maintain set membership, which makes it a cheap fan-out on the hot tick path. func_151261_b wraps it by first calling sendPacketToTrackedPlayers, then checking if trackedEntity is an EntityPlayerMP and echoing the same packet to that entity own channel. That self-include variant is used for S1C metadata, S20 attributes and S12 velocityChanged where the subject player must also see its own flags or knockback. Using the wrong helper hides self-effects like potion color or takes no knockback visually. Both take a generic Packet so S14, S18, S19 and S1B all flow through the same loop. The design separates observer sync from subject sync with one branch.",
+   "code": "    public void sendPacketToTrackedPlayers(Packet packetIn)\n    {\n        for (EntityPlayerMP entityplayermp : this.trackingPlayers)\n        {\n            entityplayermp.playerNetServerHandler.sendPacket(packetIn);\n        }\n    }\n\n    public void func_151261_b(Packet packetIn)\n    {\n        this.sendPacketToTrackedPlayers(packetIn);\n\n        if (this.trackedEntity instanceof EntityPlayerMP)\n        {\n            ((EntityPlayerMP)this.trackedEntity).playerNetServerHandler.sendPacket(packetIn);\n        }\n    }",
+   "code_walkthrough": "The for loop over trackingPlayers shows the fan-out cost scales with observer count, each sendPacket queuing on that player Netty channel. The packetIn parameter is opaque, so the same loop carries tiny S14 deltas and large S20 lists without branching. func_151261_b adds the instanceof EntityPlayerMP self-echo, which is required because a player does not track itself in trackingPlayers. Choosing between the two controls whether the subject sees its own S12 knockback or S1C name flags, a frequent source of self-desync bugs when misused."
+  },
+  {
+   "name": "removeFromTrackedPlayers/removeTrackedPlayerSymmetric",
+   "detail_long": "sendDestroyEntityPacketToTrackedPlayers loops trackingPlayers and calls removeEntity on each, which for players sends immediate S13 and for other entities queues into destroyedItemsNetCache for batched S13. removeFromTrackedPlayers checks contains before acting, then calls playerMP.removeEntity to destroy the client-side copy and removes the player from the set to stop future sends. removeTrackedPlayerSymmetric is the symmetric alias used on chunk unload or dimension change, performing the same contains, remove and removeEntity sequence. Together they ensure no stale entity shells linger after range exit, logout or chunk unload. Forgetting the removeEntity call leaks ghost mobs that float until the next S18 or relog. The S13 carries only entity IDs, so the client looks up and deletes the matching world entry. These paths are the only clean teardown for tracker membership.",
+   "code": "    public void sendDestroyEntityPacketToTrackedPlayers()\n    {\n        for (EntityPlayerMP entityplayermp : this.trackingPlayers)\n        {\n            entityplayermp.removeEntity(this.trackedEntity);\n        }\n    }\n\n    public void removeFromTrackedPlayers(EntityPlayerMP playerMP)\n    {\n        if (this.trackingPlayers.contains(playerMP))\n        {\n            playerMP.removeEntity(this.trackedEntity);\n            this.trackingPlayers.remove(playerMP);\n        }\n    }",
+   "code_walkthrough": "The destroy loop delegates to EntityPlayerMP.removeEntity, which decides between instant S13 for players and batched cache for others, explaining why player logouts vanish instantly. The contains guard prevents double-destroy S13s that would make the client delete a reused entity ID. removeEntity triggers the S13 with the tracked entity ID so the client can free the renderer and physics. The symmetric variant repeats this pattern for unload paths, so skipping either leaves ghost entities that still receive S14 moves."
+  },
+  {
+   "name": "func_180233_c",
+   "detail_long": "func_180233_c computes d0 as player X minus encodedPosX divided by 32 and d1 as player Z minus encodedPosZ divided by 32, converting the fixed-point cache back to block units. It checks d0 and d1 against plus and minus trackingDistanceThreshold, which varies by entity type such as 64 for items or 512 for dragons. It also calls trackedEntity.isSpectatedByPlayer to enforce spectator invisibility, hiding non-spectated entities from spectator cameras and vice versa. It ignores Y distance entirely, so vertical range does not gate tracking in 1.8.9. The result gates updatePlayerEntity admission and retention, preventing bandwidth waste on far entities. A false return triggers removal plus S13 destroy, while true plus chunk watch triggers the full spawn burst. Cheats cannot force the server to send out-of-range entities because this gate runs before every send.",
+   "code": "    public boolean func_180233_c(EntityPlayerMP playerMP)\n    {\n        double d0 = playerMP.posX - (double)(this.encodedPosX / 32);\n        double d1 = playerMP.posZ - (double)(this.encodedPosZ / 32);\n        return d0 >= (double)(-this.trackingDistanceThreshold) && d0 <= (double)this.trackingDistanceThreshold && d1 >= (double)(-this.trackingDistanceThreshold) && d1 <= (double)this.trackingDistanceThreshold && this.trackedEntity.isSpectatedByPlayer(playerMP);\n    }\n\n    private boolean isPlayerWatchingThisChunk(EntityPlayerMP playerMP)\n    {\n        return playerMP.getServerForPlayer().getPlayerManager().isPlayerWatchingChunk(playerMP, this.trackedEntity.chunkCoordX, this.trackedEntity.chunkCoordZ);\n    }",
+   "code_walkthrough": "The d0 and d1 lines decode the last-sent position by integer-dividing the fixed-point cache, noting the int division truncation before cast. The long return line ANDs four range comparisons with isSpectatedByPlayer, so all five must pass to keep tracking. isPlayerWatchingThisChunk below adds a second chunk-visibility requirement checked alongside this gate in updatePlayerEntity. Together they explain why entities pop in at chunk borders or vanish when spectating, and why radar hacks cannot see beyond trackingDistanceThreshold."
+  }
+ ]
+}

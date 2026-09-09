@@ -1,0 +1,153 @@
+{
+ "overview": "Login-state machine HELLO>KEY>AUTHENTICATING>READY>ACCEPTED. Validates C00 start and C01 encryption, verifies Mojang session off-thread, then hands to ServerConfigurationManager or disconnects.",
+ "methods": [
+  {
+   "detail": "Requires HELLO state via Validate. Online mode and non-local sends S01 EncryptionRequest with serverId, public key and 4-byte verifyToken; else goes READY_TO_ACCEPT.",
+   "name": "processLoginStart",
+   "packets": [
+    "C00",
+    "S01"
+   ],
+   "purpose": "Starts login or requests encryption."
+  },
+  {
+   "detail": "Requires KEY state. Compares verifyToken with private-key decrypt; throws Invalid nonce on mismatch. Enables encryption then spawns User Authenticator thread.",
+   "name": "processEncryptionResponse",
+   "packets": [
+    "C01"
+   ],
+   "purpose": "Verifies nonce and enables crypto."
+  },
+  {
+   "detail": "READY_TO_ACCEPT calls tryAcceptPlayer. DELAY_ACCEPT waits for duplicate logout then initializes. connectionTimer 600 ticks closes Took too long to log in.",
+   "name": "update",
+   "packets": [
+    "S02",
+    "S03"
+   ],
+   "purpose": "Advances ready/delayed accept and timeout."
+  },
+  {
+   "detail": "Offline-mode generates offline UUID. allowUserToConnect non-null closes with reason. Else sends S03 EnableCompression if threshold>=0, then S02 LoginSuccess and creates player.",
+   "name": "tryAcceptPlayer",
+   "packets": [
+    "S02",
+    "S03",
+    "S00"
+   ],
+   "purpose": "Applies bans, compression and success."
+  },
+  {
+   "detail": "Logs info with connection string. Sends S00 Disconnect with text reason then closeChannel. Catches and logs disconnect errors.",
+   "name": "closeConnection",
+   "packets": [
+    "S00"
+   ],
+   "purpose": "Sends kick and closes channel."
+  },
+  {
+   "detail": "UUID.nameUUIDFromBytes OfflinePlayer:name with UTF-8. Used for offline servers and singleplayer fallback when auth servers down.",
+   "name": "getOfflineProfile",
+   "packets": [],
+   "purpose": "Derives offline UUID profile."
+  }
+ ],
+ "packet_usage": [
+  {
+   "direction": "handled",
+   "id": "C00",
+   "trigger": "Client hello with GameProfile"
+  },
+  {
+   "direction": "handled",
+   "id": "C01",
+   "trigger": "Encrypted secret and verify token"
+  },
+  {
+   "direction": "sent",
+   "id": "S00",
+   "trigger": "Login disconnect with reason"
+  },
+  {
+   "direction": "sent",
+   "id": "S01",
+   "trigger": "Encryption request in online mode"
+  },
+  {
+   "direction": "sent",
+   "id": "S02",
+   "trigger": "Login success before PLAY switch"
+  },
+  {
+   "direction": "sent",
+   "id": "S03",
+   "trigger": "Enable compression if threshold set"
+  }
+ ],
+ "internal_fields": [
+  {
+   "name": "currentLoginState",
+   "role": "HELLO/KEY/AUTH/READY/DELAY/ACCEPTED enum"
+  },
+  {
+   "name": "verifyToken",
+   "role": "4-byte nonce to prevent replay"
+  },
+  {
+   "name": "loginGameProfile",
+   "role": "Pending profile, completed after auth"
+  },
+  {
+   "name": "connectionTimer",
+   "role": "Ticks since construct; 600 timeout"
+  },
+  {
+   "name": "secretKey",
+   "role": "Shared secret enabling encryption"
+  }
+ ],
+ "peers": [
+  "ServerConfigurationManager",
+  "NetHandlerPlayServer",
+  "NetworkManager",
+  "MinecraftServer"
+ ],
+ "methods_detailed": [
+  {
+   "name": "processLoginStart",
+   "detail_long": "processLoginStart handles C00 hello and branches online versus offline login. It validates state equals HELLO via Validate, throwing on duplicate hello. It stores the GameProfile from the packet. If online mode is enabled and the channel is not local, it moves to KEY state and sends S01 EncryptionRequest with empty serverId, server public key and four-byte verifyToken. Otherwise for offline or singleplayer it jumps directly to READY_TO_ACCEPT. No kick occurs here, errors throw IllegalStateException. The verifyToken nonce later proves the client holds the private key. Local channels skip encryption to reduce latency.",
+   "code": "    public void processLoginStart(C00PacketLoginStart packetIn)\n    {\n        Validate.validState(this.currentLoginState == NetHandlerLoginServer.LoginState.HELLO, \"Unexpected hello packet\", new Object[0]);\n        this.loginGameProfile = packetIn.getProfile();\n\n        if (this.server.isServerInOnlineMode() && !this.networkManager.isLocalChannel())\n        {\n            this.currentLoginState = NetHandlerLoginServer.LoginState.KEY;\n            this.networkManager.sendPacket(new S01PacketEncryptionRequest(this.serverId, this.server.getKeyPair().getPublic(), this.verifyToken));\n        }\n        else\n        {\n            this.currentLoginState = NetHandlerLoginServer.LoginState.READY_TO_ACCEPT;\n        }\n    }",
+   "code_walkthrough": "Validate.validState enforces the HELLO to KEY to AUTH state machine and rejects replays. Storing loginGameProfile preserves the requested name for later Mojang verification. The online-mode plus not-local gate selects encrypted versus instant accept. S01PacketEncryptionRequest carries serverId, public key and verifyToken nonce. The else moves offline logins straight to READY_TO_ACCEPT for tryAcceptPlayer."
+  },
+  {
+   "name": "processEncryptionResponse",
+   "detail_long": "processEncryptionResponse handles C01 key exchange in KEY state. It validates KEY state, fetches the server private key and compares the decrypted verifyToken with Arrays equals, throwing Invalid nonce on mismatch to block replay. On match it decrypts the shared secret, moves to AUTHENTICATING and enables encryption on the channel. It then spawns User Authenticator thread with incrementing ID to avoid blocking netty. That thread hashes serverId, public key and secret via CryptManager, calls hasJoinedServer to verify the Mojang session, and on success sets READY_TO_ACCEPT. Singleplayer fallback generates offline profiles when verification fails or auth servers are down, otherwise it closes with Failed to verify username. No S packets are sent here directly.",
+   "code": "    public void processEncryptionResponse(C01PacketEncryptionResponse packetIn)\n    {\n        Validate.validState(this.currentLoginState == NetHandlerLoginServer.LoginState.KEY, \"Unexpected key packet\", new Object[0]);\n        PrivateKey privatekey = this.server.getKeyPair().getPrivate();\n\n        if (!Arrays.equals(this.verifyToken, packetIn.getVerifyToken(privatekey)))\n        {\n            throw new IllegalStateException(\"Invalid nonce!\");\n        }\n        else\n        {\n            this.secretKey = packetIn.getSecretKey(privatekey);\n            this.currentLoginState = NetHandlerLoginServer.LoginState.AUTHENTICATING;\n            this.networkManager.enableEncryption(this.secretKey);\n            (new Thread(\"User Authenticator #\" + AUTHENTICATOR_THREAD_ID.incrementAndGet())",
+   "code_walkthrough": "The KEY state check rejects out-of-order C01 packets. Decrypting verifyToken with the private key and comparing to stored nonce detects tampering. Throwing Invalid nonce aborts the login without a graceful S00. Storing secretKey, setting AUTHENTICATING and enabling encryption switch the channel to ciphered mode. Spawning the authenticator thread offloads the blocking Mojang HTTPS check."
+  },
+  {
+   "name": "update",
+   "detail_long": "update ticks the login state machine and enforces the 600-tick timeout. If state is READY_TO_ACCEPT it calls tryAcceptPlayer immediately to apply bans and compression. If state is DELAY_ACCEPT it polls for the duplicate old player by UUID, and when null it flips to READY_TO_ACCEPT, initializes the new player and clears the pending reference. It increments connectionTimer every tick and closes with Took too long to log in via S00 Disconnect at exactly 600. DELAY_ACCEPT exists because createPlayerForUser kicks the old session but the logout needs ticks to complete. No PLAY packets are sent here, only login S00, S02 and S03 via helpers. Stuck AUTHENTICATING threads eventually hit the same timeout.",
+   "code": "    public void update()\n    {\n        if (this.currentLoginState == NetHandlerLoginServer.LoginState.READY_TO_ACCEPT)\n        {\n            this.tryAcceptPlayer();\n        }\n        else if (this.currentLoginState == NetHandlerLoginServer.LoginState.DELAY_ACCEPT)\n        {\n            EntityPlayerMP entityplayermp = this.server.getConfigurationManager().getPlayerByUUID(this.loginGameProfile.getId());\n\n            if (entityplayermp == null)\n            {\n                this.currentLoginState = NetHandlerLoginServer.LoginState.READY_TO_ACCEPT;\n                this.server.getConfigurationManager().initializeConnectionToPlayer(this.networkManager, this.player);\n                this.player = null;\n            }\n        }\n\n        if (this.connectionTimer++ == 600)\n        {\n            this.closeConnection(\"Took too long to log in\");\n        }\n    }",
+   "code_walkthrough": "The READY_TO_ACCEPT branch drives immediate accept without waiting for network events. The DELAY_ACCEPT branch looks up the old UUID entry to detect when the kicked duplicate has logged out. Null means safe to initializeConnectionToPlayer with the staged player object. The connectionTimer post-increment equals 600 gate sends S00 Took too long to log in. That timeout bounds Mojang outages and stalled encryption handshakes."
+  },
+  {
+   "name": "tryAcceptPlayer",
+   "detail_long": "tryAcceptPlayer applies final login gates and switches to PLAY. It completes incomplete profiles with getOfflineProfile deriving OfflinePlayer UUIDs. It calls allowUserToConnect and closes with the ban, whitelist, IP or full reason when non-null. On success it sets ACCEPTED, and if compression threshold is non-negative on a remote channel it sends S03 EnableCompression then sets the threshold on future. It sends S02 LoginSuccess with the verified profile to trigger client PLAY switch. It checks for duplicate UUID sessions, staging a new player and entering DELAY_ACCEPT when found, otherwise initializing immediately via createPlayerForUser. No teleport occurs, the follow-up initializeConnectionToPlayer sends the S01 burst. Offline servers always take the instant path.",
+   "code": "        String s = this.server.getConfigurationManager().allowUserToConnect(this.networkManager.getRemoteAddress(), this.loginGameProfile);\n\n        if (s != null)\n        {\n            this.closeConnection(s);\n        }\n        else\n        {\n            this.currentLoginState = NetHandlerLoginServer.LoginState.ACCEPTED;\n\n            if (this.server.getNetworkCompressionTreshold() >= 0 && !this.networkManager.isLocalChannel())\n            {\n                this.networkManager.sendPacket(new S03PacketEnableCompression(this.server.getNetworkCompressionTreshold()), new ChannelFutureListener()\n                {\n                    public void operationComplete(ChannelFuture p_operationComplete_1_) throws Exception\n                    {\n                        NetHandlerLoginServer.this.networkManager.setCompressionTreshold(NetHandlerLoginServer.this.server.getNetworkCompressionTreshold());\n                    }\n                }, new GenericFutureListener[0]);\n            }\n\n            this.networkManager.sendPacket(new S02PacketLoginSuccess(this.loginGameProfile));\n            EntityPlayerMP entityplayermp = this.server.getConfigurationManager().getPlayerByUUID(this.loginGameProfile.getId());\n\n            if (entityplayermp != null)\n            {\n                this.currentLoginState = NetHandlerLoginServer.LoginState.DELAY_ACCEPT;\n                this.player = this.server.getConfigurationManager().createPlayerForUser(this.loginGameProfile);\n            }\n            else\n            {\n                this.server.getConfigurationManager().initializeConnectionToPlayer(this.networkManager, this.server.getConfigurationManager().createPlayerForUser(this.loginGameProfile));\n            }",
+   "code_walkthrough": "allowUserToConnect returns null only when bans, whitelist, IP and capacity all pass. Non-null triggers closeConnection with S00 carrying that reason. Setting ACCEPTED plus S03 EnableCompression negotiates compression before LoginSuccess. S02PacketLoginSuccess carries the final UUID and name to switch the client to PLAY. The UUID duplicate check stages DELAY_ACCEPT versus immediate initializeConnectionToPlayer for overlap handling."
+  },
+  {
+   "name": "closeConnection",
+   "detail_long": "closeConnection terminates a login with S00 Disconnect and channel close. It logs the connection info plus reason for audit. It wraps the reason in ChatComponentText, sends S00PacketDisconnect, then closes the channel with the same component. Exceptions during send or close are caught and logged as Error whilst disconnecting player without rethrow. It is used for ban kicks, auth failures, duplicate handling and the 600-tick timeout. No PLAY packets are involved because the pipeline is still in LOGIN state. The client displays the text on the disconnected screen.",
+   "code": "    public void closeConnection(String reason)\n    {\n        try\n        {\n            logger.info(\"Disconnecting \" + this.getConnectionInfo() + \": \" + reason);\n            ChatComponentText chatcomponenttext = new ChatComponentText(reason);\n            this.networkManager.sendPacket(new S00PacketDisconnect(chatcomponenttext));\n            this.networkManager.closeChannel(chatcomponenttext);\n        }\n        catch (Exception exception)\n        {\n            logger.error((String)\"Error whilst disconnecting player\", (Throwable)exception);\n        }\n    }",
+   "code_walkthrough": "The try block ensures logging and packet send happen atomically. getConnectionInfo includes profile and remote address for forensics. S00PacketDisconnect carries the human-readable kick reason to the client. closeChannel with the same component tears down the netty pipeline. The catch prevents disconnect-path exceptions from crashing the server tick."
+  },
+  {
+   "name": "getOfflineProfile",
+   "detail_long": "getOfflineProfile derives deterministic offline UUIDs for cracked and singleplayer logins. It concatenates OfflinePlayer colon plus original name, encodes as UTF-8 bytes and hashes with nameUUIDFromBytes version three. It returns a new GameProfile with that UUID and the original name preserving case. It is called by tryAcceptPlayer for incomplete profiles and by the auth thread when Mojang verification fails on singleplayer or auth servers are down. Online verified logins never use this path. No packets are sent here, the UUID feeds allowUserToConnect and S02 LoginSuccess. The deterministic mapping lets offline servers keep consistent inventories by name.",
+   "code": "    protected GameProfile getOfflineProfile(GameProfile original)\n    {\n        UUID uuid = UUID.nameUUIDFromBytes((\"OfflinePlayer:\" + original.getName()).getBytes(Charsets.UTF_8));\n        return new GameProfile(uuid, original.getName());\n    }\n\n    static enum LoginState\n    {\n        HELLO,\n        KEY,",
+   "code_walkthrough": "The OfflinePlayer prefix plus name string is the canonical offline seed. getBytes with UTF_8 ensures cross-platform UUID stability. nameUUIDFromBytes produces a version-three UUID from that seed. Returning a GameProfile with that UUID and original name lets bans and NBT key by stable id. The following LoginState enum defines HELLO, KEY and later states for the handshake."
+  }
+ ]
+}

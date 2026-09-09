@@ -1,0 +1,108 @@
+{
+ "overview": "Server-side STATUS connection handler active between handshake and login. Answers a single server-list query with cached ServerStatusResponse and echoes one ping packet. Enforces one-query-per-connection then closes channel.",
+ "methods": [
+  {
+   "detail": "Stores MinecraftServer reference for status response and NetworkManager used to send replies and close channel.",
+   "name": "NetHandlerStatusServer",
+   "packets": [],
+   "purpose": "Bind handler to server and connection"
+  },
+  {
+   "detail": "First C00PacketServerQuery sets handled and sends S00PacketServerInfo; duplicate queries close channel as already handled.",
+   "name": "processServerQuery",
+   "packets": [
+    "C00PacketServerQuery",
+    "S00PacketServerInfo"
+   ],
+   "purpose": "Reply to status query with server info"
+  },
+  {
+   "detail": "Replies with S01PacketPong carrying client time, then closes channel with status-handled exit message.",
+   "name": "processPing",
+   "packets": [
+    "C01PacketPing",
+    "S01PacketPong"
+   ],
+   "purpose": "Echo ping time and terminate status session"
+  },
+  {
+   "detail": "Intentionally empty because status connections carry no player state requiring cleanup.",
+   "name": "onDisconnect",
+   "packets": [],
+   "purpose": "No-op disconnect hook for status phase"
+  }
+ ],
+ "packet_usage": [
+  {
+   "direction": "handled",
+   "id": "C00PacketServerQuery",
+   "trigger": "processServerQuery single-shot query gate"
+  },
+  {
+   "direction": "sent",
+   "id": "S00PacketServerInfo",
+   "trigger": "processServerQuery replies with getServerStatusResponse"
+  },
+  {
+   "direction": "handled",
+   "id": "C01PacketPing",
+   "trigger": "processPing latency echo request"
+  },
+  {
+   "direction": "sent",
+   "id": "S01PacketPong",
+   "trigger": "processPing echoes client time then disconnects"
+  }
+ ],
+ "internal_fields": [
+  {
+   "name": "server",
+   "role": "MinecraftServer source of MOTD and player counts"
+  },
+  {
+   "name": "networkManager",
+   "role": "Connection used to send replies and close"
+  },
+  {
+   "name": "handled",
+   "role": "One-shot guard rejecting duplicate queries"
+  },
+  {
+   "name": "EXIT_MESSAGE",
+   "role": "Shared disconnect text after status handled"
+  }
+ ],
+ "peers": [
+  "MinecraftServer",
+  "NetworkManager",
+  "INetHandlerStatusServer",
+  "S00PacketServerInfo",
+  "S01PacketPong"
+ ],
+ "methods_detailed": [
+  {
+   "name": "NetHandlerStatusServer",
+   "detail_long": "NetHandlerStatusServer is the constructor that binds a STATUS connection to its server and channel. It stores the MinecraftServer reference used later to fetch cached ServerStatusResponse with MOTD, favicon, version, and player counts. It stores the NetworkManager used to send S00PacketServerInfo and S01PacketPong and to close the channel. It leaves handled false so the first C00PacketServerQuery will be accepted. The EXIT_MESSAGE constant Status request has been handled is shared for closes after query, duplicate query, or ping. No packets are sent inside the constructor itself. The handler lives only between handshake STATUS switch and login or disconnect.",
+   "code": "    private static final IChatComponent EXIT_MESSAGE = new ChatComponentText(\"Status request has been handled.\");\n    private final MinecraftServer server;\n    private final NetworkManager networkManager;\n    private boolean handled;\n\n    public NetHandlerStatusServer(MinecraftServer serverIn, NetworkManager netManager)\n    {\n        this.server = serverIn;\n        this.networkManager = netManager;\n    }",
+   "code_walkthrough": "The EXIT_MESSAGE field provides the disconnect text sent after STATUS completes. Storing server preserves access to getServerStatusResponse for S00 replies. Storing networkManager preserves the channel for sends and closes. Leaving handled false arms the one-shot query gate for processServerQuery."
+  },
+  {
+   "name": "processServerQuery",
+   "detail_long": "processServerQuery handles incoming C00PacketServerQuery with a one-shot guard. If handled is already true it closes the channel with EXIT_MESSAGE to reject duplicate queries on the same STATUS connection. Otherwise it sets handled true to arm the guard before replying. It fetches the cached response via server.getServerStatusResponse containing description, players, version, and favicon. It constructs S00PacketServerInfo with that response and sends it via networkManager.sendPacket. The client OldServerPinger.handleServerInfo will parse it and follow with C01PacketPing. No channel close happens on the first query so the follow-up ping can arrive. A second query on the same connection is treated as abuse and disconnected.",
+   "code": "    public void processServerQuery(C00PacketServerQuery packetIn)\n    {\n        if (this.handled)\n        {\n            this.networkManager.closeChannel(EXIT_MESSAGE);\n        }\n        else\n        {\n            this.handled = true;\n            this.networkManager.sendPacket(new S00PacketServerInfo(this.server.getServerStatusResponse()));\n        }\n    }",
+   "code_walkthrough": "The handled check enforces one query per STATUS session. Closing duplicates with EXIT_MESSAGE prevents info spam. Setting handled before send avoids race where a fast second query slips through. Sending S00PacketServerInfo with getServerStatusResponse delivers MOTD and counts. The channel stays open for the expected C01 ping."
+  },
+  {
+   "name": "processPing",
+   "detail_long": "processPing handles incoming C01PacketPing and terminates the STATUS session. It reads client time via packetIn.getClientTime which is the timestamp the client sent in C01PacketPing. It constructs S01PacketPong with that same long value and sends it via networkManager.sendPacket. The client handlePong subtracts its stored send time from current time to compute pingToServer. Immediately after queuing S01 it closes the channel with EXIT_MESSAGE Status request has been handled. This enforces the query-then-ping-then-close sequence and frees the connection. No state validation on handled is done here because ping is valid even in edge orderings. Further packets on this channel will fail as closed.",
+   "code": "    }\n\n    public void processPing(C01PacketPing packetIn)\n    {\n        this.networkManager.sendPacket(new S01PacketPong(packetIn.getClientTime()));\n        this.networkManager.closeChannel(EXIT_MESSAGE);\n    }\n}",
+   "code_walkthrough": "The method extracts clientTime from the C01 request to echo it back. Sending S01PacketPong with that value lets the client match ping to send time. Closing with EXIT_MESSAGE ends the STATUS phase per protocol. The trailing brace closes the class after handling."
+  },
+  {
+   "name": "onDisconnect",
+   "detail_long": "onDisconnect is the INetHandlerStatusServer disconnect hook for STATUS phase termination. It takes an IChatComponent reason describing normal Finished handling, duplicate query, or network error. Its body is intentionally empty because STATUS connections hold no player entity, inventory, or world state needing cleanup. Unlike play-phase handlers it does not broadcast quit messages or save data. The shared EXIT_MESSAGE close from processServerQuery and processPing flows through here as a no-op. Any resource release is handled by NetworkManager channel teardown itself. Leaving it empty also avoids touching MinecraftServer from the network thread on disconnect.",
+   "code": "    /**\n     * Invoked when disconnecting, the parameter is a ChatComponent describing the reason for termination\n     */\n    public void onDisconnect(IChatComponent reason)\n    {\n    }\n\n    public void processServerQuery(C00PacketServerQuery packetIn)\n    {\n        if (this.handled)",
+   "code_walkthrough": "The javadoc notes the reason parameter carries termination text. The empty body shows no player cleanup is required for stateless STATUS. The following processServerQuery header confirms disconnect needs no gate logic. NetworkManager handles socket close independently after this callback."
+  }
+ ]
+}

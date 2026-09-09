@@ -150,6 +150,86 @@ function refresh() {
   buildOverviewSections(visible);
   buildOverviewStats(visible);
   updateFilterButton();
+  renderGlobalExtras();
+}
+
+// ============================================================
+// GLOBAL SEARCH (additive — packet search/rendering above untouched)
+// Queries SEARCH_INDEX (js/search-index.js) for Vanilla Internals,
+// Analyses and Modules; groups results by type with correct links.
+// ============================================================
+var GLOBAL_GROUPS = [
+  { key: 'classes', label: 'Vanilla Internals' },
+  { key: 'analyses', label: 'Analyses' },
+  { key: 'modules', label: 'Modules' }
+];
+
+function escHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function searchExtras(term) {
+  var none = { total: 0, shown: [] };
+  var empty = { classes: none, analyses: none, modules: none };
+  if (!term || !term.trim()) return empty;
+  if (typeof SEARCH_INDEX === 'undefined' || !SEARCH_INDEX) return empty;
+  var t = term.toLowerCase().trim();
+  function match(list) {
+    var hits = (list || []).filter(function(e) {
+      var hay = ((e.title || '') + ' ' + (e.desc || '') + ' ' + (e.keywords || '')).toLowerCase();
+      return hay.indexOf(t) !== -1;
+    });
+    return { total: hits.length, shown: hits.slice(0, 10) };
+  }
+  return { classes: match(SEARCH_INDEX.classes), analyses: match(SEARCH_INDEX.analyses), modules: match(SEARCH_INDEX.modules) };
+}
+
+function renderGlobalExtras() {
+  document.querySelectorAll('.global-extra').forEach(function(n) { n.remove(); });
+  var res = searchExtras(state.searchTerm);
+  var has = res.classes.total || res.analyses.total || res.modules.total;
+  if (!has) return;
+
+  var overview = document.getElementById('overviewSections');
+  if (overview) {
+    var ohtml = '';
+    GLOBAL_GROUPS.forEach(function(g) {
+      var r = res[g.key];
+      if (!r || !r.total) return;
+      var more = r.total > r.shown.length ? ' (showing ' + r.shown.length + ')' : '';
+      ohtml += '<div class="overview-section global-extra">';
+      ohtml += '<h2>' + g.label + ' <span style="font-size:0.7rem;color:var(--text-muted);font-weight:400;margin-left:6px">' + r.total + ' matches' + more + '</span></h2>';
+      ohtml += '<div class="section-packet-list">';
+      r.shown.forEach(function(e) {
+        ohtml += '<a href="' + escHtml(e.url) + '" class="section-packet-row">';
+        ohtml += '<span class="row-name">' + escHtml(e.title) + '</span>';
+        ohtml += '<span class="row-desc">' + escHtml(e.desc) + '</span>';
+        ohtml += '</a>';
+      });
+      ohtml += '</div></div>';
+    });
+    overview.insertAdjacentHTML('beforeend', ohtml);
+  }
+
+  var nav = document.getElementById('sidebarNav');
+  if (nav) {
+    var nhtml = '';
+    GLOBAL_GROUPS.forEach(function(g) {
+      var r = res[g.key];
+      if (!r || !r.total) return;
+      nhtml += '<div class="nav-section global-extra">';
+      nhtml += '<div class="nav-section-header"><span>' + g.label + '</span><span class="count">' + r.total + '</span></div>';
+      nhtml += '<div class="nav-items">';
+      r.shown.forEach(function(e) {
+        nhtml += '<a href="' + escHtml(e.url) + '" class="nav-item">';
+        nhtml += '<span class="nav-name">' + escHtml(e.title) + '</span>';
+        nhtml += '</a>';
+      });
+      nhtml += '</div></div>';
+    });
+    nav.insertAdjacentHTML('beforeend', nhtml);
+  }
 }
 
 // ============================================================

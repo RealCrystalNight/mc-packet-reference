@@ -1,0 +1,211 @@
+{
+ "overview": "Server-side PLAY handler for one EntityPlayerMP. Validates all C00-C19 client packets on netty thread via PacketThreadUtil. Enforces movement, chat-spam, floating and reach gates; kicks or teleports back on violation.",
+ "methods": [
+  {
+   "detail": "Sends S00 KeepAlive every 40 ticks; records lastPingTime. Decays chatSpamThresholdCount and itemDropThreshold. Kicks if idle longer than maxPlayerIdleMinutes.",
+   "name": "update",
+   "packets": [
+    "S00"
+   ],
+   "purpose": "Per-tick keepalive, spam decay and idle kick."
+  },
+  {
+   "detail": "Rejects NaN via func_183006_b with kick. Gates: abs>3.0E7 kick Illegal position; delta>100.0 teleport-back; 0.0625 moved-wrongly; 0.03125 float>80 ticks kick. Sleeping/riding branches.",
+   "name": "processPlayer",
+   "packets": [
+    "C03",
+    "C04",
+    "C05",
+    "C06",
+    "S08",
+    "S18"
+   ],
+   "purpose": "Authoritative movement and rotation validation."
+  },
+  {
+   "detail": "Validates ChatAllowedCharacters else kick. Normalizes space. Adds 20 to chatSpamThresholdCount; kick disconnect.spam if >200 and non-op. Delegates / to command manager.",
+   "name": "processChatMessage",
+   "packets": [
+    "C01",
+    "S02"
+   ],
+   "purpose": "Broadcasts chat or executes slash command."
+  },
+  {
+   "detail": "Distance gate 36.0 and buildLimit check else ignore. Protected/world-border blocks resync via S23 BlockChange. DROP_ITEM respects spectator; RELEASE_USE_ITEM stops use.",
+   "name": "processPlayerDigging",
+   "packets": [
+    "C07",
+    "S23"
+   ],
+   "purpose": "Handles dig, cancel, finish and item drop."
+  },
+  {
+   "detail": "Direction 255 means use held item. Requires hasMoved and distSq<64.0, border/protection checks. Too-high build sends S02 chat. Always resyncs with S23; corrects slot with S2F.",
+   "name": "processPlayerBlockPlacement",
+   "packets": [
+    "C08",
+    "S23",
+    "S2F",
+    "S02"
+   ],
+   "purpose": "Handles use-item and block activate."
+  },
+  {
+   "detail": "Requires matching windowId and getCanCraft. On mismatch stores uid in field_147372_n, sends S32 accepted=false, locks crafting until C0F confirm. Spectators get full resync.",
+   "name": "processClickWindow",
+   "packets": [
+    "C0E",
+    "S32"
+   ],
+   "purpose": "Validates container clicks and desync recovery."
+  },
+  {
+   "detail": "Reach 36.0 if visible else 9.0. Kicks on attacking EntityItem/XPOrb/Arrow/self. INTERACT calls interactWith; INTERACT_AT forwards hitVec; ATTACK applies held item.",
+   "name": "processUseEntity",
+   "packets": [
+    "C02"
+   ],
+   "purpose": "Validates interact and attack reach."
+  },
+  {
+   "detail": "Only accepts key equal to field_147378_h. Sets ping=(ping*3+delta)/4 using nanoTime ms. No kick; stale keys ignored.",
+   "name": "processKeepAlive",
+   "packets": [
+    "C00"
+   ],
+   "purpose": "Updates ping from keepalive echo."
+  }
+ ],
+ "packet_usage": [
+  {
+   "direction": "handled",
+   "id": "C00",
+   "trigger": "Client echoes S00 key for ping"
+  },
+  {
+   "direction": "handled",
+   "id": "C01",
+   "trigger": "Chat text or slash command"
+  },
+  {
+   "direction": "handled",
+   "id": "C02",
+   "trigger": "Interact or attack entity"
+  },
+  {
+   "direction": "handled",
+   "id": "C03",
+   "trigger": "Position/look/onGround update"
+  },
+  {
+   "direction": "handled",
+   "id": "C07",
+   "trigger": "Dig state, drop item, stop use"
+  },
+  {
+   "direction": "handled",
+   "id": "C08",
+   "trigger": "Block place or use item"
+  },
+  {
+   "direction": "handled",
+   "id": "C0E",
+   "trigger": "Container slot click"
+  },
+  {
+   "direction": "sent",
+   "id": "S00",
+   "trigger": "Periodic ping every 40 ticks"
+  },
+  {
+   "direction": "sent",
+   "id": "S08",
+   "trigger": "Teleport-back or setPlayerLocation"
+  },
+  {
+   "direction": "sent",
+   "id": "S23",
+   "trigger": "Resync rejected dig/place"
+  }
+ ],
+ "internal_fields": [
+  {
+   "name": "playerEntity",
+   "role": "Owning EntityPlayerMP being validated"
+  },
+  {
+   "name": "floatingTickCount",
+   "role": "Airborne ticks; >80 kicks for flying"
+  },
+  {
+   "name": "chatSpamThresholdCount",
+   "role": "+20 per chat, -1 per tick, >200 kick"
+  },
+  {
+   "name": "lastPosX/Y/Z + hasMoved",
+   "role": "Last acked pos for delta and teleport-back"
+  },
+  {
+   "name": "field_147372_n",
+   "role": "Pending transaction ids per window"
+  }
+ ],
+ "peers": [
+  "NetHandlerPlayClient",
+  "ServerConfigurationManager",
+  "EntityPlayerMP",
+  "PlayerManager",
+  "ItemInWorldManager"
+ ],
+ "methods_detailed": [
+  {
+   "name": "update",
+   "detail_long": "update runs every server tick for each EntityPlayerMP to maintain connection health and throttle counters. It first clears field_147366_g and increments networkTickCount, then opens a keepAlive profiler section. If more than 40 ticks elapsed since lastSentPingPacket it refreshes lastSentPingPacket and lastPingTime from nanoTime millis, stores the int key in field_147378_h and sends S00PacketKeepAlive with that key. It then decays chatSpamThresholdCount by one if positive and does the same for itemDropThreshold, which implements the 20 per message and 20 per creative drop leak. Finally it checks idle kick using getLastActiveTime and getMaxPlayerIdleMinutes, kicking with You have been idle for too long if exceeded. No teleport-back occurs here, only S00 send and conditional S40 kick. The method explains the 40 tick ping cadence and the spam decay loop.",
+   "code": "    public void update()\n    {\n        this.field_147366_g = false;\n        ++this.networkTickCount;\n        this.serverController.theProfiler.startSection(\"keepAlive\");\n\n        if ((long)this.networkTickCount - this.lastSentPingPacket > 40L)\n        {\n            this.lastSentPingPacket = (long)this.networkTickCount;\n            this.lastPingTime = this.currentTimeMillis();\n            this.field_147378_h = (int)this.lastPingTime;\n            this.sendPacket(new S00PacketKeepAlive(this.field_147378_h));\n        }\n\n        this.serverController.theProfiler.endSection();\n\n        if (this.chatSpamThresholdCount > 0)\n        {\n            --this.chatSpamThresholdCount;\n        }",
+   "code_walkthrough": "The tick counter and keepAlive section frame the periodic work. The greater-than-40L gate throttles S00PacketKeepAlive so ping is sampled about every two seconds. lastPingTime and field_147378_h store the key that processKeepAlive must later echo to compute ping. S00PacketKeepAlive carries that int key to the client for round-trip timing. The chatSpamThresholdCount decrement implements one unit of leak per tick against the plus-20 per chat addition. The following itemDropThreshold block applies the same leak to creative drops."
+  },
+  {
+   "name": "processPlayer",
+   "detail_long": "processPlayer is the authoritative movement validator for C03, C04, C05 and C06 packets on the net thread. It first rejects non-finite doubles or floats via func_183006_b and kicks with Invalid move packet received. It then handles special branches for riding entities, sleeping players and conquered End before normal walking. For normal moves it enforces absolute border abs greater than 3.0E7 with kick Illegal position. It enforces speed by comparing squared delta minus motion squared against 100.0D and teleporting back with setPlayerLocation S08 on violation. It enforces collision with a 0.0625F contracted box, flags moved-wrongly when residual delta exceeds 0.0625D, and teleport-backs if cheating through blocks. It enforces floating by counting ticks with fall less than minus 0.03125D threshold and kicking after 80 ticks when flight is not allowed. Riding divergence over 4.0D sends S18PacketEntityTeleport plus S08 correction.",
+   "code": "                    if (packetIn.isMoving())\n                    {\n                        d8 = packetIn.getPositionX();\n                        d9 = packetIn.getPositionY();\n                        d10 = packetIn.getPositionZ();\n\n                        if (Math.abs(packetIn.getPositionX()) > 3.0E7D || Math.abs(packetIn.getPositionZ()) > 3.0E7D)\n                        {\n                            this.kickPlayerFromServer(\"Illegal position\");\n                            return;\n                        }\n                    }\n\n                    if (packetIn.getRotating())\n                    {\n                        f1 = packetIn.getYaw();\n                        f2 = packetIn.getPitch();\n                    }\n\n                    this.playerEntity.onUpdateEntity();\n                    this.playerEntity.setPositionAndRotation(this.lastPosX, this.lastPosY, this.lastPosZ, f1, f2);\n\n                    if (!this.hasMoved)\n                    {\n                        return;\n                    }",
+   "code_walkthrough": "The isMoving branch copies the claimed X Y Z into d8 d9 d10 for later reconciliation. The 3.0E7D absolute check kicks with Illegal position to enforce world border limits. The isRotating branch copies yaw and pitch into f1 f2 without yet applying position. onUpdateEntity and setPositionAndRotation rewind the player to last acked lastPos values so moveEntity can replay safely. The hasMoved false early return holds the player frozen until setPlayerLocation completes, which is the teleport-back mechanism. Cheat angles include ground-spoof via onGround flag and speed disablers that try to stay under the 100.0D delta gate."
+  },
+  {
+   "name": "processChatMessage",
+   "detail_long": "processChatMessage handles inbound C01 chat and slash commands after PacketThreadUtil enqueue. If chat visibility is HIDDEN it replies with S02PacketChat chat.cannotSend in red and stops. Otherwise it marks the player active, normalizes whitespace with StringUtils.normalizeSpace and scans every char with ChatAllowedCharacters, kicking with Illegal characters in chat on failure. Strings starting with slash are delegated to handleSlashCommand and the command manager, others are broadcast as chat.type.text via sendChatMsgImpl. After dispatch it adds 20 to chatSpamThresholdCount and kicks with disconnect.spam if over 200 and the sender lacks command permission via canSendCommands. Ops and command-allowed players bypass the spam kick but still accumulate the counter. No teleport occurs, outcomes are S02 error reply, broadcast S02, or S40 kick.",
+   "code": "            this.playerEntity.markPlayerActive();\n            String s = packetIn.getMessage();\n            s = StringUtils.normalizeSpace(s);\n\n            for (int i = 0; i < s.length(); ++i)\n            {\n                if (!ChatAllowedCharacters.isAllowedCharacter(s.charAt(i)))\n                {\n                    this.kickPlayerFromServer(\"Illegal characters in chat\");\n                    return;\n                }\n            }\n\n            if (s.startsWith(\"/\"))\n            {\n                this.handleSlashCommand(s);\n            }\n            else\n            {\n                IChatComponent ichatcomponent = new ChatComponentTranslation(\"chat.type.text\", new Object[] {this.playerEntity.getDisplayName(), s});\n                this.serverController.getConfigurationManager().sendChatMsgImpl(ichatcomponent, false);\n            }\n\n            this.chatSpamThresholdCount += 20;\n\n            if (this.chatSpamThresholdCount > 200 && !this.serverController.getConfigurationManager().canSendCommands(this.playerEntity.getGameProfile()))\n            {\n                this.kickPlayerFromServer(\"disconnect.spam\");\n            }",
+   "code_walkthrough": "markPlayerActive resets idle time so chat counts as activity. normalizeSpace and the per-character isAllowedCharacter loop enforce the chat charset gate with kick on illegal characters. The startsWith slash branch separates commands from public broadcast via sendChatMsgImpl which fans out S02PacketChat. The plus-20 increment with greater-than-200 check implements the token bucket that update leaks by one per tick. The canSendCommands exemption lets ops burst without disconnect.spam kick, which spammers abuse by flooding just under the rate."
+  },
+  {
+   "name": "processPlayerDigging",
+   "detail_long": "processPlayerDigging validates C07 dig, cancel, finish, drop and stop-use actions. DROP_ITEM and DROP_ALL_ITEMS are allowed only for non-spectators and call dropOneItem false or true. RELEASE_USE_ITEM calls stopUsingItem to end blocking or eating. For START, ABORT and STOP it computes squared distance from eye-adjusted player pos and silently returns if over 36.0D, which is six blocks reach. It also silently returns if block Y is at or above getBuildLimit. START checks isBlockProtected and world border contains, calling onBlockClicked on success or resyncing with S23PacketBlockChange on failure. STOP calls blockRemoving, ABORT calls cancelDestroyingBlock, then resends S23 if the block is still non-air. Invalid status throws IllegalArgumentException with no packet.",
+   "code": "                double d0 = this.playerEntity.posX - ((double)blockpos.getX() + 0.5D);\n                double d1 = this.playerEntity.posY - ((double)blockpos.getY() + 0.5D) + 1.5D;\n                double d2 = this.playerEntity.posZ - ((double)blockpos.getZ() + 0.5D);\n                double d3 = d0 * d0 + d1 * d1 + d2 * d2;\n\n                if (d3 > 36.0D)\n                {\n                    return;\n                }\n                else if (blockpos.getY() >= this.serverController.getBuildLimit())\n                {\n                    return;\n                }\n                else\n                {\n                    if (packetIn.getStatus() == C07PacketPlayerDigging.Action.START_DESTROY_BLOCK)\n                    {\n                        if (!this.serverController.isBlockProtected(worldserver, blockpos, this.playerEntity) && worldserver.getWorldBorder().contains(blockpos))\n                        {\n                            this.playerEntity.theItemInWorldManager.onBlockClicked(blockpos, packetIn.getFacing());\n                        }\n                        else\n                        {\n                            this.playerEntity.playerNetServerHandler.sendPacket(new S23PacketBlockChange(worldserver, blockpos));\n                        }",
+   "code_walkthrough": "The d0 d1 d2 math builds eye-centered squared distance with plus 0.5 centering and plus 1.5 height offset. The greater-than-36.0D return silently drops over-reach digs without kick or resync. The buildLimit return blocks digs above world height. The START_DESTROY_BLOCK branch checks spawn protection and world border before allowing onBlockClicked. The else sends S23PacketBlockChange carrying server block state to force client resync on protected or out-of-border digs."
+  },
+  {
+   "name": "processPlayerBlockPlacement",
+   "detail_long": "processPlayerBlockPlacement handles C08 right-click use-item and block activate. Direction 255 means use held item in air, calling tryUseItem if stack is non-null and returning early. Otherwise it checks build height with getBuildLimit minus one for upward faces and sends red S02PacketChat build.tooHigh when exceeded. For valid heights it requires hasMoved true, squared distance under 64.0D or eight blocks, no spawn protection and world border contains before calling activateBlockOrUseItem. Whether activated or denied it sets flag true to trigger dual S23PacketBlockChange resyncs for target and offset pos. Afterwards it clears zero-size stacks, copies the inventory slot when max use duration is zero, and corrects mismatched held stacks with S2FPacketSetSlot. Spectator and null-stack edges return without action.",
+   "code": "        if (packetIn.getPlacedBlockDirection() == 255)\n        {\n            if (itemstack == null)\n            {\n                return;\n            }\n\n            this.playerEntity.theItemInWorldManager.tryUseItem(this.playerEntity, worldserver, itemstack);\n        }\n        else if (blockpos.getY() < this.serverController.getBuildLimit() - 1 || enumfacing != EnumFacing.UP && blockpos.getY() < this.serverController.getBuildLimit())\n        {\n            if (this.hasMoved && this.playerEntity.getDistanceSq((double)blockpos.getX() + 0.5D, (double)blockpos.getY() + 0.5D, (double)blockpos.getZ() + 0.5D) < 64.0D && !this.serverController.isBlockProtected(worldserver, blockpos, this.playerEntity) && worldserver.getWorldBorder().contains(blockpos))\n            {\n                this.playerEntity.theItemInWorldManager.activateBlockOrUseItem(this.playerEntity, worldserver, itemstack, blockpos, enumfacing, packetIn.getPlacedBlockOffsetX(), packetIn.getPlacedBlockOffsetY(), packetIn.getPlacedBlockOffsetZ());\n            }\n\n            flag = true;\n        }\n        else\n        {\n            ChatComponentTranslation chatcomponenttranslation = new ChatComponentTranslation(\"build.tooHigh\", new Object[] {Integer.valueOf(this.serverController.getBuildLimit())});\n            chatcomponenttranslation.getChatStyle().setColor(EnumChatFormatting.RED);\n            this.playerEntity.playerNetServerHandler.sendPacket(new S02PacketChat(chatcomponenttranslation));\n            flag = true;\n        }",
+   "code_walkthrough": "The 255 direction branch isolates air-use like eating or throwing from block clicks. The buildLimit minus one check separates allowed placement from tooHigh, with UP faces held one lower. The hasMoved plus less-than-64.0D plus protection plus border line gates reach, teleport state, spawn guard and border in one condition. activateBlockOrUseItem carries offsets and facing to apply the actual placement or interaction. The else sends S02PacketChat build.tooHigh in red and the flag triggers S23 resyncs, which prevents ghost blocks."
+  },
+  {
+   "name": "processClickWindow",
+   "detail_long": "processClickWindow validates C0E container clicks against the openContainer windowId and getCanCraft flag. Mismatched windowId or locked crafting is ignored entirely with no packet. Spectators bypass slotClick and get a full inventory resync via updateCraftingInventory. For survival players it calls slotClick and compares the result with the client predicted clickedItem via areItemStacksEqual. On match it sends S32PacketConfirmTransaction accepted true, then detectAndSendChanges and updateHeldItem. On mismatch it stores the action number in field_147372_n, sends S32 accepted false, locks further crafting with setCanCraft false and pushes the full server inventory list. The lock persists until C0F confirm with matching uid unlocks it. This is the classic desync recovery and dup-prevention gate.",
+   "code": "                ItemStack itemstack = this.playerEntity.openContainer.slotClick(packetIn.getSlotId(), packetIn.getUsedButton(), packetIn.getMode(), this.playerEntity);\n\n                if (ItemStack.areItemStacksEqual(packetIn.getClickedItem(), itemstack))\n                {\n                    this.playerEntity.playerNetServerHandler.sendPacket(new S32PacketConfirmTransaction(packetIn.getWindowId(), packetIn.getActionNumber(), true));\n                    this.playerEntity.isChangingQuantityOnly = true;\n                    this.playerEntity.openContainer.detectAndSendChanges();\n                    this.playerEntity.updateHeldItem();\n                    this.playerEntity.isChangingQuantityOnly = false;\n                }\n                else\n                {\n                    this.field_147372_n.addKey(this.playerEntity.openContainer.windowId, Short.valueOf(packetIn.getActionNumber()));\n                    this.playerEntity.playerNetServerHandler.sendPacket(new S32PacketConfirmTransaction(packetIn.getWindowId(), packetIn.getActionNumber(), false));\n                    this.playerEntity.openContainer.setCanCraft(this.playerEntity, false);\n                    List<ItemStack> list1 = Lists.<ItemStack>newArrayList();\n\n                    for (int j = 0; j < this.playerEntity.openContainer.inventorySlots.size(); ++j)\n                    {\n                        list1.add(((Slot)this.playerEntity.openContainer.inventorySlots.get(j)).getStack());\n                    }\n\n                    this.playerEntity.updateCraftingInventory(this.playerEntity.openContainer, list1);",
+   "code_walkthrough": "slotClick applies the server-side inventory logic for the given slot button and mode. areItemStacksEqual compares client prediction to server result to detect desync or cheating. The true branch sends S32 accepted true carrying windowId and action number to confirm the transaction. The false branch stores the action number in field_147372_n, sends S32 accepted false, and locks crafting with setCanCraft false. The slot loop plus updateCraftingInventory pushes authoritative stacks, and C0F must later echo the stored uid to unlock."
+  },
+  {
+   "name": "processUseEntity",
+   "detail_long": "processUseEntity validates C02 interact and attack after enqueue on the server thread. It resolves the entity from the world by ID and marks the player active, ignoring null entities silently. It computes visibility via canEntityBeSeen to select reach squared 36.0D when visible or 9.0D when not, which is six versus three blocks. If squared distance exceeds the gate the packet is dropped with no response. INTERACT calls interactWith, INTERACT_AT forwards hitVec to interactAt for armor stands and villagers. ATTACK kicks with Attempting to attack an invalid entity plus server warning if target is EntityItem, EntityXPOrb, EntityArrow or self. Otherwise it calls attackTargetEntityWithCurrentItem to apply damage and enchants. No S packets are sent here except the kick disconnect.",
+   "code": "            boolean flag = this.playerEntity.canEntityBeSeen(entity);\n            double d0 = 36.0D;\n\n            if (!flag)\n            {\n                d0 = 9.0D;\n            }\n\n            if (this.playerEntity.getDistanceSqToEntity(entity) < d0)\n            {\n                if (packetIn.getAction() == C02PacketUseEntity.Action.INTERACT)\n                {\n                    this.playerEntity.interactWith(entity);\n                }\n                else if (packetIn.getAction() == C02PacketUseEntity.Action.INTERACT_AT)\n                {\n                    entity.interactAt(this.playerEntity, packetIn.getHitVec());\n                }\n                else if (packetIn.getAction() == C02PacketUseEntity.Action.ATTACK)\n                {\n                    if (entity instanceof EntityItem || entity instanceof EntityXPOrb || entity instanceof EntityArrow || entity == this.playerEntity)\n                    {\n                        this.kickPlayerFromServer(\"Attempting to attack an invalid entity\");\n                        this.serverController.logWarning(\"Player \" + this.playerEntity.getName() + \" tried to attack an invalid entity\");\n                        return;",
+   "code_walkthrough": "canEntityBeSeen selects the reach gate of 36.0 versus 9.0 squared to stop wall-hit kill aura. The getDistanceSqToEntity less-than-d0 check drops out-of-reach uses without kick to tolerate lag. INTERACT versus INTERACT_AT separates leash and trade from precise hit-vector armor-stand poses. The ATTACK instanceof chain identifies invalid targets like items, XP orbs, arrows and self that normal clients never hit. The kick plus logWarning punishes packet-forged attacks, a common kill-aura and crash exploit probe."
+  },
+  {
+   "name": "processKeepAlive",
+   "detail_long": "processKeepAlive handles C00 echo replies used for ping measurement. It runs on netty without PacketThreadUtil enqueue because it only touches volatile timing fields. It compares the echoed key to field_147378_h set by update when S00 was sent. Only exact match updates ping, stale or forged keys are ignored with no kick. On match it computes delta as currentTimeMillis nano millis minus lastPingTime. It smooths ping with weighted average ping times three plus delta divided by four. No packets are sent in response and no kick or teleport occurs. This explains why disabler cheats delay or spoof keepalive to fake lag without triggering fails.",
+   "code": "    public void processKeepAlive(C00PacketKeepAlive packetIn)\n    {\n        if (packetIn.getKey() == this.field_147378_h)\n        {\n            int i = (int)(this.currentTimeMillis() - this.lastPingTime);\n            this.playerEntity.ping = (this.playerEntity.ping * 3 + i) / 4;\n        }\n    }",
+   "code_walkthrough": "The getKey equals field_147378_h gate ensures only the latest S00 echo counts. currentTimeMillis minus lastPingTime yields round-trip millis using nanoTime resolution. The ping times three plus i divided by four formula smooths jitter across samples. Ignoring mismatched keys avoids penalizing reordered packets, which is why timing disablers hold keepalives to simulate lag."
+  }
+ ]
+}

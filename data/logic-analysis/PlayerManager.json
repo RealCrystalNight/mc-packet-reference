@@ -1,0 +1,172 @@
+{
+ "overview": "Chunk-subscription manager mapping players to PlayerInstance watchers. Fans out block deltas only to watchers of that chunk. Uses playerViewRadius 3-32 for subscription square. Batches changes per tick into single, multi, or full-chunk packets.",
+ "methods": [
+  {
+   "detail": "Converts BlockPos to chunk XZ via >>4. Looks up PlayerInstance without creation. Calls flagChunkForUpdate with local xyz. Defers packet choice to onUpdate.",
+   "name": "markBlockForUpdate",
+   "packets": [
+    "S23",
+    "S22",
+    "S21"
+   ],
+   "purpose": "Flag single block coordinate for next tick flush."
+  },
+  {
+   "detail": "If numBlocksToUpdate==1 sends S23PacketBlockChange plus tile desc if hasTileEntity. If 2-63 sends S22PacketMultiBlockChange plus tiles. If 64 sends S21PacketChunkData with flagsYAreasToUpdate.",
+   "name": "PlayerInstance.onUpdate",
+   "packets": [
+    "S23",
+    "S22",
+    "S21"
+   ],
+   "purpose": "Flush accumulated block changes to chunk watchers."
+  },
+  {
+   "detail": "Iterates playersWatchingChunk. Skips players whose loadedChunks contains chunkCoords. Sends same Packet instance directly via playerNetServerHandler. No distance check.",
+   "name": "PlayerInstance.sendToAllPlayersWatchingChunk",
+   "packets": [
+    "S23",
+    "S22",
+    "S21"
+   ],
+   "purpose": "Chunk-scoped fan-out excluding fully loaded senders."
+  },
+  {
+   "detail": "Computes chunk XZ from posX/posZ. Loops viewRadius square calling getPlayerInstance true then addPlayer. Triggers chunk load and later S21 data. Sets managedPosX/Z.",
+   "name": "addPlayer",
+   "packets": [
+    "S21"
+   ],
+   "purpose": "Subscribe player to all chunk instances in view square."
+  },
+  {
+   "detail": "Loops managedPos square removing from each instance. When instance empties sends S21PacketChunkData unload true,0, drops chunk, removes instance. Removes from players list.",
+   "name": "removePlayer",
+   "packets": [
+    "S21"
+   ],
+   "purpose": "Unsubscribe player and unload empty chunks."
+  },
+  {
+   "detail": "If >8000 ticks since full pass, calls onUpdate plus processChunk for inhabited time. Else only queued playerInstancesToUpdate. Clears queue. Unloads all chunks if no players and no respawn.",
+   "name": "updatePlayerInstances",
+   "packets": [
+    "S23",
+    "S22",
+    "S21"
+   ],
+   "purpose": "Tick dirty chunk instances each server tick."
+  },
+  {
+   "detail": "Triggers only if moved squared >=64.0D (8 blocks). Diffs old managed chunk square vs new, adds/removes PlayerInstance watchers. Calls filterChunkLoadQueue and updates managedPos.",
+   "name": "updateMountedMovingPlayer",
+   "packets": [
+    "S21"
+   ],
+   "purpose": "Update subscriptions after fast vehicle movement."
+  },
+  {
+   "detail": "Rebuilds player.loadedChunks using xzDirectionsConst spiral out to viewRadius. Prioritizes center chunk then expanding rings. Controls order of S21 chunk data sends.",
+   "name": "filterChunkLoadQueue",
+   "packets": [
+    "S21"
+   ],
+   "purpose": "Reorder pending chunk loads in spiral around player."
+  }
+ ],
+ "packet_usage": [
+  {
+   "direction": "sent",
+   "id": "S23",
+   "trigger": "onUpdate single block change to watchers"
+  },
+  {
+   "direction": "sent",
+   "id": "S22",
+   "trigger": "onUpdate 2-63 block changes to watchers"
+  },
+  {
+   "direction": "sent",
+   "id": "S21",
+   "trigger": "onUpdate 64 changes or chunk load/unload"
+  }
+ ],
+ "internal_fields": [
+  {
+   "name": "playerInstances",
+   "role": "LongHashMap chunkKey to PlayerInstance watcher set"
+  },
+  {
+   "name": "players",
+   "role": "All players managed in this dimension/world"
+  },
+  {
+   "name": "playerViewRadius",
+   "role": "Clamped 3-32 subscription square radius in chunks"
+  },
+  {
+   "name": "playerInstancesToUpdate",
+   "role": "Dirty instances with pending block changes"
+  },
+  {
+   "name": "theWorldServer",
+   "role": "Owning dimension for chunk provider access"
+  }
+ ],
+ "peers": [
+  "WorldServer",
+  "WorldManager",
+  "ServerConfigurationManager",
+  "ChunkProviderServer"
+ ],
+ "methods_detailed": [
+  {
+   "name": "markBlockForUpdate",
+   "detail_long": "This method maps a world BlockPos to its chunk watcher and queues a delta. It derives chunk X and Z by arithmetic right shift 4 on block X and Z. It looks up the PlayerInstance with getPlayerInstance without creation, so unloaded chunks get no queue. If the instance exists it calls flagChunkForUpdate with local coordinates using bitwise and 15 for X and Z plus full Y. That call records the packed short and sets Y section flags for later S21 use. No S23 S22 or S21 packet is built here. The eventual choice depends on accumulated count: one becomes S23, two to sixty three become S22, sixty four becomes S21. This defers networking to PlayerInstance.onUpdate on the next tick. Chunk-scoped fan-out replaces any global radius broadcast.",
+   "code": "    public void markBlockForUpdate(BlockPos pos)\n    {\n        int i = pos.getX() >> 4;\n        int j = pos.getZ() >> 4;\n        PlayerManager.PlayerInstance playermanager$playerinstance = this.getPlayerInstance(i, j, false);\n\n        if (playermanager$playerinstance != null)\n        {\n            playermanager$playerinstance.flagChunkForUpdate(pos.getX() & 15, pos.getY(), pos.getZ() & 15);\n        }\n    }",
+   "code_walkthrough": "The signature takes BlockPos to flag. The shift lines convert block to chunk coordinates. The getPlayerInstance call uses false to avoid creating watchers. The null check ensures only watched chunks queue. The flagChunkForUpdate line passes local x y z for packing. Packet selection is deferred to onUpdate batching."
+  },
+  {
+   "name": "PlayerInstance.onUpdate",
+   "detail_long": "This is the per-tick flush that converts accumulated block edits into minimal packets. If numBlocksToUpdate is zero it does nothing and returns without networking. If count equals one it decodes the single packed short into world x y z and sends S23PacketBlockChange to chunk watchers. It also sends the tile entity description packet if that block has a tile entity. If count equals sixty four it sends S21PacketChunkData with flagsYAreasToUpdate mask for full chunk resend plus tile entities per dirty section. Otherwise for two to sixty three it sends S22PacketMultiBlockChange with count, short array, and chunk reference plus per-block tile packets. After any branch it resets numBlocksToUpdate and flagsYAreasToUpdate to zero. This 1 versus 2 to 63 versus 64 batching rule minimizes bandwidth. Only players in playersWatchingChunk receive the chosen packet.",
+   "code": "        public void onUpdate()\n        {\n            if (this.numBlocksToUpdate != 0)\n            {\n                if (this.numBlocksToUpdate == 1)\n                {\n                    int i = (this.locationOfBlockChange[0] >> 12 & 15) + this.chunkCoords.chunkXPos * 16;\n                    int j = this.locationOfBlockChange[0] & 255;\n                    int k = (this.locationOfBlockChange[0] >> 8 & 15) + this.chunkCoords.chunkZPos * 16;\n                    BlockPos blockpos = new BlockPos(i, j, k);\n                    this.sendToAllPlayersWatchingChunk(new S23PacketBlockChange(PlayerManager.this.theWorldServer, blockpos));\n\n                    if (PlayerManager.this.theWorldServer.getBlockState(blockpos).getBlock().hasTileEntity())\n                    {\n                        this.sendTileToAllPlayersWatchingChunk(PlayerManager.this.theWorldServer.getTileEntity(blockpos));\n                    }\n                }\n                else if (this.numBlocksToUpdate == 64)\n                {\n                    int i1 = this.chunkCoords.chunkXPos * 16;\n                    int k1 = this.chunkCoords.chunkZPos * 16;\n                    this.sendToAllPlayersWatchingChunk(new S21PacketChunkData(PlayerManager.this.theWorldServer.getChunkFromChunkCoords(this.chunkCoords.chunkXPos, this.chunkCoords.chunkZPos), false, this.flagsYAreasToUpdate));\n\n                    for (int i2 = 0; i2 < 16; ++i2)\n                    {\n                        if ((this.flagsYAreasToUpdate & 1 << i2) != 0)\n                        {\n                            int k2 = i2 << 4;\n                            List<TileEntity> list = PlayerManager.this.theWorldServer.getTileEntitiesIn(i1, k2, k1, i1 + 16, k2 + 16, k1 + 16);\n                        }\n                    }\n                }",
+   "code_walkthrough": "The method checks numBlocksToUpdate nonzero before branching. The equals one branch decodes packed shorts to world coords and builds S23PacketBlockChange. The tile check adds description packets for containers. The equals 64 branch builds S21PacketChunkData with Y mask for full resend. The loop over 16 sections gathers tile entities per dirty slice. The missing tail handles 2 to 63 via S22 multi change."
+  },
+  {
+   "name": "PlayerInstance.sendToAllPlayersWatchingChunk",
+   "detail_long": "This helper implements chunk-scoped fan-out for all block delta packets. It iterates playersWatchingChunk by index for the owning PlayerInstance. For each EntityPlayerMP it checks whether loadedChunks contains the chunkCoords. If the player already fully loaded the chunk via the load queue, the packet is skipped to avoid duplicate S21 or delta spam. Otherwise it sends the supplied Packet directly via playerNetServerHandler.sendPacket. No distance math with 16.0D or 1024.0D is performed because subscription implies proximity. The same Packet instance is reused across recipients, whether S23 single, S22 multi, or S21 chunk. This exclusion of fully loaded senders prevents echo during initial chunk burst. All networking for onUpdate flows through this single choke point.",
+   "code": "        public void sendToAllPlayersWatchingChunk(Packet thePacket)\n        {\n            for (int i = 0; i < this.playersWatchingChunk.size(); ++i)\n            {\n                EntityPlayerMP entityplayermp = (EntityPlayerMP)this.playersWatchingChunk.get(i);\n\n                if (!entityplayermp.loadedChunks.contains(this.chunkCoords))\n                {\n                    entityplayermp.playerNetServerHandler.sendPacket(thePacket);\n                }\n            }\n        }",
+   "code_walkthrough": "The signature takes a generic Packet to share. The for loop walks playersWatchingChunk for this chunk. The loadedChunks contains check skips players still in initial burst. The sendPacket line delivers the same S23 S22 or S21 instance to qualifiers. No radius or dimension check appears. This is pure subscription-based fan-out."
+  },
+  {
+   "name": "addPlayer",
+   "detail_long": "This method subscribes a joining or teleporting player to all nearby chunk watchers. It computes central chunk XZ from posX and posZ with right shift 4. It stores managedPosX and managedPosZ as the subscription origin for later movement diffs. It then loops a square from center minus playerViewRadius to center plus radius in both axes. For each coordinate it calls getPlayerInstance with true to create the instance if absent, which also loads the chunk. It then calls addPlayer on that instance to add the player to playersWatchingChunk and loadedChunks queue. After the square it adds the player to the global players list. It finally calls filterChunkLoadQueue to order pending S21 chunk data sends in spiral priority. The radius is clamped 3 to 32 elsewhere.",
+   "code": "    public void addPlayer(EntityPlayerMP player)\n    {\n        int i = (int)player.posX >> 4;\n        int j = (int)player.posZ >> 4;\n        player.managedPosX = player.posX;\n        player.managedPosZ = player.posZ;\n\n        for (int k = i - this.playerViewRadius; k <= i + this.playerViewRadius; ++k)\n        {\n            for (int l = j - this.playerViewRadius; l <= j + this.playerViewRadius; ++l)\n            {\n                this.getPlayerInstance(k, l, true).addPlayer(player);\n            }\n        }\n\n        this.players.add(player);\n        this.filterChunkLoadQueue(player);\n    }",
+   "code_walkthrough": "The signature takes the joining EntityPlayerMP. The shift lines derive central chunk XZ. The managedPos lines snapshot origin for movement checks. The nested loops cover the view radius square and force-create instances. The addPlayer call subscribes to each chunk watcher. The final lines register globally and reorder load queue for S21 sends."
+  },
+  {
+   "name": "removePlayer",
+   "detail_long": "This method unsubscribes a leaving player and unloads now-empty chunks. It derives the origin chunk from managedPosX and managedPosZ, not live pos, to cover the subscribed square. It loops the same view radius square around that managed origin. For each coordinate it fetches the PlayerInstance without creation. If non-null it calls removePlayer on the instance to drop the player from watchers and loadedChunks. When an instance becomes empty, that inner method sends S21PacketChunkData unload, drops the chunk, and removes the instance maps. After the loops it removes the player from the global players list. This ensures no ghost watchers remain after logout or dimension change. The S21 unload packet tells the client to discard chunk data.",
+   "code": "    public void removePlayer(EntityPlayerMP player)\n    {\n        int i = (int)player.managedPosX >> 4;\n        int j = (int)player.managedPosZ >> 4;\n\n        for (int k = i - this.playerViewRadius; k <= i + this.playerViewRadius; ++k)\n        {\n            for (int l = j - this.playerViewRadius; l <= j + this.playerViewRadius; ++l)\n            {\n                PlayerManager.PlayerInstance playermanager$playerinstance = this.getPlayerInstance(k, l, false);\n\n                if (playermanager$playerinstance != null)\n                {\n                    playermanager$playerinstance.removePlayer(player);\n                }\n            }\n        }\n\n        this.players.remove(player);\n    }",
+   "code_walkthrough": "The signature takes the departing EntityPlayerMP. The managedPos shift lines recover the subscribed center. The nested loops visit every watcher in the square without creating new ones. The null check plus removePlayer call handles unsubscribe and empty-chunk S21 unload. The final remove drops the global reference. This mirrors addPlayer subscription logic."
+  },
+  {
+   "name": "updatePlayerInstances",
+   "detail_long": "This per-tick driver flushes dirty chunk instances for block deltas. It reads total world time and compares to previousTotalWorldTime. If more than 8000 ticks elapsed it does a full pass over playerInstanceList calling onUpdate plus processChunk for inhabited time. Otherwise it only iterates playerInstancesToUpdate, which holds instances flagged by markBlockForUpdate. After either path it clears playerInstancesToUpdate to reset dirty state. If the players list is empty and the provider cannot respawn here, it unloads all chunks to save memory. This method is called from WorldServer.tick chunkMap section. It is the indirect source of S23 for one change, S22 for two to sixty three, and S21 for sixty four. No radius check occurs because watchers define recipients.",
+   "code": "    public void updatePlayerInstances()\n    {\n        long i = this.theWorldServer.getTotalWorldTime();\n\n        if (i - this.previousTotalWorldTime > 8000L)\n        {\n            this.previousTotalWorldTime = i;\n\n            for (int j = 0; j < this.playerInstanceList.size(); ++j)\n            {\n                PlayerManager.PlayerInstance playermanager$playerinstance = (PlayerManager.PlayerInstance)this.playerInstanceList.get(j);\n                playermanager$playerinstance.onUpdate();\n                playermanager$playerinstance.processChunk();\n            }\n        }\n        else\n        {\n            for (int k = 0; k < this.playerInstancesToUpdate.size(); ++k)\n            {\n                PlayerManager.PlayerInstance playermanager$playerinstance1 = (PlayerManager.PlayerInstance)this.playerInstancesToUpdate.get(k);\n                playermanager$playerinstance1.onUpdate();\n            }\n        }\n\n        this.playerInstancesToUpdate.clear();\n\n        if (this.players.isEmpty())\n        {\n            WorldProvider worldprovider = this.theWorldServer.provider;\n        }",
+   "code_walkthrough": "The signature takes no args and reads world time. The greater than 8000L branch does full onUpdate plus inhabited time. The else branch flushes only dirty instances queued for S23 S22 S21. The clear call resets the dirty list each tick. The trailing players empty check leads to unload when no viewers remain. This shows tick-driven batched flushing."
+  },
+  {
+   "name": "updateMountedMovingPlayer",
+   "detail_long": "This method updates chunk subscriptions after fast vehicle movement like boats or minecarts. It computes current chunk XZ from live posX posZ and the delta from managedPosX managedPosZ. It calculates squared movement d2 and only proceeds if at least 64.0D, which equals 8 blocks. It then derives old managed chunk and view radius plus delta in chunks j1 k1. If no chunk changed it returns without networking. Otherwise it loops the new view square, adding the player to instances not overlapping the old square. It also loops to remove from old instances not overlapping the new square. It finally calls filterChunkLoadQueue and snaps managedPos to live pos. This diff avoids resubscribing the entire square on small moves. New chunks trigger S21 loads while stale ones trigger S21 unloads.",
+   "code": "    public void updateMountedMovingPlayer(EntityPlayerMP player)\n    {\n        int i = (int)player.posX >> 4;\n        int j = (int)player.posZ >> 4;\n        double d0 = player.managedPosX - player.posX;\n        double d1 = player.managedPosZ - player.posZ;\n        double d2 = d0 * d0 + d1 * d1;\n\n        if (d2 >= 64.0D)\n        {\n            int k = (int)player.managedPosX >> 4;\n            int l = (int)player.managedPosZ >> 4;\n            int i1 = this.playerViewRadius;\n            int j1 = i - k;\n            int k1 = j - l;\n\n            if (j1 != 0 || k1 != 0)\n            {\n                for (int l1 = i - i1; l1 <= i + i1; ++l1)\n                {\n                    for (int i2 = j - i1; i2 <= j + i1; ++i2)\n                    {\n                        if (!this.overlaps(l1, i2, k, l, i1))\n                        {\n                            this.getPlayerInstance(l1, i2, true).addPlayer(player);\n                        }\n\n                        if (!this.overlaps(l1 - j1, i2 - k1, i, j, i1))\n                        {\n                            PlayerManager.PlayerInstance playermanager$playerinstance = this.getPlayerInstance(l1 - j1, i2 - k1, false);\n\n                            if (playermanager$playerinstance != null)\n                            {\n                                playermanager$playerinstance.removePlayer(player);\n                            }\n                        }\n                    }\n                }\n            }\n        }",
+   "code_walkthrough": "The signature takes the mounted EntityPlayerMP. The chunk and delta lines compute movement squared. The greater than equals 64.0D gate equals 8 blocks before work. The j1 k1 check ensures a chunk boundary crossed. The nested loops add new watchers and remove stale ones via overlaps tests. Later lines reorder load queue and snap managedPos. This is differential S21 subscription update."
+  },
+  {
+   "name": "filterChunkLoadQueue",
+   "detail_long": "This method reorders a player pending chunk load queue into spiral priority around the player. It copies loadedChunks to a temp list then clears the live queue. It computes view radius, central chunk XZ, and fetches the center PlayerInstance chunkCoords. If the old list contained the center it is added first for immediate S21 send. It then walks outward rings using xzDirectionsConst east south west north vectors with expanding step counts up to twice radius. Each visited coordinate is resolved to its PlayerInstance chunkCoords and re-added if previously queued. A final straight tail fills remaining edge chunks. This ordering makes closest chunks load first on login or teleport. The S21 chunk data sends later follow this queue order. No packets are built here, only queue order.",
+   "code": "    public void filterChunkLoadQueue(EntityPlayerMP player)\n    {\n        List<ChunkCoordIntPair> list = Lists.newArrayList(player.loadedChunks);\n        int i = 0;\n        int j = this.playerViewRadius;\n        int k = (int)player.posX >> 4;\n        int l = (int)player.posZ >> 4;\n        int i1 = 0;\n        int j1 = 0;\n        ChunkCoordIntPair chunkcoordintpair = this.getPlayerInstance(k, l, true).chunkCoords;\n        player.loadedChunks.clear();\n\n        if (list.contains(chunkcoordintpair))\n        {\n            player.loadedChunks.add(chunkcoordintpair);\n        }\n\n        for (int k1 = 1; k1 <= j * 2; ++k1)\n        {\n            for (int l1 = 0; l1 < 2; ++l1)\n            {\n                int[] aint = this.xzDirectionsConst[i++ % 4];\n\n                for (int i2 = 0; i2 < k1; ++i2)\n                {\n                    i1 += aint[0];\n                    j1 += aint[1];\n                    chunkcoordintpair = this.getPlayerInstance(k + i1, l + j1, true).chunkCoords;\n\n                    if (list.contains(chunkcoordintpair))\n                    {\n                        player.loadedChunks.add(chunkcoordintpair);\n                    }\n                }\n            }\n        }",
+   "code_walkthrough": "The signature takes the player whose queue is rebuilt. The copy plus clear lines snapshot and reset pending chunks. The center fetch plus contains check prioritizes the standing chunk. The nested k1 l1 loops walk the xzDirectionsConst spiral outward. Each step resolves chunkCoords and re-adds if previously pending. This controls S21 send order without sending directly."
+  }
+ ]
+}
