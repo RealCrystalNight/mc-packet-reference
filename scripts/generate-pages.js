@@ -156,11 +156,12 @@ function renderConceptsBody(text) {
 function renderCorrections(all, doc) {
   const list = (all || []).filter(function(c) { return c.doc === doc; });
   if (!list.length) return '';
-  return '<div class="detail-section"><h3>Verification Notes (' + list.length + ')</h3><div class="callout callout-ac">'
-    + '<p>Checked claim-by-claim against Marcelektro/MavenMCP-1.8.9. The source text above is kept verbatim; these notes correct what it gets wrong:</p>'
-    + '<ul class="writeup-list">' + list.map(function(c) {
-        return '<li><strong>' + esc(c.section) + ' [' + esc(c.verdict) + ']:</strong> ' + esc(c.fix) + '</li>';
-      }).join('') + '</ul></div></div>';
+  const wrong = list.filter(function(c) { return c.verdict === 'wrong'; }).length;
+  return '<div class="detail-section"><h3>Verification</h3><div class="callout">'
+    + '<p>Checked claim-by-claim against <a href="https://github.com/Marcelektro/MavenMCP-1.8.9" target="_blank" rel="noopener" style="color:var(--accent)">Marcelektro/MavenMCP-1.8.9</a>: '
+    + list.length + ' corrections (' + wrong + ' wrong, ' + (list.length - wrong) + ' imprecise) applied directly into the text above — no known errors remain. '
+    + 'Audit trail: <a href="https://github.com/RealCrystalNight/mc-packet-reference/blob/main/data/concepts/corrections.json" target="_blank" rel="noopener" style="color:var(--accent)">corrections.json</a>.</p>'
+    + '</div></div>';
 }
 
 const ANALYSIS_DIR = path.join(BASE, 'data', 'logic-analysis');
@@ -592,6 +593,7 @@ function main() {
       + '<meta name="theme-color" content="#0a0a0a">\n'
       + '<link rel="manifest" href="../../assets/site.webmanifest">\n'
       + '<link rel="apple-touch-icon" href="../../assets/icon-192.png">\n'
+      + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
       + '<link rel="canonical" href="' + pageUrl + '">\n'
       + '<meta property="og:title" content="' + metaTitle + '">\n'
       + '<meta property="og:description" content="' + metaDesc + '">\n'
@@ -698,6 +700,7 @@ function main() {
       + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
       + '<meta name="theme-color" content="#0a0a0a">\n'
       + '<link rel="manifest" href="../../assets/site.webmanifest">\n'
+      + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
       + '<link rel="canonical" href="' + pageUrl + '">\n'
       + '<meta property="og:title" content="' + metaTitle + '">\n'
       + '<meta property="og:description" content="' + metaDesc + '">\n'
@@ -780,6 +783,7 @@ function main() {
     + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
     + '<meta name="theme-color" content="#0a0a0a">\n'
     + '<link rel="manifest" href="../assets/site.webmanifest">\n'
+    + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
     + '<link rel="canonical" href="' + SITE + '/classes/">\n'
     + '<meta property="og:title" content="Vanilla Internals \u2014 Minecraft 1.8.9 Packet Reference">\n'
     + '<meta property="og:type" content="website">\n'
@@ -849,6 +853,7 @@ function main() {
       + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
       + '<meta name="theme-color" content="#0a0a0a">\n'
       + '<link rel="manifest" href="../../assets/site.webmanifest">\n'
+      + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
       + '<link rel="canonical" href="' + pageUrl + '">\n'
       + '<meta property="og:title" content="' + metaTitle + '">\n'
       + '<meta property="og:description" content="' + esc(metaDesc) + '">\n'
@@ -914,6 +919,7 @@ function main() {
       + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
       + '<meta name="theme-color" content="#0a0a0a">\n'
       + '<link rel="manifest" href="../assets/site.webmanifest">\n'
+      + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
       + '<link rel="canonical" href="' + SITE + '/start/">\n'
       + '<meta property="og:title" content="Start Here \u2014 Minecraft 1.8.9 Packet Reference">\n'
       + '<meta property="og:type" content="article">\n'
@@ -1023,6 +1029,7 @@ function main() {
     + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
     + '<meta name="theme-color" content="#0a0a0a">\n'
     + '<link rel="manifest" href="../assets/site.webmanifest">\n'
+    + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
     + '<link rel="canonical" href="' + SITE + '/modules/">\n'
     + '<meta property="og:title" content="Cheat Modules \u2014 Minecraft 1.8.9 Packet Reference">\n'
     + '<meta property="og:type" content="website">\n'
@@ -1086,6 +1093,7 @@ function main() {
     + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
     + '<meta name="theme-color" content="#0a0a0a">\n'
     + '<link rel="manifest" href="../assets/site.webmanifest">\n'
+    + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
     + '<link rel="canonical" href="' + SITE + '/packets/">\n'
     + '<meta property="og:title" content="All Packets \u2014 Minecraft 1.8.9 Packet Reference">\n'
     + '<meta property="og:type" content="website">\n'

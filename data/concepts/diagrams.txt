@@ -39,8 +39,8 @@ The codebase has a clear concentric structure. At the center is the world model 
 │  │   │     ├── EnumConnectionState: HANDSHAKING/STATUS/        │     │  │
 │  │   │     │    LOGIN/PLAY  +  packet ID registry              │     │  │
 │  │   │     ├── PacketBuffer (VarInt, BlockPos, NBT, ItemStack) │     │  │
-│  │   │     ├── 23 C→S play packets (C00..C19)                  │     │  │
-│  │   │     └── 71 S→C play packets (S00..S49)                  │     │  │
+│  │   │     ├── 26 C→S play packets (C00..C19)                  │     │  │
+│  │   │     └── 74 S→C play packets (S00..S49)                  │     │  │
 │  │   │                                                         │     │  │
 │  │   │   ┌───────────────────────────────────────────────┐     │     │  │
 │  │   │   │   LAYER 1 — WORLD MODEL  (shared)             │     │     │  │
@@ -74,28 +74,27 @@ The entity tree is deep but well-organized. Most of the methods you'll call on t
        ┌────────────────┬───────┴────────┬──────────────────┐
        │                │                │                  │
 EntityLivingBase   EntityItem    EntityXPOrb         EntityArrow
-       │           (dropped       (xp drops)         EntityFireball
-       │            items)                           EntitySnowball
-       │                                             EntityFishHook
-       │                                             EntityEnderPearl
-       │                                             ... (all in
-       │                                              .projectile)
+       │           (dropped       (xp drops)         (+ siblings EntityFireball,
+       │            items)                           EntitySnowball, EntityFishHook
+       │           (each directly                     in .projectile; EntityEnderPearl
+       │            extends Entity)                   in .item)
        │
    ┌───┴────────────────┬─────────────┬──────────────────────┐
    │                    │             │                      │
-EntityPlayer    EntityCreature  EntityFlying           EntityAmbient
-   │           (most mobs use   (Ghast)                (Bat)
-   │            this base)              
+EntityPlayer    EntityLiving (children: EntityCreature [most
+   │           mobs], EntityFlying [Ghast], EntityAmbientCreature
+   │           [Bat]; Creature extends Living extends LivingBase)
    │                │
    │       ┌────────┴────────┐
    │       │                 │
-   │   EntityMob       EntityAnimal
-   │   (hostile)      (passive)
-   │       │                 │
-   │   Zombie, Skeleton, Cow, Sheep, Pig,
-   │   Creeper, Spider,    Chicken, Horse,
-   │   Witch, Enderman,    Villager, Wolf,
-   │   ...                 Rabbit, ...
+   │   EntityMob       EntityAgeable
+   │   (hostile,       (Villager extends this;
+   │    extends         EntityAnimal extends this:
+   │    Creature)       passive Cow, Sheep, Pig,
+   │       │           Chicken, Horse, Rabbit, ...;
+   │   Zombie, Skeleton, Wolf extends EntityTameable
+   │   Creeper, Spider,  (Tameable extends Animal))
+   │   Witch, Enderman, ...
    │
 AbstractClientPlayer
    │
@@ -104,12 +103,12 @@ AbstractClientPlayer
    │       method: onUpdateWalkingPlayer() — builds C03/C04/C05/C06
    │
    └──→ EntityOtherPlayerMP (any other player visible)
-           method: setPositionAndRotation2() — receives S14/S18
+           method: setPositionAndRotation2() — called by NetHandlerPlayClient.handleEntityMovement (S14) / handleEntityTeleport (S18) for interpolation
 ```
 
 The teaching point: `EntityPlayerSP` is the only one of the two `AbstractClientPlayer` subclasses that *sends* packets. `EntityOtherPlayerMP` only *receives* updates from the server about other players and interpolates them smoothly. So `sendQueue` only exists on `EntityPlayerSP` — don't go looking for it on a generic player reference.
 
-Also: the abstract `EntityLivingBase.getHeldItem()` is overridden by `EntityPlayer` to read from `inventory.getCurrentItem()`, and by mobs to read from their internal equipment array. So calling `getHeldItem()` on a generic `EntityLivingBase` does the right thing regardless of whether you have a player or a mob.
+Also: the abstract `EntityLivingBase.getHeldItem()` is overridden by `EntityPlayer` to read from `inventory.getCurrentItem()`, and by `EntityLiving.getHeldItem()` (returning `equipment[0]`, inherited by all mobs). So calling `getHeldItem()` on a generic `EntityLivingBase` does the right thing regardless of whether you have a player or a mob.
 
 ---
 
@@ -153,8 +152,8 @@ A connection goes through four states. Each state has its own packet ID space, s
         └──────────┬──────────┘
                    │
                    │ Server immediately sends:
-                   │   S46PacketSetCompressionLevel   (often)
-                   │   S01PacketJoinGame(entityId, gameMode, dimension,
+                   │   S46PacketSetCompressionLevel   (PLAY, only when compression changes — not routine)
+                   │   S01PacketJoinGame(entityId, gameMode, hardcoreMode, dimension,
                    │                     difficulty, maxPlayers,
                    │                     worldType, reducedDebugInfo)
                    │   S05PacketSpawnPosition         (world spawn)
@@ -166,13 +165,13 @@ A connection goes through four states. Each state has its own packet ID space, s
                    │   C15PacketClientSettings(lang, viewDist, chatVis,
                    │                            chatColors, skinFlags)
                    │   C17PacketCustomPayload("MC|Brand", "vanilla")
-                   │   C16PacketClientStatus(PERFORM_RESPAWN)  // signals
-                   │                                              "ready"
+                   │   (vanilla never sends C16 PERFORM_RESPAWN as a join-ready
+                   │    signal; it is a post-death respawn request)
                    ▼
               ── steady state ──
 ```
 
-The teaching point: state transitions are driven by specific packets, not by timestamps or timeouts. If you ever see a packet ID that "doesn't exist", you're probably looking at it in the wrong state's lookup table. `EnumConnectionState.PLAY.directionMaps` is the lookup you want for the 94 PLAY-state packets.
+The teaching point: state transitions are driven by specific packets, not by timestamps or timeouts. If you ever see a packet ID that "doesn't exist", you're probably looking at it in the wrong state's lookup table. `EnumConnectionState.PLAY` registry (100 PLAY-state packets: 74 CLIENTBOUND + 26 SERVERBOUND) is the lookup you want — `directionMaps` is private, use `getPacket(direction, id)` / `getPacketId(direction, packet)`.
 
 ---
 
@@ -200,7 +199,7 @@ Once you're in PLAY, the per-tick exchange looks like this. The arrows show dire
    └────────────┬─────────────┘           ║                     ║
                 │                         ║                     ║
                 │ Left-click on entity:   ║                     ║
-                │  C →  C02 (ATTACK)      ║                     ║
+                │  C →  C02PacketUseEntity (Action.ATTACK)      ║                     ║
                 ├────────────────────────→║                     ║
                 │                         ║                     ║
                 │ Left-click on block:    ║                     ║
@@ -272,7 +271,7 @@ Every tick `EntityPlayerSP.onUpdateWalkingPlayer()` decides which of four positi
          │  Compute delta from last reported state: │
          │                                          │
          │    dx     = posX - lastReportedPosX      │
-         │    dy     = bb.minY - lastReportedPosY   │
+         │    dy     = getEntityBoundingBox().minY - lastReportedPosY   │
          │    dz     = posZ - lastReportedPosZ      │
          │    dyaw   = yaw   - lastReportedYaw      │
          │    dpitch = pitch - lastReportedPitch    │
@@ -310,7 +309,7 @@ Every tick `EntityPlayerSP.onUpdateWalkingPlayer()` decides which of four positi
      - Always treat this as "no position update" for delta tracking
 ```
 
-The teaching point: there is no single "send position" packet — there are four, and which one goes out depends on what changed. The shared base `C03PacketPlayer` carries only `onGround`; subclasses add fields. The Y coordinate sent is always `boundingBox.minY` (your feet), never `posY`. The 9.0E-4 threshold corresponds to a 0.03-block radius — moves smaller than that are treated as "not moving" and won't trigger a C04 unless the 20-tick forcing fires.
+The teaching point: there is no single "send position" packet — there are four, and which one goes out depends on what changed. The shared base `C03PacketPlayer` declares `protected x, y, z, yaw, pitch, onGround, moving, rotating` but serializes only `onGround`; subclasses add fields. The Y coordinate sent is always `getEntityBoundingBox().minY` (your feet), never `posY`. The 9.0E-4 threshold corresponds to a 0.03-block radius — moves smaller than that are treated as "not moving" and won't trigger a C04 unless the 20-tick forcing fires.
 
 ---
 
@@ -346,15 +345,16 @@ This is the path a packet takes from the moment your code constructs it to the m
               YES                  NO
                 │                   │
                 ▼                   ▼
-     dispatchPacket(p, null)   queue into
-                │              outboundPacketsQueue,
+     dispatchPacket(p, null)   queue into outboundPacketsQueue
+                │              (pre-channel-open buffer only),
                 │              schedule flushOutboundQueue()
                 │              on event loop, return
+                │              (open channel: writeAndFlush on event loop)
                 ▼
         ┌─────────────────────────────────┐
         │   Netty pipeline:               │
         │                                 │
-        │   PacketEncoder.encode()        │
+        │   MessageSerializer.encode() (+ MessageSerializer2 framing)   │
         │     ↓                           │
         │   ByteBuf with VarInt ID +      │
         │   p.writePacketData(buffer)     │
@@ -362,14 +362,14 @@ This is the path a packet takes from the moment your code constructs it to the m
         │   NettyCompressionEncoder       │
         │   (if compression enabled)      │
         │     ↓                           │
-        │   NettyVarint21FrameEncoder     │
+        │   MessageSerializer2     │
         │   (prepends length VarInt)      │
         │     ↓                           │
         │   socket write                  │
         └─────────────────────────────────┘
 ```
 
-The teaching point: `sendPacket` is thread-safe — you can call it from any thread. If you're not on the Netty event loop, the manager queues your packet and schedules a flush. Don't try to be clever with threading; just call `addToSendQueue` from wherever you are.
+The teaching point: `sendPacket` is thread-safe — you can call it from any thread. If you're not on the Netty event loop and the channel is not yet open, the manager buffers your packet in outboundPacketsQueue and schedules a flush; once open, sends use writeAndFlush on the event loop. Don't try to be clever with threading; just call `addToSendQueue` from wherever you are.
 
 ---
 
@@ -384,13 +384,13 @@ Inbound is more interesting because it involves a thread switch. The Netty threa
    │   Bytes arrive on socket                              │
    │              │                                        │
    │              ▼                                        │
-   │   NettyVarint21FrameDecoder reads length VarInt       │
+   │   MessageDeserializer2 reads length VarInt (framing)       │
    │              │                                        │
    │              ▼                                        │
    │   NettyCompressionDecoder (if compressed)             │
    │              │                                        │
    │              ▼                                        │
-   │   PacketDecoder.decode() reads packet ID VarInt,      │
+   │   MessageDeserializer.decode() reads packet ID VarInt,      │
    │   looks up class in EnumConnectionState's registry,   │
    │   instantiates packet, calls readPacketData(buffer)   │
    │              │                                        │
@@ -411,7 +411,8 @@ Inbound is more interesting because it involves a thread switch. The Netty threa
    │              ▼                                        │
    │   If we're NOT on the Minecraft thread:               │
    │     - Schedule a Runnable on mc that will             │
-   │       re-call handleXxx(packet)                       │
+   │       re-call packet.processPacket(handler)           │
+   │       (which dispatches to handleXxx)                 │
    │     - Throw ThreadQuickExitException                  │
    │     - Netty thread unwinds and is done                │
    │                                                       │
@@ -422,12 +423,12 @@ Inbound is more interesting because it involves a thread switch. The Netty threa
                            │  scheduledTasks queue
                            ▼
    ┌───────────────────────────────────────────────────────┐
-   │   Minecraft main thread (inside Minecraft.runTick)    │
+   │   Minecraft main thread (Runnable from runGameLoop)   │
    │                                                       │
-   │   Calls mc.scheduledTasks polling loop                │
+   │   Calls mc.scheduledTasks polling loop (in runGameLoop) │
    │              │                                        │
    │              ▼                                        │
-   │   Runnable fires → handleXxx(packet) called AGAIN     │
+   │   Runnable fires → packet.processPacket(handler) called AGAIN (dispatches to handleXxx)     │
    │              │                                        │
    │              ▼                                        │
    │   This time checkThreadAndEnqueue is a no-op,         │
@@ -489,7 +490,7 @@ What happens inside `runTick`:
             ▼
    ┌───────────────────────────────────────────────────────┐
    │                                                       │
-   │  1. Process scheduledTasks queue (drain Runnables)    │
+   │  1. (scheduledTasks are drained in runGameLoop before the tick loop, not here)    │
    │                                                       │
    │  2. ingameGUI.updateTick()       (chat fade, etc.)    │
    │                                                       │
@@ -518,16 +519,16 @@ What happens inside `runTick`:
    │  5. if (theWorld != null) {                           │
    │       playerController.updateController()             │
    │         ┌─────────────────────────────────────┐       │
-   │         │ Drives block-breaking progress:     │       │
-   │         │   - calls onPlayerDamageBlock per   │       │
-   │         │     tick while LMB held             │       │
-   │         │   - sends C0A swing animation       │       │
-   │         │   - sends C07 STOP_DESTROY when     │       │
-   │         │     curBlockDamageMP ≥ 1.0          │       │
+   │         │ Only syncs held item (C09 via      │       │
+   │         │   syncCurrentPlayItem) and drains   │       │
+   │         │   inbound packets; block damage /   │       │
+   │         │   C07 STOP at ≥1.0F lives in        │       │
+   │         │   onPlayerDamageBlock, C0A swing in │       │
+   │         │   EntityPlayerSP.swingItem          │       │
    │         └─────────────────────────────────────┘       │
    │                                                       │
-   │       myNetworkManager.processReceivedPackets()       │
-   │         (drains any inbound packets queued by Netty)  │
+   │       (inbound drain happens inside updateController via    │
+   │        netClientHandler.getNetworkManager().processReceivedPackets())│
    │                                                       │
    │       theWorld.tick()                                 │
    │       theWorld.updateEntities()                       │
@@ -616,10 +617,13 @@ This is the most complex of the input pipelines because it spans many ticks. Wat
    │          isHittingBlock = true                    │
    │ Sends:   C07PacketPlayerDigging(                  │
    │            START_DESTROY_BLOCK, pos, sideHit)     │
-   │ Sends:   C0APacketAnimation()    (arm swing)      │
+   │ (no C0A here; arm swing comes from               │
+   │  EntityPlayerSP.swingItem via Minecraft.clickMouse)│
    │                                                   │
-   │ If creative mode: also calls onPlayerDestroyBlock │
-   │ and the block disappears immediately.             │
+   │ If creative mode: sends C07 START_DESTROY_BLOCK   │
+   │ then calls clickBlockCreative (not                │
+   │ onPlayerDestroyBlock) and the block disappears    │
+   │ immediately.                                      │
    └───────────────────────────────────────────────────┘
 
    Tick 1..N: Player still holding LMB on same block
@@ -632,12 +636,12 @@ This is the most complex of the input pipelines because it spans many ticks. Wat
    │ (depends on item, enchants, haste, water, ...)    │
    │                                                   │
    │ Every 4 ticks (stepSoundTickCounter): play hit    │
-   │ sound, send C0APacketAnimation                    │
+   │ sound only (no C0A sent here)                     │
    │                                                   │
-   │ Block break-progress 0-9 is sent to the server    │
-   │ via S25PacketBlockBreakAnim — but the SERVER      │
-   │ tracks its own progress and the client's value    │
-   │ is mostly visual.                                 │
+   │ Block break-progress 0-9 goes to                  │
+   │ World.sendBlockBreakProgress (client-side render; │
+   │ S25PacketBlockBreakAnim is server→client, not     │
+   │ client→server).                                   │
    └───────────────────────┬───────────────────────────┘
                            │
               ┌────────────┴────────────┐
@@ -648,15 +652,15 @@ This is the most complex of the input pipelines because it spans many ticks. Wat
               │ (loop next tick)        ▼
               │                  onPlayerDestroyBlock()
               │                  ┌────────────────────────────┐
-              │                  │ Sends: C07 STOP_DESTROY    │
+              │                  │ (onPlayerDamageBlock sent │
+              │                  │  C07 STOP_DESTROY, then   │
+              │                  │  calls onPlayerDestroyBlock│
+              │                  │  which sends no packet)   │
               │                  │ Sets:  isHittingBlock=false│
               │                  │        curBlockDamageMP=0  │
-              │                  │ Locally: world.setBlockTo- │
-              │                  │   Air(pos) for prediction  │
-              │                  │                            │
-              │                  │ Block actually gets removed│
-              │                  │ when S23PacketBlockChange  │
-              │                  │ arrives from server.       │
+              │                  │ Predictively removes via  │
+              │                  │ world.setBlockToAir(pos); │
+              │                  │ S23 only later syncs.     │
               │                  └────────────────────────────┘
               ▼
    Player releases LMB or aims elsewhere
@@ -669,7 +673,7 @@ This is the most complex of the input pipelines because it spans many ticks. Wat
    └───────────────────────────────────────────────────┘
 ```
 
-The teaching point: block-breaking is not a single event. It's a state machine driven by ticks, with three C07 packet sub-types marking the start, abort, and completion. The server validates everything — the client's `setBlockToAir` is just a visual prediction, and the real removal happens when S23 confirms it.
+The teaching point: block-breaking is not a single event. It's a state machine driven by ticks, with three C07 packet sub-types marking the start, abort, and completion. The server validates everything — the client predictively removes via `setBlockToAir` in `onPlayerDestroyBlock`, and S23 only later syncs/corrects.
 
 ---
 
@@ -724,12 +728,11 @@ Every click in an inventory GUI follows the same path, regardless of which conta
             │                  │
             ▼                  ▼
    handleConfirm-      handleConfirm-
-   Transaction reads   Transaction sees
-   accept=true,        accept=false, REVERTS
-   nothing to do       client state by re-applying
-                       opposite, then sends a
-                       C0FPacketConfirmTransaction
-                       to acknowledge
+   Transaction reads   Transaction on accept=false
+   accept=true,        does NO client-side revert;
+   nothing to do       only replies C0FPacketConfirm-
+                       Transaction(true). Resync
+                       comes via S2F/S30.
 
    Independently, on big changes the server sends:
      S2F SetSlot(slotId, stack)   — single slot fix
@@ -753,9 +756,9 @@ When you call `entity.moveEntity(dx, dy, dz)`, this is what happens. Understandi
    │  1. Save the original dx, dy, dz for sneak detection   │
    │                                                        │
    │  2. Sneak-edge logic (player only, on the ground):     │
-   │     Probe forward and sideways with                    │
-   │     world.getCollisionBoxes(bb.offset(dx,-1,dz))       │
-   │     Iteratively shrink dx, dz until you can't fall off │
+   │     Probe with getCollidingBoundingBoxes in three     │
+   │     separate offset loops: (dx,-1,0), (0,-1,dz),      │
+   │     (dx,-1,dz). Shrink dx, dz until you can't fall off│
    │     ┌────────────────────────────────────────────┐     │
    │     │ This is the "sneak doesn't let you fall    │     │
    │     │ off the edge" feature. It works by         │     │
@@ -767,24 +770,25 @@ When you call `entity.moveEntity(dx, dy, dz)`, this is what happens. Understandi
    │  3. Query collision boxes intersecting the swept AABB: │
    │     List<AxisAlignedBB> boxes =                        │
    │       world.getCollidingBoundingBoxes(                 │
-   │         this, this.bb.addCoord(dx, dy, dz))            │
+   │         this, getEntityBoundingBox().addCoord(dx,dy,dz))│
+   │     (field is private boundingBox, not bb)            │
    │                                                        │
    │  4. Resolve Y first (gravity & ceiling):               │
    │     for (AABB other : boxes)                           │
-   │       dy = other.calculateYOffset(this.bb, dy);        │
-   │     this.bb = this.bb.offset(0, dy, 0);                │
+   │       dy = other.calculateYOffset(getEntityBoundingBox(), dy);        │
+   │     setEntityBoundingBox(getEntityBoundingBox().offset(0, dy, 0));                │
    │     if (dy was reduced)                                │
-   │       (we hit a floor or ceiling — onGround if dy<0)   │
+   │       (we hit a floor or ceiling — onGround only if strict dy<0 later)   │
    │                                                        │
    │  5. Resolve X:                                         │
    │     for (AABB other : boxes)                           │
-   │       dx = other.calculateXOffset(this.bb, dx);        │
-   │     this.bb = this.bb.offset(dx, 0, 0);                │
+   │       dx = other.calculateXOffset(getEntityBoundingBox(), dx);        │
+   │     setEntityBoundingBox(getEntityBoundingBox().offset(dx, 0, 0));                │
    │                                                        │
    │  6. Resolve Z:                                         │
    │     for (AABB other : boxes)                           │
-   │       dz = other.calculateZOffset(this.bb, dz);        │
-   │     this.bb = this.bb.offset(0, 0, dz);                │
+   │       dz = other.calculateZOffset(getEntityBoundingBox(), dz);        │
+   │     setEntityBoundingBox(getEntityBoundingBox().offset(0, 0, dz));                │
    │                                                        │
    │  7. Step-up handling (if we hit a wall horizontally    │
    │     AND there's a block ≤ stepHeight tall in the way): │
@@ -801,7 +805,7 @@ When you call `entity.moveEntity(dx, dy, dz)`, this is what happens. Understandi
    │     isCollidedHorizontally ← (dx or dz reduced)        │
    │     isCollidedVertically ← (dy reduced)                │
    │     isCollided ← either of the above                   │
-   │     onGround ← (dy reduced AND original dy ≤ 0)        │
+   │     onGround ← (isCollidedVertically AND original dy < 0.0D, strict <)        │
    │     fallDistance accumulates                           │
    │     doBlockCollisions() — fire onEntityCollidedWithBlock│
    └────────────────────────────────────────────────────────┘
@@ -827,14 +831,14 @@ Every tick, the crosshair re-raytraces the world to figure out what you're point
    │  Vec3 eyes = viewEntity.getPositionEyes(partialTicks); │
    │  Vec3 look = viewEntity.getLook(partialTicks);         │
    │  double reach = playerController.getBlockReachDistance(│
-   │                  ); // 5.0 surv, 6.0 creat             │
+   │                  ); // 4.5 surv, 5.0 creat (6.0 = extendedReach entity distance, creative)             │
    │  Vec3 endPoint = eyes.addVector(look.x*reach,          │
    │                                  look.y*reach,         │
    │                                  look.z*reach);        │
    │                                                        │
-   │  // Block ray-trace:                                   │
-   │  mc.objectMouseOver = theWorld.rayTraceBlocks(         │
-   │      eyes, endPoint, false, false, true);              │
+   │  // Block ray-trace (delegates to Entity.rayTrace):    │
+   │  mc.objectMouseOver = entity.rayTrace(reach, partialTicks)│
+   │      (which calls theWorld.rayTraceBlocks internally); │
    │                                                        │
    │  // Now look for an entity in front of that block.     │
    │  // Build an AABB containing the line eyes→endPoint    │
@@ -844,8 +848,8 @@ Every tick, the crosshair re-raytraces the world to figure out what you're point
    │                  look.y*reach,                         │
    │                  look.z*reach).expand(1,1,1);          │
    │                                                        │
-   │  List<Entity> candidates = theWorld.getEntitiesIn-     │
-   │      AABBexcluding(viewEntity, sweep, predicate);      │
+   │  List<Entity> candidates = mc.theWorld.getEntitiesIn- │
+   │      AABBexcluding(entity, sweep, predicate);          │
    │                                                        │
    │  // For each candidate, expand its bb by its           │
    │  // collisionBorderSize and call calculateIntercept    │
@@ -884,7 +888,7 @@ The teaching point: this method is the bridge between "where the camera is point
                     │     ↗ -Z (north)
                     │   ↗
                     │ ↗
-   -X (east) ←──────●──────→ +X (west)
+   -X (west) ←──────●──────→ +X (east)
                   ↙ │
                 ↙   │
               ↙     │
@@ -912,7 +916,7 @@ A cleaner coordinate reference, as text:
      +Y = up
      -Y = down
      +Z = south
-     -Z = north  (toward sunset / "north" by compass)
+     -Z = north  (sunset is west, i.e. -X)
 
    Yaw (rotationYaw):
      0°    or  ±360°  →  facing +Z  (south)
@@ -935,10 +939,10 @@ A cleaner coordinate reference, as text:
 
    The boundingBox is anchored differently from posX/posY/posZ:
      posX, posZ   = horizontal center of entity
-     posY         = bottom of entity hitbox (== bb.minY for most)
+     posY         = bottom of entity hitbox (== boundingBox.minY for most)
      bb.minX      = posX - width/2
      bb.maxX      = posX + width/2
-     bb.minY      = posY                    ← what C03/C04/C06 sends
+     boundingBox.minY = posY                    ← what C03/C04/C06 sends
      bb.maxY      = posY + height
      bb.minZ      = posZ - width/2
      bb.maxZ      = posZ + width/2
@@ -949,7 +953,7 @@ A cleaner coordinate reference, as text:
      eyeZ = posZ
 ```
 
-The teaching point: yaw 0 points south, not north. This trips people up constantly. Also: the wire protocol always sends `bb.minY`, never `posY`, even though for most entities they're equal — the safe habit is to use `getEntityBoundingBox().minY` when building position packets.
+The teaching point: yaw 0 points south, not north. This trips people up constantly. Also: the wire protocol always sends `getEntityBoundingBox().minY`, never `posY`, even though for most entities they're equal — the safe habit is to use `getEntityBoundingBox().minY` when building position packets.
 
 ---
 
@@ -980,8 +984,8 @@ The teaching point: yaw 0 points south, not north. This trips people up constant
    │     motionY = (motionY - 0.08) * 0.98                       │
    │                                                             │
    │   In water:                                                 │
-   │     motionX, Z, Y *= 0.8 (or 0.8 + adjustments for depth-   │
-   │                          strider enchant up to 0.96)        │
+   │     motionX, Z *= f1 (0.8 base; up to 0.546 at max        │
+   │                  Depth Strider: f1 += (0.546-f1)*lvl/3)  │
    │     motionY -= 0.02 (lower gravity in water)                │
    │                                                             │
    │   In lava:                                                  │
@@ -998,8 +1002,8 @@ The teaching point: yaw 0 points south, not north. This trips people up constant
    │                + sin(yaw_rad) * normalizedForward           │
    │                                                             │
    │   The friction passed to moveFlying:                        │
-   │     On ground: 0.1 * (0.16277136 / (groundFric)³)           │
-   │       = "ground acceleration"; with slipperiness=0.6 this   │
+   │     On ground: getAIMoveSpeed() * (0.16277136 / f4³)       │
+   │       (landMovementFactor); with slipperiness=0.6 this     │
    │       evaluates to about 0.1 — the magic walk speed         │
    │     In air:    0.02 (set as jumpMovementFactor)             │
    │     In water:  0.02 (×depth-strider modifier)               │
@@ -1078,8 +1082,8 @@ The teaching point: friction is multiplicative each tick, and the value depends 
    │       Slot           │
    │                      │
    │  inventory: IInventory   ← the backing store
-   │  index: int              ← index into that store
-   │  xPosition, yPosition    ← where to draw on screen
+   │  slotIndex: private final int (ctor index) / slotNumber: public int
+   │  xDisplayPosition, yDisplayPosition ← where to draw on screen
    │                      │
    │  getStack()  → inventory.getStackInSlot(index)
    │  putStack(s) → inventory.setInventorySlotContents(

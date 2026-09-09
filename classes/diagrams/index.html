@@ -11,6 +11,7 @@
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <meta name="theme-color" content="#0a0a0a">
 <link rel="manifest" href="../../assets/site.webmanifest">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <link rel="canonical" href="https://realcrystalnight.github.io/mc-packet-reference/classes/diagrams/">
 <meta property="og:title" content="Diagrams — Minecraft 1.8.9 Vanilla Internals">
 <meta property="og:description" content="Visual companion: architecture layers, packet lifecycle, threading, collision, raytrace and movement constants in plain ASCII.">
@@ -80,8 +81,8 @@
 │  │   │     ├── EnumConnectionState: HANDSHAKING/STATUS/        │     │  │
 │  │   │     │    LOGIN/PLAY  +  packet ID registry              │     │  │
 │  │   │     ├── PacketBuffer (VarInt, BlockPos, NBT, ItemStack) │     │  │
-│  │   │     ├── 23 C→S play packets (C00..C19)                  │     │  │
-│  │   │     └── 71 S→C play packets (S00..S49)                  │     │  │
+│  │   │     ├── 26 C→S play packets (C00..C19)                  │     │  │
+│  │   │     └── 74 S→C play packets (S00..S49)                  │     │  │
 │  │   │                                                         │     │  │
 │  │   │   ┌───────────────────────────────────────────────┐     │     │  │
 │  │   │   │   LAYER 1 — WORLD MODEL  (shared)             │     │     │  │
@@ -106,28 +107,27 @@
        ┌────────────────┬───────┴────────┬──────────────────┐
        │                │                │                  │
 EntityLivingBase   EntityItem    EntityXPOrb         EntityArrow
-       │           (dropped       (xp drops)         EntityFireball
-       │            items)                           EntitySnowball
-       │                                             EntityFishHook
-       │                                             EntityEnderPearl
-       │                                             ... (all in
-       │                                              .projectile)
+       │           (dropped       (xp drops)         (+ siblings EntityFireball,
+       │            items)                           EntitySnowball, EntityFishHook
+       │           (each directly                     in .projectile; EntityEnderPearl
+       │            extends Entity)                   in .item)
        │
    ┌───┴────────────────┬─────────────┬──────────────────────┐
    │                    │             │                      │
-EntityPlayer    EntityCreature  EntityFlying           EntityAmbient
-   │           (most mobs use   (Ghast)                (Bat)
-   │            this base)              
+EntityPlayer    EntityLiving (children: EntityCreature [most
+   │           mobs], EntityFlying [Ghast], EntityAmbientCreature
+   │           [Bat]; Creature extends Living extends LivingBase)
    │                │
    │       ┌────────┴────────┐
    │       │                 │
-   │   EntityMob       EntityAnimal
-   │   (hostile)      (passive)
-   │       │                 │
-   │   Zombie, Skeleton, Cow, Sheep, Pig,
-   │   Creeper, Spider,    Chicken, Horse,
-   │   Witch, Enderman,    Villager, Wolf,
-   │   ...                 Rabbit, ...
+   │   EntityMob       EntityAgeable
+   │   (hostile,       (Villager extends this;
+   │    extends         EntityAnimal extends this:
+   │    Creature)       passive Cow, Sheep, Pig,
+   │       │           Chicken, Horse, Rabbit, ...;
+   │   Zombie, Skeleton, Wolf extends EntityTameable
+   │   Creeper, Spider,  (Tameable extends Animal))
+   │   Witch, Enderman, ...
    │
 AbstractClientPlayer
    │
@@ -136,9 +136,9 @@ AbstractClientPlayer
    │       method: onUpdateWalkingPlayer() — builds C03/C04/C05/C06
    │
    └──→ EntityOtherPlayerMP (any other player visible)
-           method: setPositionAndRotation2() — receives S14/S18</code></pre>
+           method: setPositionAndRotation2() — called by NetHandlerPlayClient.handleEntityMovement (S14) / handleEntityTeleport (S18) for interpolation</code></pre>
 <p>The teaching point: <code>EntityPlayerSP</code> is the only one of the two <code>AbstractClientPlayer</code> subclasses that *sends* packets. <code>EntityOtherPlayerMP</code> only *receives* updates from the server about other players and interpolates them smoothly. So <code>sendQueue</code> only exists on <code>EntityPlayerSP</code> — don't go looking for it on a generic player reference.</p>
-<p>Also: the abstract <code>EntityLivingBase.getHeldItem()</code> is overridden by <code>EntityPlayer</code> to read from <code>inventory.getCurrentItem()</code>, and by mobs to read from their internal equipment array. So calling <code>getHeldItem()</code> on a generic <code>EntityLivingBase</code> does the right thing regardless of whether you have a player or a mob.</p>
+<p>Also: the abstract <code>EntityLivingBase.getHeldItem()</code> is overridden by <code>EntityPlayer</code> to read from <code>inventory.getCurrentItem()</code>, and by <code>EntityLiving.getHeldItem()</code> (returning <code>equipment[0]</code>, inherited by all mobs). So calling <code>getHeldItem()</code> on a generic <code>EntityLivingBase</code> does the right thing regardless of whether you have a player or a mob.</p>
 <p>---</p></div></div>
 <div class="detail-section"><h3>3. The packet protocol lifecycle</h3><div class="writeup-block"><p>A connection goes through four states. Each state has its own packet ID space, so packet ID 0x01 in <code>LOGIN</code> is a completely different packet from 0x01 in <code>PLAY</code>. The state transitions are deterministic.</p>
 <pre class="writeup-code"><code>        ┌─────────────────────┐
@@ -176,8 +176,8 @@ AbstractClientPlayer
         └──────────┬──────────┘
                    │
                    │ Server immediately sends:
-                   │   S46PacketSetCompressionLevel   (often)
-                   │   S01PacketJoinGame(entityId, gameMode, dimension,
+                   │   S46PacketSetCompressionLevel   (PLAY, only when compression changes — not routine)
+                   │   S01PacketJoinGame(entityId, gameMode, hardcoreMode, dimension,
                    │                     difficulty, maxPlayers,
                    │                     worldType, reducedDebugInfo)
                    │   S05PacketSpawnPosition         (world spawn)
@@ -189,12 +189,12 @@ AbstractClientPlayer
                    │   C15PacketClientSettings(lang, viewDist, chatVis,
                    │                            chatColors, skinFlags)
                    │   C17PacketCustomPayload("MC|Brand", "vanilla")
-                   │   C16PacketClientStatus(PERFORM_RESPAWN)  // signals
-                   │                                              "ready"
+                   │   (vanilla never sends C16 PERFORM_RESPAWN as a join-ready
+                   │    signal; it is a post-death respawn request)
                    ▼
               ── steady state ──</code></pre>
-<p>The teaching point: state transitions are driven by specific packets, not by timestamps or timeouts. If you ever see a packet ID that "doesn't exist", you're probably looking at it in the wrong state's lookup table. <code>EnumConnectionState.PLAY.directionMaps</code> is the lookup you want for the 94 PLAY-state packets.</p>
-<p>---</p></div><div class="related-list" style="margin-top:10px"><a class="related-chip" href="../../packets/C00Handshake/">C00Handshake</a><a class="related-chip" href="../../packets/C00PacketServerQuery/">C00PacketServerQuery</a><a class="related-chip" href="../../packets/S00PacketServerInfo/">S00PacketServerInfo</a><a class="related-chip" href="../../packets/C01PacketPing/">C01PacketPing</a><a class="related-chip" href="../../packets/S01PacketPong/">S01PacketPong</a><a class="related-chip" href="../../packets/C00PacketLoginStart/">C00PacketLoginStart</a><a class="related-chip" href="../../packets/S01PacketEncryptionRequest/">S01PacketEncryptionRequest</a><a class="related-chip" href="../../packets/C01PacketEncryptionResponse/">C01PacketEncryptionResponse</a><a class="related-chip" href="../../packets/S03PacketEnableCompression/">S03PacketEnableCompression</a><a class="related-chip" href="../../packets/S02PacketLoginSuccess/">S02PacketLoginSuccess</a><a class="related-chip" href="../../packets/S46PacketSetCompressionLevel/">S46PacketSetCompressionLevel</a><a class="related-chip" href="../../packets/S01PacketJoinGame/">S01PacketJoinGame</a><a class="related-chip" href="../../packets/S05PacketSpawnPosition/">S05PacketSpawnPosition</a><a class="related-chip" href="../../packets/S39PacketPlayerAbilities/">S39PacketPlayerAbilities</a><a class="related-chip" href="../../packets/S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a><a class="related-chip" href="../../packets/S26PacketMapChunkBulk/">S26PacketMapChunkBulk</a><a class="related-chip" href="../../packets/C15PacketClientSettings/">C15PacketClientSettings</a><a class="related-chip" href="../../packets/C17PacketCustomPayload/">C17PacketCustomPayload</a><a class="related-chip" href="../../packets/C16PacketClientStatus/">C16PacketClientStatus</a></div></div>
+<p>The teaching point: state transitions are driven by specific packets, not by timestamps or timeouts. If you ever see a packet ID that "doesn't exist", you're probably looking at it in the wrong state's lookup table. <code>EnumConnectionState.PLAY</code> registry (100 PLAY-state packets: 74 CLIENTBOUND + 26 SERVERBOUND) is the lookup you want — <code>directionMaps</code> is private, use <code>getPacket(direction, id)</code> / <code>getPacketId(direction, packet)</code>.</p>
+<p>---</p></div><div class="related-list" style="margin-top:10px"><a class="related-chip" href="../../packets/C00Handshake/">C00Handshake</a><a class="related-chip" href="../../packets/C00PacketServerQuery/">C00PacketServerQuery</a><a class="related-chip" href="../../packets/S00PacketServerInfo/">S00PacketServerInfo</a><a class="related-chip" href="../../packets/C01PacketPing/">C01PacketPing</a><a class="related-chip" href="../../packets/S01PacketPong/">S01PacketPong</a><a class="related-chip" href="../../packets/C00PacketLoginStart/">C00PacketLoginStart</a><a class="related-chip" href="../../packets/S01PacketEncryptionRequest/">S01PacketEncryptionRequest</a><a class="related-chip" href="../../packets/C01PacketEncryptionResponse/">C01PacketEncryptionResponse</a><a class="related-chip" href="../../packets/S03PacketEnableCompression/">S03PacketEnableCompression</a><a class="related-chip" href="../../packets/S02PacketLoginSuccess/">S02PacketLoginSuccess</a><a class="related-chip" href="../../packets/S46PacketSetCompressionLevel/">S46PacketSetCompressionLevel</a><a class="related-chip" href="../../packets/S01PacketJoinGame/">S01PacketJoinGame</a><a class="related-chip" href="../../packets/S05PacketSpawnPosition/">S05PacketSpawnPosition</a><a class="related-chip" href="../../packets/S39PacketPlayerAbilities/">S39PacketPlayerAbilities</a><a class="related-chip" href="../../packets/S08PacketPlayerPosLook/">S08PacketPlayerPosLook</a><a class="related-chip" href="../../packets/S26PacketMapChunkBulk/">S26PacketMapChunkBulk</a><a class="related-chip" href="../../packets/C15PacketClientSettings/">C15PacketClientSettings</a><a class="related-chip" href="../../packets/C17PacketCustomPayload/">C17PacketCustomPayload</a></div></div>
 <div class="detail-section"><h3>4. Steady-state packet exchange (PLAY)</h3><div class="writeup-block"><p>Once you're in PLAY, the per-tick exchange looks like this. The arrows show direction (<code>C →</code> means client to server, <code>S →</code> means server to client):</p>
 <pre class="writeup-code"><code>                                          ╔═════════════════════╗
    ┌──────────────────────────┐           ║                     ║
@@ -215,7 +215,7 @@ AbstractClientPlayer
    └────────────┬─────────────┘           ║                     ║
                 │                         ║                     ║
                 │ Left-click on entity:   ║                     ║
-                │  C →  C02 (ATTACK)      ║                     ║
+                │  C →  C02PacketUseEntity (Action.ATTACK)      ║                     ║
                 ├────────────────────────→║                     ║
                 │                         ║                     ║
                 │ Left-click on block:    ║                     ║
@@ -271,7 +271,7 @@ AbstractClientPlayer
                 │←────────────────────────╣                     ║
                 ▼                         ╚═════════════════════╝</code></pre>
 <p>The teaching point: the client is mostly a thin shell that mirrors server state and predicts a little ahead. Almost every meaningful action you take (breaking a block, hitting a player, opening a chest, swapping a slot) results in a packet whose response you must believe even when it contradicts what your client thought happened. This is why a server can "rubber-band" your position with S08 and your client must teleport back — the server is the source of truth.</p>
-<p>---</p></div></div>
+<p>---</p></div><div class="related-list" style="margin-top:10px"><a class="related-chip" href="../../packets/C02PacketUseEntity/">C02PacketUseEntity</a></div></div>
 <div class="detail-section"><h3>5. The C03PacketPlayer family — choosing which subclass to send</h3><div class="writeup-block"><p>Every tick <code>EntityPlayerSP.onUpdateWalkingPlayer()</code> decides which of four position packets to send. The decision tree:</p>
 <pre class="writeup-code"><code>   onUpdateWalkingPlayer() — runs once per tick, ~20 Hz
 
@@ -279,7 +279,7 @@ AbstractClientPlayer
          │  Compute delta from last reported state: │
          │                                          │
          │    dx     = posX - lastReportedPosX      │
-         │    dy     = bb.minY - lastReportedPosY   │
+         │    dy     = getEntityBoundingBox().minY - lastReportedPosY   │
          │    dz     = posZ - lastReportedPosZ      │
          │    dyaw   = yaw   - lastReportedYaw      │
          │    dpitch = pitch - lastReportedPitch    │
@@ -315,7 +315,7 @@ AbstractClientPlayer
    When riding (ridingEntity != null), the rules change:
      - Send C06 with x=motionX, y=-999.0, z=motionZ as a sentinel
      - Always treat this as "no position update" for delta tracking</code></pre>
-<p>The teaching point: there is no single "send position" packet — there are four, and which one goes out depends on what changed. The shared base <code>C03PacketPlayer</code> carries only <code>onGround</code>; subclasses add fields. The Y coordinate sent is always <code>boundingBox.minY</code> (your feet), never <code>posY</code>. The 9.0E-4 threshold corresponds to a 0.03-block radius — moves smaller than that are treated as "not moving" and won't trigger a C04 unless the 20-tick forcing fires.</p>
+<p>The teaching point: there is no single "send position" packet — there are four, and which one goes out depends on what changed. The shared base <code>C03PacketPlayer</code> declares <code>protected x, y, z, yaw, pitch, onGround, moving, rotating</code> but serializes only <code>onGround</code>; subclasses add fields. The Y coordinate sent is always <code>getEntityBoundingBox().minY</code> (your feet), never <code>posY</code>. The 9.0E-4 threshold corresponds to a 0.03-block radius — moves smaller than that are treated as "not moving" and won't trigger a C04 unless the 20-tick forcing fires.</p>
 <p>---</p></div><div class="related-list" style="margin-top:10px"><a class="related-chip" href="../../packets/C03PacketPlayer/">C03PacketPlayer</a></div></div>
 <div class="detail-section"><h3>6. Sending a packet — the call graph</h3><div class="writeup-block"><p>This is the path a packet takes from the moment your code constructs it to the moment Netty hands the bytes to the OS socket.</p>
 <pre class="writeup-code"><code>   Your code calls one of:
@@ -345,15 +345,16 @@ AbstractClientPlayer
               YES                  NO
                 │                   │
                 ▼                   ▼
-     dispatchPacket(p, null)   queue into
-                │              outboundPacketsQueue,
+     dispatchPacket(p, null)   queue into outboundPacketsQueue
+                │              (pre-channel-open buffer only),
                 │              schedule flushOutboundQueue()
                 │              on event loop, return
+                │              (open channel: writeAndFlush on event loop)
                 ▼
         ┌─────────────────────────────────┐
         │   Netty pipeline:               │
         │                                 │
-        │   PacketEncoder.encode()        │
+        │   MessageSerializer.encode() (+ MessageSerializer2 framing)   │
         │     ↓                           │
         │   ByteBuf with VarInt ID +      │
         │   p.writePacketData(buffer)     │
@@ -361,12 +362,12 @@ AbstractClientPlayer
         │   NettyCompressionEncoder       │
         │   (if compression enabled)      │
         │     ↓                           │
-        │   NettyVarint21FrameEncoder     │
+        │   MessageSerializer2     │
         │   (prepends length VarInt)      │
         │     ↓                           │
         │   socket write                  │
         └─────────────────────────────────┘</code></pre>
-<p>The teaching point: <code>sendPacket</code> is thread-safe — you can call it from any thread. If you're not on the Netty event loop, the manager queues your packet and schedules a flush. Don't try to be clever with threading; just call <code>addToSendQueue</code> from wherever you are.</p>
+<p>The teaching point: <code>sendPacket</code> is thread-safe — you can call it from any thread. If you're not on the Netty event loop and the channel is not yet open, the manager buffers your packet in outboundPacketsQueue and schedules a flush; once open, sends use writeAndFlush on the event loop. Don't try to be clever with threading; just call <code>addToSendQueue</code> from wherever you are.</p>
 <p>---</p></div></div>
 <div class="detail-section"><h3>7. Receiving a packet — the call graph and the thread hand-off</h3><div class="writeup-block"><p>Inbound is more interesting because it involves a thread switch. The Netty thread reads bytes; the main game thread does the work. The mechanism is <code>PacketThreadUtil.checkThreadAndEnqueue</code>:</p>
 <pre class="writeup-code"><code>   ┌───────────────────────────────────────────────────────┐
@@ -375,13 +376,13 @@ AbstractClientPlayer
    │   Bytes arrive on socket                              │
    │              │                                        │
    │              ▼                                        │
-   │   NettyVarint21FrameDecoder reads length VarInt       │
+   │   MessageDeserializer2 reads length VarInt (framing)       │
    │              │                                        │
    │              ▼                                        │
    │   NettyCompressionDecoder (if compressed)             │
    │              │                                        │
    │              ▼                                        │
-   │   PacketDecoder.decode() reads packet ID VarInt,      │
+   │   MessageDeserializer.decode() reads packet ID VarInt,      │
    │   looks up class in EnumConnectionState's registry,   │
    │   instantiates packet, calls readPacketData(buffer)   │
    │              │                                        │
@@ -402,7 +403,8 @@ AbstractClientPlayer
    │              ▼                                        │
    │   If we're NOT on the Minecraft thread:               │
    │     - Schedule a Runnable on mc that will             │
-   │       re-call handleXxx(packet)                       │
+   │       re-call packet.processPacket(handler)           │
+   │       (which dispatches to handleXxx)                 │
    │     - Throw ThreadQuickExitException                  │
    │     - Netty thread unwinds and is done                │
    │                                                       │
@@ -413,12 +415,12 @@ AbstractClientPlayer
                            │  scheduledTasks queue
                            ▼
    ┌───────────────────────────────────────────────────────┐
-   │   Minecraft main thread (inside Minecraft.runTick)    │
+   │   Minecraft main thread (Runnable from runGameLoop)   │
    │                                                       │
-   │   Calls mc.scheduledTasks polling loop                │
+   │   Calls mc.scheduledTasks polling loop (in runGameLoop) │
    │              │                                        │
    │              ▼                                        │
-   │   Runnable fires → handleXxx(packet) called AGAIN     │
+   │   Runnable fires → packet.processPacket(handler) called AGAIN (dispatches to handleXxx)     │
    │              │                                        │
    │              ▼                                        │
    │   This time checkThreadAndEnqueue is a no-op,         │
@@ -467,7 +469,7 @@ AbstractClientPlayer
             ▼
    ┌───────────────────────────────────────────────────────┐
    │                                                       │
-   │  1. Process scheduledTasks queue (drain Runnables)    │
+   │  1. (scheduledTasks are drained in runGameLoop before the tick loop, not here)    │
    │                                                       │
    │  2. ingameGUI.updateTick()       (chat fade, etc.)    │
    │                                                       │
@@ -496,16 +498,16 @@ AbstractClientPlayer
    │  5. if (theWorld != null) {                           │
    │       playerController.updateController()             │
    │         ┌─────────────────────────────────────┐       │
-   │         │ Drives block-breaking progress:     │       │
-   │         │   - calls onPlayerDamageBlock per   │       │
-   │         │     tick while LMB held             │       │
-   │         │   - sends C0A swing animation       │       │
-   │         │   - sends C07 STOP_DESTROY when     │       │
-   │         │     curBlockDamageMP ≥ 1.0          │       │
+   │         │ Only syncs held item (C09 via      │       │
+   │         │   syncCurrentPlayItem) and drains   │       │
+   │         │   inbound packets; block damage /   │       │
+   │         │   C07 STOP at ≥1.0F lives in        │       │
+   │         │   onPlayerDamageBlock, C0A swing in │       │
+   │         │   EntityPlayerSP.swingItem          │       │
    │         └─────────────────────────────────────┘       │
    │                                                       │
-   │       myNetworkManager.processReceivedPackets()       │
-   │         (drains any inbound packets queued by Netty)  │
+   │       (inbound drain happens inside updateController via    │
+   │        netClientHandler.getNetworkManager().processReceivedPackets())│
    │                                                       │
    │       theWorld.tick()                                 │
    │       theWorld.updateEntities()                       │
@@ -582,10 +584,13 @@ AbstractClientPlayer
    │          isHittingBlock = true                    │
    │ Sends:   C07PacketPlayerDigging(                  │
    │            START_DESTROY_BLOCK, pos, sideHit)     │
-   │ Sends:   C0APacketAnimation()    (arm swing)      │
+   │ (no C0A here; arm swing comes from               │
+   │  EntityPlayerSP.swingItem via Minecraft.clickMouse)│
    │                                                   │
-   │ If creative mode: also calls onPlayerDestroyBlock │
-   │ and the block disappears immediately.             │
+   │ If creative mode: sends C07 START_DESTROY_BLOCK   │
+   │ then calls clickBlockCreative (not                │
+   │ onPlayerDestroyBlock) and the block disappears    │
+   │ immediately.                                      │
    └───────────────────────────────────────────────────┘
 
    Tick 1..N: Player still holding LMB on same block
@@ -598,12 +603,12 @@ AbstractClientPlayer
    │ (depends on item, enchants, haste, water, ...)    │
    │                                                   │
    │ Every 4 ticks (stepSoundTickCounter): play hit    │
-   │ sound, send C0APacketAnimation                    │
+   │ sound only (no C0A sent here)                     │
    │                                                   │
-   │ Block break-progress 0-9 is sent to the server    │
-   │ via S25PacketBlockBreakAnim — but the SERVER      │
-   │ tracks its own progress and the client's value    │
-   │ is mostly visual.                                 │
+   │ Block break-progress 0-9 goes to                  │
+   │ World.sendBlockBreakProgress (client-side render; │
+   │ S25PacketBlockBreakAnim is server→client, not     │
+   │ client→server).                                   │
    └───────────────────────┬───────────────────────────┘
                            │
               ┌────────────┴────────────┐
@@ -614,15 +619,15 @@ AbstractClientPlayer
               │ (loop next tick)        ▼
               │                  onPlayerDestroyBlock()
               │                  ┌────────────────────────────┐
-              │                  │ Sends: C07 STOP_DESTROY    │
+              │                  │ (onPlayerDamageBlock sent │
+              │                  │  C07 STOP_DESTROY, then   │
+              │                  │  calls onPlayerDestroyBlock│
+              │                  │  which sends no packet)   │
               │                  │ Sets:  isHittingBlock=false│
               │                  │        curBlockDamageMP=0  │
-              │                  │ Locally: world.setBlockTo- │
-              │                  │   Air(pos) for prediction  │
-              │                  │                            │
-              │                  │ Block actually gets removed│
-              │                  │ when S23PacketBlockChange  │
-              │                  │ arrives from server.       │
+              │                  │ Predictively removes via  │
+              │                  │ world.setBlockToAir(pos); │
+              │                  │ S23 only later syncs.     │
               │                  └────────────────────────────┘
               ▼
    Player releases LMB or aims elsewhere
@@ -633,8 +638,8 @@ AbstractClientPlayer
    │ Sends: C07 ABORT_DESTROY_BLOCK                    │
    │ Resets: isHittingBlock=false, curBlockDamageMP=0  │
    └───────────────────────────────────────────────────┘</code></pre>
-<p>The teaching point: block-breaking is not a single event. It's a state machine driven by ticks, with three C07 packet sub-types marking the start, abort, and completion. The server validates everything — the client's <code>setBlockToAir</code> is just a visual prediction, and the real removal happens when S23 confirms it.</p>
-<p>---</p></div><div class="related-list" style="margin-top:10px"><a class="related-chip" href="../../packets/C07PacketPlayerDigging/">C07PacketPlayerDigging</a><a class="related-chip" href="../../packets/C0APacketAnimation/">C0APacketAnimation</a><a class="related-chip" href="../../packets/S25PacketBlockBreakAnim/">S25PacketBlockBreakAnim</a><a class="related-chip" href="../../packets/S23PacketBlockChange/">S23PacketBlockChange</a></div></div>
+<p>The teaching point: block-breaking is not a single event. It's a state machine driven by ticks, with three C07 packet sub-types marking the start, abort, and completion. The server validates everything — the client predictively removes via <code>setBlockToAir</code> in <code>onPlayerDestroyBlock</code>, and S23 only later syncs/corrects.</p>
+<p>---</p></div><div class="related-list" style="margin-top:10px"><a class="related-chip" href="../../packets/C07PacketPlayerDigging/">C07PacketPlayerDigging</a><a class="related-chip" href="../../packets/S25PacketBlockBreakAnim/">S25PacketBlockBreakAnim</a></div></div>
 <div class="detail-section"><h3>10. The inventory click pipeline</h3><div class="writeup-block"><p>Every click in an inventory GUI follows the same path, regardless of which container is open.</p>
 <pre class="writeup-code"><code>   Player clicks slot in any GuiContainer
 
@@ -682,18 +687,17 @@ AbstractClientPlayer
             │                  │
             ▼                  ▼
    handleConfirm-      handleConfirm-
-   Transaction reads   Transaction sees
-   accept=true,        accept=false, REVERTS
-   nothing to do       client state by re-applying
-                       opposite, then sends a
-                       C0FPacketConfirmTransaction
-                       to acknowledge
+   Transaction reads   Transaction on accept=false
+   accept=true,        does NO client-side revert;
+   nothing to do       only replies C0FPacketConfirm-
+                       Transaction(true). Resync
+                       comes via S2F/S30.
 
    Independently, on big changes the server sends:
      S2F SetSlot(slotId, stack)   — single slot fix
      S30 WindowItems(stacks[])    — full re-sync</code></pre>
 <p>The teaching point: the client *predicts* every inventory click and the server *confirms or rolls back*. If the server is laggy or there's a desync, you may briefly see a wrong slot before S2F fixes it. The transaction ID system is what lets the server identify which specific click it's confirming.</p>
-<p>---</p></div><div class="related-list" style="margin-top:10px"><a class="related-chip" href="../../packets/C0EPacketClickWindow/">C0EPacketClickWindow</a><a class="related-chip" href="../../packets/C0FPacketConfirmTransaction/">C0FPacketConfirmTransaction</a></div></div>
+<p>---</p></div><div class="related-list" style="margin-top:10px"><a class="related-chip" href="../../packets/C0EPacketClickWindow/">C0EPacketClickWindow</a></div></div>
 <div class="detail-section"><h3>11. The collision pipeline</h3><div class="writeup-block"><p>When you call <code>entity.moveEntity(dx, dy, dz)</code>, this is what happens. Understanding this is essential for anything related to movement, AABB queries, or step-up.</p>
 <pre class="writeup-code"><code>   Entity.moveEntity(dx, dy, dz)
             │
@@ -703,9 +707,9 @@ AbstractClientPlayer
    │  1. Save the original dx, dy, dz for sneak detection   │
    │                                                        │
    │  2. Sneak-edge logic (player only, on the ground):     │
-   │     Probe forward and sideways with                    │
-   │     world.getCollisionBoxes(bb.offset(dx,-1,dz))       │
-   │     Iteratively shrink dx, dz until you can't fall off │
+   │     Probe with getCollidingBoundingBoxes in three     │
+   │     separate offset loops: (dx,-1,0), (0,-1,dz),      │
+   │     (dx,-1,dz). Shrink dx, dz until you can't fall off│
    │     ┌────────────────────────────────────────────┐     │
    │     │ This is the "sneak doesn't let you fall    │     │
    │     │ off the edge" feature. It works by         │     │
@@ -717,24 +721,25 @@ AbstractClientPlayer
    │  3. Query collision boxes intersecting the swept AABB: │
    │     List&lt;AxisAlignedBB&gt; boxes =                        │
    │       world.getCollidingBoundingBoxes(                 │
-   │         this, this.bb.addCoord(dx, dy, dz))            │
+   │         this, getEntityBoundingBox().addCoord(dx,dy,dz))│
+   │     (field is private boundingBox, not bb)            │
    │                                                        │
    │  4. Resolve Y first (gravity &amp; ceiling):               │
    │     for (AABB other : boxes)                           │
-   │       dy = other.calculateYOffset(this.bb, dy);        │
-   │     this.bb = this.bb.offset(0, dy, 0);                │
+   │       dy = other.calculateYOffset(getEntityBoundingBox(), dy);        │
+   │     setEntityBoundingBox(getEntityBoundingBox().offset(0, dy, 0));                │
    │     if (dy was reduced)                                │
-   │       (we hit a floor or ceiling — onGround if dy&lt;0)   │
+   │       (we hit a floor or ceiling — onGround only if strict dy&lt;0 later)   │
    │                                                        │
    │  5. Resolve X:                                         │
    │     for (AABB other : boxes)                           │
-   │       dx = other.calculateXOffset(this.bb, dx);        │
-   │     this.bb = this.bb.offset(dx, 0, 0);                │
+   │       dx = other.calculateXOffset(getEntityBoundingBox(), dx);        │
+   │     setEntityBoundingBox(getEntityBoundingBox().offset(dx, 0, 0));                │
    │                                                        │
    │  6. Resolve Z:                                         │
    │     for (AABB other : boxes)                           │
-   │       dz = other.calculateZOffset(this.bb, dz);        │
-   │     this.bb = this.bb.offset(0, 0, dz);                │
+   │       dz = other.calculateZOffset(getEntityBoundingBox(), dz);        │
+   │     setEntityBoundingBox(getEntityBoundingBox().offset(0, 0, dz));                │
    │                                                        │
    │  7. Step-up handling (if we hit a wall horizontally    │
    │     AND there's a block ≤ stepHeight tall in the way): │
@@ -751,7 +756,7 @@ AbstractClientPlayer
    │     isCollidedHorizontally ← (dx or dz reduced)        │
    │     isCollidedVertically ← (dy reduced)                │
    │     isCollided ← either of the above                   │
-   │     onGround ← (dy reduced AND original dy ≤ 0)        │
+   │     onGround ← (isCollidedVertically AND original dy &lt; 0.0D, strict &lt;)        │
    │     fallDistance accumulates                           │
    │     doBlockCollisions() — fire onEntityCollidedWithBlock│
    └────────────────────────────────────────────────────────┘</code></pre>
@@ -768,14 +773,14 @@ AbstractClientPlayer
    │  Vec3 eyes = viewEntity.getPositionEyes(partialTicks); │
    │  Vec3 look = viewEntity.getLook(partialTicks);         │
    │  double reach = playerController.getBlockReachDistance(│
-   │                  ); // 5.0 surv, 6.0 creat             │
+   │                  ); // 4.5 surv, 5.0 creat (6.0 = extendedReach entity distance, creative)             │
    │  Vec3 endPoint = eyes.addVector(look.x*reach,          │
    │                                  look.y*reach,         │
    │                                  look.z*reach);        │
    │                                                        │
-   │  // Block ray-trace:                                   │
-   │  mc.objectMouseOver = theWorld.rayTraceBlocks(         │
-   │      eyes, endPoint, false, false, true);              │
+   │  // Block ray-trace (delegates to Entity.rayTrace):    │
+   │  mc.objectMouseOver = entity.rayTrace(reach, partialTicks)│
+   │      (which calls theWorld.rayTraceBlocks internally); │
    │                                                        │
    │  // Now look for an entity in front of that block.     │
    │  // Build an AABB containing the line eyes→endPoint    │
@@ -785,8 +790,8 @@ AbstractClientPlayer
    │                  look.y*reach,                         │
    │                  look.z*reach).expand(1,1,1);          │
    │                                                        │
-   │  List&lt;Entity&gt; candidates = theWorld.getEntitiesIn-     │
-   │      AABBexcluding(viewEntity, sweep, predicate);      │
+   │  List&lt;Entity&gt; candidates = mc.theWorld.getEntitiesIn- │
+   │      AABBexcluding(entity, sweep, predicate);          │
    │                                                        │
    │  // For each candidate, expand its bb by its           │
    │  // collisionBorderSize and call calculateIntercept    │
@@ -817,7 +822,7 @@ AbstractClientPlayer
                     │     ↗ -Z (north)
                     │   ↗
                     │ ↗
-   -X (east) ←──────●──────→ +X (west)
+   -X (west) ←──────●──────→ +X (east)
                   ↙ │
                 ↙   │
               ↙     │
@@ -841,7 +846,7 @@ AbstractClientPlayer
      +Y = up
      -Y = down
      +Z = south
-     -Z = north  (toward sunset / "north" by compass)
+     -Z = north  (sunset is west, i.e. -X)
 
    Yaw (rotationYaw):
      0°    or  ±360°  →  facing +Z  (south)
@@ -864,10 +869,10 @@ AbstractClientPlayer
 
    The boundingBox is anchored differently from posX/posY/posZ:
      posX, posZ   = horizontal center of entity
-     posY         = bottom of entity hitbox (== bb.minY for most)
+     posY         = bottom of entity hitbox (== boundingBox.minY for most)
      bb.minX      = posX - width/2
      bb.maxX      = posX + width/2
-     bb.minY      = posY                    ← what C03/C04/C06 sends
+     boundingBox.minY = posY                    ← what C03/C04/C06 sends
      bb.maxY      = posY + height
      bb.minZ      = posZ - width/2
      bb.maxZ      = posZ + width/2
@@ -876,7 +881,7 @@ AbstractClientPlayer
      eyeX = posX
      eyeY = posY + getEyeHeight()    // 1.62 for player standing
      eyeZ = posZ</code></pre>
-<p>The teaching point: yaw 0 points south, not north. This trips people up constantly. Also: the wire protocol always sends <code>bb.minY</code>, never <code>posY</code>, even though for most entities they're equal — the safe habit is to use <code>getEntityBoundingBox().minY</code> when building position packets.</p>
+<p>The teaching point: yaw 0 points south, not north. This trips people up constantly. Also: the wire protocol always sends <code>getEntityBoundingBox().minY</code>, never <code>posY</code>, even though for most entities they're equal — the safe habit is to use <code>getEntityBoundingBox().minY</code> when building position packets.</p>
 <p>---</p></div></div>
 <div class="detail-section"><h3>14. Friction and movement constants</h3><div class="writeup-block"><pre class="writeup-code"><code>   Per-tick velocity decay in EntityLivingBase.moveEntityWithHeading:
 
@@ -902,8 +907,8 @@ AbstractClientPlayer
    │     motionY = (motionY - 0.08) * 0.98                       │
    │                                                             │
    │   In water:                                                 │
-   │     motionX, Z, Y *= 0.8 (or 0.8 + adjustments for depth-   │
-   │                          strider enchant up to 0.96)        │
+   │     motionX, Z *= f1 (0.8 base; up to 0.546 at max        │
+   │                  Depth Strider: f1 += (0.546-f1)*lvl/3)  │
    │     motionY -= 0.02 (lower gravity in water)                │
    │                                                             │
    │   In lava:                                                  │
@@ -920,8 +925,8 @@ AbstractClientPlayer
    │                + sin(yaw_rad) * normalizedForward           │
    │                                                             │
    │   The friction passed to moveFlying:                        │
-   │     On ground: 0.1 * (0.16277136 / (groundFric)³)           │
-   │       = "ground acceleration"; with slipperiness=0.6 this   │
+   │     On ground: getAIMoveSpeed() * (0.16277136 / f4³)       │
+   │       (landMovementFactor); with slipperiness=0.6 this     │
    │       evaluates to about 0.1 — the magic walk speed         │
    │     In air:    0.02 (set as jumpMovementFactor)             │
    │     In water:  0.02 (×depth-strider modifier)               │
@@ -993,8 +998,8 @@ AbstractClientPlayer
    │       Slot           │
    │                      │
    │  inventory: IInventory   ← the backing store
-   │  index: int              ← index into that store
-   │  xPosition, yPosition    ← where to draw on screen
+   │  slotIndex: private final int (ctor index) / slotNumber: public int
+   │  xDisplayPosition, yDisplayPosition ← where to draw on screen
    │                      │
    │  getStack()  → inventory.getStackInSlot(index)
    │  putStack(s) → inventory.setInventorySlotContents(
@@ -1117,7 +1122,7 @@ AbstractClientPlayer
 <p>The map (<code>MCP_1_8_9_CODEBASE_MAP.md</code>) is the *lexicon* — it tells the AI what symbols exist and what their signatures are. Without it, the AI will invent method names that don't exist or guess wrong parameter orders.</p>
 <p>This diagram file is the *grammar* — it tells the AI how those symbols compose. Without it, the AI knows the parts but doesn't know which orders are correct, what's allowed in which thread, or which axis is which.</p>
 <p>Used together they let the AI write code that compiles against vanilla, threads correctly, and produces packets the server will accept. A new task description, prepended with both files, should give an AI enough context to write substantive contributions without further searching the codebase.</p></div></div>
-<div class="detail-section"><h3>Verification Notes (38)</h3><div class="callout callout-ac"><p>Checked claim-by-claim against Marcelektro/MavenMCP-1.8.9. The source text above is kept verbatim; these notes correct what it gets wrong:</p><ul class="writeup-list"><li><strong>runTick scheduledTasks [wrong]:</strong> scheduledTasks is drained in runGameLoop before the tick loop, not inside runTick.</li><li><strong>updateController role [wrong]:</strong> updateController only syncs held item (C09) and drains inbound packets; block damage/C07 STOP at &gt;=1.0F lives in onPlayerDamageBlock, C0A in swingItem.</li><li><strong>processReceivedPackets path [imprecise]:</strong> No myNetworkManager field; inbound packets drain via netClientHandler.getNetworkManager().processReceivedPackets().</li><li><strong>C02 ATTACK [imprecise]:</strong> No dedicated C02 ATTACK packet; attack is C02PacketUseEntity with Action.ATTACK enum value.</li><li><strong>Entity hierarchy [wrong]:</strong> EntityItem, EntityXPOrb, EntityArrow directly extend Entity; EntityCreature extends EntityLiving extends EntityLivingBase.</li><li><strong>EnderPearl package [wrong]:</strong> EntityEnderPearl is in net.minecraft.entity.item, not .projectile.</li><li><strong>EntityAmbient [wrong]:</strong> No EntityAmbient class; it is EntityAmbientCreature, parent of EntityBat (Ghast extends EntityFlying).</li><li><strong>Mob/Animal parents [wrong]:</strong> EntityMob extends EntityCreature, but EntityAnimal extends EntityAgeable; Villager extends EntityAgeable, Wolf extends EntityTameable.</li><li><strong>S14/S18 receivers [imprecise]:</strong> S14/S18 are received by NetHandlerPlayClient.handleEntityMovement/Teleport, which call setPositionAndRotation2 for interpolation.</li><li><strong>Mob held item [imprecise]:</strong> Mob-side getHeldItem override is EntityLiving.getHeldItem() returning equipment[0], inherited by all mobs.</li><li><strong>C03 base fields [imprecise]:</strong> Base declares protected x,y,z,yaw,pitch,onGround,moving,rotating; only onGround is serialized at base level.</li><li><strong>clickBlock C0A [wrong]:</strong> PlayerControllerMP.clickBlock sends only C07 START/ABORT; C0A comes from EntityPlayerSP.swingItem via Minecraft.clickMouse.</li><li><strong>Creative break path [wrong]:</strong> Creative path sends C07 START_DESTROY_BLOCK then calls clickBlockCreative, not onPlayerDestroyBlock.</li><li><strong>Mining C0A/progress [wrong]:</strong> onPlayerDamageBlock sends no C0A and progress goes to World.sendBlockBreakProgress, not to the server.</li><li><strong>S25 direction [wrong]:</strong> S25 is server-&gt;client; client renders progress via World.sendBlockBreakProgress.</li><li><strong>STOP_DESTROY sender [wrong]:</strong> C07 STOP_DESTROY_BLOCK is sent by onPlayerDamageBlock before calling onPlayerDestroyBlock, which sends no packet.</li><li><strong>Block removal timing [wrong]:</strong> Client predictively removes via world.setBlockToAir in onPlayerDestroyBlock; S23 only later syncs/corrects.</li><li><strong>Raytrace reach [wrong]:</strong> getBlockReachDistance returns 4.5 survival, 5.0 creative; 6.0 is only the entity-search distance when extendedReach (creative).</li><li><strong>getMouseOver delegation [imprecise]:</strong> getMouseOver delegates to Entity.rayTrace; entity sweep uses getEntitiesInAABBexcluding.</li><li><strong>Slot fields [imprecise]:</strong> Slot has private final slotIndex, public slotNumber, xDisplayPosition/yDisplayPosition.</li><li><strong>S46 join burst [wrong]:</strong> S46 is PLAY and only sent when compression changes, not as a routine join-burst packet.</li><li><strong>C16 join signal [wrong]:</strong> Vanilla never sends C16 PERFORM_RESPAWN as a join-ready signal; it is a post-death respawn request.</li><li><strong>PLAY packet count [wrong]:</strong> PLAY registers 100 packets (74 CLIENTBOUND + 26 SERVERBOUND), not 94.</li><li><strong>JoinGame ctor [imprecise]:</strong> S01PacketJoinGame ctor includes hardcoreMode: (entityId, gameType, hardcoreMode, dimension, difficulty, maxPlayers, worldType, reducedDebugInfo).</li><li><strong>directionMaps access [imprecise]:</strong> directionMaps is private; use getPacket(direction, id) / getPacketId(direction, packet).</li><li><strong>Netty decoder names [wrong]:</strong> No NettyVarint21FrameDecoder in 1.8.9; framing is MessageDeserializer2, decoding is MessageDeserializer.</li><li><strong>PacketDecoder name [wrong]:</strong> Decoder class is MessageDeserializer, not PacketDecoder.</li><li><strong>Thread hand-off target [imprecise]:</strong> Enqueued Runnable re-calls packet.processPacket(handler), which dispatches to handleXxx; not handleXxx directly.</li><li><strong>Sneak collision call [wrong]:</strong> Sneak logic calls getCollidingBoundingBoxes in three separate offset loops, not getCollisionBoxes once.</li><li><strong>boundingBox field [imprecise]:</strong> Field is private boundingBox, not bb; code uses getEntityBoundingBox().addCoord(x, y, z).</li><li><strong>onGround condition [imprecise]:</strong> Source uses strict less-than: onGround = isCollidedVertically &amp;&amp; d4 &lt; 0.0D.</li><li><strong>Depth Strider friction [wrong]:</strong> Max Depth Strider gives water friction f1=0.546, not 0.96.</li><li><strong>Ground accel formula [imprecise]:</strong> Ground accel is getAIMoveSpeed() * (0.16277136/f4^3), i.e. landMovementFactor, not hardcoded 0.1.</li><li><strong>Coordinate diagram X [wrong]:</strong> +X is east and -X is west; the first ASCII diagram swaps them (the text list is correct).</li><li><strong>Coordinate diagram Z [wrong]:</strong> -Z is north but sunset is west (-X); remove 'toward sunset' for -Z.</li><li><strong>Click revert [wrong]:</strong> handleConfirmTransaction does no client-side revert on accept=false; it only replies C0FPacketConfirmTransaction(true). Resync comes via S2F/S30.</li><li><strong>PacketEncoder name [wrong]:</strong> No PacketEncoder class in 1.8.9; outbound encoding is MessageSerializer + MessageSerializer2.</li><li><strong>Outbound queue role [imprecise]:</strong> outboundPacketsQueue/flushOutboundQueue is only the pre-channel-open buffer; open-channel sends use writeAndFlush on the event loop.</li></ul></div></div>    </div>
+<div class="detail-section"><h3>Verification</h3><div class="callout"><p>Checked claim-by-claim against <a href="https://github.com/Marcelektro/MavenMCP-1.8.9" target="_blank" rel="noopener" style="color:var(--accent)">Marcelektro/MavenMCP-1.8.9</a>: 38 corrections (24 wrong, 14 imprecise) applied directly into the text above — no known errors remain. Audit trail: <a href="https://github.com/RealCrystalNight/mc-packet-reference/blob/main/data/concepts/corrections.json" target="_blank" rel="noopener" style="color:var(--accent)">corrections.json</a>.</p></div></div>    </div>
 <div class="overview-footer" style="margin-top:32px;text-align:center;font-size:0.78rem;color:var(--text-muted)"><a href="../../" style="color:var(--accent)">Home</a> · <a href="../../start/" style="color:var(--accent)">Start Here</a> · <a href="../../packets/" style="color:var(--accent)">Packets</a> · <a href="../../classes/" style="color:var(--accent)">Vanilla Internals</a> · <a href="../../modules/" style="color:var(--accent)">Cheat Modules</a> · <a href="../../analysis/" style="color:var(--accent)">Analyses</a><br>LLMs: <a href="../../llms.txt" style="color:var(--accent)">llms.txt</a> · <a href="../../api/" style="color:var(--accent)">JSON API</a><br><span>Minecraft 1.8.9 Packet Reference — unofficial, not affiliated with Mojang or Microsoft.</span></div>
   </div>
 </main>
