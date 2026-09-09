@@ -187,8 +187,18 @@ function renderVanillaSource(pkt) {
     + '</div>';
 }
 
-function buildSidebarHtml(allPkts) {
-  let html = '';
+// Hub links so Packets / Logic Classes / Modules / Analyses all link to each other.
+function hubNav(prefix) {
+  return '<div class="nav-section"><div class="nav-section-header"><span>Reference</span></div><div class="nav-items">'
+    + '<a href="' + prefix + '" class="nav-item"><span class="nav-name">Home</span></a>'
+    + '<a href="' + prefix + 'packets/" class="nav-item"><span class="nav-name">All Packets</span></a>'
+    + '<a href="' + prefix + 'classes/" class="nav-item"><span class="nav-name">Logic Classes</span></a>'
+    + '<a href="' + prefix + 'modules/" class="nav-item"><span class="nav-name">Module Index</span></a>'
+    + '<a href="' + prefix + 'analysis/" class="nav-item"><span class="nav-name">Module Analyses</span></a>'
+    + '</div></div>';
+}
+
+function buildSidebarHtml(allPkts) {  let html = '';
   GROUPS.forEach(function(g) {
     const pkts = allPkts.filter(function(p) { return p.state === g.state && p.dir === g.dir; });
     if (pkts.length === 0) return;
@@ -502,7 +512,7 @@ function main() {
       + '    <input type="text" placeholder="Search all packets..." onclick="window.location.href=\'../../\'" role="button" readonly aria-label="Search all packets (opens main page)">\n'
       + '    <kbd class="search-kbd">/</kbd>\n'
       + '  </div>\n'
-      + '  <nav class="sidebar-nav" id="sidebarNav">' + sidebarHtml + '</nav>\n'
+      + '  <nav class="sidebar-nav" id="sidebarNav">' + hubNav('../../') + sidebarHtml + '</nav>\n'
       + '</aside>\n'
       + '<main class="main" id="main">\n'
       + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
@@ -594,7 +604,7 @@ function main() {
       + '      <span>MC <strong>1.8.9</strong></span>\n'
       + '    </a>\n'
       + '  </div>\n'
-      + '  <nav class="sidebar-nav" id="sidebarNav">' + sidebarHtml + '</nav>\n'
+      + '  <nav class="sidebar-nav" id="sidebarNav">' + hubNav('../../') + sidebarHtml + '</nav>\n'
       + '</aside>\n'
       + '<main class="main" id="main">\n'
       + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
@@ -665,6 +675,7 @@ function main() {
     + '    </a>\n'
     + '  </div>\n'
     + '  <nav class="sidebar-nav">\n'
+    + hubNav('../')
     + '    <div class="nav-section"><div class="nav-section-header"><span>Logic Classes</span><span class="count">' + Object.keys(logicData).length + '</span></div></div>\n'
     + '    <div class="nav-section"><div class="nav-section-header"><span>All Packets</span></div><div class="nav-items"><a href="../" class="nav-item"><span class="nav-name">Back to packet reference</span></a></div></div>\n'
     + '  </nav>\n'
@@ -768,6 +779,7 @@ function main() {
     + '    </a>\n'
     + '  </div>\n'
     + '  <nav class="sidebar-nav">\n'
+    + hubNav('../')
     + '    <div class="nav-section"><div class="nav-section-header"><span>Module Index</span><span class="count">' + modNames.length + '</span></div></div>\n'
     + '    <div class="nav-section"><div class="nav-section-header"><span>All Packets</span></div><div class="nav-items"><a href="../" class="nav-item"><span class="nav-name">Back to packet reference</span></a></div></div>\n'
     + '  </nav>\n'
@@ -831,7 +843,7 @@ function main() {
     + '      <span>MC <strong>1.8.9</strong></span>\n'
     + '    </a>\n'
     + '  </div>\n'
-    + '  <nav class="sidebar-nav">' + sidebarHtml + '</nav>\n'
+    + '  <nav class="sidebar-nav">' + hubNav('../') + sidebarHtml + '</nav>\n'
     + '</aside>\n'
     + '<main class="main" id="main">\n'
     + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
