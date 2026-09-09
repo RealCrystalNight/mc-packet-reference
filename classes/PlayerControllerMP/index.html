@@ -57,45 +57,209 @@
 <div class="detail-section"><h3>Deep Analysis</h3><div class="writeup-block">
 <p>Client interaction controller translating clicks/keys to server C packets with prediction. No tick entity itself; driven by Minecraft loop via updateController. Validates creative/adventure/spectator/border locally, plays sounds/particles, then sends authoritative request. Paired with NetHandlerPlayClient and EntityPlayerSP.</p>
 </div></div>
-<div class="detail-section"><h3>Key Methods (8)</h3>
+<div class="detail-section"><h3>Key Methods — In Depth (8)</h3>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">clickBlock</span></div>
 <p class="impl-pattern">Starts block hit; creative instant vs survival progress init.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Rejects spectator/no-edit adventure and outside border. Creative sends START_DESTROY + clickBlockCreative + delay 5. Survival aborts prior block, sends START, inits curBlockDamageMP/step counter.</p>
+<p class="impl-pattern">clickBlock first enforces adventure and spectator rules, returning false for spectators and for adventure players without allowEdit or whose held item cannot destroy the target block. It then enforces world border containment on the block position, refusing clicks outside the border. In creative mode it queues C07 START_DESTROY_BLOCK with position and face, calls clickBlockCreative for instant local break, and sets blockHitDelay to 5 to throttle repeats. In survival it aborts any prior target with C07 ABORT_DESTROY_BLOCK to the old currentBlock when switching positions, then queues C07 START_DESTROY_BLOCK for the new location. It calls onBlockClicked for zero-damage starts, instantly breaks when relative hardness reaches 1.0, else initializes isHittingBlock, currentBlock, currentItemHittingBlock, curBlockDamageMP zero and crack overlay. The server validates reach, hardness and timing, so nuker cheats that spam START without STOP are detected here.</p>
+<pre class="writeup-code"><code>        if (!this.mc.theWorld.getWorldBorder().contains(loc))
+        {
+            return false;
+        }
+        else
+        {
+            if (this.currentGameType.isCreative())
+            {
+                this.netClientHandler.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, loc, face));
+                clickBlockCreative(this.mc, this, loc, face);
+                this.blockHitDelay = 5;
+            }
+            else if (!this.isHittingBlock || !this.isHittingPosition(loc))
+            {
+                if (this.isHittingBlock)
+                {
+                    this.netClientHandler.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.ABORT_DESTROY_BLOCK, this.currentBlock, face));
+                }
+
+                this.netClientHandler.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.START_DESTROY_BLOCK, loc, face));
+                Block block1 = this.mc.theWorld.getBlockState(loc).getBlock();
+                boolean flag = block1.getMaterial() != Material.air;</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The border contains check runs before any packet, so out-of-border clicks never reach the server. The creative branch shows the START_DESTROY plus instant client break plus 5-tick delay pattern, explaining creative nuker speed limits. The survival branch first sends ABORT for the stale currentBlock when retargeting, keeping server crack state consistent. The final START_DESTROY carries the new loc and face the server validates for reach and hardness, and suppressing ABORT leaves ghost cracks server-side.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C07</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onPlayerDamageBlock</span></div>
 <p class="impl-pattern">Accumulates crack progress and finishes block.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Honors blockHitDelay. Creative re-sends START. Survival adds getPlayerRelativeBlockHardness, step sound every 4 ticks, on &gt;=1 sends STOP_DESTROY + onPlayerDestroyBlock + delay 5.</p>
+<p class="impl-pattern">onPlayerDamageBlock first calls syncCurrentPlayItem so any hotbar change emits C09 before mining packets, keeping server held-item in sync. It honors blockHitDelay by decrementing and returning true to swallow clicks during the 5-tick cooldown after place or break. In creative with border containment it re-sends C07 START_DESTROY_BLOCK and instantly breaks via clickBlockCreative, re-arming the delay. If isHittingPosition confirms the same block and held item, it returns false on air to clear isHittingBlock, else adds getPlayerRelativeBlockHardness to curBlockDamageMP for progressive cracking. Every 4 stepSoundTickCounter ticks it plays the block step sound locally at the block center for feedback. When curBlockDamageMP reaches 1.0 it clears isHittingBlock, sends C07 STOP_DESTROY_BLOCK, calls onPlayerDestroyBlock for local removal, zeroes damage and re-arms delay. Otherwise it falls through to clickBlock to start a new target, so holding mouse produces START, progress, STOP sequencing.</p>
+<pre class="writeup-code"><code>                this.curBlockDamageMP += block.getPlayerRelativeBlockHardness(this.mc.thePlayer, this.mc.thePlayer.worldObj, posBlock);
+
+                if (this.stepSoundTickCounter % 4.0F == 0.0F)
+                {
+                    this.mc.getSoundHandler().playSound(new PositionedSoundRecord(new ResourceLocation(block.stepSound.getStepSound()), (block.stepSound.getVolume() + 1.0F) / 8.0F, block.stepSound.getFrequency() * 0.5F, (float)posBlock.getX() + 0.5F, (float)posBlock.getY() + 0.5F, (float)posBlock.getZ() + 0.5F));
+                }
+
+                ++this.stepSoundTickCounter;
+
+                if (this.curBlockDamageMP &gt;= 1.0F)
+                {
+                    this.isHittingBlock = false;
+                    this.netClientHandler.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.STOP_DESTROY_BLOCK, posBlock, directionFacing));
+                    this.onPlayerDestroyBlock(posBlock, directionFacing);
+                    this.curBlockDamageMP = 0.0F;
+                    this.stepSoundTickCounter = 0.0F;
+                    this.blockHitDelay = 5;
+                }
+
+                this.mc.theWorld.sendBlockBreakProgress(this.mc.thePlayer.getEntityId(), this.currentBlock, (int)(this.curBlockDamageMP * 10.0F) - 1);</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The hardness accumulation line advances crack progress per tick based on tool, haste and block strength, so speed-mine cheats inflate this value locally but the server recomputes it. The step-sound block plays every fourth tick purely client-side with no packet, giving audio feedback during digging. The 1.0 threshold branch sends STOP_DESTROY_BLOCK with exact pos and face, which is the only packet the server accepts as a legitimate break. sendBlockBreakProgress updates the local crack overlay from 0 to 9, and forging STOP without real progress is the core fast-break detection signal.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C07</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onPlayerRightClick</span></div>
 <p class="impl-pattern">Block activate or ItemBlock place with prediction.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Border + spectator checks. Tries onBlockActivated, validates canPlaceBlockOnSide for ItemBlock, always sends C08 placement, then locally applies onItemUse (creative restores damage/count).</p>
+<p class="impl-pattern">onPlayerRightClick first syncs the hotbar via syncCurrentPlayItem so the server sees the correct held item for placement. It computes hitVec offsets f, f1, f2 as fractional positions inside the block for precise face placement and tile orientation. It rejects clicks outside the world border with no packet, preventing border-bypass builds. In non-spectator it tries onBlockActivated for doors, chests and levers when not sneaking with an item, setting flag true to indicate activation consumed the click. It validates ItemBlock.canPlaceBlockOnSide before sending, returning false early on illegal placement to save bandwidth. It always queues C08PacketPlayerBlockPlacement with hitPos, face index, current item and f offsets, even for pure activation, because the server re-decides activation versus place. Locally it applies onItemUse with creative restore of damage and count versus survival consume, or returns true for pure activation. Spectators send C08 but skip local world changes, so the server must ignore their placements.</p>
+<pre class="writeup-code"><code>            if (this.currentGameType != WorldSettings.GameType.SPECTATOR)
+            {
+                IBlockState iblockstate = worldIn.getBlockState(hitPos);
+
+                if ((!player.isSneaking() || player.getHeldItem() == null) &amp;&amp; iblockstate.getBlock().onBlockActivated(worldIn, hitPos, iblockstate, player, side, f, f1, f2))
+                {
+                    flag = true;
+                }
+
+                if (!flag &amp;&amp; heldStack != null &amp;&amp; heldStack.getItem() instanceof ItemBlock)
+                {
+                    ItemBlock itemblock = (ItemBlock)heldStack.getItem();
+
+                    if (!itemblock.canPlaceBlockOnSide(worldIn, hitPos, side, player, heldStack))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            this.netClientHandler.addToSendQueue(new C08PacketPlayerBlockPlacement(hitPos, side.getIndex(), player.inventory.getCurrentItem(), f, f1, f2));
+
+            if (!flag &amp;&amp; this.currentGameType != WorldSettings.GameType.SPECTATOR)</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The onBlockActivated call predicts door or chest opening locally so the GUI feels instant, with flag recording whether activation succeeded. The canPlaceBlockOnSide check mirrors server placement rules for ItemBlock, aborting without a packet on illegal faces. The C08 line packs block position, face index, held stack and fractional hit offsets the server uses to orient slabs, stairs and pistons. Sending C08 even when flag is true lets the server confirm activation, and spamming C08 with crafted offsets is the scaffold and ghost-block vector.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C08</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">sendUseItem</span></div>
 <p class="impl-pattern">Air right-click (food, bow, etc).</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Blocks spectator, syncs hotbar, sends C08 with current item (pos -1), calls useItemRightClick locally and updates mainInventory if count changed.</p>
+<p class="impl-pattern">sendUseItem blocks all use in SPECTATOR mode with an immediate false and no packet, enforcing spectator intangibility. It syncs the hotbar via syncCurrentPlayItem so the following C08 references the correct slot. It queues C08PacketPlayerBlockPlacement constructed from the current inventory item with the air-use constructor that uses -1 position internally. It records the pre-use stackSize, then calls useItemRightClick locally to predict food eating, bow drawing, potion throwing or snowball spawning. If the returned stack differs by identity or count it writes the result into mainInventory, clears to null on zero, and returns true to indicate consumption. If nothing changed it returns false, meaning the item had no right-click action. The server separately validates cooldowns, food hunger and projectile spawn on C08 receipt, so no-use-delay or fast-eat cheats forge timing around this packet.</p>
+<pre class="writeup-code"><code>    public boolean sendUseItem(EntityPlayer playerIn, World worldIn, ItemStack itemStackIn)
+    {
+        if (this.currentGameType == WorldSettings.GameType.SPECTATOR)
+        {
+            return false;
+        }
+        else
+        {
+            this.syncCurrentPlayItem();
+            this.netClientHandler.addToSendQueue(new C08PacketPlayerBlockPlacement(playerIn.inventory.getCurrentItem()));
+            int i = itemStackIn.stackSize;
+            ItemStack itemstack = itemStackIn.useItemRightClick(worldIn, playerIn);
+
+            if (itemstack != itemStackIn || itemstack != null &amp;&amp; itemstack.stackSize != i)
+            {
+                playerIn.inventory.mainInventory[playerIn.inventory.currentItem] = itemstack;
+
+                if (itemstack.stackSize == 0)
+                {
+                    playerIn.inventory.mainInventory[playerIn.inventory.currentItem] = null;
+                }
+
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The spectator early-return shows air-use is entirely disabled for that mode with no network traffic. syncCurrentPlayItem emits C09 first when needed so the C08 that follows is attributed to the right hotbar slot. The C08 air-use constructor signals right-click-air rather than block-place, which the server maps to food, bows and throwables. The stackSize comparison detects consumption locally for instant inventory feedback, while the server authoritative consume arrives later, so desync here causes ghost food or infinite snowballs if C08 is replayed.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C08</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">attackEntity/interactWithEntitySendPacket</span></div>
 <p class="impl-pattern">Left-click attack vs right-click interact.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Syncs item, sends C02 ATTACK or INTERACT (+hitVec variant). Applies local attackTargetEntityWithCurrentItem/interact only if not spectator.</p>
+<p class="impl-pattern">attackEntity syncs the hotbar, queues C02PacketUseEntity with Action.ATTACK for the target entity ID, then applies attackTargetEntityWithCurrentItem locally only when not in spectator. interactWithEntitySendPacket syncs the hotbar, queues C02 with Action.INTERACT, and applies playerIn.interactWith locally only for non-spectators. isPlayerRightClickingOnEntity computes a hitVec offset from entity position, queues C02 with the Vec3 interact-at variant for armor stands and villagers, and applies interactAt locally for non-spectators. All three share netClientHandler as the sink and always send the C02 even in spectator, letting the server decide to ignore effects while still logging the attempt. The server validates distance, line of sight and cooldown, applying damage or leash or trade effects. Suppressing C02 creates silent aura where damage happens without animation, while spamming C02 with forged IDs is the reach and kill-aura vector. Local prediction keeps hits feeling instant pending S19, S0B or S06 confirmations.</p>
+<pre class="writeup-code"><code>    public void attackEntity(EntityPlayer playerIn, Entity targetEntity)
+    {
+        this.syncCurrentPlayItem();
+        this.netClientHandler.addToSendQueue(new C02PacketUseEntity(targetEntity, C02PacketUseEntity.Action.ATTACK));
+
+        if (this.currentGameType != WorldSettings.GameType.SPECTATOR)
+        {
+            playerIn.attackTargetEntityWithCurrentItem(targetEntity);
+        }
+    }
+
+    /**
+     * Send packet to server - player is interacting with another entity (left click)
+     */
+    public boolean interactWithEntitySendPacket(EntityPlayer playerIn, Entity targetEntity)
+    {
+        this.syncCurrentPlayItem();
+        this.netClientHandler.addToSendQueue(new C02PacketUseEntity(targetEntity, C02PacketUseEntity.Action.INTERACT));
+        return this.currentGameType != WorldSettings.GameType.SPECTATOR &amp;&amp; playerIn.interactWith(targetEntity);
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">syncCurrentPlayItem before each C02 guarantees the server uses the current weapon for damage calculation rather than a stale slot. The ATTACK constructor carries only the entity ID, while the INTERACT and Vec3 variants add interaction coordinates for precise armor-stand handling. The spectator conditionals show packets are still sent but local effects are skipped, so the server is the final arbiter. Forging ATTACK with distant IDs is reach, and omitting the paired C0A swing is the no-swing signature.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C02</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">windowClick/sendEnchantPacket</span></div>
 <p class="impl-pattern">Container click and enchant button.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Gets next transaction ID, applies local slotClick, sends C0E with result + txn. Enchant sends C11 windowID+button for server-side level roll.</p>
+<p class="impl-pattern">windowClick obtains the next short transaction ID from openContainer.getNextTransactionID, applies slotClick locally for instant GUI movement with mouseButton and mode, then queues C0EPacketClickWindow with windowId, slotId, button, mode, resulting ItemStack and transaction ID. The server replays the click against its authoritative Container, validates the transaction, and corrects with S2F or S30 on mismatch. sendEnchantPacket queues C11PacketEnchantItem with windowID and button for the enchantment table selection, where the server rolls levels and applies S31 progress. sendSlotPacket and sendPacketDropItem queue C10 creative actions for set or drop slot, gated on isCreative to prevent survival item spawning. Racing C0E clicks against C0D close or spamming transaction IDs is the classic inventory-dupe and chest-stealer pattern. The local slotClick prediction is why containers feel instant despite round-trip validation.</p>
+<pre class="writeup-code"><code>    public ItemStack windowClick(int windowId, int slotId, int mouseButtonClicked, int mode, EntityPlayer playerIn)
+    {
+        short short1 = playerIn.openContainer.getNextTransactionID(playerIn.inventory);
+        ItemStack itemstack = playerIn.openContainer.slotClick(slotId, mouseButtonClicked, mode, playerIn);
+        this.netClientHandler.addToSendQueue(new C0EPacketClickWindow(windowId, slotId, mouseButtonClicked, mode, itemstack, short1));
+        return itemstack;
+    }
+
+    /**
+     * GuiEnchantment uses this during multiplayer to tell PlayerControllerMP to send a packet indicating the
+     * enchantment action the player has taken.
+     *  
+     * @param windowID The ID of the current window
+     * @param button The button id (enchantment selected)
+     */
+    public void sendEnchantPacket(int windowID, int button)
+    {
+        this.netClientHandler.addToSendQueue(new C11PacketEnchantItem(windowID, button));
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">getNextTransactionID allocates the short the server will echo or reject in S32 confirm, linking each C0E to a server settlement. slotClick mutates the client Container immediately for responsive dragging, with the result stack echoed in the C0E for server comparison. The C0E constructor packs window, slot, button, mode and transaction together so the server can replay the exact click. The C11 line carries only window and enchant button, with the actual level cost decided server-side, so forged C11 buttons attempt free-enchant exploits.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C0E</span><span class="related-chip" style="opacity:.65">C11</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">syncCurrentPlayItem</span></div>
 <p class="impl-pattern">Hotbar change notifier called before most actions.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Compares inventory.currentItem to cached currentPlayerItem; on change updates cache and sends C09 HeldItemChange.</p>
+<p class="impl-pattern">syncCurrentPlayItem reads the live hotbar index from mc.thePlayer.inventory.currentItem each call and compares it to the cached currentPlayerItem field. On mismatch it copies the new index into the cache and queues C09PacketHeldItemChange with that slot on netClientHandler. It is invoked at the top of updateController, click handling, damage, right-click, use-item, attack and interact paths, making it the universal pre-action hotbar sync. Because it only sends on change, scrolling without acting emits a single C09, while acting without scrolling emits none. The server applies the slot switch before processing the following C07, C08 or C02, so weapon or block identity is correct. Blocking C09 while switching items causes ghost-block or wrong-weapon hits where client and server disagree. The cache also drives isHittingPosition validation for mining continuity.</p>
+<pre class="writeup-code"><code>    private void syncCurrentPlayItem()
+    {
+        int i = this.mc.thePlayer.inventory.currentItem;
+
+        if (i != this.currentPlayerItem)
+        {
+            this.currentPlayerItem = i;
+            this.netClientHandler.addToSendQueue(new C09PacketHeldItemChange(this.currentPlayerItem));
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The inventory.currentItem read captures the live hotbar slot after number-key or wheel input. The inequality against currentPlayerItem filters redundant sends so idle ticks produce no C09. The C09 constructor carries just the slot index the server equips before handling the next action packet. If this sync is skipped the server applies C07 or C08 with the previous slot, which is the slot-desync behind far-place or wrong-tool anomalies.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C09</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">resetBlockRemoving/onStoppedUsingItem</span></div>
 <p class="impl-pattern">Abort mining and stop use.</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">reset sends ABORT_DESTROY + clears isHittingBlock/damage/progress. stopUsing sends RELEASE_USE_ITEM with ORIGIN/DOWN then local stopUsingItem.</p>
+<p class="impl-pattern">resetBlockRemoving checks isHittingBlock and on true queues C07 ABORT_DESTROY_BLOCK with currentBlock and DOWN face, clears isHittingBlock and curBlockDamageMP, and clears the crack overlay via sendBlockBreakProgress with -1. It is called when the mouse is released, the target changes, or the held item switches via isHittingPosition mismatch. onStoppedUsingItem syncs the hotbar, queues C07 RELEASE_USE_ITEM with ORIGIN and DOWN placeholders, and calls stopUsingItem locally to end bow draw or food eat. Both use the C07 channel with distinct actions so the server can separate mining abort from use release. For bow release the server spawns the arrow based on draw duration, while for food it cancels eating progress. Omitting ABORT leaves server crack progress running, and omitting RELEASE allows fast-bow or no-slow exploits that the server times via packet intervals.</p>
+<pre class="writeup-code"><code>    public void resetBlockRemoving()
+    {
+        if (this.isHittingBlock)
+        {
+            this.netClientHandler.addToSendQueue(new C07PacketPlayerDigging(C07PacketPlayerDigging.Action.ABORT_DESTROY_BLOCK, this.currentBlock, EnumFacing.DOWN));
+            this.isHittingBlock = false;
+            this.curBlockDamageMP = 0.0F;
+            this.mc.theWorld.sendBlockBreakProgress(this.mc.thePlayer.getEntityId(), this.currentBlock, -1);
+        }
+    }
+
+    public boolean onPlayerDamageBlock(BlockPos posBlock, EnumFacing directionFacing)</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The isHittingBlock guard ensures ABORT is only sent when a dig was actually in progress, avoiding spurious server resets. The C07 ABORT carries the stale currentBlock so the server can clear crack state for that exact position. Clearing curBlockDamageMP and sending progress -1 removes the local crack overlay in step with the server. onStoppedUsingItem mirrors this with RELEASE_USE_ITEM for bows and food, so blocking either ABORT or RELEASE desyncs server progress timers used by anti-cheat.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C07</span></div>
 </div>
 </div>

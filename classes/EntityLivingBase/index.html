@@ -57,55 +57,258 @@
 <div class="detail-section"><h3>Deep Analysis</h3><div class="writeup-block">
 <p>Abstract base for all living entities in 1.8.9, owning health, attributes, combat, potions and equipment state. Server-side logic broadcasts visual effects through WorldServer EntityTracker while persistent state syncs via DataWatcher slots. Client mirrors hurt, death, swing, pickup and potion color through status, animation and metadata packets.</p>
 </div></div>
-<div class="detail-section"><h3>Key Methods (10)</h3>
+<div class="detail-section"><h3>Key Methods — In Depth (10)</h3>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">swingItem</span></div>
 <p class="impl-pattern">Start arm-swing animation and broadcast to trackers</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Resets swingProgressInt and sets isSwingInProgress, then calls EntityTracker.sendToAllTrackingEntity with S0BPacketAnimation type 0 on WorldServer.</p>
+<p class="impl-pattern">swingItem starts a client-visible arm swing on the server and broadcasts it to all tracking clients. It first checks isSwingInProgress and swingProgressInt against half of getArmSwingAnimationEnd to avoid restarting a swing mid-stroke unless expired or invalid. On start it sets swingProgressInt to -1 and isSwingInProgress to true so updateArmSwingProgress will advance it next tick. It then guards with worldObj instanceof WorldServer to ensure this only runs on the logical server. It obtains the EntityTracker from WorldServer and calls sendToAllTrackingEntity with new S0BPacketAnimation(this, 0) where type 0 means swing arm. Receivers including the attacker itself if tracked and nearby players get S0B and play the swing animation without changing inventory or health. This keeps swings visual-only while combat damage is handled separately by attack logic. No DataWatcher change is made here because animation is transient.</p>
+<pre class="writeup-code"><code>    public void swingItem()
+    {
+        if (!this.isSwingInProgress || this.swingProgressInt &gt;= this.getArmSwingAnimationEnd() / 2 || this.swingProgressInt &lt; 0)
+        {
+            this.swingProgressInt = -1;
+            this.isSwingInProgress = true;
+
+            if (this.worldObj instanceof WorldServer)
+            {
+                ((WorldServer)this.worldObj).getEntityTracker().sendToAllTrackingEntity(this, new S0BPacketAnimation(this, 0));
+            }
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The guard condition prevents overlapping swings by allowing restart only when idle, past half duration, or with invalid counter. Resetting swingProgressInt to -1 and setting isSwingInProgress starts the animation timer consumed by updateArmSwingProgress. The instanceof WorldServer check confines packet sending to the logical server and avoids client double-send. sendToAllTrackingEntity forwards the new S0BPacketAnimation with entity ID and type 0 to every tracking client. Clients then render the arm swing while server logic continues independently.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S0B</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onItemPickup</span></div>
 <p class="impl-pattern">Broadcast pickup animation when collecting item, arrow or XP orb</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Server-only guard on worldObj.isRemote, then sends S0DPacketCollectItem with picked-up and collector entity IDs to all tracking clients.</p>
+<p class="impl-pattern">onItemPickup broadcasts the pickup beam animation when a living entity collects an item, arrow, or XP orb. It first rejects dead pickup entities with isDead and rejects client worlds with worldObj.isRemote so only the server emits packets. It fetches EntityTracker from the WorldServer to find all clients tracking the picked-up entity. For EntityItem it sends S0DPacketCollectItem with args picked-up entity ID and collector entity ID so clients can fly the item to the collector. It repeats the same S0D send for EntityArrow and for EntityXPOrb using identical constructor arguments. Receivers hide or remove the ground entity and render it moving into the collector inventory or body. No inventory mutation happens here; actual stack transfer is done by caller logic before or after this visual. This separation keeps visuals in sync even if stack handling differs by subclass.</p>
+<pre class="writeup-code"><code>    public void onItemPickup(Entity p_71001_1_, int p_71001_2_)
+    {
+        if (!p_71001_1_.isDead &amp;&amp; !this.worldObj.isRemote)
+        {
+            EntityTracker entitytracker = ((WorldServer)this.worldObj).getEntityTracker();
+
+            if (p_71001_1_ instanceof EntityItem)
+            {
+                entitytracker.sendToAllTrackingEntity(p_71001_1_, new S0DPacketCollectItem(p_71001_1_.getEntityId(), this.getEntityId()));
+            }
+
+            if (p_71001_1_ instanceof EntityArrow)
+            {
+                entitytracker.sendToAllTrackingEntity(p_71001_1_, new S0DPacketCollectItem(p_71001_1_.getEntityId(), this.getEntityId()));
+            }
+
+            if (p_71001_1_ instanceof EntityXPOrb)
+            {
+                entitytracker.sendToAllTrackingEntity(p_71001_1_, new S0DPacketCollectItem(p_71001_1_.getEntityId(), this.getEntityId()));
+            }
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The method signature takes the picked-up entity and stack size though size is unused for the packet. The isDead plus isRemote guard ensures only live server-side pickups broadcast. Getting EntityTracker from WorldServer provides the audience of tracking clients. Each instanceof branch constructs S0DPacketCollectItem with collected ID first and collector ID second. Tracking clients receive S0D and animate the orb, arrow, or item flying to the collector.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S0D</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onUpdate</span></div>
 <p class="impl-pattern">Per-tick equipment diff sync and arrow-count decay</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Compares previousEquipment to getEquipmentInSlot each tick on server; on mismatch sends S04PacketEntityEquipment and reapplies attribute modifiers.</p>
+<p class="impl-pattern">onUpdate runs every tick to decay stuck arrows and sync changed equipment to tracking clients. It calls super.onUpdate first for base entity movement and then gates server-only work with !worldObj.isRemote. It reads arrow count from DataWatcher slot 9 via getArrowCountInEntity and if above zero initializes arrowHitTimer to 20 times 30 minus count. It decrements arrowHitTimer each tick and calls setArrowCountInEntity with count minus one when it expires, which updates DataWatcher slot 9 for S1C metadata sync. It then loops slots 0 to 4 comparing previousEquipment cache to getEquipmentInSlot current value with ItemStack.areItemStacksEqual. On mismatch it sends S04PacketEntityEquipment with args entity ID, slot index j, and new ItemStack so clients update rendered held item and armor. It also removes old attribute modifiers and applies new ones to attributeMap to keep damage, armor, and speed correct. It caches a copy of the new stack in previousEquipment to avoid resending every tick. Every 20 ticks it resets CombatTracker to age out old damage entries.</p>
+<pre class="writeup-code"><code>        if (!this.worldObj.isRemote)
+        {
+            int i = this.getArrowCountInEntity();
+
+            if (i &gt; 0)
+            {
+                if (this.arrowHitTimer &lt;= 0)
+                {
+                    this.arrowHitTimer = 20 * (30 - i);
+                }
+
+                --this.arrowHitTimer;
+
+                if (this.arrowHitTimer &lt;= 0)
+                {
+                    this.setArrowCountInEntity(i - 1);
+                }
+            }
+
+            for (int j = 0; j &lt; 5; ++j)
+            {
+                ItemStack itemstack = this.previousEquipment[j];
+                ItemStack itemstack1 = this.getEquipmentInSlot(j);
+
+                if (!ItemStack.areItemStacksEqual(itemstack1, itemstack))
+                {
+                    ((WorldServer)this.worldObj).getEntityTracker().sendToAllTrackingEntity(this, new S04PacketEntityEquipment(this.getEntityId(), j, itemstack1));</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The !isRemote branch confines arrow decay and equipment broadcast to the server. Arrow logic reads DataWatcher slot 9 and uses arrowHitTimer as a countdown scaled by remaining arrows before decrementing the visible count. The for loop over five slots diffs cached previousEquipment against live getEquipmentInSlot. On inequality it calls sendToAllTrackingEntity with S04PacketEntityEquipment carrying entity ID, slot, and new stack. Receivers update the rendered equipment slot while the server also swaps attribute modifiers locally.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S04</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">attackEntityFrom</span></div>
 <p class="impl-pattern">Apply damage, knockback and hurt broadcast</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Server-side damage pipeline with armor and potion reduction; calls worldObj.setEntityState byte 2 which tracker forwards as S19PacketEntityStatus.</p>
+<p class="impl-pattern">attackEntityFrom is the server damage pipeline that validates, reduces, applies damage, and broadcasts hurt state. Earlier guards reject invulnerable sources, client worlds, dead entities, and fire damage with fire resistance. Armor, absorption, and potion reductions are applied inside damageEntity before health in DataWatcher slot 6 is lowered. Revenge target, recentlyHit timer, and attackingPlayer fields are set from source.getEntity for loot and AI. If flag remains true meaning full hurt rather than throttled repeat hit, it calls worldObj.setEntityState with byte 2. WorldServer forwards that state as S19PacketEntityStatus with entity ID and op code 2 to all tracking clients. Receivers invoke handleStatusUpdate byte 2 to play hurt sound, set hurtTime to 10, and flash red. Knockback via knockBack and hurt or death sounds follow, with onDeath called if health falls to zero. Throttled hits skip the S19 broadcast and knockback by clearing flag.</p>
+<pre class="writeup-code"><code>                if (flag)
+                {
+                    this.worldObj.setEntityState(this, (byte)2);
+
+                    if (source != DamageSource.drown)
+                    {
+                        this.setBeenAttacked();
+                    }
+
+                    if (entity != null)
+                    {
+                        double d1 = entity.posX - this.posX;
+                        double d0;
+
+                        for (d0 = entity.posZ - this.posZ; d1 * d1 + d0 * d0 &lt; 1.0E-4D; d0 = (Math.random() - Math.random()) * 0.01D)
+                        {
+                            d1 = (Math.random() - Math.random()) * 0.01D;
+                        }
+
+                        this.attackedAtYaw = (float)(MathHelper.atan2(d0, d1) * 180.0D / Math.PI - (double)this.rotationYaw);
+                        this.knockBack(entity, amount, d1, d0);
+                    }
+                    else
+                    {
+                        this.attackedAtYaw = (float)((int)(Math.random() * 2.0D) * 180);
+                    }
+                }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The if flag block runs only for full-strength hits that should be visible and knock back. setEntityState with byte 2 is the packet trigger that WorldServer turns into S19 to tracking clients. setBeenAttacked marks velocityChanged except for drown so motion syncs. The entity-null check computes knockback direction from attacker position with a small random fallback to avoid divide by zero. knockBack then applies motion while attackedAtYaw orients the hurt tilt on receivers.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S19</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onDeath</span></div>
 <p class="impl-pattern">Handle death drops and death animation broadcast</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Awards score, drops loot on server, then setEntityState byte 3 so tracking clients play death sound and animation.</p>
+<p class="impl-pattern">onDeath awards score, drops loot on the server, and broadcasts the death animation. It resolves the killer via getAttackingEntity and source.getEntity, then calls addToPlayerScore if scoreValue is non-negative. It notifies the killer with onKillEntity for achievements and AI. It sets dead to true and resets CombatTracker to close the combat log. Guarded by !worldObj.isRemote it computes looting level from the killer, checks canDropLoot and doMobLoot gamerule, then calls dropFewItems, dropEquipment, and rarely addRandomDrop. These spawn EntityItem and EntityXPOrb which have their own spawn packets. Finally it calls worldObj.setEntityState with byte 3 which WorldServer forwards as S19PacketEntityStatus op 3. Tracking clients receive S19 and play death sound, rotate the corpse, and start the death timer.</p>
+<pre class="writeup-code"><code>        this.dead = true;
+        this.getCombatTracker().reset();
+
+        if (!this.worldObj.isRemote)
+        {
+            int i = 0;
+
+            if (entity instanceof EntityPlayer)
+            {
+                i = EnchantmentHelper.getLootingModifier((EntityLivingBase)entity);
+            }
+
+            if (this.canDropLoot() &amp;&amp; this.worldObj.getGameRules().getBoolean("doMobLoot"))
+            {
+                this.dropFewItems(this.recentlyHit &gt; 0, i);
+                this.dropEquipment(this.recentlyHit &gt; 0, i);
+
+                if (this.recentlyHit &gt; 0 &amp;&amp; this.rand.nextFloat() &lt; 0.025F + (float)i * 0.01F)
+                {
+                    this.addRandomDrop();
+                }
+            }
+        }
+
+        this.worldObj.setEntityState(this, (byte)3);</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Setting dead and resetting CombatTracker marks the entity as finished on both sides. The !isRemote guard confines looting calculation and dropFewItems plus dropEquipment spawning to the server. Looting level comes from the killer player while doMobLoot and canDropLoot gate drops. The final setEntityState with byte 3 always runs so WorldServer can broadcast S19 death. Clients then run handleStatusUpdate byte 3 to set health zero and invoke onDeath locally.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S19</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">handleStatusUpdate</span></div>
 <p class="impl-pattern">Client-side handler for hurt and death status bytes</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Byte 2 replays hurt animation and sound; byte 3 sets health zero and calls onDeath. Other IDs delegate to Entity super handler.</p>
+<p class="impl-pattern">handleStatusUpdate runs on the client to mirror hurt and death states received as S19PacketEntityStatus. For id 2 it sets limbSwingAmount to 1.5, copies maxHurtResistantTime into hurtResistantTime, and sets hurtTime and maxHurtTime to 10 for the red flash duration. It zeroes attackedAtYaw, plays getHurtSound with randomized pitch, and calls attackEntityFrom with generic zero damage to trigger hurt hooks without changing health. For id 3 it plays getDeathSound with randomized pitch, forces DataWatcher health to zero via setHealth, and calls onDeath with generic source to start client death animation. Both branches rely on the server having sent S19 op 2 from attackEntityFrom or op 3 from onDeath via setEntityState. Unknown IDs delegate to super.handleStatusUpdate for base entity handling like spawn particles. This keeps client visuals driven entirely by server broadcasts rather than local simulation.</p>
+<pre class="writeup-code"><code>    public void handleStatusUpdate(byte id)
+    {
+        if (id == 2)
+        {
+            this.limbSwingAmount = 1.5F;
+            this.hurtResistantTime = this.maxHurtResistantTime;
+            this.hurtTime = this.maxHurtTime = 10;
+            this.attackedAtYaw = 0.0F;
+            String s = this.getHurtSound();
+
+            if (s != null)
+            {
+                this.playSound(this.getHurtSound(), this.getSoundVolume(), (this.rand.nextFloat() - this.rand.nextFloat()) * 0.2F + 1.0F);
+            }
+
+            this.attackEntityFrom(DamageSource.generic, 0.0F);
+        }
+        else if (id == 3)
+        {
+            String s1 = this.getDeathSound();
+
+            if (s1 != null)
+            {
+                this.playSound(this.getDeathSound(), this.getSoundVolume(), (this.rand.nextFloat() - this.rand.nextFloat()) * 0.2F + 1.0F);
+            }
+
+            this.setHealth(0.0F);
+            this.onDeath(DamageSource.generic);</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The id 2 branch reconstructs hurt visuals by setting swing, resistance, and hurt timers plus sound. Calling attackEntityFrom with zero generic damage fires client hooks while early isRemote return prevents health change. The id 3 branch plays death sound, zeroes DataWatcher health, and invokes onDeath for corpse animation. Both branches are entered only when S19PacketEntityStatus with matching op arrives. Other IDs fall through to Entity super handler.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S19</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">addPotionEffect</span></div>
 <p class="impl-pattern">Add or combine active potion effect</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Validates isPotionApplicable, combines or inserts into activePotionsMap, then marks potionsNeedUpdate so DataWatcher slots 7 and 8 sync via tracker metadata.</p>
+<p class="impl-pattern">addPotionEffect adds or combines a potion effect and schedules a metadata sync. It first calls isPotionApplicable which rejects regeneration and poison on undead creatures but allows all else. If activePotionsMap already contains the potion ID it calls combine on the existing PotionEffect to merge duration and amplifier, then calls onChangedPotionEffect with reapply true to refresh attribute modifiers. If new it inserts the effect into activePotionsMap and calls onNewPotionEffect to apply attribute modifiers to attributeMap. Both paths set potionsNeedUpdate to true so updatePotionEffects will recompute DataWatcher slots 7 potion color and 8 ambient flag. Those DataWatcher changes are sent by EntityTracker as S1C reflect S1CPacketEntityMetadata to tracking clients. Clients then render particles, tint, and invisibility without receiving a dedicated potion packet. Duration refresh packets at 600-tick intervals also flow through this dirty path.</p>
+<pre class="writeup-code"><code>    public void addPotionEffect(PotionEffect potioneffectIn)
+    {
+        if (this.isPotionApplicable(potioneffectIn))
+        {
+            if (this.activePotionsMap.containsKey(Integer.valueOf(potioneffectIn.getPotionID())))
+            {
+                ((PotionEffect)this.activePotionsMap.get(Integer.valueOf(potioneffectIn.getPotionID()))).combine(potioneffectIn);
+                this.onChangedPotionEffect((PotionEffect)this.activePotionsMap.get(Integer.valueOf(potioneffectIn.getPotionID())), true);
+            }
+            else
+            {
+                this.activePotionsMap.put(Integer.valueOf(potioneffectIn.getPotionID()), potioneffectIn);
+                this.onNewPotionEffect(potioneffectIn);
+            }
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The isPotionApplicable guard filters invalid undead heals and poisons before mutation. The containsKey branch merges into the existing effect and calls onChangedPotionEffect to reapply speed, damage, or health modifiers. The else branch inserts the new mapping and calls onNewPotionEffect to apply modifiers once. Both set potionsNeedUpdate so the next tick pushes DataWatcher slots 7 and 8 via S1C metadata.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S1C</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">removePotionEffect</span></div>
 <p class="impl-pattern">Remove potion effect and refresh metadata</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Removes entry from activePotionsMap and calls onFinishedPotionEffect, which strips attribute modifiers and flags DataWatcher color update.</p>
+<p class="impl-pattern">removePotionEffect removes a server-side potion and triggers attribute cleanup and resync. It removes the entry from activePotionsMap by integer potion ID and captures the old PotionEffect. If non-null it calls onFinishedPotionEffect which sets potionsNeedUpdate true and on the server removes attribute modifiers from attributeMap via Potion.potionTypes. The dirty flag causes updatePotionEffects to call updatePotionMetadata next tick, recomputing liquid color and ambient flag or clearing slots 7 and 8 if empty. EntityTracker then sends the changed DataWatcher entries as S1C S1CPacketEntityMetadata to all tracking clients. Receivers stop rendering that effect tint and particles and update invisibility. This differs from removePotionEffectClient which only edits the client map without attribute work. If the ID was absent no packet or modifier change occurs.</p>
+<pre class="writeup-code"><code>    public void removePotionEffect(int potionId)
+    {
+        PotionEffect potioneffect = (PotionEffect)this.activePotionsMap.remove(Integer.valueOf(potionId));
+
+        if (potioneffect != null)
+        {
+            this.onFinishedPotionEffect(potioneffect);
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The map remove by boxed potion ID both unregisters the effect and returns it for cleanup. The null check avoids dirtying metadata when nothing was active. onFinishedPotionEffect sets potionsNeedUpdate and strips server attribute modifiers. The next server tick then emits S1C metadata with updated color, ambient, and invisibility flags.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S1C</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">updatePotionMetadata</span></div>
 <p class="impl-pattern">Recompute potion color and invisibility flags</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Computes liquid color with PotionHelper and updates DataWatcher objects 7 and 8 plus invisibility flag; empty map resets metadata.</p>
+<p class="impl-pattern">updatePotionMetadata recomputes potion-driven DataWatcher state for S1C sync. If activePotionsMap is empty it calls resetPotionEffectMetadata which writes 0 to slot 7 color and 0 to slot 8 ambient, then calls setInvisible false to clear invisibility. If non-empty it calls PotionHelper.calcPotionLiquidColor over all active effects to blend the particle tint integer. It writes slot 8 with 1 if PotionHelper.getAreAmbient returns true else 0 to control ambient versus strong particles. It writes slot 7 with the blended color integer for client spell particles. It calls setInvisible based on isPotionActive for invisibility ID so armor and body render correctly. EntityTracker detects these DataWatcher changes and sends S1C S1CPacketEntityMetadata to tracking clients. Clients read slots 7, 8, and invisibility flag to render potion visuals.</p>
+<pre class="writeup-code"><code>    protected void updatePotionMetadata()
+    {
+        if (this.activePotionsMap.isEmpty())
+        {
+            this.resetPotionEffectMetadata();
+            this.setInvisible(false);
+        }
+        else
+        {
+            int i = PotionHelper.calcPotionLiquidColor(this.activePotionsMap.values());
+            this.dataWatcher.updateObject(8, Byte.valueOf((byte)(PotionHelper.getAreAmbient(this.activePotionsMap.values()) ? 1 : 0)));
+            this.dataWatcher.updateObject(7, Integer.valueOf(i));
+            this.setInvisible(this.isPotionActive(Potion.invisibility.id));
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The isEmpty branch clears color and ambient slots and disables invisibility for the clean state. The else branch blends active effects into a single RGB integer and writes ambient flag to slot 8. Writing slot 7 publishes the tint while setInvisible mirrors the invisibility potion. Changed DataWatcher objects are then broadcast as S1C metadata to trackers.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S1C</span></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">markPotionsDirty</span></div>
 <p class="impl-pattern">Flag potion metadata for next tick sync</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Sets potionsNeedUpdate true; consumed in updatePotionEffects on server to push DataWatcher changes to tracking clients.</p>
+<p class="impl-pattern">markPotionsDirty flags potion metadata for refresh on the next tick. It sets the private boolean potionsNeedUpdate to true without touching activePotionsMap or DataWatcher immediately. The flag is consumed in updatePotionEffects which on the server calls updatePotionMetadata to rewrite slots 7 and 8 and invisibility. Those DataWatcher deltas are then sent by EntityTracker as S1C S1CPacketEntityMetadata to tracking clients. It is called by onNewPotionEffect, onChangedPotionEffect, and onFinishedPotionEffect after attribute modifiers change. This batches multiple adds or removes in one tick into a single metadata packet. If called on the client it only affects local particle spawning logic. No packet is sent synchronously inside this method itself.</p>
+<pre class="writeup-code"><code>    /**
+     * Sends an END_COMBAT packet to the client
+     */
+    public void sendEndCombat()
+    {
+    }
+
+    protected void markPotionsDirty()
+    {
+        this.potionsNeedUpdate = true;
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The empty sendEndCombat stub shows combat packets are unused in this version. markPotionsDirty simply sets potionsNeedUpdate to true to defer work. The next updatePotionEffects tick sees the flag and calls updatePotionMetadata on the server. Resulting DataWatcher slot 7 and 8 edits flow as S1C metadata to tracking clients.</p>
 <div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S1C</span></div>
 </div>
 </div>

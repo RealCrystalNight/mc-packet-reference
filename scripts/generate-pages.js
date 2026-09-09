@@ -88,7 +88,9 @@ function loadLogicAnalysis() {
   try {
     fs.readdirSync(ANALYSIS_DIR).filter(function(f) { return f.endsWith('.json'); }).forEach(function(f) {
       const o = JSON.parse(fs.readFileSync(path.join(ANALYSIS_DIR, f), 'utf8'));
-      Object.keys(o).forEach(function(k) { merged[k] = o[k]; });
+      Object.keys(o).forEach(function(k) {
+        merged[k] = Object.assign(merged[k] || {}, o[k]);
+      });
     });
   } catch (e) { /* no analysis yet */ }
   return merged;
@@ -116,11 +118,25 @@ function renderAnalysis(a, allPkts, slugSet) {
   parts.push('<p>' + esc(a.overview) + '</p>');
   parts.push('</div></div>');
   if (a.methods && a.methods.length) {
-    parts.push('<div class="detail-section"><h3>Key Methods (' + a.methods.length + ')</h3>');
+    const det = {};
+    (a.methods_detailed || []).forEach(function(md) { det[md.name] = md; });
+    const nDet = (a.methods_detailed || []).length;
+    parts.push('<div class="detail-section"><h3>Key Methods' + (nDet ? ' — In Depth (' + nDet + ')' : ' (' + a.methods.length + ')') + '</h3>');
     a.methods.forEach(function(m) {
+      const md = det[m.name];
       parts.push('<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">' + esc(m.name) + '</span></div>');
       parts.push('<p class="impl-pattern">' + esc(m.purpose) + '</p>');
-      parts.push('<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">' + esc(m.detail) + '</p>');
+      if (md) {
+        md.detail_long.split(/\n+/).forEach(function(para) {
+          if (para.trim()) parts.push('<p class="impl-pattern">' + esc(para.trim()) + '</p>');
+        });
+        parts.push('<pre class="writeup-code"><code>' + esc(md.code.replace(/^\n+/, '').replace(/\s+$/, '')) + '</code></pre>');
+        md.code_walkthrough.split(/\n+/).forEach(function(para) {
+          if (para.trim()) parts.push('<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">' + esc(para.trim()) + '</p>');
+        });
+      } else {
+        parts.push('<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">' + esc(m.detail) + '</p>');
+      }
       if (m.packets && m.packets.length) parts.push('<div class="related-list" style="margin-top:6px">' + linkifyPacketRefs(m.packets, allPkts, '../../packets/') + '</div>');
       parts.push('</div>');
     });
@@ -707,6 +723,9 @@ function main() {
     + Object.keys(logicData).map(function(slug) {
       return '  <url><loc>' + SITE + '/classes/' + slug + '/</loc><lastmod>' + mtime(path.join(LOGIC_DIR, slug + '.java')) + '</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>';
     }).join('\n') + '\n'
+    + ['api/', 'api/packets.json', 'api/classes.json', 'api/modules.json', 'api/analyses.json', 'api/index.json', 'llms.txt'].map(function(u) {
+      return '  <url><loc>' + SITE + '/' + u + '</loc><changefreq>weekly</changefreq><priority>0.5</priority></url>';
+    }).join('\n') + '\n'
     + allPkts.map(function(p) {
       const mc = (p.implementation && p.implementation.modules) ? p.implementation.modules.length : 0;
       const prio = mc >= 4 ? '0.9' : (mc >= 1 ? '0.8' : '0.6');
@@ -889,6 +908,62 @@ function main() {
     home = home.replace(/<style>\n[\s\S]*?\n<\/style>/, '<style>\n' + css + '\n</style>');
   }
   fs.writeFileSync(homePath, home);
+
+  // ============================================================
+  // LLM API — full-fidelity JSON + generated llms.txt so crawlers
+  // and models can traverse packets, classes, modules, analyses
+  // ============================================================
+  const apiDir = path.join(BASE, 'api');
+  fs.mkdirSync(apiDir, { recursive: true });
+  const apiPackets = allPkts.map(function(p) {
+    const o = JSON.parse(JSON.stringify(p));
+    o.url = SITE + '/packets/' + p.id + '/';
+    o.mcp_path = mcpPathFor(p);
+    o.logic_classes = logicRefs[p.id] || [];
+    return o;
+  });
+  fs.writeFileSync(path.join(apiDir, 'packets.json'), JSON.stringify({ site: SITE, version: '1.8.9', count: apiPackets.length, packets: apiPackets }, null, 1));
+  const apiClasses = Object.keys(logicData).map(function(slug) {
+    const ld = logicData[slug];
+    return { slug: slug, title: ld.entry.title, rel: ld.entry.rel, desc: ld.entry.desc, url: SITE + '/classes/' + slug + '/', source_url: ld.blob, packets: ld.packets, peers: ld.peers, analysis: ld.analysis || null };
+  });
+  fs.writeFileSync(path.join(apiDir, 'classes.json'), JSON.stringify({ site: SITE, version: '1.8.9', count: apiClasses.length, classes: apiClasses }, null, 1));
+  fs.writeFileSync(path.join(apiDir, 'modules.json'), JSON.stringify({ site: SITE, count: modNames.length, modules: modMap }, null, 1));
+  let apiAnalyses = [];
+  try {
+    const idx = JSON.parse(fs.readFileSync(path.join(BASE, 'data', 'analysis', 'index.json'), 'utf8'));
+    apiAnalyses = (idx.analyses || []).map(function(slug) {
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(BASE, 'data', 'analysis', slug + '.json'), 'utf8'));
+        return { slug: slug, url: SITE + '/analysis/' + data.category + '/' + slug + '.html' };
+      } catch (e) { return { slug: slug, url: SITE + '/analysis/' }; }
+    });
+  } catch (e) { /* no analyses */ }
+  fs.writeFileSync(path.join(apiDir, 'analyses.json'), JSON.stringify({ site: SITE, count: apiAnalyses.length, analyses: apiAnalyses }, null, 1));
+  fs.writeFileSync(path.join(apiDir, 'index.json'), JSON.stringify({ site: SITE, version: '1.8.9', endpoints: ['api/packets.json', 'api/classes.json', 'api/modules.json', 'api/analyses.json', 'api/index.json', 'sitemap.xml', 'llms.txt'] }, null, 1));
+  const llmsLines = ['# Minecraft 1.8.9 Packet Reference — llms.txt', '# ' + SITE + '/', '',
+    '> Searchable reference for all 105 Minecraft 1.8.9 network packets — fields, wire encoding, MCP classes, real client examples and anti-cheat notes.',
+    '> Plus 16 verbatim MCP logic-class sources with deep analysis, module index and module analyses.', '',
+    '## Hubs', '- [Home](' + SITE + '/)', '- [All Packets](' + SITE + '/packets/)', '- [Logic Classes](' + SITE + '/classes/)',
+    '- [Module Index](' + SITE + '/modules/)', '- [Module Analyses](' + SITE + '/analysis/)', '',
+    '## Machine API (traverse these first)', '- [' + SITE + '/api/index.json](' + SITE + '/api/index.json)',
+    '- [' + SITE + '/api/packets.json](' + SITE + '/api/packets.json)', '- [' + SITE + '/api/classes.json](' + SITE + '/api/classes.json)',
+    '- [' + SITE + '/api/modules.json](' + SITE + '/api/modules.json)', '- [' + SITE + '/api/analyses.json](' + SITE + '/api/analyses.json) — full module-analysis index',
+    '- [Sitemap](' + SITE + '/sitemap.xml)', '',
+    '## Packets (' + allPkts.length + ')'];
+  GROUPS.forEach(function(g) {
+    const pkts = allPkts.filter(function(p) { return p.state === g.state && p.dir === g.dir; });
+    if (!pkts.length) return;
+    llmsLines.push('### ' + g.label + ' (' + pkts.length + ')');
+    pkts.forEach(function(p) { llmsLines.push('- [' + p.id + ' ' + p.hex + ' — ' + p.name + '](' + SITE + '/packets/' + p.id + '/): ' + p.desc); });
+  });
+  llmsLines.push('', '## Logic Classes (' + apiClasses.length + ' — full MCP sources + analysis)');
+  apiClasses.forEach(function(c) { llmsLines.push('- [' + c.title + '](' + c.url + '): ' + c.desc + ' Packets: ' + c.packets.join(', ') + '.'); });
+  llmsLines.push('', '## Protocol states', '- Handshaking: C00Handshake',
+    '- Login: C00PacketLoginStart, C01PacketEncryptionResponse, S00PacketDisconnect, S01PacketEncryptionRequest, S02PacketLoginSuccess, S03PacketEnableCompression',
+    '- Status: C00PacketServerQuery, C01PacketPing, S00PacketServerInfo, S01PacketPong',
+    '- Play: 23 serverbound + 71 clientbound packets, see /packets/ index.');
+  fs.writeFileSync(path.join(BASE, 'llms.txt'), llmsLines.join('\n') + '\n');
 
   console.log('Generated ' + allPkts.length + ' standalone packet pages + module index (' + modNames.length + ' modules) + packet listing + static home links + sitemap');
 }

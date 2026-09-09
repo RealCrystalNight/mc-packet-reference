@@ -56,24 +56,68 @@
 <div class="detail-section"><h3>Deep Analysis</h3><div class="writeup-block">
 <p>Server-side STATUS connection handler active between handshake and login. Answers a single server-list query with cached ServerStatusResponse and echoes one ping packet. Enforces one-query-per-connection then closes channel.</p>
 </div></div>
-<div class="detail-section"><h3>Key Methods (4)</h3>
+<div class="detail-section"><h3>Key Methods — In Depth (4)</h3>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">NetHandlerStatusServer</span></div>
 <p class="impl-pattern">Bind handler to server and connection</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Stores MinecraftServer reference for status response and NetworkManager used to send replies and close channel.</p>
+<p class="impl-pattern">NetHandlerStatusServer is the constructor that binds a STATUS connection to its server and channel. It stores the MinecraftServer reference used later to fetch cached ServerStatusResponse with MOTD, favicon, version, and player counts. It stores the NetworkManager used to send S00PacketServerInfo and S01PacketPong and to close the channel. It leaves handled false so the first C00PacketServerQuery will be accepted. The EXIT_MESSAGE constant Status request has been handled is shared for closes after query, duplicate query, or ping. No packets are sent inside the constructor itself. The handler lives only between handshake STATUS switch and login or disconnect.</p>
+<pre class="writeup-code"><code>    private static final IChatComponent EXIT_MESSAGE = new ChatComponentText("Status request has been handled.");
+    private final MinecraftServer server;
+    private final NetworkManager networkManager;
+    private boolean handled;
+
+    public NetHandlerStatusServer(MinecraftServer serverIn, NetworkManager netManager)
+    {
+        this.server = serverIn;
+        this.networkManager = netManager;
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The EXIT_MESSAGE field provides the disconnect text sent after STATUS completes. Storing server preserves access to getServerStatusResponse for S00 replies. Storing networkManager preserves the channel for sends and closes. Leaving handled false arms the one-shot query gate for processServerQuery.</p>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">processServerQuery</span></div>
 <p class="impl-pattern">Reply to status query with server info</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">First C00PacketServerQuery sets handled and sends S00PacketServerInfo; duplicate queries close channel as already handled.</p>
+<p class="impl-pattern">processServerQuery handles incoming C00PacketServerQuery with a one-shot guard. If handled is already true it closes the channel with EXIT_MESSAGE to reject duplicate queries on the same STATUS connection. Otherwise it sets handled true to arm the guard before replying. It fetches the cached response via server.getServerStatusResponse containing description, players, version, and favicon. It constructs S00PacketServerInfo with that response and sends it via networkManager.sendPacket. The client OldServerPinger.handleServerInfo will parse it and follow with C01PacketPing. No channel close happens on the first query so the follow-up ping can arrive. A second query on the same connection is treated as abuse and disconnected.</p>
+<pre class="writeup-code"><code>    public void processServerQuery(C00PacketServerQuery packetIn)
+    {
+        if (this.handled)
+        {
+            this.networkManager.closeChannel(EXIT_MESSAGE);
+        }
+        else
+        {
+            this.handled = true;
+            this.networkManager.sendPacket(new S00PacketServerInfo(this.server.getServerStatusResponse()));
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The handled check enforces one query per STATUS session. Closing duplicates with EXIT_MESSAGE prevents info spam. Setting handled before send avoids race where a fast second query slips through. Sending S00PacketServerInfo with getServerStatusResponse delivers MOTD and counts. The channel stays open for the expected C01 ping.</p>
 <div class="related-list" style="margin-top:6px"><a class="related-chip" href="../../packets/C00PacketServerQuery/">C00PacketServerQuery</a><a class="related-chip" href="../../packets/S00PacketServerInfo/">S00PacketServerInfo</a></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">processPing</span></div>
 <p class="impl-pattern">Echo ping time and terminate status session</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Replies with S01PacketPong carrying client time, then closes channel with status-handled exit message.</p>
+<p class="impl-pattern">processPing handles incoming C01PacketPing and terminates the STATUS session. It reads client time via packetIn.getClientTime which is the timestamp the client sent in C01PacketPing. It constructs S01PacketPong with that same long value and sends it via networkManager.sendPacket. The client handlePong subtracts its stored send time from current time to compute pingToServer. Immediately after queuing S01 it closes the channel with EXIT_MESSAGE Status request has been handled. This enforces the query-then-ping-then-close sequence and frees the connection. No state validation on handled is done here because ping is valid even in edge orderings. Further packets on this channel will fail as closed.</p>
+<pre class="writeup-code"><code>    }
+
+    public void processPing(C01PacketPing packetIn)
+    {
+        this.networkManager.sendPacket(new S01PacketPong(packetIn.getClientTime()));
+        this.networkManager.closeChannel(EXIT_MESSAGE);
+    }
+}</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The method extracts clientTime from the C01 request to echo it back. Sending S01PacketPong with that value lets the client match ping to send time. Closing with EXIT_MESSAGE ends the STATUS phase per protocol. The trailing brace closes the class after handling.</p>
 <div class="related-list" style="margin-top:6px"><a class="related-chip" href="../../packets/C01PacketPing/">C01PacketPing</a><a class="related-chip" href="../../packets/S01PacketPong/">S01PacketPong</a></div>
 </div>
 <div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onDisconnect</span></div>
 <p class="impl-pattern">No-op disconnect hook for status phase</p>
-<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Intentionally empty because status connections carry no player state requiring cleanup.</p>
+<p class="impl-pattern">onDisconnect is the INetHandlerStatusServer disconnect hook for STATUS phase termination. It takes an IChatComponent reason describing normal Finished handling, duplicate query, or network error. Its body is intentionally empty because STATUS connections hold no player entity, inventory, or world state needing cleanup. Unlike play-phase handlers it does not broadcast quit messages or save data. The shared EXIT_MESSAGE close from processServerQuery and processPing flows through here as a no-op. Any resource release is handled by NetworkManager channel teardown itself. Leaving it empty also avoids touching MinecraftServer from the network thread on disconnect.</p>
+<pre class="writeup-code"><code>    /**
+     * Invoked when disconnecting, the parameter is a ChatComponent describing the reason for termination
+     */
+    public void onDisconnect(IChatComponent reason)
+    {
+    }
+
+    public void processServerQuery(C00PacketServerQuery packetIn)
+    {
+        if (this.handled)</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The javadoc notes the reason parameter carries termination text. The empty body shows no player cleanup is required for stateless STATUS. The following processServerQuery header confirms disconnect needs no gate logic. NetworkManager handles socket close independently after this callback.</p>
 </div>
 </div>
 <div class="detail-section"><h3>Packet Usage</h3><table class="fields-table"><thead><tr><th>Packet</th><th>Dir</th><th>Trigger</th></tr></thead><tbody>
