@@ -63,7 +63,19 @@ const LOGIC_CLASSES = [
   { slug: 'EntityLivingBase', rel: 'net/minecraft/entity/EntityLivingBase.java', title: 'EntityLivingBase', desc: 'Living-entity base: swingItem, potion-effect add/remove and item pickup emit S0B, S1D/S1E and S0D through the tracker.' },
   { slug: 'OldServerPinger', rel: 'net/minecraft/client/network/OldServerPinger.java', title: 'OldServerPinger', desc: 'Server-list prober: C00Handshake(47, STATUS) + C00 query + C01 ping sequence feeding the multiplayer latency readout.' },
   { slug: 'NetHandlerStatusServer', rel: 'net/minecraft/server/network/NetHandlerStatusServer.java', title: 'NetHandlerStatusServer', desc: 'Server status responder: answers C00 query with S00 JSON and C01 ping with S01 echo, then closes the channel.' },
-  { slug: 'ItemInWorldManager', rel: 'net/minecraft/server/management/ItemInWorldManager.java', title: 'ItemInWorldManager', desc: 'Survival interaction handler: block break/place and creative resync emit S23 corrections and S38 list updates.' }
+  { slug: 'ItemInWorldManager', rel: 'net/minecraft/server/management/ItemInWorldManager.java', title: 'ItemInWorldManager', desc: 'Survival interaction handler: block break/place and creative resync emit S23 corrections and S38 list updates.' },
+  { slug: 'Timer', rel: 'net/minecraft/util/Timer.java', title: 'Timer', desc: 'Tick-loop clock: 20 ticks/sec, renderPartialTicks interpolation, timerSpeed for timer cheats to target.' },
+  { slug: 'Minecraft', rel: 'net/minecraft/client/Minecraft.java', title: 'Minecraft', desc: 'Client singleton and main loop: runTick game logic, updateCameraAndRender, thePlayer/theWorld access, addScheduledTask.' },
+  { slug: 'NetworkManager', rel: 'net/minecraft/network/NetworkManager.java', title: 'NetworkManager', desc: 'Netty channel wrapper: sendPacket/dispatchPacket, MessageSerializer pipeline, per-connection state machine driver.' },
+  { slug: 'PacketBuffer', rel: 'net/minecraft/network/PacketBuffer.java', title: 'PacketBuffer', desc: 'Wire-format helpers: VarInt/VarLong, BlockPos, ItemStack, NBT, chat, UUID read/write used by every packet.' },
+  { slug: 'EnumConnectionState', rel: 'net/minecraft/network/EnumConnectionState.java', title: 'EnumConnectionState', desc: 'Protocol registry: HANDSHAKING/STATUS/LOGIN/PLAY packet-ID maps, direction routing, compression hooks.' },
+  { slug: 'MathHelper', rel: 'net/minecraft/util/MathHelper.java', title: 'MathHelper', desc: 'Fast lookup-table trig, floor/clamp/angle-wrap helpers backing movement, rotation and render math.' },
+  { slug: 'BlockPos', rel: 'net/minecraft/util/BlockPos.java', title: 'BlockPos', desc: 'Immutable integer position with MutableBlockPos for hot loops, packing, offsets and box iteration.' },
+  { slug: 'AxisAlignedBB', rel: 'net/minecraft/util/AxisAlignedBB.java', title: 'AxisAlignedBB', desc: 'Immutable collision box: offsets, expansion, axis sweep resolvers and ray intercept used by moveEntity.' },
+  { slug: 'Entity', rel: 'net/minecraft/entity/Entity.java', title: 'Entity', desc: 'Root of all entities: public pos/motion/rotation fields, moveEntity collision, DataWatcher flags, NBT persistence.' },
+  { slug: 'EntityPlayer', rel: 'net/minecraft/entity/player/EntityPlayer.java', title: 'EntityPlayer', desc: 'Shared player base: inventory, food, capabilities, sleep, XP, attack pipeline inherited by SP and MP.' },
+  { slug: 'World', rel: 'net/minecraft/world/World.java', title: 'World', desc: 'Abstract world: block read/write, raytrace, entity/AABB queries, spawning, weather, scoreboard and border access.' },
+  { slug: 'Container', rel: 'net/minecraft/inventory/Container.java', title: 'Container', desc: 'GUI inventory model: Slot views, slotClick prediction, transaction IDs, shift-click merge driving C0E/S32.' }
 ];
 function loadLogicSource(entry) {
   const p = path.join(LOGIC_DIR, entry.slug + '.java');
@@ -111,9 +123,15 @@ function loadLogicAnalysis() {
   try {
     fs.readdirSync(ANALYSIS_DIR).filter(function(f) { return f.endsWith('.json'); }).forEach(function(f) {
       const o = JSON.parse(fs.readFileSync(path.join(ANALYSIS_DIR, f), 'utf8'));
-      Object.keys(o).forEach(function(k) {
-        merged[k] = Object.assign(merged[k] || {}, o[k]);
-      });
+      if (o && o.overview && o.methods) {
+        // per-slug file: filename is the slug
+        const slug = f.replace(/\.json$/, '');
+        merged[slug] = Object.assign(merged[slug] || {}, o);
+      } else {
+        Object.keys(o).forEach(function(k) {
+          merged[k] = Object.assign(merged[k] || {}, o[k]);
+        });
+      }
     });
   } catch (e) { /* no analysis yet */ }
   return merged;

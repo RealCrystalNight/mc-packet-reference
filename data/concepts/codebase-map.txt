@@ -1,0 +1,1228 @@
+# MCP 1.8.9 Diagrams — Companion Reference
+
+This file is the visual companion to `MCP_1_8_9_CODEBASE_MAP.md`. The map describes *what* exists in the codebase; these diagrams describe *how* the parts connect and *how data flows* between them. Read the map first to learn the names; read this file to learn the shapes.
+
+Every diagram below is plain ASCII so it survives copy-paste into any context window. They are organized roughly from outermost (how the whole game is laid out) inward to specific subsystems (collision, raytracing, friction). Each diagram is followed by a short explanation of what it teaches.
+
+---
+
+## 1. The four architectural layers
+
+The codebase has a clear concentric structure. At the center is the world model — what blocks, entities, and items are. One ring out is the network protocol — how that model is serialized. One ring further is the client runtime — the game loop, renderer, GUI, local player. The outermost ring is the integrated server, which only exists in singleplayer.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  LAYER 4 — INTEGRATED SERVER                            │
+│              (singleplayer only; lives in its own thread)               │
+│       net.minecraft.server.*  +  net.minecraft.server.integrated.*      │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │              LAYER 3 — CLIENT RUNTIME                             │  │
+│  │           (everything that runs on the player's machine)          │  │
+│  │   net.minecraft.client.*                                          │  │
+│  │                                                                   │  │
+│  │   Minecraft  ──  EntityRenderer  ──  RenderGlobal                 │  │
+│  │       │                                                           │  │
+│  │       ├─→  PlayerControllerMP   (left-/right-click logic)         │  │
+│  │       ├─→  GuiScreen            (currentScreen, menus)            │  │
+│  │       ├─→  GuiIngame            (HUD)                             │  │
+│  │       ├─→  GameSettings         (mouseSensitivity, keybinds, ...) │  │
+│  │       ├─→  NetHandlerPlayClient (RECEIVES S→C packets)            │  │
+│  │       └─→  thePlayer (EntityPlayerSP) + theWorld (WorldClient)    │  │
+│  │                                                                   │  │
+│  │   ┌─────────────────────────────────────────────────────────┐     │  │
+│  │   │         LAYER 2 — NETWORK PROTOCOL  (shared)            │     │  │
+│  │   │   net.minecraft.network.*                               │     │  │
+│  │   │                                                         │     │  │
+│  │   │   NetworkManager (Netty channel wrapper)                │     │  │
+│  │   │     │                                                   │     │  │
+│  │   │     ├── EnumConnectionState: HANDSHAKING/STATUS/        │     │  │
+│  │   │     │    LOGIN/PLAY  +  packet ID registry              │     │  │
+│  │   │     ├── PacketBuffer (VarInt, BlockPos, NBT, ItemStack) │     │  │
+│  │   │     ├── 23 C→S play packets (C00..C19)                  │     │  │
+│  │   │     └── 71 S→C play packets (S00..S49)                  │     │  │
+│  │   │                                                         │     │  │
+│  │   │   ┌───────────────────────────────────────────────┐     │     │  │
+│  │   │   │   LAYER 1 — WORLD MODEL  (shared)             │     │     │  │
+│  │   │   │   net.minecraft.{block, item, entity,         │     │     │  │
+│  │   │   │     world, inventory, nbt, potion, tile,      │     │     │  │
+│  │   │   │     util}                                     │     │     │  │
+│  │   │   │                                               │     │     │  │
+│  │   │   │   Block, IBlockState, Item, ItemStack         │     │     │  │
+│  │   │   │   Entity → EntityLivingBase → EntityPlayer    │     │     │  │
+│  │   │   │   World, Chunk, BlockPos, AxisAlignedBB       │     │     │  │
+│  │   │   │   NBTTagCompound, MathHelper, Vec3, EnumFacing│     │     │  │
+│  │   │   └───────────────────────────────────────────────┘     │     │  │
+│  │   └─────────────────────────────────────────────────────────┘     │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+The teaching point: outer layers depend on inner layers, but never the reverse. `Block` doesn't know about packets; `Packet` doesn't know about `Minecraft.theWorld`. When you write new code, find the innermost layer where it belongs and put it there — code in the wrong layer creates circular dependencies or accidentally depends on `Minecraft.getMinecraft()` from a place that should be reusable on the server side too.
+
+In multiplayer, Layer 4 doesn't run on your machine — it runs on the dedicated server, which is a separate jar that uses Layers 1 and 2 but has its own implementation of Layer 3-equivalent code (`MinecraftServer`, `NetHandlerPlayServer`, `EntityPlayerMP`, `WorldServer`). The client side never touches `WorldServer` or `EntityPlayerMP` even in singleplayer except through carefully threaded boundaries.
+
+---
+
+## 2. Entity class hierarchy
+
+The entity tree is deep but well-organized. Most of the methods you'll call on the local player are defined two or three levels up the chain, which is why knowing the hierarchy matters: if a method isn't on `EntityPlayerSP`, it's almost certainly inherited from `EntityLivingBase` or `Entity`.
+
+```
+                              Entity
+                                │
+       ┌────────────────┬───────┴────────┬──────────────────┐
+       │                │                │                  │
+EntityLivingBase   EntityItem    EntityXPOrb         EntityArrow
+       │           (dropped       (xp drops)         EntityFireball
+       │            items)                           EntitySnowball
+       │                                             EntityFishHook
+       │                                             EntityEnderPearl
+       │                                             ... (all in
+       │                                              .projectile)
+       │
+   ┌───┴────────────────┬─────────────┬──────────────────────┐
+   │                    │             │                      │
+EntityPlayer    EntityCreature  EntityFlying           EntityAmbient
+   │           (most mobs use   (Ghast)                (Bat)
+   │            this base)              
+   │                │
+   │       ┌────────┴────────┐
+   │       │                 │
+   │   EntityMob       EntityAnimal
+   │   (hostile)      (passive)
+   │       │                 │
+   │   Zombie, Skeleton, Cow, Sheep, Pig,
+   │   Creeper, Spider,    Chicken, Horse,
+   │   Witch, Enderman,    Villager, Wolf,
+   │   ...                 Rabbit, ...
+   │
+AbstractClientPlayer
+   │
+   ├──→ EntityPlayerSP      (the local "you")
+   │       fields: sendQueue, movementInput, sprintingTicksLeft
+   │       method: onUpdateWalkingPlayer() — builds C03/C04/C05/C06
+   │
+   └──→ EntityOtherPlayerMP (any other player visible)
+           method: setPositionAndRotation2() — receives S14/S18
+```
+
+The teaching point: `EntityPlayerSP` is the only one of the two `AbstractClientPlayer` subclasses that *sends* packets. `EntityOtherPlayerMP` only *receives* updates from the server about other players and interpolates them smoothly. So `sendQueue` only exists on `EntityPlayerSP` — don't go looking for it on a generic player reference.
+
+Also: the abstract `EntityLivingBase.getHeldItem()` is overridden by `EntityPlayer` to read from `inventory.getCurrentItem()`, and by mobs to read from their internal equipment array. So calling `getHeldItem()` on a generic `EntityLivingBase` does the right thing regardless of whether you have a player or a mob.
+
+---
+
+## 3. The packet protocol lifecycle
+
+A connection goes through four states. Each state has its own packet ID space, so packet ID 0x01 in `LOGIN` is a completely different packet from 0x01 in `PLAY`. The state transitions are deterministic.
+
+```
+        ┌─────────────────────┐
+        │     HANDSHAKING     │   Initial state on TCP connect
+        │   (state ID = -1)   │
+        └──────────┬──────────┘
+                   │
+                   │ Client sends:
+                   │   C00Handshake(protocolVersion, host, port, nextState)
+                   │     nextState = 1 → STATUS
+                   │     nextState = 2 → LOGIN
+                   ▼
+        ┌─────────────────────┐
+        │   STATUS or LOGIN   │
+        │   (state ID = 1/2)  │
+        └──────────┬──────────┘
+                   │
+                   │ STATUS path (server-list ping):
+                   │   C →  C00PacketServerQuery
+                   │   S →  S00PacketServerInfo
+                   │   C →  C01PacketPing
+                   │   S →  S01PacketPong
+                   │   ─ connection closes ─
+                   │
+                   │ LOGIN path (joining a server):
+                   │   C →  C00PacketLoginStart(username)
+                   │   S →  S01PacketEncryptionRequest  (only if online-mode)
+                   │   C →  C01PacketEncryptionResponse
+                   │   S →  S03PacketEnableCompression  (sets threshold)
+                   │   S →  S02PacketLoginSuccess(uuid, name)
+                   ▼
+        ┌─────────────────────┐
+        │        PLAY         │   Now you exchange play-state packets
+        │   (state ID = 0)    │   every tick, 20 times per second
+        └──────────┬──────────┘
+                   │
+                   │ Server immediately sends:
+                   │   S46PacketSetCompressionLevel   (often)
+                   │   S01PacketJoinGame(entityId, gameMode, dimension,
+                   │                     difficulty, maxPlayers,
+                   │                     worldType, reducedDebugInfo)
+                   │   S05PacketSpawnPosition         (world spawn)
+                   │   S39PacketPlayerAbilities       (fly/invuln state)
+                   │   S08PacketPlayerPosLook         (initial teleport)
+                   │   S26PacketMapChunkBulk          (visible chunks)
+                   │
+                   │ Client replies:
+                   │   C15PacketClientSettings(lang, viewDist, chatVis,
+                   │                            chatColors, skinFlags)
+                   │   C17PacketCustomPayload("MC|Brand", "vanilla")
+                   │   C16PacketClientStatus(PERFORM_RESPAWN)  // signals
+                   │                                              "ready"
+                   ▼
+              ── steady state ──
+```
+
+The teaching point: state transitions are driven by specific packets, not by timestamps or timeouts. If you ever see a packet ID that "doesn't exist", you're probably looking at it in the wrong state's lookup table. `EnumConnectionState.PLAY.directionMaps` is the lookup you want for the 94 PLAY-state packets.
+
+---
+
+## 4. Steady-state packet exchange (PLAY)
+
+Once you're in PLAY, the per-tick exchange looks like this. The arrows show direction (`C →` means client to server, `S →` means server to client):
+
+```
+                                          ╔═════════════════════╗
+   ┌──────────────────────────┐           ║                     ║
+   │     Every tick (50ms)    │           ║      SERVER         ║
+   └────────────┬─────────────┘           ║                     ║
+                │                         ║                     ║
+                │  C →  C03/C04/C05/C06   ║                     ║
+                ├────────────────────────→║  Position/rotation  ║
+                │                         ║                     ║
+                │  S →  S12 (knockback)   ║                     ║
+                │←────────────────────────╣  Velocity change    ║
+                │                         ║                     ║
+                │  S →  S08 (correction)  ║                     ║
+                │←────────────────────────╣  Anti-cheat setback ║
+                │                         ║                     ║
+   ┌────────────┴─────────────┐           ║                     ║
+   │      On player input     │           ║                     ║
+   └────────────┬─────────────┘           ║                     ║
+                │                         ║                     ║
+                │ Left-click on entity:   ║                     ║
+                │  C →  C02 (ATTACK)      ║                     ║
+                ├────────────────────────→║                     ║
+                │                         ║                     ║
+                │ Left-click on block:    ║                     ║
+                │  C →  C07 START_DESTROY ║                     ║
+                ├────────────────────────→║                     ║
+                │                         ║                     ║
+                │ Mining continues...     ║                     ║
+                │  C →  C07 STOP_DESTROY  ║                     ║
+                │       when done         ║                     ║
+                ├────────────────────────→║                     ║
+                │                         ║                     ║
+                │ Right-click block:      ║                     ║
+                │  C →  C08 (placement)   ║                     ║
+                ├────────────────────────→║                     ║
+                │                         ║                     ║
+                │ Right-click air:        ║                     ║
+                │  C →  C08 (sentinel)    ║                     ║
+                ├────────────────────────→║                     ║
+                │                         ║                     ║
+                │ Inventory click:        ║                     ║
+                │  C →  C0E ClickWindow   ║                     ║
+                ├────────────────────────→║                     ║
+                │                         ║                     ║
+                │  S →  S2F SetSlot       ║                     ║
+                │←────────────────────────╣                     ║
+                │  S →  S32 Confirm       ║                     ║
+                │←────────────────────────╣                     ║
+                │                         ║                     ║
+                │ Animation:              ║                     ║
+                │  C →  C0A (arm swing)   ║                     ║
+                ├────────────────────────→║                     ║
+                │                         ║                     ║
+   ┌────────────┴─────────────┐           ║                     ║
+   │       Continuously       │           ║                     ║
+   └────────────┬─────────────┘           ║                     ║
+                │                         ║                     ║
+                │  S →  S00 KeepAlive id  ║                     ║
+                │←────────────────────────╣  Every 20 seconds   ║
+                │  C →  C00 KeepAlive id  ║                     ║
+                ├────────────────────────→║                     ║
+                │                         ║                     ║
+                │  S →  S14/S15/S16/S17   ║                     ║
+                │←────────────────────────╣  Other entities     ║
+                │  S →  S18 (teleport     ║   moved             ║
+                │       if large delta)   ║                     ║
+                │                         ║                     ║
+                │  S →  S23/S22           ║                     ║
+                │←────────────────────────╣  Block updates      ║
+                │                         ║                     ║
+                │  S →  S26 (chunk bulk)  ║                     ║
+                │←────────────────────────╣  New chunks loaded  ║
+                │  S →  S21 (single)      ║                     ║
+                │←────────────────────────╣                     ║
+                ▼                         ╚═════════════════════╝
+```
+
+The teaching point: the client is mostly a thin shell that mirrors server state and predicts a little ahead. Almost every meaningful action you take (breaking a block, hitting a player, opening a chest, swapping a slot) results in a packet whose response you must believe even when it contradicts what your client thought happened. This is why a server can "rubber-band" your position with S08 and your client must teleport back — the server is the source of truth.
+
+---
+
+## 5. The C03PacketPlayer family — choosing which subclass to send
+
+Every tick `EntityPlayerSP.onUpdateWalkingPlayer()` decides which of four position packets to send. The decision tree:
+
+```
+   onUpdateWalkingPlayer() — runs once per tick, ~20 Hz
+
+         ┌──────────────────────────────────────────┐
+         │  Compute delta from last reported state: │
+         │                                          │
+         │    dx     = posX - lastReportedPosX      │
+         │    dy     = bb.minY - lastReportedPosY   │
+         │    dz     = posZ - lastReportedPosZ      │
+         │    dyaw   = yaw   - lastReportedYaw      │
+         │    dpitch = pitch - lastReportedPitch    │
+         │                                          │
+         │    moved   = (dx²+dy²+dz² > 9.0E-4)      │
+         │            ││ (positionUpdateTicks ≥ 20) │
+         │    rotated = (dyaw ≠ 0 ││ dpitch ≠ 0)    │
+         └────────────────────┬─────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+              ▼               ▼               ▼
+        moved=true       moved=true       moved=false
+        rotated=true     rotated=false    rotated=true
+              │               │               │
+              ▼               ▼               ▼
+       C06PosLook       C04Position      C05Look
+       (x,y,z,yaw,      (x,y,z,         (yaw,pitch,
+        pitch,onGr)      onGr)           onGr)
+                              │
+                              │
+                              ▼
+                    moved=false, rotated=false
+                              │
+                              ▼
+                       C03Player(onGround)
+                       (the "still here" ping)
+
+
+   Even when idle, every 20 ticks (1 second) positionUpdateTicks
+   forces moved=true so a full position is re-sent.
+
+   When riding (ridingEntity != null), the rules change:
+     - Send C06 with x=motionX, y=-999.0, z=motionZ as a sentinel
+     - Always treat this as "no position update" for delta tracking
+```
+
+The teaching point: there is no single "send position" packet — there are four, and which one goes out depends on what changed. The shared base `C03PacketPlayer` carries only `onGround`; subclasses add fields. The Y coordinate sent is always `boundingBox.minY` (your feet), never `posY`. The 9.0E-4 threshold corresponds to a 0.03-block radius — moves smaller than that are treated as "not moving" and won't trigger a C04 unless the 20-tick forcing fires.
+
+---
+
+## 6. Sending a packet — the call graph
+
+This is the path a packet takes from the moment your code constructs it to the moment Netty hands the bytes to the OS socket.
+
+```
+   Your code calls one of:
+
+        mc.thePlayer.sendQueue.addToSendQueue(packet)
+        mc.getNetHandler().addToSendQueue(packet)
+                          │
+                          ▼
+        ┌─────────────────────────────────┐
+        │   NetHandlerPlayClient          │
+        │     .addToSendQueue(Packet p)   │
+        └─────────────────┬───────────────┘
+                          │
+                          ▼
+        ┌─────────────────────────────────┐
+        │   NetworkManager                │
+        │     .sendPacket(Packet p)       │
+        └─────────────────┬───────────────┘
+                          │
+              ┌───────────┴───────────┐
+              │ Channel in event-     │
+              │ loop thread?          │
+              └───────────┬───────────┘
+                          │
+                ┌─────────┴─────────┐
+                │                   │
+              YES                  NO
+                │                   │
+                ▼                   ▼
+     dispatchPacket(p, null)   queue into
+                │              outboundPacketsQueue,
+                │              schedule flushOutboundQueue()
+                │              on event loop, return
+                ▼
+        ┌─────────────────────────────────┐
+        │   Netty pipeline:               │
+        │                                 │
+        │   PacketEncoder.encode()        │
+        │     ↓                           │
+        │   ByteBuf with VarInt ID +      │
+        │   p.writePacketData(buffer)     │
+        │     ↓                           │
+        │   NettyCompressionEncoder       │
+        │   (if compression enabled)      │
+        │     ↓                           │
+        │   NettyVarint21FrameEncoder     │
+        │   (prepends length VarInt)      │
+        │     ↓                           │
+        │   socket write                  │
+        └─────────────────────────────────┘
+```
+
+The teaching point: `sendPacket` is thread-safe — you can call it from any thread. If you're not on the Netty event loop, the manager queues your packet and schedules a flush. Don't try to be clever with threading; just call `addToSendQueue` from wherever you are.
+
+---
+
+## 7. Receiving a packet — the call graph and the thread hand-off
+
+Inbound is more interesting because it involves a thread switch. The Netty thread reads bytes; the main game thread does the work. The mechanism is `PacketThreadUtil.checkThreadAndEnqueue`:
+
+```
+   ┌───────────────────────────────────────────────────────┐
+   │   Netty I/O thread                                    │
+   │                                                       │
+   │   Bytes arrive on socket                              │
+   │              │                                        │
+   │              ▼                                        │
+   │   NettyVarint21FrameDecoder reads length VarInt       │
+   │              │                                        │
+   │              ▼                                        │
+   │   NettyCompressionDecoder (if compressed)             │
+   │              │                                        │
+   │              ▼                                        │
+   │   PacketDecoder.decode() reads packet ID VarInt,      │
+   │   looks up class in EnumConnectionState's registry,   │
+   │   instantiates packet, calls readPacketData(buffer)   │
+   │              │                                        │
+   │              ▼                                        │
+   │   NetworkManager.channelRead0(ctx, packet)            │
+   │              │                                        │
+   │              ▼                                        │
+   │   packet.processPacket(netHandler)                    │
+   │              │                                        │
+   │              ▼                                        │
+   │   netHandler.handleXxx(packet) called                 │
+   │              │                                        │
+   │              ▼                                        │
+   │   First line of handleXxx is usually:                 │
+   │     PacketThreadUtil.checkThreadAndEnqueue(           │
+   │         this, packet, mc);                            │
+   │              │                                        │
+   │              ▼                                        │
+   │   If we're NOT on the Minecraft thread:               │
+   │     - Schedule a Runnable on mc that will             │
+   │       re-call handleXxx(packet)                       │
+   │     - Throw ThreadQuickExitException                  │
+   │     - Netty thread unwinds and is done                │
+   │                                                       │
+   └───────────────────────┬───────────────────────────────┘
+                           │
+                           │  Runnable enqueued on
+                           │  Minecraft thread's
+                           │  scheduledTasks queue
+                           ▼
+   ┌───────────────────────────────────────────────────────┐
+   │   Minecraft main thread (inside Minecraft.runTick)    │
+   │                                                       │
+   │   Calls mc.scheduledTasks polling loop                │
+   │              │                                        │
+   │              ▼                                        │
+   │   Runnable fires → handleXxx(packet) called AGAIN     │
+   │              │                                        │
+   │              ▼                                        │
+   │   This time checkThreadAndEnqueue is a no-op,         │
+   │   so handleXxx proceeds past it                       │
+   │              │                                        │
+   │              ▼                                        │
+   │   handleXxx mutates mc.theWorld, mc.thePlayer,        │
+   │   spawns entities, processes inventory, ...           │
+   │   (safe — we're on the main thread)                   │
+   └───────────────────────────────────────────────────────┘
+```
+
+The teaching point: every `handleXxx` method is *called twice* — first on the Netty thread (where it bails out immediately) and then on the main thread (where it does real work). When you read a handler's body, you can assume the world and player are safe to touch.
+
+If you ever need to do work on the main thread from elsewhere (a custom thread, a callback, anything), use `mc.addScheduledTask(Runnable)`. Never just touch `mc.theWorld` from a thread you don't control.
+
+---
+
+## 8. The Minecraft.runTick / render loop
+
+The outer loop drives everything. `runGameLoop` runs as fast as the FPS allows. Inside it, `runTick` runs at 20 Hz (more if behind), and rendering runs at FPS Hz with `partialTicks` interpolation between the most recent two ticks.
+
+```
+   Minecraft.run() — called once at startup
+            │
+            ▼
+   Minecraft.runGameLoop() — loops until shutdown
+   ┌───────────────────────────────────────────────────────┐
+   │                                                       │
+   │   while (running) {                                   │
+   │                                                       │
+   │     timer.updateTimer()                               │
+   │     ┌────────────────────────────────────────────┐    │
+   │     │ Computes how many full ticks (50ms slices) │    │
+   │     │ have elapsed since the last frame, AND     │    │
+   │     │ how far into the next tick we are          │    │
+   │     │ (partialTicks ∈ [0.0, 1.0))                │    │
+   │     └────────────────────────────────────────────┘    │
+   │                                                       │
+   │     for (int i = 0; i < timer.elapsedTicks; i++) {    │
+   │       runTick()    ← THE GAME-LOGIC TICK              │
+   │     }                                                 │
+   │                                                       │
+   │     entityRenderer.updateCameraAndRender(             │
+   │       timer.renderPartialTicks, systemTime)           │
+   │                                                       │
+   │     updateDisplay()    ← swap buffers + LWJGL poll    │
+   │                                                       │
+   │     // FPS limiting, vsync                            │
+   │   }                                                   │
+   └───────────────────────────────────────────────────────┘
+```
+
+What happens inside `runTick`:
+
+```
+   Minecraft.runTick()
+            │
+            ▼
+   ┌───────────────────────────────────────────────────────┐
+   │                                                       │
+   │  1. Process scheduledTasks queue (drain Runnables)    │
+   │                                                       │
+   │  2. ingameGUI.updateTick()       (chat fade, etc.)    │
+   │                                                       │
+   │  3. entityRenderer.getMouseOver(1.0F)                 │
+   │      ┌──────────────────────────────────────┐         │
+   │      │ Raycast from camera, results stored: │         │
+   │      │   mc.objectMouseOver (MovingObjPos)  │         │
+   │      │   entityRenderer.pointedEntity       │         │
+   │      └──────────────────────────────────────┘         │
+   │                                                       │
+   │  4. dispatchKeypresses()         (process key queue)  │
+   │     handleMouseInput()                                │
+   │     handleKeyboardInput()                             │
+   │                                                       │
+   │     ┌─────────────────────────────────────────┐       │
+   │     │ Within keyboard/mouse handling:         │       │
+   │     │  - leftClick → clickMouse()             │       │
+   │     │     → playerController.clickBlock()     │       │
+   │     │       or attackTargetEntityWithItem()   │       │
+   │     │  - rightClick → rightClickMouse()       │       │
+   │     │     → playerController.onPlayerRight…   │       │
+   │     │       or sendUseItem()                  │       │
+   │     │  - middle → middleClickMouse()          │       │
+   │     └─────────────────────────────────────────┘       │
+   │                                                       │
+   │  5. if (theWorld != null) {                           │
+   │       playerController.updateController()             │
+   │         ┌─────────────────────────────────────┐       │
+   │         │ Drives block-breaking progress:     │       │
+   │         │   - calls onPlayerDamageBlock per   │       │
+   │         │     tick while LMB held             │       │
+   │         │   - sends C0A swing animation       │       │
+   │         │   - sends C07 STOP_DESTROY when     │       │
+   │         │     curBlockDamageMP ≥ 1.0          │       │
+   │         └─────────────────────────────────────┘       │
+   │                                                       │
+   │       myNetworkManager.processReceivedPackets()       │
+   │         (drains any inbound packets queued by Netty)  │
+   │                                                       │
+   │       theWorld.tick()                                 │
+   │       theWorld.updateEntities()                       │
+   │         ┌─────────────────────────────────────┐       │
+   │         │ For each entity:                    │       │
+   │         │   theWorld.updateEntity(e)          │       │
+   │         │     → e.onUpdate()                  │       │
+   │         │       → e.onEntityUpdate()          │       │
+   │         │       → (for living) onLivingUpdate │       │
+   │         │       → (for player) updateEntity-  │       │
+   │         │         ActionState +               │       │
+   │         │         onUpdateWalkingPlayer       │       │
+   │         └─────────────────────────────────────┘       │
+   │     }                                                 │
+   │                                                       │
+   │  6. soundHandler.update()                             │
+   │  7. musicTicker.update()                              │
+   │  8. ... (stats, achievements, snooper, etc.)          │
+   └───────────────────────────────────────────────────────┘
+```
+
+What happens inside `updateCameraAndRender`:
+
+```
+   EntityRenderer.updateCameraAndRender(partialTicks, nanoTime)
+            │
+            ▼
+   ┌───────────────────────────────────────────────────────┐
+   │                                                       │
+   │  if (mc.theWorld != null && mc.getRenderViewEntity() != null) {
+   │    renderWorld(partialTicks, finishTimeNano)          │
+   │      ┌─────────────────────────────────────┐          │
+   │      │ For each stereoscopic pass (0..N):  │          │
+   │      │   renderWorldPass(pass, partial, …) │          │
+   │      │     ├ updateLightmap()              │          │
+   │      │     ├ setupCameraTransform()        │          │
+   │      │     ├ renderGlobal.setupTerrain()   │          │
+   │      │     ├ renderGlobal.renderEntities() │          │
+   │      │     ├ for each block layer:         │          │
+   │      │     │   renderGlobal.renderBlockLayer(SOLID),  │
+   │      │     │                              (CUTOUT_MIPPED),
+   │      │     │                              (CUTOUT),   │
+   │      │     │                              (TRANSLUCENT)
+   │      │     ├ renderHand()                 │          │
+   │      │     └ renderRainSnow()             │          │
+   │      └─────────────────────────────────────┘          │
+   │  }                                                    │
+   │                                                       │
+   │  setupOverlayRendering()        ← switches to 2D      │
+   │                                                       │
+   │  if (mc.currentScreen != null) {                      │
+   │    currentScreen.drawScreen(mouseX, mouseY, partial)  │
+   │  } else if (mc.theWorld != null) {                    │
+   │    ingameGUI.renderGameOverlay(partial)               │
+   │      ├ renderTooltip (selected hotbar item)           │
+   │      ├ renderExpBar                                   │
+   │      ├ renderPlayerStats (hearts, hunger, armor)      │
+   │      ├ renderHorseJumpBar (if riding horse)           │
+   │      ├ renderChat                                     │
+   │      ├ renderBossHealth                               │
+   │      ├ renderScoreboard                               │
+   │      └ renderTitle                                    │
+   │  }                                                    │
+   └───────────────────────────────────────────────────────┘
+```
+
+The teaching point: tick-rate work goes in `runTick` paths, render-rate work goes in `updateCameraAndRender` paths. The two are decoupled — the game can render 200 FPS while still only ticking 20 times per second. `partialTicks` is the glue: between ticks N and N+1, render-rate code interpolates `prevPosX + (posX - prevPosX) * partialTicks` to make motion smooth.
+
+---
+
+## 9. The block-breaking pipeline (left-click → server confirmation)
+
+This is the most complex of the input pipelines because it spans many ticks. Watch the state machine in `PlayerControllerMP`:
+
+```
+   Tick 0: Player presses LMB while pointing at a block
+            │
+            ▼
+   Minecraft.clickMouse()
+            │
+            ▼
+   playerController.clickBlock(pos, sideHit)
+   ┌───────────────────────────────────────────────────┐
+   │ Records: currentBlock = pos                       │
+   │          curBlockDamageMP = 0.0                   │
+   │          isHittingBlock = true                    │
+   │ Sends:   C07PacketPlayerDigging(                  │
+   │            START_DESTROY_BLOCK, pos, sideHit)     │
+   │ Sends:   C0APacketAnimation()    (arm swing)      │
+   │                                                   │
+   │ If creative mode: also calls onPlayerDestroyBlock │
+   │ and the block disappears immediately.             │
+   └───────────────────────────────────────────────────┘
+
+   Tick 1..N: Player still holding LMB on same block
+
+            │
+            ▼
+   playerController.onPlayerDamageBlock(pos, side)
+   ┌───────────────────────────────────────────────────┐
+   │ Increments curBlockDamageMP by the per-tick rate  │
+   │ (depends on item, enchants, haste, water, ...)    │
+   │                                                   │
+   │ Every 4 ticks (stepSoundTickCounter): play hit    │
+   │ sound, send C0APacketAnimation                    │
+   │                                                   │
+   │ Block break-progress 0-9 is sent to the server    │
+   │ via S25PacketBlockBreakAnim — but the SERVER      │
+   │ tracks its own progress and the client's value    │
+   │ is mostly visual.                                 │
+   └───────────────────────┬───────────────────────────┘
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+              ▼                         ▼
+       curBlockDamageMP < 1.0    curBlockDamageMP ≥ 1.0
+              │                         │
+              │ (loop next tick)        ▼
+              │                  onPlayerDestroyBlock()
+              │                  ┌────────────────────────────┐
+              │                  │ Sends: C07 STOP_DESTROY    │
+              │                  │ Sets:  isHittingBlock=false│
+              │                  │        curBlockDamageMP=0  │
+              │                  │ Locally: world.setBlockTo- │
+              │                  │   Air(pos) for prediction  │
+              │                  │                            │
+              │                  │ Block actually gets removed│
+              │                  │ when S23PacketBlockChange  │
+              │                  │ arrives from server.       │
+              │                  └────────────────────────────┘
+              ▼
+   Player releases LMB or aims elsewhere
+            │
+            ▼
+   playerController.resetBlockRemoving()
+   ┌───────────────────────────────────────────────────┐
+   │ Sends: C07 ABORT_DESTROY_BLOCK                    │
+   │ Resets: isHittingBlock=false, curBlockDamageMP=0  │
+   └───────────────────────────────────────────────────┘
+```
+
+The teaching point: block-breaking is not a single event. It's a state machine driven by ticks, with three C07 packet sub-types marking the start, abort, and completion. The server validates everything — the client's `setBlockToAir` is just a visual prediction, and the real removal happens when S23 confirms it.
+
+---
+
+## 10. The inventory click pipeline
+
+Every click in an inventory GUI follows the same path, regardless of which container is open.
+
+```
+   Player clicks slot in any GuiContainer
+
+                   │
+                   ▼
+   GuiContainer.mouseClicked(x, y, button)
+                   │
+                   ▼
+   GuiContainer.handleMouseClick(slot, slotId, button, mode)
+                   │
+                   │   mode meaning:
+                   │     0 = normal click
+                   │     1 = shift-click
+                   │     2 = hotbar key (numbers 0–8)
+                   │     3 = middle-click (creative pick)
+                   │     4 = drop (Q key, etc.)
+                   │     5 = drag (split/distribute)
+                   │     6 = double-click (collect all)
+                   │
+                   ▼
+   playerController.windowClick(windowId, slotId, button, mode, player)
+                   │
+                   ▼
+   ┌──────────────────────────────────────────────────────┐
+   │ 1. Generate a fresh transaction short via            │
+   │    container.getNextTransactionID(inventory)         │
+   │                                                      │
+   │ 2. Call container.slotClick(slotId, button, mode,    │
+   │    player) to apply the click LOCALLY                │
+   │                                                      │
+   │ 3. Send C0EPacketClickWindow(windowId, slotId,       │
+   │    button, mode, slotStackAfterClick, transactionId) │
+   └──────────────────────────────────────────────────────┘
+                   │
+                   ▼ ...server processes the click...
+                   │
+            ┌──────┴───────────┐
+            │                  │
+            ▼                  ▼
+   Server accepts        Server rejects
+            │                  │
+            ▼                  ▼
+   S32 ConfirmTrans-   S32 ConfirmTrans-
+   action(accept=true) action(accept=false)
+            │                  │
+            ▼                  ▼
+   handleConfirm-      handleConfirm-
+   Transaction reads   Transaction sees
+   accept=true,        accept=false, REVERTS
+   nothing to do       client state by re-applying
+                       opposite, then sends a
+                       C0FPacketConfirmTransaction
+                       to acknowledge
+
+   Independently, on big changes the server sends:
+     S2F SetSlot(slotId, stack)   — single slot fix
+     S30 WindowItems(stacks[])    — full re-sync
+```
+
+The teaching point: the client *predicts* every inventory click and the server *confirms or rolls back*. If the server is laggy or there's a desync, you may briefly see a wrong slot before S2F fixes it. The transaction ID system is what lets the server identify which specific click it's confirming.
+
+---
+
+## 11. The collision pipeline
+
+When you call `entity.moveEntity(dx, dy, dz)`, this is what happens. Understanding this is essential for anything related to movement, AABB queries, or step-up.
+
+```
+   Entity.moveEntity(dx, dy, dz)
+            │
+            ▼
+   ┌────────────────────────────────────────────────────────┐
+   │                                                        │
+   │  1. Save the original dx, dy, dz for sneak detection   │
+   │                                                        │
+   │  2. Sneak-edge logic (player only, on the ground):     │
+   │     Probe forward and sideways with                    │
+   │     world.getCollisionBoxes(bb.offset(dx,-1,dz))       │
+   │     Iteratively shrink dx, dz until you can't fall off │
+   │     ┌────────────────────────────────────────────┐     │
+   │     │ This is the "sneak doesn't let you fall    │     │
+   │     │ off the edge" feature. It works by         │     │
+   │     │ repeatedly checking whether the next       │     │
+   │     │ position would have ground below it; if    │     │
+   │     │ not, dx (or dz) is set to 0.               │     │
+   │     └────────────────────────────────────────────┘     │
+   │                                                        │
+   │  3. Query collision boxes intersecting the swept AABB: │
+   │     List<AxisAlignedBB> boxes =                        │
+   │       world.getCollidingBoundingBoxes(                 │
+   │         this, this.bb.addCoord(dx, dy, dz))            │
+   │                                                        │
+   │  4. Resolve Y first (gravity & ceiling):               │
+   │     for (AABB other : boxes)                           │
+   │       dy = other.calculateYOffset(this.bb, dy);        │
+   │     this.bb = this.bb.offset(0, dy, 0);                │
+   │     if (dy was reduced)                                │
+   │       (we hit a floor or ceiling — onGround if dy<0)   │
+   │                                                        │
+   │  5. Resolve X:                                         │
+   │     for (AABB other : boxes)                           │
+   │       dx = other.calculateXOffset(this.bb, dx);        │
+   │     this.bb = this.bb.offset(dx, 0, 0);                │
+   │                                                        │
+   │  6. Resolve Z:                                         │
+   │     for (AABB other : boxes)                           │
+   │       dz = other.calculateZOffset(this.bb, dz);        │
+   │     this.bb = this.bb.offset(0, 0, dz);                │
+   │                                                        │
+   │  7. Step-up handling (if we hit a wall horizontally    │
+   │     AND there's a block ≤ stepHeight tall in the way): │
+   │     Try the move again at higher Y. If it works,       │
+   │     accept the higher result. Otherwise revert.        │
+   │     ┌────────────────────────────────────────────┐     │
+   │     │ This is why you "auto-step" up 0.5–0.6     │     │
+   │     │ block stairs without jumping. stepHeight   │     │
+   │     │ is 0.6 for the player, 1.0 for horses.     │     │
+   │     └────────────────────────────────────────────┘     │
+   │                                                        │
+   │  8. Update fields:                                     │
+   │     posX, posY, posZ ← bb center / minY                │
+   │     isCollidedHorizontally ← (dx or dz reduced)        │
+   │     isCollidedVertically ← (dy reduced)                │
+   │     isCollided ← either of the above                   │
+   │     onGround ← (dy reduced AND original dy ≤ 0)        │
+   │     fallDistance accumulates                           │
+   │     doBlockCollisions() — fire onEntityCollidedWithBlock│
+   └────────────────────────────────────────────────────────┘
+```
+
+The teaching point: collision resolution is axis-separated. Y is resolved first (so you land on a floor before checking horizontal motion), then X, then Z. Each axis uses the relevant `calculateXOffset` / `calculateYOffset` / `calculateZOffset` helper on `AxisAlignedBB`. Step-up is a fallback that retries the failed horizontal move at a higher Y.
+
+A subtle consequence: an entity's `onGround` state is set *during* `moveEntity`, not on a separate query. So if you read `entity.onGround` immediately after assigning motion but before calling `moveEntity`, you get last tick's value.
+
+---
+
+## 12. The raytrace pipeline (getMouseOver / objectMouseOver)
+
+Every tick, the crosshair re-raytraces the world to figure out what you're pointing at. This populates `mc.objectMouseOver` (a `MovingObjectPosition`) and `entityRenderer.pointedEntity`.
+
+```
+   EntityRenderer.getMouseOver(float partialTicks)
+            │
+            ▼
+   ┌────────────────────────────────────────────────────────┐
+   │                                                        │
+   │  Entity viewEntity = mc.getRenderViewEntity();         │
+   │  Vec3 eyes = viewEntity.getPositionEyes(partialTicks); │
+   │  Vec3 look = viewEntity.getLook(partialTicks);         │
+   │  double reach = playerController.getBlockReachDistance(│
+   │                  ); // 5.0 surv, 6.0 creat             │
+   │  Vec3 endPoint = eyes.addVector(look.x*reach,          │
+   │                                  look.y*reach,         │
+   │                                  look.z*reach);        │
+   │                                                        │
+   │  // Block ray-trace:                                   │
+   │  mc.objectMouseOver = theWorld.rayTraceBlocks(         │
+   │      eyes, endPoint, false, false, true);              │
+   │                                                        │
+   │  // Now look for an entity in front of that block.     │
+   │  // Build an AABB containing the line eyes→endPoint    │
+   │  // and query every entity intersecting it.            │
+   │  AxisAlignedBB sweep = viewEntity.getEntityBoundingBox │
+   │      ().addCoord(look.x*reach,                         │
+   │                  look.y*reach,                         │
+   │                  look.z*reach).expand(1,1,1);          │
+   │                                                        │
+   │  List<Entity> candidates = theWorld.getEntitiesIn-     │
+   │      AABBexcluding(viewEntity, sweep, predicate);      │
+   │                                                        │
+   │  // For each candidate, expand its bb by its           │
+   │  // collisionBorderSize and call calculateIntercept    │
+   │  // on the eyes→endPoint line.                         │
+   │                                                        │
+   │  // Pick the closest hit that's also closer than       │
+   │  // the block hit (if any).                            │
+   │                                                        │
+   │  // If an entity was hit, replace objectMouseOver      │
+   │  // with a MovingObjectPosition built from that entity │
+   │  // (and set pointedEntity).                           │
+   │                                                        │
+   └────────────────────────────────────────────────────────┘
+
+   After getMouseOver, mc.objectMouseOver is one of:
+     - typeOfHit = MISS     → nothing in range
+     - typeOfHit = BLOCK    → blockPos and sideHit are valid
+     - typeOfHit = ENTITY   → entityHit is valid; hitVec is the
+                              point on the entity's hitbox that
+                              was hit
+```
+
+The teaching point: this method is the bridge between "where the camera is pointing" and "what game object is the player about to interact with". Every left-click and right-click reads `objectMouseOver` to decide what to do. The raytrace is cheap — it's done every tick. You can call `entityRenderer.getMouseOver(1.0F)` at any time to force a re-raytrace.
+
+`World.rayTraceBlocks` has three overloads — the 5-arg version is what's used here. The `stopOnLiquid` parameter controls whether to stop on water/lava; the `ignoreBlockWithoutBoundingBox` flag affects how non-cube blocks (signs, torches) are handled; the `returnLastUncollidableBlock` flag is used to fall back to the last partially-collided block if nothing else hits.
+
+---
+
+## 13. Coordinate system
+
+```
+                    ↑ +Y (up)
+                    │
+                    │
+                    │
+                    │     ↗ -Z (north)
+                    │   ↗
+                    │ ↗
+   -X (east) ←──────●──────→ +X (west)
+                  ↙ │
+                ↙   │
+              ↙     │
+            +Z      │
+        (south)     ↓ -Y (down)
+                    
+   Wait — let me redraw that correctly:
+
+                    ↑ +Y (up)
+                    │
+                    │   ↗ +X (east, sunrise side)
+                    │ ↗
+                    ●─────────→ ... (this gets messy in 2D)
+                  ↙
+                ↙
+              +Z (south)
+```
+
+A cleaner coordinate reference, as text:
+
+```
+   Axes:
+     +X = east   (toward sunrise)
+     -X = west
+     +Y = up
+     -Y = down
+     +Z = south
+     -Z = north  (toward sunset / "north" by compass)
+
+   Yaw (rotationYaw):
+     0°    or  ±360°  →  facing +Z  (south)
+     90°               →  facing -X  (west)
+     180°  or -180°    →  facing -Z  (north)
+     -90°  or 270°     →  facing +X  (east)
+     Yaw INCREASES clockwise when looking down at the player.
+
+   Pitch (rotationPitch):
+     -90°  →  looking straight up
+       0°  →  looking at horizon
+     +90°  →  looking straight down
+
+   The "look vector" from getLook(partialTicks) is computed as:
+     pitch_rad = pitch * π / 180
+     yaw_rad   = -yaw  * π / 180 - π
+     x =  sin(yaw_rad) * -cos(pitch_rad)
+     y =  -sin(pitch_rad)
+     z =  cos(yaw_rad) * -cos(pitch_rad)
+
+   The boundingBox is anchored differently from posX/posY/posZ:
+     posX, posZ   = horizontal center of entity
+     posY         = bottom of entity hitbox (== bb.minY for most)
+     bb.minX      = posX - width/2
+     bb.maxX      = posX + width/2
+     bb.minY      = posY                    ← what C03/C04/C06 sends
+     bb.maxY      = posY + height
+     bb.minZ      = posZ - width/2
+     bb.maxZ      = posZ + width/2
+
+   Eye position (used for raytracing):
+     eyeX = posX
+     eyeY = posY + getEyeHeight()    // 1.62 for player standing
+     eyeZ = posZ
+```
+
+The teaching point: yaw 0 points south, not north. This trips people up constantly. Also: the wire protocol always sends `bb.minY`, never `posY`, even though for most entities they're equal — the safe habit is to use `getEntityBoundingBox().minY` when building position packets.
+
+---
+
+## 14. Friction and movement constants
+
+```
+   Per-tick velocity decay in EntityLivingBase.moveEntityWithHeading:
+
+   ┌─────────────────────────────────────────────────────────────┐
+   │                                                             │
+   │   On land (most of the time):                               │
+   │     motionX *= 0.91 * groundBlock.slipperiness              │
+   │     motionZ *= 0.91 * groundBlock.slipperiness              │
+   │     motionY = (motionY - 0.08) * 0.98     ← gravity         │
+   │                                                             │
+   │     groundBlock.slipperiness defaults:                      │
+   │       most blocks ............ 0.6                          │
+   │       slime block ............ 0.8                          │
+   │       ice / packed ice ....... 0.98                         │
+   │       blue ice (1.13+, n/a 1.8)                             │
+   │                                                             │
+   │     So normal ground friction is 0.91 * 0.6 = 0.546         │
+   │     Ice friction is             0.91 * 0.98 = 0.8918        │
+   │                                                             │
+   │   In air (off ground):                                      │
+   │     motionX *= 0.91                                         │
+   │     motionZ *= 0.91                                         │
+   │     motionY = (motionY - 0.08) * 0.98                       │
+   │                                                             │
+   │   In water:                                                 │
+   │     motionX, Z, Y *= 0.8 (or 0.8 + adjustments for depth-   │
+   │                          strider enchant up to 0.96)        │
+   │     motionY -= 0.02 (lower gravity in water)                │
+   │                                                             │
+   │   In lava:                                                  │
+   │     motionX, Y, Z *= 0.5                                    │
+   │                                                             │
+   │   moveFlying(strafe, forward, friction):                    │
+   │     float dist² = strafe² + forward²                        │
+   │     if (dist² < 0.0001) return     // no input              │
+   │     normalize, scale by friction                            │
+   │     yaw_rad = rotationYaw * π/180                           │
+   │     motionX += -sin(yaw_rad) * normalizedStrafe             │
+   │                + cos(yaw_rad) * normalizedForward           │
+   │     motionZ +=  cos(yaw_rad) * normalizedStrafe             │
+   │                + sin(yaw_rad) * normalizedForward           │
+   │                                                             │
+   │   The friction passed to moveFlying:                        │
+   │     On ground: 0.1 * (0.16277136 / (groundFric)³)           │
+   │       = "ground acceleration"; with slipperiness=0.6 this   │
+   │       evaluates to about 0.1 — the magic walk speed         │
+   │     In air:    0.02 (set as jumpMovementFactor)             │
+   │     In water:  0.02 (×depth-strider modifier)               │
+   │                                                             │
+   └─────────────────────────────────────────────────────────────┘
+
+   Vertical:
+     Base jump impulse:  motionY = 0.42  (getJumpUpwardsMotion)
+     Jump-boost potion:  motionY += (amplifier + 1) * 0.1
+     Sprint-jump adds horizontal motion:
+       motionX -= sin(yaw) * 0.2
+       motionZ += cos(yaw) * 0.2
+     Gravity:            motionY -= 0.08
+     Air drag on Y:      motionY *= 0.98
+
+   Terminal velocities (approx, after gravity converges):
+     Free-fall:  ≈ -3.92 blocks/tick (≈ -78.4 m/s)
+                 capped by S12 anyway at 3.9
+```
+
+The teaching point: friction is multiplicative each tick, and the value depends on what you're standing on. The 0.91 ground constant and the 0.6 default slipperiness produce the familiar ~0.546 horizontal decay per tick. Ice's 0.98 slipperiness produces the slippery feel you know from gameplay.
+
+---
+
+## 15. The ItemStack ⇄ container ⇄ slot relationship
+
+```
+                     IInventory (interface)
+                    "I am a backing store for stacks"
+                    ┌────────────────────────────┐
+                    │ getStackInSlot(int)        │
+                    │ setInventorySlotContents() │
+                    │ decrStackSize()            │
+                    │ getSizeInventory()         │
+                    │ markDirty()                │
+                    └─────────────┬──────────────┘
+                                  │
+            ┌─────────────────────┼─────────────────────┐
+            │                     │                     │
+            ▼                     ▼                     ▼
+     InventoryPlayer       TileEntityChest      InventoryBasic
+     (40 slots:           (27 slots)            (used by ender
+      36 main +                                  chest, dispenser
+      4 armor)                                   minecart, etc.)
+            │
+            │ player.inventory
+            │
+            ▼
+   ┌──────────────────────┐
+   │   EntityPlayer       │
+   │     .inventory       │ ← InventoryPlayer
+   │     .inventoryContainer ← ContainerPlayer (the survival
+   │     .openContainer       inventory + 2x2 craft grid)
+   └──────────┬───────────┘
+              │
+              │ When you open a GUI, openContainer changes
+              │ to that GUI's Container subclass:
+              ▼
+   ┌──────────────────────┐
+   │      Container       │
+   │  (e.g. ContainerChest│
+   │   for a chest GUI)   │
+   │                      │
+   │  inventorySlots:     │
+   │    List<Slot>        │
+   │                      │
+   │  Each Slot is a VIEW │
+   │  that maps a (x,y)   │
+   │  GUI position to a   │
+   │  specific (IInventory,│
+   │  index) pair         │
+   └──────────┬───────────┘
+              │
+              ▼ inventorySlots[i]
+   ┌──────────────────────┐
+   │       Slot           │
+   │                      │
+   │  inventory: IInventory   ← the backing store
+   │  index: int              ← index into that store
+   │  xPosition, yPosition    ← where to draw on screen
+   │                      │
+   │  getStack()  → inventory.getStackInSlot(index)
+   │  putStack(s) → inventory.setInventorySlotContents(
+   │                  index, s)                          │
+   └──────────────────────┘
+              │
+              ▼
+       ItemStack instance
+   ┌──────────────────────┐
+   │      ItemStack       │
+   │                      │
+   │  stackSize: int      │
+   │  itemDamage           │
+   │  stackTagCompound:   │ ← optional NBT (enchants,
+   │     NBTTagCompound   │    custom name, display tag,
+   │                      │    cooldown, etc.)
+   │  item: Item          │ ← singleton from registry
+   └──────────────────────┘
+```
+
+The teaching point: a `Slot` is a *view*, not a storage. It just remembers "I'm slot #5 of THAT chest" and forwards reads/writes to the chest's `IInventory`. When you have a `Container` open (e.g. a chest), the same player slot can appear in *two* slots simultaneously — once as part of the chest container (`inventorySlots[27..62]` mapping to `player.inventory`) and conceptually as part of the player's hotbar. The container's `transferStackInSlot(player, slotIndex)` is the shift-click handler that knows which target range to move a stack to.
+
+---
+
+## 16. Where to find what — a quick lookup table
+
+```
+   "I need to..."                  →  "Look in..."
+
+   Get the local player            →  Minecraft.getMinecraft().thePlayer
+   Get the world                   →  mc.theWorld (WorldClient)
+   Get what the crosshair is on    →  mc.objectMouseOver
+   Send a packet                   →  mc.thePlayer.sendQueue.addToSendQueue
+   Check a keybind                 →  mc.gameSettings.keyBind*.isKeyDown()
+   Get the current GUI             →  mc.currentScreen
+   Open a GUI                      →  mc.displayGuiScreen(new MyGui())
+   Get held item                   →  mc.thePlayer.getHeldItem() (ItemStack)
+   Get held slot index             →  mc.thePlayer.inventory.currentItem
+   Change held slot                →  send C09PacketHeldItemChange
+   Get/set block at position       →  mc.theWorld.getBlockState(pos),
+                                       .setBlockState(pos, state)
+   Raycast blocks                  →  mc.theWorld.rayTraceBlocks(start, end)
+   Raycast crosshair               →  mc.entityRenderer.getMouseOver(1.0F)
+   Entities in box                 →  mc.theWorld.getEntitiesWithinAABB(
+                                         Class, AxisAlignedBB)
+   Get player by name              →  mc.theWorld.getPlayerEntityByName()
+   Player attack entity            →  mc.playerController.attackEntity(
+                                         mc.thePlayer, target)
+   Player use item in hand         →  mc.playerController.sendUseItem(
+                                         mc.thePlayer, mc.theWorld, stack)
+   Player right-click block        →  mc.playerController.onPlayerRightClick(
+                                         mc.thePlayer, mc.theWorld, stack,
+                                         pos, side, hitVec)
+   Player break block (creative)   →  PlayerControllerMP.clickBlockCreative
+   Distance to entity              →  e1.getDistanceToEntity(e2)
+   Bounding box of entity          →  e.getEntityBoundingBox()
+   Eye position                    →  e.getPositionEyes(partialTicks)
+   Look vector                     →  e.getLook(partialTicks)
+   Yaw/pitch from delta            →  Math.atan2 + degrees conversion;
+                                       MathHelper.wrapAngleTo180_float
+   Run code on main thread         →  mc.addScheduledTask(Runnable)
+   Send chat                       →  mc.thePlayer.sendChatMessage(String)
+   Show toast/title                →  mc.ingameGUI.displayTitle(...)
+   FontRenderer                    →  mc.fontRendererObj
+   Draw a rectangle                →  Gui.drawRect(...)
+   Draw text                       →  fontRenderer.drawString(...) /
+                                       .drawStringWithShadow(...)
+   Bind a texture                  →  mc.getTextureManager().bindTexture(
+                                         resourceLocation)
+   Get screen size (scaled)        →  new ScaledResolution(mc).get*Width()
+   Math sin/cos (fast)             →  MathHelper.sin/cos (TABLE LOOKUP)
+   sqrt, floor, clamp              →  MathHelper.sqrt_*, floor_*, clamp_*
+   Block by name                   →  Blocks.<name>   or
+                                       Block.getBlockFromName("minecraft:x")
+   Item by name                    →  Items.<name>    or
+                                       Item.getByNameOrId("minecraft:x")
+   Read/write NBT                  →  NBTTagCompound get*/set* methods
+   Get enchantment level on item   →  EnchantmentHelper.getEnchantmentLevel(
+                                         enchId, stack)
+   Check if potion active          →  player.isPotionActive(Potion.x)
+   Add a potion effect             →  player.addPotionEffect(
+                                         new PotionEffect(id, dur, amp))
+```
+
+---
+
+## 17. Mental shortcuts for navigating new code
+
+When you encounter a name in the codebase you don't recognize, the structure usually tells you where it lives:
+
+```
+   Starts with C##   →  Client-to-server packet
+                        net.minecraft.network.play.client.<name>
+
+   Starts with S##   →  Server-to-client packet
+                        net.minecraft.network.play.server.<name>
+
+   Starts with Gui   →  GUI screen or HUD element
+                        net.minecraft.client.gui.* (or subpackages)
+
+   Starts with Container  →  Inventory container
+                             net.minecraft.inventory.*
+
+   Starts with Entity     →  net.minecraft.entity.* (look for the
+                             matching subpackage: monster, passive,
+                             item, projectile, ...)
+
+   Starts with Block      →  net.minecraft.block.*
+
+   Starts with Item       →  net.minecraft.item.*
+
+   Starts with Render     →  net.minecraft.client.renderer.entity.*
+                             (or the entity's own renderer file)
+
+   Starts with Model      →  net.minecraft.client.model.*
+
+   Starts with TileEntity →  net.minecraft.tileentity.*
+
+   Starts with NBT        →  net.minecraft.nbt.*
+
+   Starts with Math/Vec/  →  net.minecraft.util.*
+   BlockPos/AABB/Enum
+   Facing/etc.
+
+   Ends with Packet       →  Look for the packet ID prefix (C##/S##)
+
+   Ends with Handler      →  An INetHandler implementation
+                             (NetHandlerPlayClient, NetHandlerLoginClient)
+
+   Ends with Provider     →  IChunkProvider / ISaveFormat / similar
+```
+
+The teaching point: vanilla naming is consistent enough that you can usually guess a class's location from its name alone. When grepping, prefer the full class name over partial substrings — `EntityPlayerSP` is unique while "Player" matches hundreds of files.
+
+---
+
+## Final note on usage
+
+When pasting this into AI context along with the codebase map, the two files complement each other:
+
+The map (`MCP_1_8_9_CODEBASE_MAP.md`) is the *lexicon* — it tells the AI what symbols exist and what their signatures are. Without it, the AI will invent method names that don't exist or guess wrong parameter orders.
+
+This diagram file is the *grammar* — it tells the AI how those symbols compose. Without it, the AI knows the parts but doesn't know which orders are correct, what's allowed in which thread, or which axis is which.
+
+Used together they let the AI write code that compiles against vanilla, threads correctly, and produces packets the server will accept. A new task description, prepended with both files, should give an AI enough context to write substantive contributions without further searching the codebase.
+

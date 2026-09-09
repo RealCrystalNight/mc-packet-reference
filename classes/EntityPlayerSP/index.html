@@ -53,8 +53,276 @@
     </div>
     <div class="detail-body">
       <div class="detail-section"><h3>Packets Referenced (9)</h3><div class="related-list"><a class="related-chip" href="../../packets/C01PacketChatMessage/">C01PacketChatMessage</a><a class="related-chip" href="../../packets/C03PacketPlayer/">C03PacketPlayer</a><a class="related-chip" href="../../packets/C07PacketPlayerDigging/">C07PacketPlayerDigging</a><a class="related-chip" href="../../packets/C0APacketAnimation/">C0APacketAnimation</a><a class="related-chip" href="../../packets/C0BPacketEntityAction/">C0BPacketEntityAction</a><a class="related-chip" href="../../packets/C0CPacketInput/">C0CPacketInput</a><a class="related-chip" href="../../packets/C0DPacketCloseWindow/">C0DPacketCloseWindow</a><a class="related-chip" href="../../packets/C13PacketPlayerAbilities/">C13PacketPlayerAbilities</a><a class="related-chip" href="../../packets/C16PacketClientStatus/">C16PacketClientStatus</a></div></div>
-      <div class="detail-section"><h3>Related Vanilla Internals</h3><div class="related-list"><a class="related-chip" href="../NetHandlerPlayClient/">NetHandlerPlayClient</a></div></div>
-      <div class="detail-section"><h3>Full Source</h3>
+      <div class="detail-section"><h3>Related Vanilla Internals</h3><div class="related-list"><a class="related-chip" href="../NetHandlerPlayClient/">NetHandlerPlayClient</a><a class="related-chip" href="../Minecraft/">Minecraft</a><a class="related-chip" href="../BlockPos/">BlockPos</a><a class="related-chip" href="../Entity/">Entity</a><a class="related-chip" href="../EntityPlayer/">EntityPlayer</a><a class="related-chip" href="../World/">World</a><a class="related-chip" href="../PlayerControllerMP/">PlayerControllerMP</a></div></div>
+<div class="detail-section"><h3>Deep Analysis</h3><div class="writeup-block">
+<p>Client-side local player (extends AbstractClientPlayer). Predicts movement, health, input each tick. Tick flow: onUpdate (riding vs walk) -&gt; onUpdateWalkingPlayer + onLivingUpdate (sprint, fly, portal). Bridges Minecraft, MovementInput and NetHandlerPlayClient sendQueue for all C packets.</p>
+</div></div>
+<div class="detail-section"><h3>Key Methods — In Depth (9)</h3>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onUpdate</span></div>
+<p class="impl-pattern">Per-tick client update; delegates to walk or riding branch.</p>
+<p class="impl-pattern">onUpdate runs every client tick for the local player and first gates on worldObj.isBlockLoaded at BlockPos(posX, 0, posZ) so no packets are sent from unloaded areas. It calls super.onUpdate first to run entity physics, collision, and position integration before any networking decision. If isRiding is true it takes the vehicle branch and does not call onUpdateWalkingPlayer at all. In the riding branch it queues a C03 C05PacketPlayerLook with current rotationYaw, rotationPitch and onGround every tick because the server drives vehicle position. It also queues a C0CPacketInput with moveStrafing, moveForward, movementInput.jump and movementInput.sneak so the server can steer the ridden horse, boat, pig or minecart. If not riding it delegates to onUpdateWalkingPlayer which owns the on-foot C03 family and C0B throttling. This split prevents double-sending position while riding and explains why ground-spoof and blink cheats hook the on-foot path. The receiver NetHandlerPlayServer validates look and input and applies them to the riding entity rather than the player.</p>
+<pre class="writeup-code"><code>    public void onUpdate()
+    {
+        if (this.worldObj.isBlockLoaded(new BlockPos(this.posX, 0.0D, this.posZ)))
+        {
+            super.onUpdate();
+
+            if (this.isRiding())
+            {
+                this.sendQueue.addToSendQueue(new C03PacketPlayer.C05PacketPlayerLook(this.rotationYaw, this.rotationPitch, this.onGround));
+                this.sendQueue.addToSendQueue(new C0CPacketInput(this.moveStrafing, this.moveForward, this.movementInput.jump, this.movementInput.sneak));
+            }
+            else
+            {
+                this.onUpdateWalkingPlayer();
+            }
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The isBlockLoaded guard stops updates when the player column is unloaded, preventing desync packets from void or unloaded chunks. super.onUpdate runs shared EntityLivingBase physics before networking so sent values reflect the new tick. The isRiding branch constructs C05PacketPlayerLook from live yaw, pitch and onGround, telling the server where the rider looks while the vehicle moves. The next line constructs C0CPacketInput from strafe, forward, jump and sneak, which is the only channel for steering ridden entities. The else calls onUpdateWalkingPlayer for the on-foot C03 and C0B logic, so suppressing either queue call creates a blink-like stall that the server later corrects.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C03_C05</span><span class="related-chip" style="opacity:.65">C0C</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onUpdateWalkingPlayer</span></div>
+<p class="impl-pattern">Sends sprint/sneak deltas and throttled position/look updates.</p>
+<p class="impl-pattern">onUpdateWalkingPlayer compares live isSprinting against cached serverSprintState and live isSneaking against serverSneakState, sending C0BPacketEntityAction START or STOP only on a flip to save bandwidth. It then gates all position traffic on isCurrentViewEntity so only the camera entity transmits, ignoring other render-view switches. It computes d0, d1 from posX and boundingBox.minY minus lastReported, d2 from posZ, and d3, d4 from yaw and pitch deltas. It sets flag2 when squared positional delta exceeds 9.0E-4D or positionUpdateTicks reaches 20, forcing a keep-alive at least once per second. It sets flag3 when yaw or pitch changed at all, then picks C06 pos-look when both moved, C04 position when only moved, C05 look when only rotated, else bare C03 onGround keep-alive. When ridingEntity is non-null it sends a special C06 with motionX, -999.0D Y and motionZ as a stall marker and forces flag2 false. Finally it increments positionUpdateTicks, and on flag2 or flag3 copies current pos and angles into lastReported fields and zeroes the tick counter, which is the state blink freezes.</p>
+<pre class="writeup-code"><code>        if (this.isCurrentViewEntity())
+        {
+            double d0 = this.posX - this.lastReportedPosX;
+            double d1 = this.getEntityBoundingBox().minY - this.lastReportedPosY;
+            double d2 = this.posZ - this.lastReportedPosZ;
+            double d3 = (double)(this.rotationYaw - this.lastReportedYaw);
+            double d4 = (double)(this.rotationPitch - this.lastReportedPitch);
+            boolean flag2 = d0 * d0 + d1 * d1 + d2 * d2 &gt; 9.0E-4D || this.positionUpdateTicks &gt;= 20;
+            boolean flag3 = d3 != 0.0D || d4 != 0.0D;
+
+            if (this.ridingEntity == null)
+            {
+                if (flag2 &amp;&amp; flag3)
+                {
+                    this.sendQueue.addToSendQueue(new C03PacketPlayer.C06PacketPlayerPosLook(this.posX, this.getEntityBoundingBox().minY, this.posZ, this.rotationYaw, this.rotationPitch, this.onGround));
+                }
+                else if (flag2)
+                {
+                    this.sendQueue.addToSendQueue(new C03PacketPlayer.C04PacketPlayerPosition(this.posX, this.getEntityBoundingBox().minY, this.posZ, this.onGround));
+                }
+                else if (flag3)
+                {
+                    this.sendQueue.addToSendQueue(new C03PacketPlayer.C05PacketPlayerLook(this.rotationYaw, this.rotationPitch, this.onGround));
+                }
+                else
+                {
+                    this.sendQueue.addToSendQueue(new C03PacketPlayer(this.onGround));
+                }
+            }
+            else
+            {
+                this.sendQueue.addToSendQueue(new C03PacketPlayer.C06PacketPlayerPosLook(this.motionX, -999.0D, this.motionZ, this.rotationYaw, this.rotationPitch, this.onGround));</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The d0 through d4 lines snapshot how far position and look drifted since the last transmitted report, using boundingBox.minY for the feet Y the server validates. flag2 applies the 9.0E-4D squared-distance threshold plus the 20-tick forced update, which is why standing still still sends a bare C03 once per second. flag3 fires on any yaw or pitch delta, separating look-only C05 traffic from movement. The four-way if chain maps the two booleans to C06, C04, C05 or base C03, each carrying the onGround boolean the server uses for fall damage, so spoofing that bit is ground-spoof. The riding branch with -999.0D Y signals the server not to apply on-foot movement, and freezing these queues while continuing to render locally is exactly a blink exploit.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C0B</span><span class="related-chip" style="opacity:.65">C03</span><span class="related-chip" style="opacity:.65">C03_C04</span><span class="related-chip" style="opacity:.65">C03_C05</span><span class="related-chip" style="opacity:.65">C03_C06</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onLivingUpdate</span></div>
+<p class="impl-pattern">Handles sprint timers, fly toggle, horse jump, portal, push-out.</p>
+<p class="impl-pattern">onLivingUpdate runs before physics each tick and first decrements sprintingTicksLeft, sprintToggleTimer and timeUntilPortal so sprint expiry, double-tap windows and portal cooldowns age correctly. It handles double-tap-W sprint by setting sprintToggleTimer to 7 on first tap and calling setSprinting true on second tap within the window, gated on food above 6, allowFlying, onGround and not using an item or blinded. It handles the sprint key, sprint cancel on slowdown or collision, and slows movementInput by 0.2 while using an item. For flight it forces isFlying true in spectator mode with a C13 send, and detects double-space via flyToggleTimer 7 to toggle capabilities.isFlying and call sendPlayerAbilities which emits C13PacketPlayerAbilities. It manages horse jump charging with horseJumpPowerCounter from -10 through 10, sending C0B RIDING_JUMP on release and computing power up to 0.8 plus curve, plus horse inventory via C0B OPEN_INVENTORY. On landing while flying in non-spectator it clears isFlying and re-sends C13, and it accumulates timeInPortal toward 1.0 for dimension travel. The server NetHandlerPlayServer re-validates abilities and jump power, so forged C13 or C0B values are the classic fly and horse-jump cheat vectors.</p>
+<pre class="writeup-code"><code>        if (this.capabilities.allowFlying)
+        {
+            if (this.mc.playerController.isSpectatorMode())
+            {
+                if (!this.capabilities.isFlying)
+                {
+                    this.capabilities.isFlying = true;
+                    this.sendPlayerAbilities();
+                }
+            }
+            else if (!flag &amp;&amp; this.movementInput.jump)
+            {
+                if (this.flyToggleTimer == 0)
+                {
+                    this.flyToggleTimer = 7;
+                }
+                else
+                {
+                    this.capabilities.isFlying = !this.capabilities.isFlying;
+                    this.sendPlayerAbilities();
+                    this.flyToggleTimer = 0;
+                }
+            }
+        }
+
+        if (this.capabilities.isFlying &amp;&amp; this.isCurrentViewEntity())
+        {
+            if (this.movementInput.sneak)
+            {
+                this.motionY -= (double)(this.capabilities.getFlySpeed() * 3.0F);
+            }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The allowFlying outer gate ensures only creative or spectator clients can enter the toggle logic, otherwise no C13 is produced here. The spectator inner branch forces isFlying true and calls sendPlayerAbilities, which queues C13 with the full capabilities object for server approval. The double-space detector uses flyToggleTimer 7 ticks to distinguish a tap from a hold, flipping isFlying and re-sending C13 on the second press. The isFlying plus isCurrentViewEntity block then applies flySpeed vertical motion locally, so a forged C13 that enables flying without permission lets the client move vertically until the server corrects it.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C13</span><span class="related-chip" style="opacity:.65">C0B</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">sendChatMessage</span></div>
+<p class="impl-pattern">Forwards user chat to server.</p>
+<p class="impl-pattern">sendChatMessage takes the raw string from the chat GUI or command line with no client-side filtering, length splitting or command parsing. It wraps the string verbatim in a new C01PacketChatMessage and adds it to sendQueue via addToSendQueue for TCP flush. It does not distinguish slash commands from public chat, leaving that decision to NetHandlerPlayServer on the receiving side. The server then routes slash-prefixed text to the command dispatcher and other text to broadcast with spam and visibility checks. Because the client sends the full string, server plugins see the exact typed content including formatting codes. Dropping or mutating this packet silences the player, while flooding it is chat spam. No other packet is emitted here, so chat has no movement or inventory side effects.</p>
+<pre class="writeup-code"><code>    public void sendChatMessage(String message)
+    {
+        this.sendQueue.addToSendQueue(new C01PacketChatMessage(message));
+    }
+
+    /**
+     * Swings the item the player is holding.
+     */
+    public void swingItem()
+    {
+        super.swingItem();
+        this.sendQueue.addToSendQueue(new C0APacketAnimation());
+    }
+
+    public void respawnPlayer()
+    {
+        this.sendQueue.addToSendQueue(new C16PacketClientStatus(C16PacketClientStatus.EnumState.PERFORM_RESPAWN));
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The single addToSendQueue line shows the entire method body, constructing C01PacketChatMessage directly from the message argument with no rewrite. sendQueue is the NetHandlerPlayClient channel to the server, so the text leaves the client in one TCP packet. The neighboring swingItem and respawnPlayer snippets show the same one-line queue pattern for C0A and C16, confirming this class delegates all authority to the server. If this C01 is blocked the server never sees chat, and if forged at high rate the server throttle or kick applies.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C01</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">swingItem</span></div>
+<p class="impl-pattern">Local arm swing plus server animation notify.</p>
+<p class="impl-pattern">swingItem first calls super.swingItem to run the client-side arm swing timer and render animation immediately without waiting for the server. It then constructs an empty C0APacketAnimation with no entity ID or hand argument, because 1.8.9 has a single swing type inferred from the sender. It queues that packet on sendQueue so the server and then other clients via S0B animation can mirror the motion. It is called for attacks, block hits and item use visuals, decoupling visual feedback from damage outcome. The server uses the C0A arrival time as a heuristic alongside C02 attack and C07 dig packets for anti-cheat timing. Suppressing C0A while still attacking creates silent swings that look like no-animation kill-aura. The receiver NetHandlerPlayServer broadcasts the swing to trackers without changing inventory or health.</p>
+<pre class="writeup-code"><code>    public void swingItem()
+    {
+        super.swingItem();
+        this.sendQueue.addToSendQueue(new C0APacketAnimation());
+    }
+
+    public void respawnPlayer()
+    {
+        this.sendQueue.addToSendQueue(new C16PacketClientStatus(C16PacketClientStatus.EnumState.PERFORM_RESPAWN));
+    }
+
+    /**
+     * Deals damage to the entity. If its a EntityPlayer then will take damage from the armor first and then health
+     * second with the reduced value. Args: damageAmount
+     */</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">super.swingItem starts the local swingTimer and arm render so the player sees instant feedback before any round trip. The new C0APacketAnimation line carries no fields, the server attributes it to the sending NetHandlerPlayServer connection. addToSendQueue flushes it to the server where it fans out as S0B animation to nearby trackers. Deleting this line keeps local visuals but hides swings from others, a common silent-aim artifact, while spamming it has no damage effect without a paired C02.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C0A</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">dropOneItem</span></div>
+<p class="impl-pattern">Requests server item drop; no client spawn.</p>
+<p class="impl-pattern">dropOneItem maps the boolean dropAll from the Q key handler to a C07PacketPlayerDigging Action enum, choosing DROP_ALL_ITEMS when true and DROP_ITEM for a single item. It constructs the packet with BlockPos.ORIGIN and EnumFacing.DOWN as dummy position and facing values because drops carry no block target. It queues the packet on sendQueue and returns null without spawning any EntityItem client-side, keeping inventory authoritative. The server NetHandlerPlayServer interprets the action, splits or clears the held stack, and spawns the EntityItem itself with pickup delay. Holding Ctrl-Q drives the dropAll path to empty the stack, while tapping Q drops one. Forging this C07 with modified actions is how drop-spam or inventory-desync exploits attempt to duplicate items, but the server re-validates the held stack. No S packet is produced locally here.</p>
+<pre class="writeup-code"><code>    /**
+     * Called when player presses the drop item key
+     */
+    public EntityItem dropOneItem(boolean dropAll)
+    {
+        C07PacketPlayerDigging.Action c07packetplayerdigging$action = dropAll ? C07PacketPlayerDigging.Action.DROP_ALL_ITEMS : C07PacketPlayerDigging.Action.DROP_ITEM;
+        this.sendQueue.addToSendQueue(new C07PacketPlayerDigging(c07packetplayerdigging$action, BlockPos.ORIGIN, EnumFacing.DOWN));
+        return null;
+    }
+
+    /**
+     * Joins the passed in entity item with the world. Args: entityItem
+     */
+    protected void joinEntityItemWithWorld(EntityItem itemIn)
+    {
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The ternary line translates the dropAll boolean into the exact C07 Action enum the server switches on, so the packet meaning hinges on that one enum value. The constructor uses BlockPos.ORIGIN and EnumFacing.DOWN as placeholders because the server ignores position for drop actions, unlike dig actions that need a real block. addToSendQueue sends the request without creating an EntityItem, proving drops are server-authoritative. Returning null signals no local entity to the caller, so blocking the packet means nothing drops and replaying it duplicates drop attempts the server must deduplicate.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C07</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">closeScreen</span></div>
+<p class="impl-pattern">Notifies server container close.</p>
+<p class="impl-pattern">closeScreen reads openContainer.windowId as the server-assigned container ID so the close refers to the exact chest, furnace or custom GUI. It constructs C0DPacketCloseWindow with that ID and queues it on sendQueue to tell the server the client dismissed the screen. It then calls closeScreenAndDropStack which clears the cursor ItemStack via inventory.setItemStack null, calls super.closeScreen and calls mc.displayGuiScreen null to remove the GUI. The server NetHandlerPlayServer closes its Container on C0D, cancels pending slot transactions and may drop or retain the cursor stack. Sending a wrong windowId desyncs containers and can leave ghost items until the next S2E or S30 resync. This is a pure teardown with no item movement packet, so dupes that race C0E clicks against C0D rely on server ordering here.</p>
+<pre class="writeup-code"><code>    public void closeScreen()
+    {
+        this.sendQueue.addToSendQueue(new C0DPacketCloseWindow(this.openContainer.windowId));
+        this.closeScreenAndDropStack();
+    }
+
+    public void closeScreenAndDropStack()
+    {
+        this.inventory.setItemStack((ItemStack)null);
+        super.closeScreen();
+        this.mc.displayGuiScreen((GuiScreen)null);
+    }
+
+    /**
+     * Updates health locally.
+     */</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The C0DPacketCloseWindow constructor captures openContainer.windowId at call time, binding the close to the currently open container instance. addToSendQueue delivers that ID to the server where NetHandlerPlayServer matches it against its own openContainer. closeScreenAndDropStack then nulls the dragged cursor stack and clears the GuiScreen locally, so visuals close even if the packet is delayed. If the C0D is dropped the server keeps the container open and later forces S2E close, which is why inventory-desync fixes always resync windowId.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C0D</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">sendPlayerAbilities</span></div>
+<p class="impl-pattern">Syncs capabilities (fly, creative) to server.</p>
+<p class="impl-pattern">sendPlayerAbilities wraps the live this.capabilities object, including isFlying, allowFlying, isCreativeMode, flySpeed and walkSpeed, into a new C13PacketPlayerAbilities. It queues that snapshot on sendQueue with no extra validation, trusting the caller in onLivingUpdate to have flipped the flags correctly for spectator, double-space or landing. It is called when spectator forces flight on, when double-space toggles flight, and when landing clears flight in non-spectator. The server compares the received flags against the authoritative GameType and op state, ignoring or kicking on illegal fly enable. Because the whole capabilities struct is sent, stale walkSpeed or flySpeed values can also leak to the server if mods mutate them. The receiver applies allowed changes and echoes the authoritative state back via S39, so a forged C13 only persists until the next S39 correction.</p>
+<pre class="writeup-code"><code>    /**
+     * Sends the player's abilities to the server (if there is one).
+     */
+    public void sendPlayerAbilities()
+    {
+        this.sendQueue.addToSendQueue(new C13PacketPlayerAbilities(this.capabilities));
+    }
+
+    /**
+     * returns true if this is an EntityPlayerSP, or the logged in player.
+     */
+    public boolean isUser()
+    {
+        return true;
+    }
+
+    protected void sendHorseJump()
+    {
+        this.sendQueue.addToSendQueue(new C0BPacketEntityAction(this, C0BPacketEntityAction.Action.RIDING_JUMP, (int)(this.getHorseJumpPower() * 100.0F)));
+    }
+
+    public void sendHorseInventory()
+    {
+        this.sendQueue.addToSendQueue(new C0BPacketEntityAction(this, C0BPacketEntityAction.Action.OPEN_INVENTORY));
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The one-line body constructs C13PacketPlayerAbilities from this.capabilities by reference copy, so every flag and speed at call time goes on the wire. addToSendQueue pushes it through NetHandlerPlayClient to NetHandlerPlayServer, which re-checks allowFlying against gamemode. The adjacent sendHorseJump and sendHorseInventory lines show the C0B RIDING_JUMP with power times 100 and OPEN_INVENTORY pattern, distinguishing ability sync from action packets. Tampering with capabilities before this call is the client fly-speed hack, corrected when the server replies with S39.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C13</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">respawnPlayer</span></div>
+<p class="impl-pattern">Requests respawn after death screen.</p>
+<p class="impl-pattern">respawnPlayer is bound to the death-screen respawn button and takes no position or health arguments because the server owns the spawn point. It constructs C16PacketClientStatus with EnumState.PERFORM_RESPAWN, the dedicated respawn enum distinct from OPEN_INVENTORY statistics states. It queues that packet on sendQueue so NetHandlerPlayServer can trigger ServerConfigurationManager respawn, clearing death, resetting health and food, and teleporting to spawn or bed. The client does not move itself or heal locally here, waiting for S07 respawn, S06 health and S21 chunk packets to rebuild state. Pressing the button twice queues duplicate C16s that the server idempotently ignores if already alive. Blocking this packet leaves the player on the death screen indefinitely, while forging it while alive is ignored by the server state check.</p>
+<pre class="writeup-code"><code>    public void respawnPlayer()
+    {
+        this.sendQueue.addToSendQueue(new C16PacketClientStatus(C16PacketClientStatus.EnumState.PERFORM_RESPAWN));
+    }
+
+    /**
+     * Deals damage to the entity. If its a EntityPlayer then will take damage from the armor first and then health
+     * second with the reduced value. Args: damageAmount
+     */
+    protected void damageEntity(DamageSource damageSrc, float damageAmount)
+    {
+        if (!this.isEntityInvulnerable(damageSrc))
+        {
+            this.setHealth(this.getHealth() - damageAmount);
+        }
+    }
+
+    /**
+     * set current crafting inventory back to the 2x2 square
+     */</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The constructor argument PERFORM_RESPAWN selects the respawn branch in NetHandlerPlayServer handleClientStatus, not a generic status update. addToSendQueue sends it over the established play channel, so it only works while connected to a server after death. The following damageEntity snippet shows local health subtraction is separate and not invoked here, proving respawn does not heal client-side. The server responds with position, health and inventory resyncs, so dropping C16 strands the client on the death GUI.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C16</span></div>
+</div>
+</div>
+<div class="detail-section"><h3>Packet Usage</h3><table class="fields-table"><thead><tr><th>Packet</th><th>Dir</th><th>Trigger</th></tr></thead><tbody>
+<tr><td class="f-name">C01</td><td class="f-type">sent</td><td class="f-desc">User sends chat via sendChatMessage.</td></tr>
+<tr><td class="f-name">C03</td><td class="f-type">sent</td><td class="f-desc">Forced keep-alive every tick when pos/look unchanged; also riding look.</td></tr>
+<tr><td class="f-name">C07</td><td class="f-type">sent</td><td class="f-desc">Q drop key via dropOneItem.</td></tr>
+<tr><td class="f-name">C0A</td><td class="f-type">sent</td><td class="f-desc">Arm swing via swingItem.</td></tr>
+<tr><td class="f-name">C0B</td><td class="f-type">sent</td><td class="f-desc">Sprint/sneak toggle, horse jump/inventory.</td></tr>
+<tr><td class="f-name">C0C</td><td class="f-type">sent</td><td class="f-desc">Riding input each tick in onUpdate.</td></tr>
+<tr><td class="f-name">C0D</td><td class="f-type">sent</td><td class="f-desc">Closing container screen.</td></tr>
+<tr><td class="f-name">C13</td><td class="f-type">sent</td><td class="f-desc">Fly state change in onLivingUpdate.</td></tr>
+<tr><td class="f-name">C16</td><td class="f-type">sent</td><td class="f-desc">Respawn button via respawnPlayer.</td></tr>
+</tbody></table></div>
+<div class="detail-section"><h3>Internal State</h3><div class="subclass-list">
+<div class="subclass-item"><span class="sub-name">sendQueue</span><span class="sub-desc">NetHandlerPlayClient used for all addToSendQueue C packets</span></div>
+<div class="subclass-item"><span class="sub-name">lastReportedPosX/Y/Z + Yaw/Pitch</span><span class="sub-desc">Last sent transform; delta vs 9.0E-4 threshold picks packet type</span></div>
+<div class="subclass-item"><span class="sub-name">positionUpdateTicks</span><span class="sub-desc">Forces C03 at least every 20 ticks when idle</span></div>
+<div class="subclass-item"><span class="sub-name">serverSprintState/serverSneakState</span><span class="sub-desc">Caches last C0B state to send only on change</span></div>
+<div class="subclass-item"><span class="sub-name">movementInput</span><span class="sub-desc">Keyboard input driving moveStrafe/Forward/jump/sneak</span></div>
+<div class="subclass-item"><span class="sub-name">sprintToggleTimer/sprintingTicksLeft</span><span class="sub-desc">Double-tap sprint window and sprint expiry timer</span></div>
+</div></div>
+<div class="detail-section"><h3>Related Vanilla Internals</h3><div class="related-list"><a class="related-chip" href="../NetHandlerPlayClient/">NetHandlerPlayClient</a><a class="related-chip" href="../Minecraft/">Minecraft</a><a class="related-chip" href="../PlayerControllerMP/">PlayerControllerMP</a><span class="related-chip" style="opacity:.65">MovementInput</span><span class="related-chip" style="opacity:.65">AbstractClientPlayer</span></div></div>      <div class="detail-section"><h3>Full Source</h3>
       <div class="code-viewer"><div class="cv-toolbar"><span class="cv-file">EntityPlayerSP.java</span><span class="cv-meta">910 lines · MCP 1.8.9 · verbatim</span><button class="cv-copy">Copy</button><a class="cv-link" href="https://github.com/Marcelektro/MavenMCP-1.8.9/blob/master/src/main/java/net/minecraft/client/entity/EntityPlayerSP.java" target="_blank" rel="noopener">Original ↗</a></div><div class="cv-body"><table class="cv-table"><tr class="cv-row"><td class="cv-ln"><span class="cv-num">1</span></td><td class="cv-code"><pre><code>package net.minecraft.client.entity;</code></pre></td></tr>
 <tr class="cv-row"><td class="cv-ln"><span class="cv-num">2</span></td><td class="cv-code"><pre><code></code></pre></td></tr>
 <tr class="cv-row"><td class="cv-ln"><span class="cv-num">3</span></td><td class="cv-code"><pre><code>import net.minecraft.client.Minecraft;</code></pre></td></tr>

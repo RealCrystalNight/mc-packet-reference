@@ -53,8 +53,173 @@
     </div>
     <div class="detail-body">
       <div class="detail-section"><h3>Packets Referenced (4)</h3><div class="related-list"><a class="related-chip" href="../../packets/S00PacketDisconnect/">S00PacketDisconnect</a><a class="related-chip" href="../../packets/S01PacketEncryptionRequest/">S01PacketEncryptionRequest</a><a class="related-chip" href="../../packets/S02PacketLoginSuccess/">S02PacketLoginSuccess</a><a class="related-chip" href="../../packets/S03PacketEnableCompression/">S03PacketEnableCompression</a></div></div>
-      <div class="detail-section"><h3>Related Vanilla Internals</h3><div class="related-list"><a class="related-chip" href="../EntityPlayerMP/">EntityPlayerMP</a></div></div>
-      <div class="detail-section"><h3>Full Source</h3>
+      <div class="detail-section"><h3>Related Vanilla Internals</h3><div class="related-list"><a class="related-chip" href="../EntityPlayerMP/">EntityPlayerMP</a><a class="related-chip" href="../NetworkManager/">NetworkManager</a><a class="related-chip" href="../ServerConfigurationManager/">ServerConfigurationManager</a><a class="related-chip" href="../NetHandlerPlayServer/">NetHandlerPlayServer</a></div></div>
+<div class="detail-section"><h3>Deep Analysis</h3><div class="writeup-block">
+<p>Login-state machine HELLO&gt;KEY&gt;AUTHENTICATING&gt;READY&gt;ACCEPTED. Validates C00 start and C01 encryption, verifies Mojang session off-thread, then hands to ServerConfigurationManager or disconnects.</p>
+</div></div>
+<div class="detail-section"><h3>Key Methods — In Depth (6)</h3>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">processLoginStart</span></div>
+<p class="impl-pattern">Starts login or requests encryption.</p>
+<p class="impl-pattern">processLoginStart handles C00 hello and branches online versus offline login. It validates state equals HELLO via Validate, throwing on duplicate hello. It stores the GameProfile from the packet. If online mode is enabled and the channel is not local, it moves to KEY state and sends S01 EncryptionRequest with empty serverId, server public key and four-byte verifyToken. Otherwise for offline or singleplayer it jumps directly to READY_TO_ACCEPT. No kick occurs here, errors throw IllegalStateException. The verifyToken nonce later proves the client holds the private key. Local channels skip encryption to reduce latency.</p>
+<pre class="writeup-code"><code>    public void processLoginStart(C00PacketLoginStart packetIn)
+    {
+        Validate.validState(this.currentLoginState == NetHandlerLoginServer.LoginState.HELLO, "Unexpected hello packet", new Object[0]);
+        this.loginGameProfile = packetIn.getProfile();
+
+        if (this.server.isServerInOnlineMode() &amp;&amp; !this.networkManager.isLocalChannel())
+        {
+            this.currentLoginState = NetHandlerLoginServer.LoginState.KEY;
+            this.networkManager.sendPacket(new S01PacketEncryptionRequest(this.serverId, this.server.getKeyPair().getPublic(), this.verifyToken));
+        }
+        else
+        {
+            this.currentLoginState = NetHandlerLoginServer.LoginState.READY_TO_ACCEPT;
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Validate.validState enforces the HELLO to KEY to AUTH state machine and rejects replays. Storing loginGameProfile preserves the requested name for later Mojang verification. The online-mode plus not-local gate selects encrypted versus instant accept. S01PacketEncryptionRequest carries serverId, public key and verifyToken nonce. The else moves offline logins straight to READY_TO_ACCEPT for tryAcceptPlayer.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C00</span><span class="related-chip" style="opacity:.65">S01</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">processEncryptionResponse</span></div>
+<p class="impl-pattern">Verifies nonce and enables crypto.</p>
+<p class="impl-pattern">processEncryptionResponse handles C01 key exchange in KEY state. It validates KEY state, fetches the server private key and compares the decrypted verifyToken with Arrays equals, throwing Invalid nonce on mismatch to block replay. On match it decrypts the shared secret, moves to AUTHENTICATING and enables encryption on the channel. It then spawns User Authenticator thread with incrementing ID to avoid blocking netty. That thread hashes serverId, public key and secret via CryptManager, calls hasJoinedServer to verify the Mojang session, and on success sets READY_TO_ACCEPT. Singleplayer fallback generates offline profiles when verification fails or auth servers are down, otherwise it closes with Failed to verify username. No S packets are sent here directly.</p>
+<pre class="writeup-code"><code>    public void processEncryptionResponse(C01PacketEncryptionResponse packetIn)
+    {
+        Validate.validState(this.currentLoginState == NetHandlerLoginServer.LoginState.KEY, "Unexpected key packet", new Object[0]);
+        PrivateKey privatekey = this.server.getKeyPair().getPrivate();
+
+        if (!Arrays.equals(this.verifyToken, packetIn.getVerifyToken(privatekey)))
+        {
+            throw new IllegalStateException("Invalid nonce!");
+        }
+        else
+        {
+            this.secretKey = packetIn.getSecretKey(privatekey);
+            this.currentLoginState = NetHandlerLoginServer.LoginState.AUTHENTICATING;
+            this.networkManager.enableEncryption(this.secretKey);
+            (new Thread("User Authenticator #" + AUTHENTICATOR_THREAD_ID.incrementAndGet())</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The KEY state check rejects out-of-order C01 packets. Decrypting verifyToken with the private key and comparing to stored nonce detects tampering. Throwing Invalid nonce aborts the login without a graceful S00. Storing secretKey, setting AUTHENTICATING and enabling encryption switch the channel to ciphered mode. Spawning the authenticator thread offloads the blocking Mojang HTTPS check.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">C01</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">update</span></div>
+<p class="impl-pattern">Advances ready/delayed accept and timeout.</p>
+<p class="impl-pattern">update ticks the login state machine and enforces the 600-tick timeout. If state is READY_TO_ACCEPT it calls tryAcceptPlayer immediately to apply bans and compression. If state is DELAY_ACCEPT it polls for the duplicate old player by UUID, and when null it flips to READY_TO_ACCEPT, initializes the new player and clears the pending reference. It increments connectionTimer every tick and closes with Took too long to log in via S00 Disconnect at exactly 600. DELAY_ACCEPT exists because createPlayerForUser kicks the old session but the logout needs ticks to complete. No PLAY packets are sent here, only login S00, S02 and S03 via helpers. Stuck AUTHENTICATING threads eventually hit the same timeout.</p>
+<pre class="writeup-code"><code>    public void update()
+    {
+        if (this.currentLoginState == NetHandlerLoginServer.LoginState.READY_TO_ACCEPT)
+        {
+            this.tryAcceptPlayer();
+        }
+        else if (this.currentLoginState == NetHandlerLoginServer.LoginState.DELAY_ACCEPT)
+        {
+            EntityPlayerMP entityplayermp = this.server.getConfigurationManager().getPlayerByUUID(this.loginGameProfile.getId());
+
+            if (entityplayermp == null)
+            {
+                this.currentLoginState = NetHandlerLoginServer.LoginState.READY_TO_ACCEPT;
+                this.server.getConfigurationManager().initializeConnectionToPlayer(this.networkManager, this.player);
+                this.player = null;
+            }
+        }
+
+        if (this.connectionTimer++ == 600)
+        {
+            this.closeConnection("Took too long to log in");
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The READY_TO_ACCEPT branch drives immediate accept without waiting for network events. The DELAY_ACCEPT branch looks up the old UUID entry to detect when the kicked duplicate has logged out. Null means safe to initializeConnectionToPlayer with the staged player object. The connectionTimer post-increment equals 600 gate sends S00 Took too long to log in. That timeout bounds Mojang outages and stalled encryption handshakes.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S02</span><span class="related-chip" style="opacity:.65">S03</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">tryAcceptPlayer</span></div>
+<p class="impl-pattern">Applies bans, compression and success.</p>
+<p class="impl-pattern">tryAcceptPlayer applies final login gates and switches to PLAY. It completes incomplete profiles with getOfflineProfile deriving OfflinePlayer UUIDs. It calls allowUserToConnect and closes with the ban, whitelist, IP or full reason when non-null. On success it sets ACCEPTED, and if compression threshold is non-negative on a remote channel it sends S03 EnableCompression then sets the threshold on future. It sends S02 LoginSuccess with the verified profile to trigger client PLAY switch. It checks for duplicate UUID sessions, staging a new player and entering DELAY_ACCEPT when found, otherwise initializing immediately via createPlayerForUser. No teleport occurs, the follow-up initializeConnectionToPlayer sends the S01 burst. Offline servers always take the instant path.</p>
+<pre class="writeup-code"><code>        String s = this.server.getConfigurationManager().allowUserToConnect(this.networkManager.getRemoteAddress(), this.loginGameProfile);
+
+        if (s != null)
+        {
+            this.closeConnection(s);
+        }
+        else
+        {
+            this.currentLoginState = NetHandlerLoginServer.LoginState.ACCEPTED;
+
+            if (this.server.getNetworkCompressionTreshold() &gt;= 0 &amp;&amp; !this.networkManager.isLocalChannel())
+            {
+                this.networkManager.sendPacket(new S03PacketEnableCompression(this.server.getNetworkCompressionTreshold()), new ChannelFutureListener()
+                {
+                    public void operationComplete(ChannelFuture p_operationComplete_1_) throws Exception
+                    {
+                        NetHandlerLoginServer.this.networkManager.setCompressionTreshold(NetHandlerLoginServer.this.server.getNetworkCompressionTreshold());
+                    }
+                }, new GenericFutureListener[0]);
+            }
+
+            this.networkManager.sendPacket(new S02PacketLoginSuccess(this.loginGameProfile));
+            EntityPlayerMP entityplayermp = this.server.getConfigurationManager().getPlayerByUUID(this.loginGameProfile.getId());
+
+            if (entityplayermp != null)
+            {
+                this.currentLoginState = NetHandlerLoginServer.LoginState.DELAY_ACCEPT;
+                this.player = this.server.getConfigurationManager().createPlayerForUser(this.loginGameProfile);
+            }
+            else
+            {
+                this.server.getConfigurationManager().initializeConnectionToPlayer(this.networkManager, this.server.getConfigurationManager().createPlayerForUser(this.loginGameProfile));
+            }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">allowUserToConnect returns null only when bans, whitelist, IP and capacity all pass. Non-null triggers closeConnection with S00 carrying that reason. Setting ACCEPTED plus S03 EnableCompression negotiates compression before LoginSuccess. S02PacketLoginSuccess carries the final UUID and name to switch the client to PLAY. The UUID duplicate check stages DELAY_ACCEPT versus immediate initializeConnectionToPlayer for overlap handling.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S02</span><span class="related-chip" style="opacity:.65">S03</span><span class="related-chip" style="opacity:.65">S00</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">closeConnection</span></div>
+<p class="impl-pattern">Sends kick and closes channel.</p>
+<p class="impl-pattern">closeConnection terminates a login with S00 Disconnect and channel close. It logs the connection info plus reason for audit. It wraps the reason in ChatComponentText, sends S00PacketDisconnect, then closes the channel with the same component. Exceptions during send or close are caught and logged as Error whilst disconnecting player without rethrow. It is used for ban kicks, auth failures, duplicate handling and the 600-tick timeout. No PLAY packets are involved because the pipeline is still in LOGIN state. The client displays the text on the disconnected screen.</p>
+<pre class="writeup-code"><code>    public void closeConnection(String reason)
+    {
+        try
+        {
+            logger.info("Disconnecting " + this.getConnectionInfo() + ": " + reason);
+            ChatComponentText chatcomponenttext = new ChatComponentText(reason);
+            this.networkManager.sendPacket(new S00PacketDisconnect(chatcomponenttext));
+            this.networkManager.closeChannel(chatcomponenttext);
+        }
+        catch (Exception exception)
+        {
+            logger.error((String)"Error whilst disconnecting player", (Throwable)exception);
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The try block ensures logging and packet send happen atomically. getConnectionInfo includes profile and remote address for forensics. S00PacketDisconnect carries the human-readable kick reason to the client. closeChannel with the same component tears down the netty pipeline. The catch prevents disconnect-path exceptions from crashing the server tick.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S00</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">getOfflineProfile</span></div>
+<p class="impl-pattern">Derives offline UUID profile.</p>
+<p class="impl-pattern">getOfflineProfile derives deterministic offline UUIDs for cracked and singleplayer logins. It concatenates OfflinePlayer colon plus original name, encodes as UTF-8 bytes and hashes with nameUUIDFromBytes version three. It returns a new GameProfile with that UUID and the original name preserving case. It is called by tryAcceptPlayer for incomplete profiles and by the auth thread when Mojang verification fails on singleplayer or auth servers are down. Online verified logins never use this path. No packets are sent here, the UUID feeds allowUserToConnect and S02 LoginSuccess. The deterministic mapping lets offline servers keep consistent inventories by name.</p>
+<pre class="writeup-code"><code>    protected GameProfile getOfflineProfile(GameProfile original)
+    {
+        UUID uuid = UUID.nameUUIDFromBytes(("OfflinePlayer:" + original.getName()).getBytes(Charsets.UTF_8));
+        return new GameProfile(uuid, original.getName());
+    }
+
+    static enum LoginState
+    {
+        HELLO,
+        KEY,</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The OfflinePlayer prefix plus name string is the canonical offline seed. getBytes with UTF_8 ensures cross-platform UUID stability. nameUUIDFromBytes produces a version-three UUID from that seed. Returning a GameProfile with that UUID and original name lets bans and NBT key by stable id. The following LoginState enum defines HELLO, KEY and later states for the handshake.</p>
+</div>
+</div>
+<div class="detail-section"><h3>Packet Usage</h3><table class="fields-table"><thead><tr><th>Packet</th><th>Dir</th><th>Trigger</th></tr></thead><tbody>
+<tr><td class="f-name">C00</td><td class="f-type">handled</td><td class="f-desc">Client hello with GameProfile</td></tr>
+<tr><td class="f-name">C01</td><td class="f-type">handled</td><td class="f-desc">Encrypted secret and verify token</td></tr>
+<tr><td class="f-name">S00</td><td class="f-type">sent</td><td class="f-desc">Login disconnect with reason</td></tr>
+<tr><td class="f-name">S01</td><td class="f-type">sent</td><td class="f-desc">Encryption request in online mode</td></tr>
+<tr><td class="f-name">S02</td><td class="f-type">sent</td><td class="f-desc">Login success before PLAY switch</td></tr>
+<tr><td class="f-name">S03</td><td class="f-type">sent</td><td class="f-desc">Enable compression if threshold set</td></tr>
+</tbody></table></div>
+<div class="detail-section"><h3>Internal State</h3><div class="subclass-list">
+<div class="subclass-item"><span class="sub-name">currentLoginState</span><span class="sub-desc">HELLO/KEY/AUTH/READY/DELAY/ACCEPTED enum</span></div>
+<div class="subclass-item"><span class="sub-name">verifyToken</span><span class="sub-desc">4-byte nonce to prevent replay</span></div>
+<div class="subclass-item"><span class="sub-name">loginGameProfile</span><span class="sub-desc">Pending profile, completed after auth</span></div>
+<div class="subclass-item"><span class="sub-name">connectionTimer</span><span class="sub-desc">Ticks since construct; 600 timeout</span></div>
+<div class="subclass-item"><span class="sub-name">secretKey</span><span class="sub-desc">Shared secret enabling encryption</span></div>
+</div></div>
+<div class="detail-section"><h3>Related Vanilla Internals</h3><div class="related-list"><a class="related-chip" href="../ServerConfigurationManager/">ServerConfigurationManager</a><a class="related-chip" href="../NetHandlerPlayServer/">NetHandlerPlayServer</a><a class="related-chip" href="../NetworkManager/">NetworkManager</a><span class="related-chip" style="opacity:.65">MinecraftServer</span></div></div>      <div class="detail-section"><h3>Full Source</h3>
       <div class="code-viewer"><div class="cv-toolbar"><span class="cv-file">NetHandlerLoginServer.java</span><span class="cv-meta">248 lines · MCP 1.8.9 · verbatim</span><button class="cv-copy">Copy</button><a class="cv-link" href="https://github.com/Marcelektro/MavenMCP-1.8.9/blob/master/src/main/java/net/minecraft/server/network/NetHandlerLoginServer.java" target="_blank" rel="noopener">Original ↗</a></div><div class="cv-body"><table class="cv-table"><tr class="cv-row"><td class="cv-ln"><span class="cv-num">1</span></td><td class="cv-code"><pre><code>package net.minecraft.server.network;</code></pre></td></tr>
 <tr class="cv-row"><td class="cv-ln"><span class="cv-num">2</span></td><td class="cv-code"><pre><code></code></pre></td></tr>
 <tr class="cv-row"><td class="cv-ln"><span class="cv-num">3</span></td><td class="cv-code"><pre><code>import com.google.common.base.Charsets;</code></pre></td></tr>

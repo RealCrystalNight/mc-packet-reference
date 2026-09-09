@@ -53,8 +53,230 @@
     </div>
     <div class="detail-body">
       <div class="detail-section"><h3>Packets Referenced (2)</h3><div class="related-list"><a class="related-chip" href="../../packets/S23PacketBlockChange/">S23PacketBlockChange</a><a class="related-chip" href="../../packets/S38PacketPlayerListItem/">S38PacketPlayerListItem</a></div></div>
-      <div class="detail-section"><h3>Related Vanilla Internals</h3><div class="related-list"><a class="related-chip" href="../EntityPlayerMP/">EntityPlayerMP</a><a class="related-chip" href="../WorldServer/">WorldServer</a></div></div>
-      <div class="detail-section"><h3>Full Source</h3>
+      <div class="detail-section"><h3>Related Vanilla Internals</h3><div class="related-list"><a class="related-chip" href="../EntityPlayerMP/">EntityPlayerMP</a><a class="related-chip" href="../WorldServer/">WorldServer</a><a class="related-chip" href="../BlockPos/">BlockPos</a><a class="related-chip" href="../EntityPlayer/">EntityPlayer</a><a class="related-chip" href="../World/">World</a><a class="related-chip" href="../NetHandlerPlayServer/">NetHandlerPlayServer</a></div></div>
+<div class="detail-section"><h3>Deep Analysis</h3><div class="writeup-block">
+<p>Server-side per-player survival, creative, adventure and spectator interaction controller. Validates dig timing, block harvesting, item use and block activation from NetHandlerPlayServer. Sends corrections and progress animations plus gamemode broadcasts to other players.</p>
+</div></div>
+<div class="detail-section"><h3>Key Methods — In Depth (8)</h3>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">setGameType</span></div>
+<p class="impl-pattern">Change gamemode and broadcast to all players</p>
+<p class="impl-pattern">setGameType changes the owned player's gamemode and broadcasts it to the whole server. It stores the new WorldSettings.GameType in gameType for later survivalOrAdventure and isCreative checks. It calls type.configurePlayerCapabilities on thisPlayerMP.capabilities to set fly, edit, and damage flags. It calls thisPlayerMP.sendPlayerAbilities to push those flags to the owner, updating its own client permissions. It then broadcasts S38PacketPlayerListItem with Action UPDATE_GAME_MODE and an array containing thisPlayerMP via sendPacketToAllPlayers. Every connected client receives S38 and updates the tab-list gamemode icon plus adventure interaction rules for that player. The owner also gets the broadcast in addition to the direct abilities packet. No block or inventory change happens here.</p>
+<pre class="writeup-code"><code>    public void setGameType(WorldSettings.GameType type)
+    {
+        this.gameType = type;
+        type.configurePlayerCapabilities(this.thisPlayerMP.capabilities);
+        this.thisPlayerMP.sendPlayerAbilities();
+        this.thisPlayerMP.mcServer.getConfigurationManager().sendPacketToAllPlayers(new S38PacketPlayerListItem(S38PacketPlayerListItem.Action.UPDATE_GAME_MODE, new EntityPlayerMP[] {this.thisPlayerMP}));
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Storing gameType updates local mode used by dig and use guards. configurePlayerCapabilities maps survival, creative, adventure, and spectator to capability booleans. sendPlayerAbilities pushes those flags to the owner client. Broadcasting S38 UPDATE_GAME_MODE informs all other clients of the new mode for rendering and permissions.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S38</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">onBlockClicked</span></div>
+<p class="impl-pattern">Begin survival dig or instant creative break</p>
+<p class="impl-pattern">onBlockClicked starts block breaking when the client sends a dig-start packet. In creative it tries extinguishFire first to put out fire without breaking, and if not fire it calls tryHarvestBlock for instant removal. In survival and adventure it loads the target Block and enforces adventure canDestroy rules via isAllowEdit and held stack canDestroy, returning early for spectator or disallowed tools. It extinguishes fire at the position, snapshots initialDamage from curblockDamage, and queries getPlayerRelativeBlockHardness for dig speed. It notifies the block via onBlockClicked for doors and special handling. If hardness is at least 1.0 it calls tryHarvestBlock immediately for instant crops or soft blocks. Otherwise it sets isDestroyingBlock true, records field_180240_f position, and calls theWorld.sendBlockBreakProgress with staged crack 0 to 10. That call emits S25PacketBlockBreakAnim to watching clients so all see the crack overlay grow.</p>
+<pre class="writeup-code"><code>    public void onBlockClicked(BlockPos pos, EnumFacing side)
+    {
+        if (this.isCreative())
+        {
+            if (!this.theWorld.extinguishFire((EntityPlayer)null, pos, side))
+            {
+                this.tryHarvestBlock(pos);
+            }
+        }
+        else
+        {
+            Block block = this.theWorld.getBlockState(pos).getBlock();</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The isCreative branch handles instant break versus fire extinguish without progress packets. The else branch loads the server block for survival hardness and adventure checks. Adventure validation returns early when the held item cannot destroy the block. Later code sets isDestroyingBlock and sends S25 crack progress to trackers.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S25</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">updateBlockRemoving</span></div>
+<p class="impl-pattern">Tick ongoing dig progress and finish harvest</p>
+<p class="impl-pattern">updateBlockRemoving ticks every server tick to advance survival digging and emit S25 progress. It increments curblockDamage as the tick counter for both pending-finish and active-dig paths. If receivedFinishDiggingPacket is true meaning stop-dig arrived early, it computes elapsed ticks, loads the Block at field_180241_i, and clears the flag if now air. It multiplies getPlayerRelativeBlockHardness by elapsed plus one to get fraction f and scales to 0 to 10 stage j. If j differs from durabilityRemainingOnBlock it calls theWorld.sendBlockBreakProgress with player ID, position, and stage, which sends S25PacketBlockBreakAnim to trackers. When f reaches 1.0 it clears the flag and calls tryHarvestBlock to remove and loot the block. Else if isDestroyingBlock is active it performs similar progress for field_180240_f, sending -1 reset and clearing the flag if the block turned to air. Stage caching avoids spamming S25 every tick when unchanged.</p>
+<pre class="writeup-code"><code>    public void updateBlockRemoving()
+    {
+        ++this.curblockDamage;
+
+        if (this.receivedFinishDiggingPacket)
+        {
+            int i = this.curblockDamage - this.initialBlockDamage;
+            Block block = this.theWorld.getBlockState(this.field_180241_i).getBlock();
+
+            if (block.getMaterial() == Material.air)
+            {
+                this.receivedFinishDiggingPacket = false;
+            }
+            else
+            {
+                float f = block.getPlayerRelativeBlockHardness(this.thisPlayerMP, this.thisPlayerMP.worldObj, this.field_180241_i) * (float)(i + 1);
+                int j = (int)(f * 10.0F);
+
+                if (j != this.durabilityRemainingOnBlock)
+                {
+                    this.theWorld.sendBlockBreakProgress(this.thisPlayerMP.getEntityId(), this.field_180241_i, j);
+                    this.durabilityRemainingOnBlock = j;
+                }
+
+                if (f &gt;= 1.0F)
+                {
+                    this.receivedFinishDiggingPacket = false;
+                    this.tryHarvestBlock(this.field_180241_i);
+                }
+            }
+        }
+        else if (this.isDestroyingBlock)
+        {
+            Block block1 = this.theWorld.getBlockState(this.field_180240_f).getBlock();</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Incrementing curblockDamage drives both dig paths forward each tick. The receivedFinishDiggingPacket branch finishes blocks whose stop packet arrived before hardness completed. Computing f from hardness times elapsed gives break fraction scaled to S25 stage 0 to 10. sendBlockBreakProgress emits S25 only when the stage changed to limit traffic. Reaching 1.0 harvests the block while the isDestroyingBlock branch maintains live crack for held dig.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S25</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">blockRemoving</span></div>
+<p class="impl-pattern">Handle stop-digging packet mid-break</p>
+<p class="impl-pattern">blockRemoving handles the stop-digging C07 packet when it arrives mid-break. It first verifies pos equals field_180240_f so stale or moved targets are ignored. It computes elapsed ticks as curblockDamage minus initialDamage and loads the server Block. If material is air it does nothing because onUpdate or harvest already cleared it. It multiplies getPlayerRelativeBlockHardness by elapsed plus one to estimate break fraction f. If f is at least 0.7 it treats the dig as complete: clears isDestroyingBlock, sends progress -1 via sendBlockBreakProgress to erase crack via S25, and calls tryHarvestBlock to remove and drop loot. If below 0.7 and receivedFinishDiggingPacket is not already set, it parks the request by clearing isDestroyingBlock, setting receivedFinishDiggingPacket true, and copying position and initial damage into field_180241_i and initialBlockDamage. updateBlockRemoving will then finish it over subsequent ticks with staged S25 updates.</p>
+<pre class="writeup-code"><code>    public void blockRemoving(BlockPos pos)
+    {
+        if (pos.equals(this.field_180240_f))
+        {
+            int i = this.curblockDamage - this.initialDamage;
+            Block block = this.theWorld.getBlockState(pos).getBlock();
+
+            if (block.getMaterial() != Material.air)
+            {
+                float f = block.getPlayerRelativeBlockHardness(this.thisPlayerMP, this.thisPlayerMP.worldObj, pos) * (float)(i + 1);
+
+                if (f &gt;= 0.7F)
+                {
+                    this.isDestroyingBlock = false;
+                    this.theWorld.sendBlockBreakProgress(this.thisPlayerMP.getEntityId(), pos, -1);
+                    this.tryHarvestBlock(pos);
+                }
+                else if (!this.receivedFinishDiggingPacket)
+                {
+                    this.isDestroyingBlock = false;
+                    this.receivedFinishDiggingPacket = true;
+                    this.field_180241_i = pos;
+                    this.initialBlockDamage = this.initialDamage;
+                }
+            }
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The pos equality guard ensures only the active dig target can be finished. Elapsed ticks times hardness estimates how far digging progressed. The 0.7 threshold allows slightly early stops to succeed while sending S25 -1 to clear crack. Parking below threshold defers harvest to updateBlockRemoving with staged S25. Air targets are ignored as already broken.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S25</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">cancelDestroyingBlock</span></div>
+<p class="impl-pattern">Abort dig and clear crack overlay</p>
+<p class="impl-pattern">cancelDestroyingBlock aborts an in-progress survival dig when the client sends abort or switches target. It unconditionally sets isDestroyingBlock false to stop updateBlockRemoving from advancing crack stages. It calls theWorld.sendBlockBreakProgress with the breaker entity ID, field_180240_f position, and -1 stage. WorldServer forwards that as S25PacketBlockBreakAnim with destroy stage -1 to all clients tracking the position. Receivers clear the crack overlay for that breaker ID. No block removal, loot, or tool damage occurs on cancel. The curblockDamage counter is left for the next onBlockClicked to re-baseline via initialDamage. Duplicate cancels simply resend -1 which clients treat as idempotent clear.</p>
+<pre class="writeup-code"><code>    /**
+     * Stops the block breaking process
+     */
+    public void cancelDestroyingBlock()
+    {
+        this.isDestroyingBlock = false;
+        this.theWorld.sendBlockBreakProgress(this.thisPlayerMP.getEntityId(), this.field_180240_f, -1);
+    }
+
+    /**</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Clearing isDestroyingBlock halts tick progress in updateBlockRemoving. Sending break progress -1 emits S25 telling trackers to remove the crack. The breaker ID plus position key the overlay so other diggers are unaffected. No harvest or drops follow because cancellation is visual-only.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S25</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">tryHarvestBlock</span></div>
+<p class="impl-pattern">Remove block, drop loot and correct creative client</p>
+<p class="impl-pattern">tryHarvestBlock removes the block, plays break effects, and corrects the client as needed. It first blocks creative sword use from breaking blocks to preserve attack semantics. It loads IBlockState and TileEntity, then enforces adventure and spectator rules with isAllowEdit and canDestroy checks. It plays AuxSFX 2001 break particles and sound at the position via playAuxSFXAtEntity for nearby clients. It calls removeBlock which fires onBlockHarvested and setBlockToAir plus onBlockDestroyedByPlayer. In creative it sends S23PacketBlockChange with world and position directly to the breaker via playerNetServerHandler so the client matches instant server removal. In survival it damages the held stack, destroys it at zero size, and if both removed and harvestable calls harvestBlock to drop items and XP. The boolean return reports whether setBlockToAir succeeded.</p>
+<pre class="writeup-code"><code>            this.theWorld.playAuxSFXAtEntity(this.thisPlayerMP, 2001, pos, Block.getStateId(iblockstate));
+            boolean flag1 = this.removeBlock(pos);
+
+            if (this.isCreative())
+            {
+                this.thisPlayerMP.playerNetServerHandler.sendPacket(new S23PacketBlockChange(this.theWorld, pos));
+            }
+            else
+            {
+                ItemStack itemstack1 = this.thisPlayerMP.getCurrentEquippedItem();
+                boolean flag = this.thisPlayerMP.canHarvestBlock(iblockstate.getBlock());</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">Playing AuxSFX 2001 broadcasts break particles and sound to nearby clients. removeBlock performs the actual setBlockToAir with harvest callbacks. The creative branch sends S23PacketBlockChange to the breaker to force client chunk match after instant break. The survival branch inspects the held stack and harvest permission to decide drops and tool damage.</p>
+<div class="related-list" style="margin-top:6px"><span class="related-chip" style="opacity:.65">S23</span></div>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">tryUseItem</span></div>
+<p class="impl-pattern">Apply right-click item use with creative restore</p>
+<p class="impl-pattern">tryUseItem applies right-click item use from NetHandlerPlayServer C08 handling. It immediately returns false for spectator mode to block consumables, throws, and placements. It snapshots stackSize and metadata before calling stack.useItemRightClick with world and player for potions, food, buckets, or projectiles. If the returned stack differs by identity, size, max use duration, or metadata, it writes the result into the current hotbar slot. In creative it restores stackSize and item damage so blocks and items are infinite while still triggering effects. If size reached zero it clears the slot to null to remove consumed items. If the player is not in a use animation it calls sendContainerToPlayer to resync the inventory container, correcting any client-server drift. True signals the interaction was consumed while false lets the caller try block activation instead. No block-change packet is sent here beyond container sync.</p>
+<pre class="writeup-code"><code>    public boolean tryUseItem(EntityPlayer player, World worldIn, ItemStack stack)
+    {
+        if (this.gameType == WorldSettings.GameType.SPECTATOR)
+        {
+            return false;
+        }
+        else
+        {
+            int i = stack.stackSize;
+            int j = stack.getMetadata();
+            ItemStack itemstack = stack.useItemRightClick(worldIn, player);
+
+            if (itemstack != stack || itemstack != null &amp;&amp; (itemstack.stackSize != i || itemstack.getMaxItemUseDuration() &gt; 0 || itemstack.getMetadata() != j))
+            {
+                player.inventory.mainInventory[player.inventory.currentItem] = itemstack;
+
+                if (this.isCreative())
+                {
+                    itemstack.stackSize = i;
+
+                    if (itemstack.isItemStackDamageable())
+                    {
+                        itemstack.setItemDamage(j);
+                    }
+                }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The spectator guard blocks all right-click use for observers. Snapshotting size and metadata detects consumption or transformation from useItemRightClick. Writing the result into mainInventory keeps server inventory authoritative. Creative restore plus damage reset preserves infinite items while still firing use effects.</p>
+</div>
+<div class="impl-module-entry"><div class="impl-module-header"><span class="impl-module-name">activateBlockOrUseItem</span></div>
+<p class="impl-pattern">Activate block or place held item</p>
+<p class="impl-pattern">activateBlockOrUseItem handles right-click on a block position, choosing block activation versus item placement. Spectators only open chest and inventory GUIs via displayGUIChest without editing, returning false for other blocks. For players it first tries onBlockActivated when not sneaking or when empty-handed, letting doors, chests, furnaces, and levers consume the click with true. If that fails and stack is null it returns false to end the interaction. In creative it records metadata and size, calls stack.onItemUse for placement, then restores damage and size for infinite blocks before returning the result. In survival it directly returns stack.onItemUse which places blocks, consumes items, and triggers TileEntity updates. Block changes from placement flow through WorldServer mark-and-notify as S22 and S23 packets rather than from this method. Deduplication with NetHandlerPlayServer position and face validation prevents ghost blocks.</p>
+<pre class="writeup-code"><code>        else
+        {
+            if (!player.isSneaking() || player.getHeldItem() == null)
+            {
+                IBlockState iblockstate = worldIn.getBlockState(pos);
+
+                if (iblockstate.getBlock().onBlockActivated(worldIn, pos, iblockstate, player, side, offsetX, offsetY, offsetZ))
+                {
+                    return true;
+                }
+            }
+
+            if (stack == null)
+            {
+                return false;
+            }
+            else if (this.isCreative())
+            {
+                int j = stack.getMetadata();
+                int i = stack.stackSize;
+                boolean flag = stack.onItemUse(player, worldIn, pos, side, offsetX, offsetY, offsetZ);
+                stack.setItemDamage(j);
+                stack.stackSize = i;
+                return flag;
+            }
+            else
+            {
+                return stack.onItemUse(player, worldIn, pos, side, offsetX, offsetY, offsetZ);
+            }
+        }
+    }</code></pre>
+<p class="impl-pattern" style="font-size:0.8rem;color:var(--text-muted)">The sneaking check lets players place blocks instead of opening GUIs when holding items. onBlockActivated gives the target block first chance to consume the click. Null stack returns false after failed activation to stop further work. Creative placement restores metadata and size after onItemUse while survival delegates directly for consumption.</p>
+</div>
+</div>
+<div class="detail-section"><h3>Packet Usage</h3><table class="fields-table"><thead><tr><th>Packet</th><th>Dir</th><th>Trigger</th></tr></thead><tbody>
+<tr><td class="f-name">C07/C08</td><td class="f-type">handled</td><td class="f-desc">NetHandlerPlayServer dig and block-place drive these methods</td></tr>
+<tr><td class="f-name">S25</td><td class="f-type">sent</td><td class="f-desc">sendBlockBreakProgress in dig start, tick and cancel</td></tr>
+<tr><td class="f-name">S23</td><td class="f-type">sent</td><td class="f-desc">tryHarvestBlock creative correction to breaker</td></tr>
+<tr><td class="f-name">S38</td><td class="f-type">sent</td><td class="f-desc">setGameType UPDATE_GAME_MODE broadcast</td></tr>
+</tbody></table></div>
+<div class="detail-section"><h3>Internal State</h3><div class="subclass-list">
+<div class="subclass-item"><span class="sub-name">theWorld</span><span class="sub-desc">Server world where block edits are applied</span></div>
+<div class="subclass-item"><span class="sub-name">thisPlayerMP</span><span class="sub-desc">Owning player for abilities and packet replies</span></div>
+<div class="subclass-item"><span class="sub-name">gameType</span><span class="sub-desc">Current survival, creative, adventure or spectator mode</span></div>
+<div class="subclass-item"><span class="sub-name">isDestroyingBlock</span><span class="sub-desc">Whether survival dig progress is active</span></div>
+<div class="subclass-item"><span class="sub-name">receivedFinishDiggingPacket</span><span class="sub-desc">Pending finish when stop arrived early</span></div>
+<div class="subclass-item"><span class="sub-name">durabilityRemainingOnBlock</span><span class="sub-desc">Last sent 0-10 crack stage to avoid resends</span></div>
+</div></div>
+<div class="detail-section"><h3>Related Vanilla Internals</h3><div class="related-list"><a class="related-chip" href="../EntityPlayerMP/">EntityPlayerMP</a><a class="related-chip" href="../WorldServer/">WorldServer</a><span class="related-chip" style="opacity:.65">WorldSettings</span><a class="related-chip" href="../NetHandlerPlayServer/">NetHandlerPlayServer</a><span class="related-chip" style="opacity:.65">TileEntityChest</span></div></div>      <div class="detail-section"><h3>Full Source</h3>
       <div class="code-viewer"><div class="cv-toolbar"><span class="cv-file">ItemInWorldManager.java</span><span class="cv-meta">455 lines · MCP 1.8.9 · verbatim</span><button class="cv-copy">Copy</button><a class="cv-link" href="https://github.com/Marcelektro/MavenMCP-1.8.9/blob/master/src/main/java/net/minecraft/server/management/ItemInWorldManager.java" target="_blank" rel="noopener">Original ↗</a></div><div class="cv-body"><table class="cv-table"><tr class="cv-row"><td class="cv-ln"><span class="cv-num">1</span></td><td class="cv-code"><pre><code>package net.minecraft.server.management;</code></pre></td></tr>
 <tr class="cv-row"><td class="cv-ln"><span class="cv-num">2</span></td><td class="cv-code"><pre><code></code></pre></td></tr>
 <tr class="cv-row"><td class="cv-ln"><span class="cv-num">3</span></td><td class="cv-code"><pre><code>import net.minecraft.block.Block;</code></pre></td></tr>
