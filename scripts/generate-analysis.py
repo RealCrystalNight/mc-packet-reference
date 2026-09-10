@@ -186,7 +186,7 @@ def render_viewer(f, ac_repo=None):
 
 def render_page(a, analyses):
     sidebar = build_sidebar(analyses, a["slug"], "page")
-    meta_desc = (a["module"] + " module (" + a["client"] + ") full source analysis \u2014 " + a["overview"][:180])
+    meta_desc = (a["module"] + " module (" + a["client"] + ") full source analysis, " + a["overview"][:180])
     packets_html = ""
     if a.get("packets"):
         chips = "".join('<a class="related-chip" href="../../packets/%s/">%s</a>' % (p, p) for p in a["packets"])
@@ -235,12 +235,12 @@ def render_page(a, analyses):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>%s %s \u2014 Full Source Analysis | Minecraft 1.8.9 Packet Reference</title>
+<title>%s %s, Minecraft 1.8.9 Module Source Analysis</title>
 <meta name="description" content="%s">
 <meta name="robots" content="index, follow">
 <meta name="theme-color" content="#0a0a0a">
 <link rel="canonical" href="%s/analysis/%s/%s.html">
-<meta property="og:title" content="%s %s \u2014 Full Source Analysis">
+<meta property="og:title" content="%s %s, Minecraft 1.8.9 Module Analysis">
 <meta property="og:locale" content="en_US">
 <meta property="article:published_time" content="%s">
 <meta property="article:modified_time" content="%s">
@@ -256,7 +256,7 @@ def render_page(a, analyses):
 <link rel="stylesheet" href="../../assets/github-dark.min.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
 <script type="application/ld+json">
-{"@context":"https://schema.org","@type":"TechArticle","headline":"%s %s \u2014 Full Source Analysis","description":"%s","datePublished":"%s","dateModified":"%s","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"%s/analysis/%s/%s.html"},"author":{"@type":"Organization","name":"MC Packet Reference"},"publisher":{"@type":"Organization","name":"MC Packet Reference"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"}}
+{"@context":"https://schema.org","@type":"TechArticle","headline":"%s %s, Minecraft 1.8.9 Module Analysis","description":"%s","datePublished":"%s","dateModified":"%s","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"%s/analysis/%s/%s.html"},"author":{"@type":"Organization","name":"MC Packet Reference"},"publisher":{"@type":"Organization","name":"MC Packet Reference"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"}}
 </script>
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"%s/"},{"@type":"ListItem","position":2,"name":"Module Analysis","item":"%s/analysis/"},{"@type":"ListItem","position":3,"name":"%s %s","item":"%s/analysis/%s/%s.html"}]}

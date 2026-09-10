@@ -16,14 +16,48 @@ let SITE;
 try { const cfg = require('../config.json'); SITE = cfg.SITE || 'https://realcrystalnight.github.io/mc-packet-reference'; } catch (e) { SITE = 'https://realcrystalnight.github.io/mc-packet-reference'; }
 
 const GROUPS = [
-  { label: 'Handshaking', state: 'HANDSHAKING', dir: 'SERVERBOUND' },
-  { label: 'Login \u2192 Server', state: 'LOGIN', dir: 'SERVERBOUND' },
-  { label: 'Login \u2192 Client', state: 'LOGIN', dir: 'CLIENTBOUND' },
-  { label: 'Status \u2192 Server', state: 'STATUS', dir: 'SERVERBOUND' },
-  { label: 'Status \u2192 Client', state: 'STATUS', dir: 'CLIENTBOUND' },
-  { label: 'Play \u2192 Server', state: 'PLAY', dir: 'SERVERBOUND' },
-  { label: 'Play \u2192 Client', state: 'PLAY', dir: 'CLIENTBOUND' }
+  { label: 'Handshaking', state: 'HANDSHAKING', dir: 'SERVERBOUND', slug: 'handshaking' },
+  { label: 'Login \u2192 Server', slug: 'login-server', state: 'LOGIN', dir: 'SERVERBOUND' },
+  { label: 'Login \u2192 Client', slug: 'login-client', state: 'LOGIN', dir: 'CLIENTBOUND' },
+  { label: 'Status \u2192 Server', slug: 'status-server', state: 'STATUS', dir: 'SERVERBOUND' },
+  { label: 'Status \u2192 Client', slug: 'status-client', state: 'STATUS', dir: 'CLIENTBOUND' },
+  { label: 'Play \u2192 Server', slug: 'play-server', state: 'PLAY', dir: 'SERVERBOUND' },
+  { label: 'Play \u2192 Client', slug: 'play-client', state: 'PLAY', dir: 'CLIENTBOUND' }
 ];
+
+function groupFor(pkt) {
+  for (var i = 0; i < GROUPS.length; i++) {
+    if (GROUPS[i].state === pkt.state && GROUPS[i].dir === pkt.dir) return GROUPS[i];
+  }
+  return GROUPS[5];
+}
+function titleCase(s) { return String(s).charAt(0) + String(s).slice(1).toLowerCase(); }
+function cleanDash(s) {
+  s = String(s).replace(/ \u2014 /g, ', ').replace(/\u2014/g, ', ');
+  return s.replace(/\s*,\s*,/g, ',').replace(/\s{2,}/g, ' ');
+}
+function cutDesc(s, n) {
+  s = cleanDash(String(s).replace(/"/g, '&quot;'));
+  if (s.length <= n) return s;
+  s = s.substring(0, n);
+  var sp = s.lastIndexOf(' ');
+  return sp > 40 ? s.substring(0, sp) : s;
+}
+function crumbJson(items) {
+  return '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":['
+    + items.map(function(it, i) {
+        return '{"@type":"ListItem","position":' + (i + 1) + ',"name":"' + it.name + '","item":"' + it.url + '"}';
+      }).join(',') + ']}\n</script>\n';
+}
+function crumbNav(items) {
+  return '<nav class="crumbs" aria-label="Breadcrumb" style="font-size:0.78rem;color:var(--text-muted);margin-bottom:14px">'
+    + items.map(function(it, i) {
+        var sep = i ? '<span style="margin:0 6px">\u203a</span>' : '';
+        return sep + (it.url && i < items.length - 1
+          ? '<a href="' + it.url + '" style="color:var(--accent)">' + esc(it.name) + '</a>'
+          : '<span>' + esc(it.name) + '</span>');
+      }).join('') + '</nav>\n';
+}
 
 // Protocol state + direction -> MCP package path (same mapping as fetch-vanilla-sources.js)
 const STATE_DIR = {
@@ -94,6 +128,19 @@ function renderLogicRefs(slugs) {
     + '</div><p style="font-size:0.75rem;color:var(--text-muted);margin-top:6px">Full 1.8.9 logic-class sources that send or handle this packet, stored verbatim.</p></div>';
 }
 
+// Deep-dive analysis references (data/analysis/*) — links ranking packet
+// pages to the module/anticheat analysis pages they discuss.
+function renderAnalysisRefs(list, title) {
+  if (!list || !list.length) return '';
+  var seen = {};
+  var chips = list.filter(function(a) { if (seen[a.slug]) return false; seen[a.slug] = 1; return true; })
+    .map(function(a) {
+      return '<a class="related-chip" href="../../analysis/' + a.category + '/' + a.slug + '.html">' + esc(a.label) + '</a>';
+    }).join('');
+  return '<div class="detail-section"><h3>' + esc(title || 'Module Analyses') + '</h3><div class="related-list">' + chips
+    + '</div><p style="font-size:0.75rem;color:var(--text-muted);margin-top:6px">Full source walkthroughs of the modules and anti-cheats that use this packet.</p></div>';
+}
+
 // Completeness: which of the 8 content signals a packet page carries.
 function completenessBadge(pkt, logic) {
   var signals = [pkt.fields && pkt.fields.length, pkt.encoding && pkt.encoding.length,
@@ -122,7 +169,7 @@ function packetPager(id, allPkts) {
 // rendered as cohesive pages inside Vanilla Internals
 // ============================================================
 const CONCEPTS = [
-  { slug: 'codebase-map', file: 'codebase-map.txt', doc: 'codebase-map.txt', title: 'Codebase Map', desc: 'Complete reference of the deobfuscated 1.8.9 net/minecraft source: world model, protocol, client runtime, utilities — every signature copied verbatim.' },
+  { slug: 'codebase-map', file: 'codebase-map.txt', doc: 'codebase-map.txt', title: 'Codebase Map', desc: 'Complete reference of the deobfuscated 1.8.9 net/minecraft source: world model, protocol, client runtime, utilities, with every signature copied verbatim.' },
   { slug: 'diagrams', file: 'diagrams.txt', doc: 'diagrams.txt', title: 'Diagrams', desc: 'Visual companion: architecture layers, packet lifecycle, threading, collision, raytrace and movement constants in plain ASCII.' }
 ];
 function renderConceptsBody(text) {
@@ -514,6 +561,21 @@ function main() {
   // Build sidebar once
   const sidebarHtml = buildSidebarHtml(allPkts);
 
+  // Module/anticheat analysis maps: by packet id and by module name
+  const analysesByPacket = {};
+  const analysesByModule = {};
+  try {
+    const aidx = JSON.parse(fs.readFileSync(path.join(BASE, 'data', 'analysis', 'index.json'), 'utf8'));
+    (aidx.analyses || []).forEach(function(slug) {
+      const a = JSON.parse(fs.readFileSync(path.join(BASE, 'data', 'analysis', slug + '.json'), 'utf8'));
+      const rec = { slug: slug, category: a.category, label: a.module + ' (' + a.client + ')' };
+      (a.packets || []).forEach(function(pid) {
+        (analysesByPacket[pid] = analysesByPacket[pid] || []).push(rec);
+      });
+      (analysesByModule[a.module.toLowerCase()] = analysesByModule[a.module.toLowerCase()] || []).push(rec);
+    });
+  } catch (e) { /* no analyses available */ }
+
   // Logic-class cross references: packet id -> [slugs], slug -> {entry, code, packets, peers}
   const logicData = {};
   const logicRefs = {};
@@ -546,16 +608,16 @@ function main() {
     const dir2 = path.join(OUT_DIR, pkt.id);
     fs.mkdirSync(dir2, { recursive: true });
 
-    const metaTitle = pkt.id + ' \u2014 Minecraft 1.8.9 Packet Reference';
     const dirLabel = pkt.dir === 'SERVERBOUND' ? 'Serverbound' : 'Clientbound';
-    const fullDesc = (pkt.id + ' (' + pkt.hex + ') \u2014 ' + dirLabel + ' \u2014 Protocol State: ' + pkt.state + '. ' + pkt.desc + (pkt.fields && pkt.fields.length ? ' Fields: ' + pkt.fields.map(function(f) { return f.name; }).join(', ') + '.' : '')).substring(0, 400);
+    const metaTitle = pkt.id + ' (' + pkt.hex + '), ' + dirLabel + ' ' + titleCase(pkt.state) + ', Minecraft 1.8.9';
+    const fullDesc = pkt.id + ' (' + pkt.hex + '), ' + dirLabel + ' ' + pkt.state + ' packet, Minecraft 1.8.9 (protocol 47). ' + pkt.desc + (pkt.fields && pkt.fields.length ? ' Fields: ' + pkt.fields.map(function(f) { return f.name; }).join(', ') + '.' : '');
     const tags = (pkt.tags || []).join(', ');
     const moduleList = pkt.implementation && pkt.implementation.modules ? pkt.implementation.modules : [];
     const modules = moduleList.map(function(m) { return m.name; }).join(', ');
     const moduleCount = moduleList.length;
 
     // Description: protocol facts + module names for richer search snippets (kept ≤160 chars for SERPs).
-    const metaDesc = (fullDesc + (modules ? ' Modules: ' + modules + '.' : '')).replace(/"/g, '&quot;').substring(0, 155);
+    const metaDesc = pkt.seo_desc ? cutDesc(pkt.seo_desc, 155) : cutDesc(pkt.id + ' (' + pkt.hex + ') ' + dirLabel + ' ' + pkt.state + ' packet: ' + pkt.desc + ' Minecraft 1.8.9 (protocol 47) reference: fields, encoding, MCP source, modules.', 155);
 
     const dirClass = pkt.dir === 'SERVERBOUND' ? 'dir-sb' : 'dir-cb';
     const dirLabelFull = pkt.dir === 'SERVERBOUND' ? 'Serverbound (Client \u2192 Server)' : 'Clientbound (Server \u2192 Client)';
@@ -570,6 +632,8 @@ function main() {
 
     var implEsc = (pkt.implementation && pkt.implementation.overview ? pkt.implementation.overview : '').replace(/"/g, '\\"').substring(0, 300);
 
+    const grp = groupFor(pkt);
+    const grpUrl = SITE + '/packets/' + grp.slug + '/';
     const pageUrl = SITE + '/packets/' + pkt.id + '/';
     const ogImage = SITE + '/assets/og-image.png';
     const pktJsonPath = path.join(PACKETS_DIR, pkt.id + '.json');
@@ -602,23 +666,22 @@ function main() {
       + '<meta property="og:site_name" content="MC 1.8.9 Packet Reference">\n'
       + '<meta property="og:image" content="' + ogImage + '">\n'
       + '<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">\n'
-      + '<meta property="og:image:alt" content="Minecraft 1.8.9 Packet Reference — network protocol documentation">\n'
+      + '<meta property="og:image:alt" content="Minecraft 1.8.9 Packet Reference, network protocol documentation">\n'
       + '<meta property="article:published_time" content="' + pubDate + '">\n'
       + '<meta property="article:modified_time" content="' + modDate + '">\n'
       + '<meta name="twitter:card" content="summary_large_image">\n'
       + '<meta name="twitter:title" content="' + metaTitle + '">\n'
-      + '<meta name="twitter:description" content="' + pkt.id + ' (' + pkt.hex + '): ' + pkt.desc.substring(0, 120) + '">\n'
+      + '<meta name="twitter:description" content="' + cleanDash(pkt.id + ' (' + pkt.hex + '): ' + pkt.desc).substring(0, 120) + '">\n'
       + '<meta name="twitter:image" content="' + ogImage + '">\n'
       + '<meta name="twitter:label1" content="Direction"><meta name="twitter:data1" content="' + dirLabel + '">\n'
       + '<meta name="twitter:label2" content="State"><meta name="twitter:data2" content="' + pkt.state + '">\n'
       + '<meta name="twitter:label3" content="Modules"><meta name="twitter:data3" content="' + modules + '">\n'
-      + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
       + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
       + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
       + '<link rel="stylesheet" href="../../css/style.css">\n'
       + '<link rel="stylesheet" href="../../assets/github-dark.min.css">\n'
       + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"TechArticle","headline":"' + metaTitle + '","description":"' + metaDesc.replace(/&quot;/g, '\\"') + '","datePublished":"' + pubDate + '","dateModified":"' + modDate + '","inLanguage":"en","mainEntityOfPage":{"@type":"WebPage","@id":"' + pageUrl + '"},"author":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"publisher":{"@type":"Organization","name":"MC Packet Reference","url":"' + SITE + '"},"about":{"@type":"SoftwareApplication","name":"Minecraft Java Edition","version":"1.8.9"},"proficiencyLevel":"Expert","articleSection":"' + pkt.state + ' Protocol \u2014 ' + dirLabel + '"}\n</script>\n'
-      + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Home","item":"' + SITE + '/"},{"@type":"ListItem","position":2,"name":"' + pkt.state + ' Protocol","item":"' + SITE + '/packets/"},{"@type":"ListItem","position":3,"name":"' + pkt.id + '","item":"' + pageUrl + '"}]}\n</script>\n'
+      + crumbJson([{name:'Home',url:SITE+'/'},{name:'All Packets',url:SITE+'/packets/'},{name:grp.label,url:grpUrl},{name:pkt.id,url:pageUrl}])
       + '</head>\n<body>\n'
       + '<aside class="sidebar" id="sidebar">\n'
       + '  <div class="sidebar-header">\n'
@@ -638,6 +701,7 @@ function main() {
       + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
       + '  <div class="content-detail" style="display:block;max-width:860px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
       + '    <div class="detail-header" id="detailHeader">\n'
+      + crumbNav([{name:'Home',url:'../../'},{name:'All Packets',url:'../../packets/'},{name:grp.label,url:'../../packets/'+grp.slug+'/'},{name:pkt.id}])
       + '      <h1><span class="detail-hex">' + pkt.hex + '</span> ' + pkt.id + '</h1>\n'
       + '      <p class="detail-desc">' + pkt.desc + '</p>\n'
       + '      <div class="detail-meta">\n'
@@ -653,6 +717,7 @@ function main() {
       + '    </div>\n'
       + '    <div class="detail-body" id="detailBody">\n'
       + renderDetail(pkt, logicRefs[pkt.id]) + '\n'
+      + renderAnalysisRefs(analysesByPacket[pkt.id], 'Module Analyses Using ' + pkt.id) + '\n'
       + '    </div>\n'
       + siteFooter('../../') + '\n'
       + '  </div>\n'
@@ -663,6 +728,76 @@ function main() {
 
     fs.writeFileSync(path.join(dir2, 'index.html'), html);
   }
+
+  // ============================================================
+  // State-group listing pages — /packets/<slug>/ with ItemList
+  // ============================================================
+  GROUPS.forEach(function(g) {
+    const gpkts = allPkts.filter(function(pp) { return pp.state === g.state && pp.dir === g.dir; });
+    if (!gpkts.length) return;
+    const gUrl = SITE + '/packets/' + g.slug + '/';
+    const gTitle = g.label + ' Packets, Minecraft 1.8.9 Protocol 47';
+    const gDesc = cutDesc(g.label + ' packets for Minecraft 1.8.9 (protocol 47): ' + gpkts.length + ' packets \u2014 ' + gpkts.map(function(pp) { return pp.id; }).join(', ') + '.', 155);
+    const gRows = gpkts.map(function(pp) {
+      return '<a href="../../packets/' + pp.id + '/" class="section-packet-row">'
+        + '<span class="row-hex">' + pp.id.substring(0, 3) + '</span>'
+        + '<span class="row-name">' + pp.name + '</span>'
+        + '<span class="row-desc">' + esc(pp.desc) + '</span></a>';
+    }).join('');
+    const gHtml = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
+      + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+      + '<title>' + gTitle + '</title>\n'
+      + '<meta name="description" content="' + gDesc + '">\n'
+      + '<meta name="keywords" content="Minecraft, 1.8.9, protocol 47, ' + g.label + ', packets">\n'
+      + '<meta name="author" content="MC Packet Reference">\n'
+      + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
+      + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
+      + '<meta name="theme-color" content="#0a0a0a">\n'
+      + '<link rel="manifest" href="../../assets/site.webmanifest">\n'
+      + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
+      + '<link rel="canonical" href="' + gUrl + '">\n'
+      + '<meta property="og:title" content="' + gTitle + '">\n'
+      + '<meta property="og:description" content="' + gDesc + '">\n'
+      + '<meta property="og:type" content="website">\n'
+      + '<meta property="og:url" content="' + gUrl + '">\n'
+      + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
+      + '<meta name="twitter:card" content="summary">\n'
+      + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+      + '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n'
+      + '<link rel="stylesheet" href="../../css/style.css">\n'
+      + '<script type="application/ld+json">\n{"@context":"https://schema.org","@type":"ItemList","name":"' + gTitle + '","itemListElement":['
+      + gpkts.map(function(pp, i) {
+          return '{"@type":"ListItem","position":' + (i + 1) + ',"url":"' + SITE + '/packets/' + pp.id + '/","name":"' + pp.id + '"}';
+        }).join(',') + ']}\n</script>\n'
+      + crumbJson([{name:'Home',url:SITE+'/'},{name:'All Packets',url:SITE+'/packets/'},{name:g.label,url:gUrl}])
+      + '</head>\n<body>\n'
+      + '<aside class="sidebar" id="sidebar">\n'
+      + '  <div class="sidebar-header">\n'
+      + '    <a href="../../" class="logo" style="text-decoration:none">\n'
+      + '      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 7h10M7 12h10M7 17h6"/></svg>\n'
+      + '      <span>MC <strong>1.8.9</strong></span>\n'
+      + '    </a>\n'
+      + '  </div>\n'
+      + '  <nav class="sidebar-nav" id="sidebarNav">' + hubNav('../../') + sidebarHtml + '</nav>\n'
+      + '</aside>\n'
+      + '<main class="main" id="main">\n'
+      + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
+      + '  <div class="content-detail" style="display:block;max-width:900px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
+      + '    <div class="detail-header">\n'
+      + crumbNav([{name:'Home',url:'../../'},{name:'All Packets',url:'../../packets/'},{name:g.label}])
+      + '      <h1>' + g.label + ' Packets</h1>\n'
+      + '      <p class="detail-desc">' + gpkts.length + ' Minecraft 1.8.9 (protocol 47) packets: ' + esc(g.label) + '. Click through for fields, wire encoding and MCP sources.</p>\n'
+      + '    </div>\n'
+      + '    <div class="section-packet-list">' + gRows + '</div>\n'
+      + siteFooter('../../') + '\n'
+      + '  </div>\n'
+      + '</main>\n'
+      + '<script>(function(){var t=document.getElementById(\'sidebarToggle\');if(t)t.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.toggle(\'open\');});document.querySelectorAll(\'#sidebar a\').forEach(function(a){a.addEventListener(\'click\',function(){document.getElementById(\'sidebar\').classList.remove(\'open\');});});})();</script>\n'
+      + '</body>\n</html>';
+    const gdir = path.join(OUT_DIR, g.slug);
+    fs.mkdirSync(gdir, { recursive: true });
+    fs.writeFileSync(path.join(gdir, 'index.html'), gHtml);
+  });
 
   // ============================================================
   // Logic-class pages — full vanilla sources catted verbatim from
@@ -682,7 +817,7 @@ function main() {
     const pageUrl = SITE + '/classes/' + slug + '/';
     const ogImage = SITE + '/assets/og-image.png';
     const modDate = mtime(path.join(LOGIC_DIR, slug + '.java'));
-    const metaTitle = e.title + ' \u2014 Minecraft 1.8.9 Logic Class Reference';
+    const metaTitle = e.title + ', MCP 1.8.9 Source, Minecraft 1.8.9';
     const metaDesc = (e.title + ' (' + e.rel + '): full MCP 1.8.9 source. Packets used: ' + ld.packets.join(', ') + '.').substring(0, 155);
     const pktChips = ld.packets.map(function(pid) {
       return '<a class="related-chip" href="../../packets/' + pid + '/">' + esc(pid) + '</a>';
@@ -731,6 +866,7 @@ function main() {
       + '<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>\n'
       + '  <div class="content-detail" style="display:block;max-width:860px;margin:0 auto;padding:40px 48px 80px;width:100%">\n'
       + '    <div class="detail-header">\n'
+      + crumbNav([{name:'Home',url:'../../'},{name:'Vanilla Internals',url:'../../classes/'},{name:e.title}])
       + '      <h1>' + e.title + '</h1>\n'
       + '      <p class="detail-desc">' + e.desc + '</p>\n'
       + '      <div class="detail-meta"><span class="meta-mcp">' + esc(e.rel) + '</span></div>\n'
@@ -777,15 +913,16 @@ function main() {
   }).join('\n');
   const logicIndex = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
     + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-    + '<title>Vanilla Internals \u2014 Minecraft 1.8.9 Packet Reference</title>\n'
-    + '<meta name="description" content="Full MCP 1.8.9 logic-class sources that send and handle network packets: EntityPlayerSP, EntityPlayerMP and more, each linked to every packet they use.">\n'
+    + '<title>MCP 1.8.9 Source, Minecraft 1.8.9 Vanilla Internals</title>\n'
+    + '<meta name="description" content="MCP 1.8.9 source and mappings: 28 full deobfuscated vanilla classes that send and handle Minecraft 1.8.9 packets, including EntityPlayerSP, NetHandlerPlayServer and World.">\n'
     + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
     + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
     + '<meta name="theme-color" content="#0a0a0a">\n'
     + '<link rel="manifest" href="../assets/site.webmanifest">\n'
     + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
     + '<link rel="canonical" href="' + SITE + '/classes/">\n'
-    + '<meta property="og:title" content="Vanilla Internals \u2014 Minecraft 1.8.9 Packet Reference">\n'
+    + crumbJson([{name:'Home',url:SITE+'/'},{name:'Vanilla Internals',url:SITE+'/classes/'}])
+    + '<meta property="og:title" content="MCP 1.8.9 Source, Minecraft 1.8.9 Vanilla Internals">\n'
     + '<meta property="og:type" content="website">\n'
     + '<meta property="og:url" content="' + SITE + '/classes/">\n'
     + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
@@ -841,8 +978,8 @@ function main() {
         + '</div>';
     }).join('\n');
     const pageUrl = SITE + '/classes/' + cp.slug + '/';
-    const metaTitle = cp.title + ' \u2014 Minecraft 1.8.9 Vanilla Internals';
-    const metaDesc = cp.desc.substring(0, 155);
+    const metaTitle = cp.title + ', Minecraft 1.8.9 Vanilla Internals';
+    const metaDesc = cutDesc(cp.desc, 155);
     const clsHtml = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
       + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
       + '<title>' + metaTitle + '</title>\n'
@@ -913,7 +1050,7 @@ function main() {
     }).join('\n');
     const guideHtml = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
       + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-      + '<title>Start Here \u2014 Minecraft 1.8.9 Packet Reference</title>\n'
+      + '<title>Start Here, Minecraft 1.8.9 Protocol 47</title>\n'
       + '<meta name="description" content="' + esc(guide.desc).substring(0, 155) + '">\n'
       + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
       + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
@@ -921,7 +1058,8 @@ function main() {
       + '<link rel="manifest" href="../assets/site.webmanifest">\n'
       + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
       + '<link rel="canonical" href="' + SITE + '/start/">\n'
-      + '<meta property="og:title" content="Start Here \u2014 Minecraft 1.8.9 Packet Reference">\n'
+    + crumbJson([{name:'Home',url:SITE+'/'},{name:'Start Here',url:SITE+'/start/'}])
+      + '<meta property="og:title" content="Start Here, Minecraft 1.8.9 Protocol 47">\n'
       + '<meta property="og:type" content="article">\n'
       + '<meta property="og:url" content="' + SITE + '/start/">\n'
       + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
@@ -963,6 +1101,9 @@ function main() {
   const sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
     + '  <url><loc>' + SITE + '/</loc><lastmod>' + mtime(path.join(BASE, 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>1.0</priority></url>\n'
     + '  <url><loc>' + SITE + '/packets/</loc><lastmod>' + mtime(path.join(BASE, 'packets', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.9</priority></url>\n'
+    + GROUPS.map(function(g) {
+      return '  <url><loc>' + SITE + '/packets/' + g.slug + '/</loc><lastmod>' + mtime(path.join(BASE, 'packets', g.slug, 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.85</priority></url>';
+    }).join('\n') + '\n'
     + '  <url><loc>' + SITE + '/modules/</loc><lastmod>' + mtime(path.join(BASE, 'modules', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>\n'
     + '  <url><loc>' + SITE + '/classes/</loc><lastmod>' + mtime(path.join(BASE, 'classes', 'index.html')) + '</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>\n'
     + '  <url><loc>' + SITE + '/start/</loc><lastmod>' + mtime(path.join(BASE, 'start', 'index.html')) + '</lastmod><changefreq>monthly</changefreq><priority>0.9</priority></url>\n'
@@ -1012,26 +1153,31 @@ function main() {
     const clientSet = {};
     hits.forEach(function(h) { h.clients.forEach(function(c) { clientSet[c] = true; }); });
     const clientNames = Object.keys(clientSet).sort();
+    const ma = analysesByModule[mn.toLowerCase()] || [];
     return '<div class="mod-card">'
       + '<div class="mod-card-head"><span class="mod-card-name">' + esc(mn) + '</span>'
       + '<span class="mod-card-count">' + hits.length + (hits.length === 1 ? ' packet' : ' packets') + '</span></div>'
       + '<div class="mod-card-pkts">' + hits.map(function(h) {
           return '<a class="related-chip" href="../packets/' + h.id + '/">' + esc(h.id) + '</a>';
         }).join('') + '</div>'
+      + (ma.length ? '<div class="mod-card-pkts" style="margin-top:6px">' + ma.map(function(a) {
+          return '<a class="related-chip" href="../analysis/' + a.category + '/' + a.slug + '.html" style="border-color:var(--orange);color:var(--orange)">\u2699 ' + esc(a.label) + '</a>';
+        }).join('') + '</div>' : '')
       + (clientNames.length ? '<div class="mod-card-clients">' + clientNames.join(', ') + '</div>' : '')
       + '</div>';
   }).join('\n');
   const modHtml = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
     + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-    + '<title>Cheat Modules \u2014 Minecraft 1.8.9 Packet Reference</title>\n'
-    + '<meta name="description" content="Index of every cheat module implementation across the 10 reference clients, mapped to the Minecraft 1.8.9 packets they use: KillAura, Scaffold, Velocity, Disabler, Fly, Speed and more.">\n'
+    + '<title>Cheat Modules & Anti-Cheats, Minecraft 1.8.9 Packet Reference</title>\n'
+    + '<meta name="description" content="Every cheat module and anti-cheat implementation across 10 Minecraft 1.8.9 clients, mapped to the packets they use and to full source analyses: KillAura, Scaffold, Blink, Disabler, Fly, Speed and more.">\n'
     + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
     + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
     + '<meta name="theme-color" content="#0a0a0a">\n'
     + '<link rel="manifest" href="../assets/site.webmanifest">\n'
     + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
     + '<link rel="canonical" href="' + SITE + '/modules/">\n'
-    + '<meta property="og:title" content="Cheat Modules \u2014 Minecraft 1.8.9 Packet Reference">\n'
+    + crumbJson([{name:'Home',url:SITE+'/'},{name:'Cheat Modules',url:SITE+'/modules/'}])
+    + '<meta property="og:title" content="Cheat Modules, Minecraft 1.8.9 Packet Reference">\n'
     + '<meta property="og:type" content="website">\n'
     + '<meta property="og:url" content="' + SITE + '/modules/">\n'
     + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
@@ -1075,7 +1221,7 @@ function main() {
   const listSections = GROUPS.map(function(g) {
     const pkts = allPkts.filter(function(p) { return p.state === g.state && p.dir === g.dir; });
     if (!pkts.length) return '';
-    return '<div class="overview-section"><h2>' + g.label + ' <span style="font-size:0.7rem;color:var(--text-muted);font-weight:400;margin-left:6px">' + pkts.length + ' packets</span></h2>'
+    return '<div class="overview-section"><h2><a href="../packets/' + g.slug + '/" style="color:var(--text-primary);text-decoration:none">' + g.label + '</a> <span' + ' style="font-size:0.7rem;color:var(--text-muted);font-weight:400;margin-left:6px">' + pkts.length + ' packets</span></h2>'
       + '<div class="section-packet-list">'
       + pkts.map(function(p) {
           return '<a href="../packets/' + p.id + '/" class="section-packet-row">'
@@ -1087,17 +1233,18 @@ function main() {
   }).join('');
   const packetsIndex = '<!DOCTYPE html>\n<html lang="en" data-theme="dark">\n<head>\n'
     + '<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-    + '<title>All Packets \u2014 Minecraft 1.8.9 Packet Reference</title>\n'
-    + '<meta name="description" content="Browse all 105 Minecraft 1.8.9 network packets organized by protocol state and direction: handshaking, login, status, and play.">\n'
+    + '<title>All Packets, Minecraft 1.8.9 Protocol 47 (MCP Source)</title>\n'
+    + '<meta name="description" content="Browse all 105 Minecraft 1.8.9 (protocol 47) network packets by state and direction: handshaking, login, status, play, with fields, MCP source and modules.">\n'
     + '<meta name="robots" content="index, follow, max-image-preview:large">\n'
     + '<meta name="referrer" content="strict-origin-when-cross-origin">\n'
     + '<meta name="theme-color" content="#0a0a0a">\n'
     + '<link rel="manifest" href="../assets/site.webmanifest">\n'
     + '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>📦</text></svg>">\n'
     + '<link rel="canonical" href="' + SITE + '/packets/">\n'
-    + '<meta property="og:title" content="All Packets \u2014 Minecraft 1.8.9 Packet Reference">\n'
+    + '<meta property="og:title" content="All Packets, Minecraft 1.8.9 Protocol 47 (MCP Source)">\n'
     + '<meta property="og:type" content="website">\n'
     + '<meta property="og:url" content="' + SITE + '/packets/">\n'
+    + crumbJson([{name:'Home',url:SITE+'/'},{name:'All Packets',url:SITE+'/packets/'}])
     + '<meta property="og:image" content="' + SITE + '/assets/og-image.png">\n'
     + '<meta name="twitter:card" content="summary_large_image">\n'
     + '<link rel="preconnect" href="https://fonts.googleapis.com">\n<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
@@ -1166,6 +1313,7 @@ function main() {
     const o = JSON.parse(JSON.stringify(p));
     o.url = SITE + '/packets/' + p.id + '/';
     o.mcp_path = mcpPathFor(p);
+    o.group = groupFor(p).slug;
     o.logic_classes = logicRefs[p.id] || [];
     return o;
   });
@@ -1189,10 +1337,11 @@ function main() {
   fs.writeFileSync(path.join(apiDir, 'analyses.json'), JSON.stringify({ site: SITE, count: apiAnalyses.length, analyses: apiAnalyses }, null, 1));
   fs.writeFileSync(path.join(apiDir, 'index.json'), JSON.stringify({ site: SITE, version: '1.8.9', endpoints: ['api/packets.json', 'api/classes.json', 'api/modules.json', 'api/analyses.json', 'api/index.json', 'sitemap.xml', 'llms.txt'] }, null, 1));
   const llmsLines = ['# Minecraft 1.8.9 Packet Reference — llms.txt', '# ' + SITE + '/', '',
-    '> Searchable reference for all 105 Minecraft 1.8.9 network packets — fields, wire encoding, MCP classes, real client examples and anti-cheat notes.',
+    '> Searchable reference for all 105 Minecraft 1.8.9 network packets (protocol 47): fields, wire encoding, MCP 1.8.9 source, real client examples and anti-cheat notes.',
     '> Plus 16 verbatim MCP logic-class sources with deep analysis, module index and module analyses.', '',
     '## Hubs', '- [Home](' + SITE + '/)', '- [All Packets](' + SITE + '/packets/)', '- [Vanilla Internals](' + SITE + '/classes/)',
     '- [Cheat Modules](' + SITE + '/modules/)', '- [Module Analyses](' + SITE + '/analysis/)', '',
+    '## Module & anti-cheat analyses (' + apiAnalyses.length + ')', 'Full source walkthroughs for every module and anti-cheat in the corpus (KillAura, Scaffold, Blink, NoFall, Disabler, Kauri, NCP and more). Index: [' + SITE + '/api/analyses.json](' + SITE + '/api/analyses.json), hub: [' + SITE + '/analysis/](' + SITE + '/analysis/).', '',
     '## Machine API (traverse these first)', '- [' + SITE + '/api/index.json](' + SITE + '/api/index.json)',
     '- [' + SITE + '/api/packets.json](' + SITE + '/api/packets.json)', '- [' + SITE + '/api/classes.json](' + SITE + '/api/classes.json)',
     '- [' + SITE + '/api/modules.json](' + SITE + '/api/modules.json)', '- [' + SITE + '/api/analyses.json](' + SITE + '/api/analyses.json) — full module-analysis index',
@@ -1201,7 +1350,7 @@ function main() {
   GROUPS.forEach(function(g) {
     const pkts = allPkts.filter(function(p) { return p.state === g.state && p.dir === g.dir; });
     if (!pkts.length) return;
-    llmsLines.push('### ' + g.label + ' (' + pkts.length + ')');
+    llmsLines.push('### [' + g.label + '](' + SITE + '/packets/' + g.slug + '/) (' + pkts.length + ')');
     pkts.forEach(function(p) { llmsLines.push('- [' + p.id + ' ' + p.hex + ' — ' + p.name + '](' + SITE + '/packets/' + p.id + '/): ' + p.desc); });
   });
   llmsLines.push('', '## Vanilla Internals (' + apiClasses.length + ' — full MCP sources + analysis)');

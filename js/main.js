@@ -324,6 +324,26 @@ function buildOverviewSections(filtered) {
 }
 
 // ============================================================
+// ?q= DEEP LINK — makes the SearchAction target real
+// (https://.../?q=scaffold pre-fills and runs the search)
+// ============================================================
+(function initQueryParam() {
+  try {
+    var q = new URLSearchParams(window.location.search).get('q');
+    if (q) {
+      state.searchTerm = q;
+      var input = document.getElementById('sidebarSearch');
+      if (input) input.value = q;
+      // search-result variants should not be indexed (canonical points to clean URL)
+      var robots = document.createElement('meta');
+      robots.name = 'robots';
+      robots.content = 'noindex, follow';
+      document.head.appendChild(robots);
+    }
+  } catch (e) { /* older browsers: skip */ }
+})();
+
+// ============================================================
 // EVENT HANDLERS
 // ============================================================
 document.getElementById('sidebarSearch').addEventListener('input', debounce(function() {
