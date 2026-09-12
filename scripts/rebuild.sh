@@ -25,6 +25,20 @@ node scripts/build.js
 echo "==> generate-analysis.py (module analyses + hub — before pages so the sitemap sees fresh mtimes)"
 python3 scripts/generate-analysis.py
 
+# Full MCP 1.8.9 source browser + code graph (requires vendor/, see README).
+if [[ -d vendor/MavenMCP-1.8.9/src/main/java ]]; then
+  echo "==> generate-source.js (source/** class pages + browser + api/source.json)"
+  node scripts/generate-source.js
+  if [[ -f vendor/graphify-out/graph.json ]]; then
+    echo "==> generate-graph.js (source/graph/** + api/graph.json)"
+    node scripts/generate-graph.js
+  else
+    echo "    (no vendor/graphify-out/graph.json — run scripts/build-graph.sh to add the graph)"
+  fi
+else
+  echo "==> source browser skipped (run scripts/fetch-mcp-src.sh once to enable)"
+fi
+
 echo "==> generate-pages.js (packets/*/index.html + sitemap)"
 node scripts/generate-pages.js
 

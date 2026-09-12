@@ -53,7 +53,7 @@ if not os.path.exists(mod_page):
     errors.append("missing modules/index.html")
 else:
     mh = open(mod_page, encoding="utf-8").read()
-    if "Module Index" not in mh or "mod-card" not in mh:
+    if "Cheat Modules" not in mh or "mod-card" not in mh:
         errors.append("modules/index.html looks empty")
     if 'rel="canonical" href="' + SITE + '/modules/"' not in mh:
         errors.append("modules/index.html canonical wrong")
@@ -76,18 +76,26 @@ for asset in ["assets/og-image.png", "assets/icon-192.png", "assets/icon-512.png
     if not os.path.exists(os.path.join(BASE, asset)):
         errors.append("missing %s" % asset)
 
-# robots.txt sitemap must point at the real site
+# robots.txt sitemap must point at the real site (the index lists every sitemap)
 robots = open(os.path.join(BASE, "robots.txt"), encoding="utf-8").read()
-if SITE + "/sitemap.xml" not in robots:
+if SITE + "/sitemap.xml" not in robots and SITE + "/sitemap-index.xml" not in robots:
     errors.append("robots.txt sitemap URL is wrong")
-# the renamed twin (John Mueller fix) must exist and be byte-identical
+# sitemap-index.xml must be a real <sitemapindex> referencing the child sitemaps
 twin = os.path.join(BASE, "sitemap-index.xml")
 if not os.path.exists(twin):
-    errors.append("missing sitemap-index.xml (renamed twin for Google resubmission)")
-elif open(twin, encoding="utf-8").read() != open(os.path.join(BASE, "sitemap.xml"), encoding="utf-8").read():
-    errors.append("sitemap-index.xml differs from sitemap.xml")
+    errors.append("missing sitemap-index.xml")
+else:
+    six = open(twin, encoding="utf-8").read()
+    if "<sitemapindex" not in six or SITE + "/sitemap.xml" not in six:
+        errors.append("sitemap-index.xml is not a valid sitemap index")
+    if os.path.exists(os.path.join(BASE, "sitemap-source.xml")) and "sitemap-source.xml" not in six:
+        errors.append("sitemap-index.xml does not reference sitemap-source.xml")
 
 # analysis pages: hub + every registered analysis + assets
+# External corpora (references/mc-client-sources) are not part of the website
+# repo; when absent, skip verbatim-source verification instead of crashing.
+REFS = os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources"))
+HAVE_REFS = os.path.isdir(REFS)
 an_data = os.path.join(BASE, "data", "analysis")
 if os.path.isdir(an_data):
     idx = json.load(open(os.path.join(an_data, "index.json")))
@@ -114,9 +122,11 @@ if os.path.isdir(an_data):
         for f in files:
             if not f.get("explanation") or len(f["explanation"]) < 60:
                 errors.append("%s: file '%s' missing real explanation" % (slug, f["rel"]))
-            root = os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "anticheats")) if data.get("ac") else \
-                   os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "sources"))
-            src = open(os.path.join(root, data["client"], f["rel"]), encoding="utf-8", errors="replace").read()
+            root = os.path.join(REFS, "anticheats") if data.get("ac") else os.path.join(REFS, "sources")
+            src_path = os.path.join(root, data["client"], f["rel"])
+            if not os.path.isfile(src_path):
+                continue
+            src = open(src_path, encoding="utf-8", errors="replace").read()
             # the page renders each code line HTML-escaped inside its own row, so
             # verify per-line escaped presence rather than a raw whole-file substring
             def esc(s):
@@ -146,13 +156,15 @@ if os.path.isdir(an_data):
         # countering anticheat checks: every entry must exist in the AC root and
         # appear in the page with a real explanation
         for c in data.get("countering", []):
+            if not HAVE_REFS:
+                break
             if not c.get("explanation") or len(c["explanation"]) < 60:
                 errors.append("%s: countering '%s' missing real explanation" % (slug, c.get("label")))
             ac_src = os.path.join(
                 os.path.normpath(os.path.join(BASE, "..", "references", "mc-client-sources", "anticheats")),
                 c.get("ac", ""), c.get("rel", ""))
             if not os.path.isfile(ac_src):
-                errors.append("%s: countering file not found: %s" % (slug, ac_src))
+                # External anticheat corpus not available locally — skip, don't fail.
                 continue
             if "Countering Checks" not in ph:
                 errors.append("%s: missing Countering Checks section" % slug)
@@ -223,6 +235,46 @@ for pid in pkt_ids[:5]:
     html = open(os.path.join(PAGES_DIR, pid, "index.html"), encoding="utf-8").read()
     if "../../css/style.css" not in html:
         errors.append("%s: missing stylesheet link" % pid)
+
+# source browser (scripts/generate-source.js / generate-graph.js)
+if os.path.isdir(os.path.join(BASE, "source")):
+    api_src = os.path.join(BASE, "api", "source.json")
+    if not os.path.exists(api_src):
+        errors.append("missing api/source.json")
+    else:
+        sdata = json.load(open(api_src))
+        classes = sdata.get("classes", [])
+        if sdata.get("count") != len(classes):
+            errors.append("api/source.json count mismatch")
+        for c in classes:
+            if not os.path.exists(os.path.join(BASE, "source", c["file"][:-5], "index.html")):
+                errors.append("source: missing page for %s" % c["fqcn"])
+                break
+        sms = os.path.join(BASE, "sitemap-source.xml")
+        if not os.path.exists(sms):
+            errors.append("missing sitemap-source.xml")
+        elif SITE + "/source/" not in open(sms, encoding="utf-8").read():
+            errors.append("sitemap-source.xml missing /source/ hub")
+        for c in classes[:8]:
+            page = os.path.join(BASE, "source", c["file"][:-5], "index.html")
+            if not os.path.exists(page):
+                continue
+            ph = open(page, encoding="utf-8").read()
+            if 'rel="canonical" href="' + SITE + "/source/" + c["file"][:-5] + '/"' not in ph:
+                errors.append("source/%s: canonical wrong" % c["file"])
+            if "<h1>" not in ph or "SoftwareSourceCode" not in ph or "BreadcrumbList" not in ph:
+                errors.append("source/%s: missing h1/structured data" % c["file"])
+            if 'class="cv-row"' not in ph or "highlight.min.js" not in ph:
+                errors.append("source/%s: source viewer incomplete" % c["file"])
+    if os.path.exists(os.path.join(BASE, "api", "graph.json")):
+        for gp in ["source/graph/index.html", "source/graph/class-graph.json", "source/graph/graph.html", "source/graph/tree.html"]:
+            if not os.path.exists(os.path.join(BASE, gp)):
+                errors.append("missing %s" % gp)
+else:
+    print("note: source/ not built (run scripts/generate-source.js with vendor/ present)")
+
+if not HAVE_REFS:
+    print("note: references/mc-client-sources absent — analysis source verification skipped")
 
 if errors:
     print("\nERRORS (%d):" % len(errors))

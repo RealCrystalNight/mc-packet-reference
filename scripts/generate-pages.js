@@ -14,6 +14,8 @@ const OUT_DIR = path.join(BASE, 'packets');
 
 let SITE;
 try { const cfg = require('../config.json'); SITE = cfg.SITE || 'https://realcrystalnight.github.io/mc-packet-reference'; } catch (e) { SITE = 'https://realcrystalnight.github.io/mc-packet-reference'; }
+// Shared page chrome (also used by generate-source.js / generate-graph.js).
+const { esc, hubNav, siteFooter } = require('./site-chrome');
 
 const GROUPS = [
   { label: 'Handshaking', state: 'HANDSHAKING', dir: 'SERVERBOUND', slug: 'handshaking' },
@@ -338,31 +340,8 @@ function renderVanillaSource(pkt) {
     + '</div>';
 }
 
-// Hub links so Packets / Vanilla Internals / Modules / Analyses all link to each other.
-function hubNav(prefix) {  return '<div class="nav-section"><div class="nav-section-header"><span>Reference</span></div><div class="nav-items">'
-    + '<a href="' + prefix + '" class="nav-item"><span class="nav-name">Home</span></a>'
-    + '<a href="' + prefix + 'start/" class="nav-item"><span class="nav-name">Start Here</span></a>'
-    + '<a href="' + prefix + 'packets/" class="nav-item"><span class="nav-name">All Packets</span></a>'
-    + '<a href="' + prefix + 'classes/" class="nav-item"><span class="nav-name">Vanilla Internals</span></a>'
-    + '<a href="' + prefix + 'modules/" class="nav-item"><span class="nav-name">Cheat Modules</span></a>'
-    + '<a href="' + prefix + 'analysis/" class="nav-item"><span class="nav-name">Module Analyses</span></a>'
-    + '</div></div>';
-}
-
-// Unified footer for every generated page: hub links + machine API + brand.
-function siteFooter(prefix) {
-  return '<div class="overview-footer" style="margin-top:32px;text-align:center;font-size:0.78rem;color:var(--text-muted)">'
-    + '<a href="' + prefix + '" style="color:var(--accent)">Home</a>'
-    + ' \u00b7 <a href="' + prefix + 'start/" style="color:var(--accent)">Start Here</a>'
-    + ' \u00b7 <a href="' + prefix + 'packets/" style="color:var(--accent)">Packets</a>'
-    + ' \u00b7 <a href="' + prefix + 'classes/" style="color:var(--accent)">Vanilla Internals</a>'
-    + ' \u00b7 <a href="' + prefix + 'modules/" style="color:var(--accent)">Cheat Modules</a>'
-    + ' \u00b7 <a href="' + prefix + 'analysis/" style="color:var(--accent)">Analyses</a>'
-    + '<br>LLMs: <a href="' + prefix + 'llms.txt" style="color:var(--accent)">llms.txt</a>'
-    + ' \u00b7 <a href="' + prefix + 'api/" style="color:var(--accent)">JSON API</a>'
-    + '<br><span>Minecraft 1.8.9 Packet Reference \u2014 unofficial, not affiliated with Mojang or Microsoft.</span>'
-    + '</div>';
-}
+// hubNav / siteFooter / esc live in scripts/site-chrome.js (shared with the
+// Source Browser and Code Graph generators).
 
 function buildSidebarHtml(allPkts) {  let html = '';
   GROUPS.forEach(function(g) {
@@ -384,8 +363,6 @@ function buildSidebarHtml(allPkts) {  let html = '';
   });
   return html;
 }
-
-function esc(s) { if (!s) return ''; return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
 // Lightweight prose renderer: paragraphs, ```java fences, inline `code`.
 function renderProse(s) {
@@ -1128,9 +1105,14 @@ function main() {
   fs.writeFileSync(path.join(BASE, 'sitemap.xml'), sitemap);
   // Proper sitemap index (per Google large-sitemaps spec: <sitemapindex>,
   // not a urlset twin) so sitemap-index.xml stays a valid discovery URL.
-  const sitemapIndex = '<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-    + '  <sitemap><loc>' + SITE + '/sitemap.xml</loc><lastmod>' + mtime(path.join(BASE, 'sitemap.xml')) + '</lastmod></sitemap>\n'
-    + '</sitemapindex>\n';
+  let sitemapIndex = '<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    + '  <sitemap><loc>' + SITE + '/sitemap.xml</loc><lastmod>' + mtime(path.join(BASE, 'sitemap.xml')) + '</lastmod></sitemap>\n';
+  // Source Browser sitemap (1612+ class pages) — separate file so the core
+  // sitemap stays small; both are discoverable via this index.
+  if (fs.existsSync(path.join(BASE, 'sitemap-source.xml'))) {
+    sitemapIndex += '  <sitemap><loc>' + SITE + '/sitemap-source.xml</loc><lastmod>' + mtime(path.join(BASE, 'sitemap-source.xml')) + '</lastmod></sitemap>\n';
+  }
+  sitemapIndex += '</sitemapindex>\n';
   fs.writeFileSync(path.join(BASE, 'sitemap-index.xml'), sitemapIndex);
 
   // ============================================================
@@ -1335,7 +1317,7 @@ function main() {
     });
   } catch (e) { /* no analyses */ }
   fs.writeFileSync(path.join(apiDir, 'analyses.json'), JSON.stringify({ site: SITE, count: apiAnalyses.length, analyses: apiAnalyses }, null, 1));
-  fs.writeFileSync(path.join(apiDir, 'index.json'), JSON.stringify({ site: SITE, version: '1.8.9', endpoints: ['api/packets.json', 'api/classes.json', 'api/modules.json', 'api/analyses.json', 'api/index.json', 'sitemap.xml', 'llms.txt'] }, null, 1));
+  fs.writeFileSync(path.join(apiDir, 'index.json'), JSON.stringify({ site: SITE, version: '1.8.9', endpoints: ['api/packets.json', 'api/classes.json', 'api/modules.json', 'api/analyses.json', 'api/source.json', 'api/graph.json', 'api/index.json', 'sitemap.xml', 'sitemap-source.xml', 'llms.txt', 'source/graph/class-graph.json'] }, null, 1));
   const llmsLines = ['# Minecraft 1.8.9 Packet Reference — llms.txt', '# ' + SITE + '/', '',
     '> Searchable reference for all 105 Minecraft 1.8.9 network packets (protocol 47): fields, wire encoding, MCP 1.8.9 source, real client examples and anti-cheat notes.',
     '> Plus 16 verbatim MCP logic-class sources with deep analysis, module index and module analyses.', '',
@@ -1357,6 +1339,17 @@ function main() {
   apiClasses.forEach(function(c) { llmsLines.push('- [' + c.title + '](' + c.url + '): ' + c.desc + ' Packets: ' + c.packets.join(', ') + '.'); });
   llmsLines.push('', '## Vanilla Internals — Concepts (' + CONCEPTS.length + ' verified guides)');
   CONCEPTS.forEach(function(c) { llmsLines.push('- [' + c.title + '](' + SITE + '/classes/' + c.slug + '/): ' + c.desc); });
+  // Full source browser + code graph (scripts/generate-source.js + generate-graph.js)
+  try {
+    const srcIdx = JSON.parse(fs.readFileSync(path.join(apiDir, 'source.json'), 'utf8'));
+    llmsLines.push('', '## Source Browser (' + srcIdx.count + ' classes, ' + srcIdx.packages + ' packages, ' + srcIdx.lines.toLocaleString('en-US') + ' lines, ' + srcIdx.resources + ' resources)');
+    llmsLines.push('- Hub: [' + SITE + '/source/](' + SITE + '/source/) — every MCP 1.8.9 class and package, source verbatim.');
+    llmsLines.push('- Machine index: [' + SITE + '/api/source.json](' + SITE + '/api/source.json)');
+    llmsLines.push('- Assets (textures, models, lang, shaders): [' + SITE + '/source/resources/](' + SITE + '/source/resources/)');
+    llmsLines.push('', '## Code Graph');
+    llmsLines.push('- Hub: [' + SITE + '/source/graph/](' + SITE + '/source/graph/) — class dependency graph, god nodes, communities.');
+    llmsLines.push('- Data: [' + SITE + '/api/graph.json](' + SITE + '/api/graph.json) and [' + SITE + '/source/graph/class-graph.json](' + SITE + '/source/graph/class-graph.json)');
+  } catch (e) { /* source browser not generated */ }
   llmsLines.push('', '## Protocol states', '- Handshaking: C00Handshake',
     '- Login: C00PacketLoginStart, C01PacketEncryptionResponse, S00PacketDisconnect, S01PacketEncryptionRequest, S02PacketLoginSuccess, S03PacketEnableCompression',
     '- Status: C00PacketServerQuery, C01PacketPing, S00PacketServerInfo, S01PacketPong',
