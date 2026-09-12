@@ -246,26 +246,36 @@ if os.path.isdir(os.path.join(BASE, "source")):
         classes = sdata.get("classes", [])
         if sdata.get("count") != len(classes):
             errors.append("api/source.json count mismatch")
-        for c in classes:
-            if not os.path.exists(os.path.join(BASE, "source", c["file"][:-5], "index.html")):
-                errors.append("source: missing page for %s" % c["fqcn"])
-                break
         sms = os.path.join(BASE, "sitemap-source.xml")
-        if not os.path.exists(sms):
+        ss = open(sms, encoding="utf-8").read() if os.path.exists(sms) else ""
+        if not ss:
             errors.append("missing sitemap-source.xml")
-        elif SITE + "/source/" not in open(sms, encoding="utf-8").read():
+        elif SITE + "/source/" not in ss:
             errors.append("sitemap-source.xml missing /source/ hub")
-        for c in classes[:8]:
+        # every class page: exists, correct canonical, full SEO, in the sitemap
+        pkgs = set()
+        for c in classes:
+            canon = SITE + "/source/" + c["file"][:-5] + "/"
             page = os.path.join(BASE, "source", c["file"][:-5], "index.html")
             if not os.path.exists(page):
+                errors.append("source: missing page for %s" % c["fqcn"])
                 continue
+            if canon not in ss:
+                errors.append("source: sitemap missing %s" % c["fqcn"])
             ph = open(page, encoding="utf-8").read()
-            if 'rel="canonical" href="' + SITE + "/source/" + c["file"][:-5] + '/"' not in ph:
+            if 'rel="canonical" href="' + canon + '"' not in ph:
                 errors.append("source/%s: canonical wrong" % c["file"])
             if "<h1>" not in ph or "SoftwareSourceCode" not in ph or "BreadcrumbList" not in ph:
                 errors.append("source/%s: missing h1/structured data" % c["file"])
             if 'class="cv-row"' not in ph or "highlight.min.js" not in ph:
                 errors.append("source/%s: source viewer incomplete" % c["file"])
+            if 'name="robots" content="index, follow' not in ph or "noindex" in ph:
+                errors.append("source/%s: not indexable" % c["file"])
+            pkgs.add(c["package"])
+        for p in sorted(pkgs):
+            rel = os.path.join("source", p.replace(".", "/"))
+            if os.path.isdir(os.path.join(BASE, rel)) and (SITE + "/source/" + p.replace(".", "/") + "/") not in ss:
+                errors.append("source: sitemap missing package %s" % p)
     if os.path.exists(os.path.join(BASE, "api", "graph.json")):
         for gp in ["source/graph/index.html", "source/graph/class-graph.json", "source/graph/graph.html", "source/graph/tree.html"]:
             if not os.path.exists(os.path.join(BASE, gp)):

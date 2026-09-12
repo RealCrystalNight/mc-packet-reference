@@ -484,9 +484,14 @@ function main() {
   if (gg) {
     urls.push({ loc: SITE + '/source/graph/', lastmod: today(), p: '0.8', f: 'weekly' });
     urls.push({ loc: SITE + '/source/graph/graph.html', lastmod: today(), p: '0.6', f: 'weekly' });
+    urls.push({ loc: SITE + '/source/graph/classes.html', lastmod: today(), p: '0.7', f: 'weekly' });
     urls.push({ loc: SITE + '/source/graph/tree.html', lastmod: today(), p: '0.5', f: 'weekly' });
   }
   classes.forEach(function(c) { urls.push({ loc: SITE + '/' + c.url, lastmod: mtimeMap[c.rel], p: '0.6', f: 'monthly' }); });
+  packages.forEach(function(p) {
+    const slugPath = p.split('.').join('/');
+    if (!seenClassDir[slugPath]) urls.push({ loc: SITE + '/source/' + slugPath + '/', lastmod: today(), p: '0.5', f: 'monthly' });
+  });
   const sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
     + urls.map(function(u) { return '  <url><loc>' + u.loc + '</loc><lastmod>' + u.lastmod + '</lastmod><changefreq>' + u.f + '</changefreq><priority>' + u.p + '</priority></url>'; }).join('\n')
     + '\n</urlset>\n';

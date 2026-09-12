@@ -19,7 +19,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
 const { esc, hubNav, siteFooter } = require('./site-chrome');
 const { loadClassGraph, communityLabel } = require('./graph-lib');
 
@@ -104,27 +103,18 @@ function main() {
   fs.writeFileSync(path.join(BASE, 'api', 'graph.json'), JSON.stringify(slim));
   console.log('  wrote source/graph/class-graph.json + api/graph.json (' + nodesOut.length + ' nodes, ' + linksOut.length + ' edges)');
 
-  // 3. Try to render an interactive node-level graph from the slim graph.
+  // 3. Progressive class explorer: static package layout, nodes added on
+  //    demand (the old graphify render laid out all 1,612 nodes at once and
+  //    was slow to view). Template lives in scripts/graph-explorer.html.
   let classesHtml = false;
+  const coreFiles = CORE.map(function(c) { return c[1]; }).filter(function(f) { return gg.byFile[f]; });
   try {
-    const tmp = path.join(BASE, 'vendor', 'graphify-out', '.classcheck');
-    fs.rmSync(tmp, { recursive: true, force: true });
-    fs.mkdirSync(tmp, { recursive: true });
-    const synth = {
-      directed: false, multigraph: false, graph: {},
-      nodes: nodesOut.map(function(n) { return { id: n.id, label: n.label, community: n.community, file_type: 'code', source_file: n.file, source_location: 'L1', norm_label: n.label.toLowerCase() }; }),
-      links: linksOut.map(function(e) { return { source: e.source, target: e.target, relation: e.relation, confidence: 'EXTRACTED', confidence_score: 1, weight: e.weight }; })
-    };
-    fs.writeFileSync(path.join(tmp, 'graph.json'), JSON.stringify(synth));
-    execFileSync('graphify', ['export', 'html', '--graph', path.join(tmp, 'graph.json'), '--node-limit', '2000'], { stdio: 'ignore', timeout: 120000 });
-    const produced = path.join(tmp, 'graph.html');
-    if (fs.existsSync(produced) && fs.statSync(produced).size < 8 * 1024 * 1024) {
-      fs.copyFileSync(produced, path.join(OUT, 'classes.html'));
-      brandHtml(path.join(OUT, 'classes.html'), 'Minecraft 1.8.9 Class Dependency Graph (Interactive)', 'Interactive class-level graph of all ' + gg.counts.files + ' Minecraft 1.8.9 classes and their calls/imports/inheritance edges.');
-      classesHtml = true;
-      console.log('  rendered interactive class graph (classes.html)');
-    }
-  } catch (e) { console.log('  class-level render skipped: ' + e.message.split('\n')[0]); }
+    const tpl = fs.readFileSync(path.join(__dirname, 'graph-explorer.html'), 'utf8');
+    const page = tpl.replace(/__PREFIX__/g, prefix).replace(/__SITE__/g, SITE).replace('__CORE__', JSON.stringify(coreFiles));
+    fs.writeFileSync(path.join(OUT, 'classes.html'), page);
+    classesHtml = true;
+    console.log('  wrote progressive class explorer (classes.html, core seed ' + coreFiles.length + ')');
+  } catch (e) { console.log('  class explorer failed: ' + e.message); }
 
   // 4. Static, crawlable hub.
   const totalDeg = gg.allFiles.reduce(function(n, f) { return n + gg.byFile[f].degree; }, 0);
@@ -170,7 +160,7 @@ function main() {
     }) + '\n</script>\n';
 
   const views = [
-    classesHtml ? ['Classes (interactive)', 'classes.html', gg.counts.files + ' class nodes'] : null,
+    classesHtml ? ['Classes (progressive explorer)', 'classes.html', 'start small, add packages'] : null,
     ['Communities (interactive)', 'graph.html', gg.counts.communities + ' community nodes'],
     ['Symbol tree (interactive)', 'tree.html', gg.counts.rawNodes.toLocaleString('en-US') + ' symbols'],
     ['graphify report (markdown)', 'GRAPH_REPORT.md', 'full report'],
